@@ -1,4 +1,8 @@
-import { tool, type ToolDefinition } from "@opencode-ai/plugin";
+import {
+  tool,
+  type ToolDefinition,
+  type ToolContext,
+} from "@opencode-ai/plugin";
 import type {
   OpencodeClient,
   AssistantMessage,
@@ -17,7 +21,11 @@ export function get(client: OpencodeClient): ToolDefinition {
         .describe("Session containing the message"),
       messageID: tool.schema.string().describe("Message to retrieve"),
     },
-    async execute(args): Promise<string> {
+    async execute(args, ctx: ToolContext): Promise<string> {
+      ctx.metadata({
+        title: `Retrieving message ${args.messageID.slice(0, 20)}...`,
+      });
+
       try {
         const result = await client.session.message({
           sessionID: args.sessionID,
@@ -34,13 +42,11 @@ export function get(client: OpencodeClient): ToolDefinition {
         const info = result.data.info;
         const parts = result.data.parts.map(format);
 
-        // Extract model ID safely from the union type
         let model: string | undefined;
         if (info.role === "assistant")
           model = (info as AssistantMessage).modelID;
         else model = (info as UserMessage).model.modelID;
 
-        // Try to get session context, gracefully degrade on failure
         let title: string | undefined;
         let directory: string | undefined;
         try {
@@ -52,6 +58,10 @@ export function get(client: OpencodeClient): ToolDefinition {
         } catch {
           // Cross-project session — can't get context, that's fine
         }
+
+        ctx.metadata({
+          title: `${info.role} message (${parts.length} part${parts.length !== 1 ? "s" : ""})${title ? ` from "${title}"` : ""}`,
+        });
 
         const out: MessageOutput = {
           ok: true,
@@ -67,10 +77,7 @@ export function get(client: OpencodeClient): ToolDefinition {
         };
         return JSON.stringify(out);
       } catch (e) {
-        const err: ErrorOutput = {
-          ok: false,
-          error: errmsg(e),
-        };
+        const err: ErrorOutput = { ok: false, error: errmsg(e) };
         return JSON.stringify(err);
       }
     },

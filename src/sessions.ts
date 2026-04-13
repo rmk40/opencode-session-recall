@@ -1,4 +1,8 @@
-import { tool, type ToolDefinition } from "@opencode-ai/plugin";
+import {
+  tool,
+  type ToolDefinition,
+  type ToolContext,
+} from "@opencode-ai/plugin";
 import type { OpencodeClient } from "@opencode-ai/sdk/v2";
 import {
   errmsg,
@@ -29,7 +33,13 @@ export function sessions(
         .default(20)
         .describe("Max sessions to return"),
     },
-    async execute(args): Promise<string> {
+    async execute(args, ctx: ToolContext): Promise<string> {
+      ctx.metadata({
+        title: args.search
+          ? `Listing ${args.scope} sessions matching "${args.search}"`
+          : `Listing ${args.scope} sessions`,
+      });
+
       if (args.scope === "global" && !global) {
         const err: ErrorOutput = {
           ok: false,
@@ -93,6 +103,10 @@ export function sessions(
           }
         }
 
+        ctx.metadata({
+          title: `Found ${items.length} ${args.scope} sessions${args.search ? ` matching "${args.search}"` : ""}`,
+        });
+
         const out: SessionsOutput = {
           ok: true,
           sessions: items,
@@ -101,10 +115,7 @@ export function sessions(
         };
         return JSON.stringify(out);
       } catch (e) {
-        const err: ErrorOutput = {
-          ok: false,
-          error: errmsg(e),
-        };
+        const err: ErrorOutput = { ok: false, error: errmsg(e) };
         return JSON.stringify(err);
       }
     },

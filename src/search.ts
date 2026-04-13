@@ -1,5 +1,8 @@
-import { tool, type ToolDefinition } from "@opencode-ai/plugin";
-import type { ToolContext } from "@opencode-ai/plugin";
+import {
+  tool,
+  type ToolDefinition,
+  type ToolContext,
+} from "@opencode-ai/plugin";
 import type {
   OpencodeClient,
   Session,
@@ -128,6 +131,8 @@ Start with scope "session" (fastest). Widen to "project" if not found. Use sessi
         .describe("Filter sessions by title"),
     },
     async execute(args, ctx: ToolContext): Promise<string> {
+      ctx.metadata({ title: `Searching ${args.scope} for "${args.query}"` });
+
       if (args.scope === "global" && !args.sessionID && !global) {
         const err: ErrorOutput = {
           ok: false,
@@ -138,7 +143,6 @@ Start with scope "session" (fastest). Widen to "project" if not found. Use sessi
       }
 
       try {
-        // Build session list
         let targets: SessionMeta[] = [];
 
         if (args.sessionID) {
@@ -183,7 +187,6 @@ Start with scope "session" (fastest). Widen to "project" if not found. Use sessi
           if (resp.data) targets = resp.data.map(meta);
         }
 
-        // Collect results per-session then merge to avoid race conditions
         const collected: SearchResult[] = [];
         let scanned = 0;
         let total = 0;
@@ -202,7 +205,6 @@ Start with scope "session" (fastest). Widen to "project" if not found. Use sessi
           const remaining = args.results - collected.length;
           const batch = targets.slice(i, i + CONCURRENCY);
 
-          // Load messages in parallel, scan sequentially per-session
           const loaded = await Promise.all(
             batch.map(async (t) => {
               try {
@@ -233,8 +235,11 @@ Start with scope "session" (fastest). Widen to "project" if not found. Use sessi
           scanned += batch.length;
         }
 
-        // Trim to limit (in case last batch produced excess)
         const final = collected.slice(0, args.results);
+
+        ctx.metadata({
+          title: `Found ${final.length} result${final.length !== 1 ? "s" : ""} for "${args.query}" (${scanned} session${scanned !== 1 ? "s" : ""} searched)`,
+        });
 
         const out: SearchOutput = {
           ok: true,
@@ -245,10 +250,7 @@ Start with scope "session" (fastest). Widen to "project" if not found. Use sessi
         };
         return JSON.stringify(out);
       } catch (e) {
-        const err: ErrorOutput = {
-          ok: false,
-          error: errmsg(e),
-        };
+        const err: ErrorOutput = { ok: false, error: errmsg(e) };
         return JSON.stringify(err);
       }
     },
