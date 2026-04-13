@@ -1,12 +1,14 @@
 # opencode-session-recall
 
-**Give your agent a memory that survives compaction — without building another memory system.**
+A plugin for [opencode](https://github.com/opencode-ai/opencode) that gives your agent a memory that survives compaction — without building another memory system.
 
-Most agent "memory" solutions add a new subsystem: vector databases, embedding pipelines, separate knowledge stores. They duplicate your data into yet another place that needs to be maintained, synced, and debugged.
+opencode is an open-source AI coding agent that runs in your terminal. It manages long conversations through compaction: summarizing older context to keep the active window focused. But compaction means the agent forgets — original tool outputs, earlier reasoning, the user's exact words.
 
-`opencode-session-recall` takes a different approach: **your conversation history is already the richest source of context you have.** opencode stores every message, every tool output, every reasoning trace in its database — even after compaction prunes them from the agent's context window. This plugin simply gives the agent tools to search and retrieve what's already there.
+This plugin adds five tools to the agent's toolkit that let it search and retrieve that lost context on demand, within the current session, across all sessions in the project, or across every project on the machine.
 
-No embeddings. No vector store. No data duplication. Just direct access to the context your agent already generated.
+**It doesn't create a separate memory store.** Most agent "memory" solutions add vector databases, embedding pipelines, or knowledge graphs — duplicating your data into yet another system. `opencode-session-recall` does none of that. opencode already stores every message, every tool output, every reasoning trace in its database, even after compaction prunes them from context. This plugin simply gives the agent access to what's already there.
+
+No embeddings. No vector store. No data duplication. No setup. Just install the plugin and the agent can remember.
 
 ## What this enables
 
