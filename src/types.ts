@@ -1,3 +1,11 @@
+export const TOOLS = [
+  "recall",
+  "recall_get",
+  "recall_sessions",
+  "recall_context",
+  "recall_messages",
+] as const;
+
 export type SearchResult = {
   sessionID: string;
   sessionTitle: string;

@@ -5,9 +5,10 @@ import type {
   AssistantMessage,
   UserMessage,
 } from "@opencode-ai/sdk/v2";
-import type { PartOutput, MessageItem } from "./types.js";
+import { TOOLS, type PartOutput, type MessageItem } from "./types.js";
 
 const INPUT_SEARCH_LIMIT = 10_000;
+const SELF = new Set<string>(TOOLS);
 
 function input(val: unknown): string {
   const raw = JSON.stringify(val);
@@ -21,6 +22,7 @@ export function matches(text: string, query: string): boolean {
 }
 
 export function searchable(part: Part): string[] {
+  if (part.type === "tool" && SELF.has(part.tool)) return [];
   switch (part.type) {
     case "text":
     case "reasoning":

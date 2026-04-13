@@ -11,13 +11,7 @@ type Options = {
   global?: boolean;
 };
 
-const TOOLS = [
-  "recall",
-  "recall_get",
-  "recall_sessions",
-  "recall_context",
-  "recall_messages",
-];
+import { TOOLS } from "./types.js";
 
 const server: Plugin = async (ctx, options) => {
   const opts = (options ?? {}) as Options;
