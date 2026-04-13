@@ -22,10 +22,31 @@ export function context(client: OpencodeClient): ToolDefinition {
         .min(0)
         .max(10)
         .default(3)
-        .describe("Number of messages to include before AND after the target"),
+        .describe(
+          "Number of messages to include before AND after the target (symmetric). Overridden by before/after if set.",
+        ),
+      before: tool.schema
+        .number()
+        .min(0)
+        .max(10)
+        .optional()
+        .describe(
+          "Messages to include before the target (overrides window for the before side)",
+        ),
+      after: tool.schema
+        .number()
+        .min(0)
+        .max(10)
+        .optional()
+        .describe(
+          "Messages to include after the target (overrides window for the after side)",
+        ),
     },
     async execute(args, ctx: ToolContext): Promise<string> {
       ctx.metadata({ title: "Getting context around message..." });
+
+      const nb = args.before ?? args.window;
+      const na = args.after ?? args.window;
 
       try {
         const resp = await client.session.messages({
@@ -50,8 +71,8 @@ export function context(client: OpencodeClient): ToolDefinition {
           return JSON.stringify(err);
         }
 
-        const start = Math.max(0, idx - args.window);
-        const end = Math.min(msgs.length, idx + args.window + 1);
+        const start = Math.max(0, idx - nb);
+        const end = Math.min(msgs.length, idx + na + 1);
         const slice = msgs.slice(start, end);
 
         const items = slice.map((m) => {
