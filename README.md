@@ -1,182 +1,140 @@
 # opencode-recall
 
-An [opencode](https://github.com/opencode-ai/opencode) plugin that gives agents the ability to search and retrieve conversation history from the database. Recovers context lost to compaction — original tool outputs, earlier messages, reasoning, and user instructions that were pruned from the agent's context window.
+**Give your agent a memory that survives compaction.**
 
-## Why
+When opencode compacts a session, everything before the boundary disappears from the agent's context: tool outputs get replaced with `"[Old tool result content cleared]"`, earlier messages are filtered out, and the original user requirements vanish. The agent forgets what it already solved, what errors it already debugged, what the user originally asked for.
 
-When opencode compacts a session, the agent loses access to earlier conversation content. Tool outputs get pruned (replaced with "[Old tool result content cleared]") and messages before the compaction boundary are filtered out. But the original data remains in the database. This plugin lets the agent search and retrieve it.
+But all of that data is still in the database. `opencode-recall` gives the agent tools to search and retrieve it.
+
+## What this enables
+
+**"We already solved this."** The agent searches its own history and finds the solution from 2 hours ago that got compacted away, instead of solving the same problem again.
+
+**"How did we do it in that other project?"** Cross-project search finds the JWT middleware implementation from the auth project, the Docker config from the deployment project, the test patterns from the API project.
+
+**"What did you originally ask for?"** After 50+ tool calls and 3 compactions, the agent can pull up the user's exact original requirements to make sure it's still on track.
+
+**"What was that error?"** The full stack trace from the tool output that got pruned is still there. The agent retrieves it instead of reproducing the error.
+
+**"Show me what happened."** Browse any session chronologically, play back the conversation, understand the narrative of how a problem was investigated and solved.
 
 ## Install
-
-Add to your `opencode.jsonc`:
 
 ```jsonc
 {
   "plugin": [
-    // Basic — project-scoped search
     "opencode-recall",
 
-    // With options — enable cross-project search
+    // Enable cross-project search
     ["opencode-recall", { "global": true }],
   ],
 }
 ```
 
-For local development:
+## Tools
 
-```jsonc
-{
-  "plugin": ["./path/to/opencode-recall-plugin"],
-}
+Five tools, designed around how agents actually navigate conversation history:
+
+### `recall` — Search
+
+The primary tool. Full-text search across text, tool outputs, tool inputs, reasoning, and subtask descriptions. Searches the current session by default, or widen to all project sessions or all sessions globally.
+
 ```
+recall({ query: "authentication", scope: "project" })
+recall({ query: "error", after: <2 days ago>, type: "tool" })
+recall({ query: "JWT", sessionID: "ses_from_another_project" })
+```
+
+| Param            | Default     | Description                                   |
+| ---------------- | ----------- | --------------------------------------------- |
+| `query`          | required    | Text to search for (case-insensitive)         |
+| `scope`          | `"session"` | `"session"`, `"project"`, or `"global"`       |
+| `sessionID`      | —           | Target a specific session (overrides scope)   |
+| `type`           | `"all"`     | `"text"`, `"tool"`, `"reasoning"`, or `"all"` |
+| `role`           | `"all"`     | `"user"`, `"assistant"`, or `"all"`           |
+| `before`/`after` | —           | Timestamp filters (ms epoch)                  |
+| `width`          | `200`       | Snippet size (50-1000 chars)                  |
+| `sessions`       | `10`        | Max sessions to scan                          |
+| `results`        | `10`        | Max results to return                         |
+
+### `recall_get` — Retrieve
+
+Get the full content of a specific message, including all parts. Tool outputs are returned in their original form, even if they were pruned from context. Use after `recall` finds something interesting.
+
+```
+recall_get({ sessionID: "ses_abc", messageID: "msg_def" })
+```
+
+### `recall_context` — Expand
+
+Get a window of messages around a specific message. After `recall` finds a match, see what was asked before it and what happened after. Supports symmetric and asymmetric windows.
+
+```
+recall_context({ sessionID: "ses_abc", messageID: "msg_def", window: 3 })
+recall_context({ sessionID: "ses_abc", messageID: "msg_def", before: 1, after: 5 })
+```
+
+Returns `hasMoreBefore`/`hasMoreAfter` so the agent knows if it's at a boundary.
+
+### `recall_messages` — Browse
+
+Paginated message browsing. Walk through a session chronologically, read the beginning, check the most recent messages, or filter by role. Also supports content filtering to combine search and pagination.
+
+```
+recall_messages({ limit: 5, role: "user", reverse: true })
+recall_messages({ sessionID: "ses_abc", offset: 10, limit: 10 })
+recall_messages({ query: "npm", role: "user", reverse: true })
+```
+
+Defaults to the current session. Pagination metadata includes `total`, `hasMore`, and `offset`.
+
+### `recall_sessions` — Discover
+
+List sessions by title. The starting point for cross-session and cross-project work.
+
+```
+recall_sessions({ scope: "project", search: "auth" })
+recall_sessions({ scope: "global", search: "deployment" })
+```
+
+## Real-world workflow
+
+This is what it actually looks like when an agent uses these tools to answer "what have we been doing with our UniFi network?" across a 3-week, 600+ message session in a different project:
+
+```
+1. recall_sessions({ scope: "global", search: "unifi" })
+   → discovers the ubiopti project session
+
+2. recall_messages({ sessionID: "...", limit: 5, role: "user", reverse: true })
+   → reads the most recent user messages to understand current state
+
+3. recall({ query: "kickout threshold", sessionID: "...", width: 500 })
+   → finds the technical root cause analysis in tool outputs
+
+4. recall_context({ sessionID: "...", messageID: "...", window: 3 })
+   → expands around the Ubiquiti support chat to see the full interaction
+
+5. recall({ query: "iwpriv", sessionID: "...", after: <recent timestamp> })
+   → finds only recent mentions, not the whole session history
+```
+
+Five tool calls, complete narrative reconstructed across projects.
 
 ## Options
 
-| Option    | Type      | Default | Description                                               |
-| --------- | --------- | ------- | --------------------------------------------------------- |
-| `primary` | `boolean` | `true`  | Register tools as primary tools (available to all agents) |
-| `global`  | `boolean` | `false` | Enable cross-project search (`scope: "global"`)           |
+| Option    | Type      | Default | Description                                         |
+| --------- | --------- | ------- | --------------------------------------------------- |
+| `primary` | `boolean` | `true`  | Register tools as primary (available to all agents) |
+| `global`  | `boolean` | `false` | Enable cross-project search via `scope: "global"`   |
 
-## Tools
+## How it works
 
-### `recall`
-
-Search conversation history. The primary tool.
-
-**Parameters:**
-
-| Name        | Type                                       | Default     | Description                                          |
-| ----------- | ------------------------------------------ | ----------- | ---------------------------------------------------- |
-| `query`     | `string`                                   | required    | Text to search for (case-insensitive)                |
-| `scope`     | `"session" \| "project" \| "global"`       | `"session"` | How far to search                                    |
-| `sessionID` | `string?`                                  | —           | Target a specific session (overrides scope)          |
-| `type`      | `"text" \| "tool" \| "reasoning" \| "all"` | `"all"`     | Filter by part type                                  |
-| `role`      | `"user" \| "assistant" \| "all"`           | `"all"`     | Filter by message role                               |
-| `sessions`  | `number`                                   | `10`        | Max sessions to scan (1-50)                          |
-| `results`   | `number`                                   | `10`        | Max results to return (1-50)                         |
-| `title`     | `string?`                                  | —           | Filter sessions by title                             |
-| `before`    | `number?`                                  | —           | Only match messages before this timestamp (ms epoch) |
-| `after`     | `number?`                                  | —           | Only match messages after this timestamp (ms epoch)  |
-| `width`     | `number`                                   | `200`       | Snippet width in characters (50-1000)                |
-
-**Searches:** text parts, tool outputs, tool inputs, tool titles, reasoning text, subtask descriptions.
-
-**Returns:** JSON with matching snippets, session/message/part IDs, and whether each result was pruned.
-
-### `recall_get`
-
-Retrieve full message content by ID. Use after `recall` to get the complete content of a search result.
-
-**Parameters:**
-
-| Name        | Type     | Description                    |
-| ----------- | -------- | ------------------------------ |
-| `sessionID` | `string` | Session containing the message |
-| `messageID` | `string` | Message to retrieve            |
-
-**Returns:** JSON with full message info and all parts (text, tool outputs, reasoning, etc). Tool outputs are returned in full — even if they were pruned from context.
-
-### `recall_context`
-
-Get messages surrounding a specific message. Use after `recall` finds a match and you need conversation context.
-
-**Parameters:**
-
-| Name        | Type     | Default  | Description                                            |
-| ----------- | -------- | -------- | ------------------------------------------------------ |
-| `sessionID` | `string` | required | Session containing the message                         |
-| `messageID` | `string` | required | Center message to get context around                   |
-| `window`    | `number` | `3`      | Messages to include before AND after the target (0-10) |
-
-**Returns:** JSON with message window, `center: true` on the target message, and `hasMoreBefore`/`hasMoreAfter` boundary indicators.
-
-### `recall_messages`
-
-Browse messages in a session with pagination. Use to play back conversation history chronologically.
-
-**Parameters:**
-
-| Name        | Type                             | Default  | Description                                    |
-| ----------- | -------------------------------- | -------- | ---------------------------------------------- |
-| `sessionID` | `string`                         | required | Session to browse                              |
-| `offset`    | `number`                         | `0`      | Skip this many messages                        |
-| `limit`     | `number`                         | `10`     | Max messages to return (1-50)                  |
-| `role`      | `"user" \| "assistant" \| "all"` | `"all"`  | Filter by message role                         |
-| `reverse`   | `boolean`                        | `false`  | If true, newest first (offset 0 = most recent) |
-
-**Returns:** JSON with messages and pagination metadata (`offset`, `returned`, `total`, `hasMore`). Role filter is applied before pagination.
-
-### `recall_sessions`
-
-List sessions for discovery. Use before `recall` to find the right session.
-
-**Parameters:**
-
-| Name     | Type                    | Default     | Description             |
-| -------- | ----------------------- | ----------- | ----------------------- |
-| `scope`  | `"project" \| "global"` | `"project"` | Scope of search         |
-| `search` | `string?`               | —           | Filter by session title |
-| `limit`  | `number`                | `20`        | Max sessions (1-100)    |
-
-**Returns:** JSON with session metadata (IDs, titles, directories, timestamps).
-
-## Usage Patterns
-
-### Temporal search
-
-```
-recall({ query: "error", after: 1712764200000, scope: "session" })
-  → only recent errors, not the whole session history
-```
-
-### Context expansion
-
-```
-recall({ query: "kickout" })
-  → finds a match at msg_X
-recall_context({ sessionID: "ses_abc", messageID: "msg_X", window: 3 })
-  → see 3 messages before and after the match
-```
-
-### Conversation playback
-
-```
-recall_messages({ sessionID: "ses_abc", limit: 5, role: "user", reverse: true })
-  → last 5 user messages (most recent first)
-recall_messages({ sessionID: "ses_abc", offset: 0, limit: 10 })
-  → read the beginning of the session
-```
-
-### Progressive exploration
-
-```
-recall_sessions({ scope: "global", search: "auth" })
-  → find the auth session
-recall_messages({ sessionID: "ses_xyz", limit: 5, reverse: true })
-  → see where it left off
-recall({ query: "JWT", sessionID: "ses_xyz" })
-  → find the specific implementation
-recall_context({ sessionID: "ses_xyz", messageID: "msg_uvw", window: 5 })
-  → see the full implementation flow
-```
-
-### Cross-project search (requires `global: true`)
-
-```
-recall_sessions({ scope: "global", search: "auth" })
-  → lists sessions across all projects
-recall({ query: "JWT middleware", sessionID: "ses_other" })
-  → searches that session
-```
-
-## How It Works
-
-- Uses the opencode SDK client (no direct database access)
-- Searches client-side via substring matching after loading messages
-- Original tool outputs are preserved in the database even after pruning
-- Sessions are scanned newest-first with bounded concurrency (3 at a time)
+- Uses the opencode SDK client for all data access (no direct database queries)
+- opencode preserves all message and part data in the database, even after compaction prunes it from the agent's context window
+- Search is client-side substring matching — no server-side full-text index needed
+- Sessions are scanned newest-first with bounded concurrency
 - Respects abort signals for long-running searches
-- Global scope is disabled by default for security
+- Global scope is disabled by default
 
 ## License
 

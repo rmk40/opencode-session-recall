@@ -1,0 +1,49 @@
+name: Latest Snapshot
+
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+jobs:
+  latest:
+    runs-on: ubuntu-latest
+    concurrency:
+      group: latest-snapshot
+      cancel-in-progress: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+
+      - run: bun install
+
+      - run: bun run typecheck
+
+      - name: Delete previous latest release
+        run: |
+          gh release delete latest --cleanup-tag --yes 2>/dev/null || true
+          git push origin :refs/tags/latest 2>/dev/null || true
+          sleep 2
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create latest snapshot release
+        run: |
+          gh release create latest \
+            --prerelease \
+            --latest=false \
+            --target "$COMMIT_SHA" \
+            --title "Latest Snapshot" \
+            --notes "Rolling pre-release tracking the latest \`main\` commit.
+
+          **Commit:** $COMMIT_SHA
+          **Date:** $(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+          This is not a stable release. Use a versioned tag (e.g., \`v0.1.0\`) for production."
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          COMMIT_SHA: ${{ github.sha }}

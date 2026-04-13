@@ -1,16 +1,28 @@
 {
+  "$schema": "https://json.schemastore.org/package.json",
   "name": "opencode-recall",
   "version": "0.1.0",
   "type": "module",
-  "description": "OpenCode plugin that lets agents search and retrieve conversation history lost to compaction",
-  "main": "./src/index.ts",
+  "description": "Give your opencode agent a memory that survives compaction — search and retrieve conversation history across sessions and projects",
+  "main": "./dist/index.js",
   "exports": {
-    ".": "./src/index.ts",
-    "./server": "./src/index.ts"
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./server": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
   },
+  "files": [
+    "dist"
+  ],
   "scripts": {
     "dev": "opencode plugin dev",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "compile": "tsup src/index.ts --format esm && tsc --emitDeclarationOnly --outDir dist",
+    "prepublishOnly": "npm run typecheck && npm run compile"
   },
   "keywords": [
     "opencode",
@@ -19,8 +31,23 @@
     "recall",
     "history",
     "compaction",
-    "context"
+    "context",
+    "search",
+    "memory"
   ],
+  "author": "maelos",
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/rmk40/opencode-recall.git"
+  },
+  "homepage": "https://github.com/rmk40/opencode-recall#readme",
+  "bugs": {
+    "url": "https://github.com/rmk40/opencode-recall/issues"
+  },
   "license": "MIT",
   "peerDependencies": {
     "@opencode-ai/plugin": ">=1.2.0"
@@ -31,6 +58,7 @@
   },
   "devDependencies": {
     "@opencode-ai/plugin": "^1.4.3",
+    "tsup": "^8.5.1",
     "typescript": "^6.0.2"
   }
 }

@@ -1,0 +1,9 @@
+src/
+PLAN.md
+PLAN-v2.md
+CONTEXT.md
+AGENTS.md
+tsconfig.json
+*.tsbuildinfo
+.git
+.gitignore
