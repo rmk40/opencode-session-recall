@@ -3,15 +3,11 @@ import {
   type ToolDefinition,
   type ToolContext,
 } from "@opencode-ai/plugin";
-import type { OpencodeClient } from "@opencode-ai/sdk/v2";
+import type { OpencodeClient, Part } from "@opencode-ai/sdk/v2";
 import { errmsg, type MessagesOutput, type ErrorOutput } from "./types.js";
-import { formatMsg, searchable } from "./extract.js";
+import { formatMsg, searchable, matches } from "./extract.js";
 
-function matches(text: string, query: string): boolean {
-  return text.toLowerCase().includes(query.toLowerCase());
-}
-
-function msgMatches(msg: { parts: Array<any> }, query: string): boolean {
+function msgMatches(msg: { parts: Array<Part> }, query: string): boolean {
   for (const part of msg.parts) {
     for (const text of searchable(part)) {
       if (matches(text, query)) return true;
@@ -53,6 +49,7 @@ export function messages(client: OpencodeClient): ToolDefinition {
         .describe("If true, start from most recent messages"),
       query: tool.schema
         .string()
+        .min(1)
         .optional()
         .describe(
           "Only include messages containing this text (searches all parts)",
@@ -60,6 +57,14 @@ export function messages(client: OpencodeClient): ToolDefinition {
     },
     async execute(args, ctx: ToolContext): Promise<string> {
       const sid = args.sessionID ?? ctx.sessionID;
+      if (!sid) {
+        const err: ErrorOutput = {
+          ok: false,
+          error: "No sessionID provided and no current session available",
+        };
+        return JSON.stringify(err);
+      }
+
       ctx.metadata({ title: "Browsing messages..." });
 
       try {

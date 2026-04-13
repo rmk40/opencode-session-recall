@@ -16,6 +16,10 @@ function input(val: unknown): string {
     : raw;
 }
 
+export function matches(text: string, query: string): boolean {
+  return text.toLowerCase().includes(query.toLowerCase());
+}
+
 export function searchable(part: Part): string[] {
   switch (part.type) {
     case "text":

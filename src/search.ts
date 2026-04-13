@@ -15,7 +15,7 @@ import {
   type SearchOutput,
   type ErrorOutput,
 } from "./types.js";
-import { searchable, snippet, pruned } from "./extract.js";
+import { searchable, snippet, pruned, matches } from "./extract.js";
 
 const CONCURRENCY = 3;
 
@@ -28,10 +28,6 @@ type SessionMeta = { id: string; title: string; directory: string };
 
 function meta(s: Session | GlobalSession): SessionMeta {
   return { id: s.id, title: s.title, directory: s.directory };
-}
-
-function matches(text: string, query: string): boolean {
-  return text.toLowerCase().includes(query.toLowerCase());
 }
 
 function scan(
