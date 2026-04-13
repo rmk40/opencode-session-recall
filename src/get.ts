@@ -3,14 +3,10 @@ import {
   type ToolDefinition,
   type ToolContext,
 } from "@opencode-ai/plugin";
-import type {
-  OpencodeClient,
-  AssistantMessage,
-  UserMessage,
-} from "@opencode-ai/sdk/v2";
+import type { OpencodeClient } from "@opencode-ai/sdk/v2";
 import type { MessageOutput, ErrorOutput } from "./types.js";
 import { errmsg } from "./types.js";
-import { format } from "./extract.js";
+import { formatMsg } from "./extract.js";
 
 export function get(client: OpencodeClient): ToolDefinition {
   return tool({
@@ -39,13 +35,7 @@ export function get(client: OpencodeClient): ToolDefinition {
           return JSON.stringify(err);
         }
 
-        const info = result.data.info;
-        const parts = result.data.parts.map(format);
-
-        let model: string | undefined;
-        if (info.role === "assistant")
-          model = (info as AssistantMessage).modelID;
-        else model = (info as UserMessage).model.modelID;
+        const item = formatMsg(result.data);
 
         let title: string | undefined;
         let directory: string | undefined;
@@ -60,19 +50,13 @@ export function get(client: OpencodeClient): ToolDefinition {
         }
 
         ctx.metadata({
-          title: `${info.role} message (${parts.length} part${parts.length !== 1 ? "s" : ""})${title ? ` from "${title}"` : ""}`,
+          title: `${item.message.role} message (${item.parts.length} part${item.parts.length !== 1 ? "s" : ""})${title ? ` from "${title}"` : ""}`,
         });
 
         const out: MessageOutput = {
           ok: true,
-          message: {
-            id: info.id,
-            role: info.role,
-            time: info.time.created,
-            agent: info.agent,
-            model,
-          },
-          parts,
+          message: item.message,
+          parts: item.parts,
           context: { sessionTitle: title, directory },
         };
         return JSON.stringify(out);

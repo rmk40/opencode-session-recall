@@ -7,6 +7,7 @@ import type {
   OpencodeClient,
   Session,
   GlobalSession,
+  Part,
 } from "@opencode-ai/sdk/v2";
 import {
   errmsg,
@@ -31,19 +32,25 @@ function matches(text: string, query: string): boolean {
 function scan(
   messages: Array<{
     info: { id: string; role: "user" | "assistant"; time: { created: number } };
-    parts: Array<any>;
+    parts: Array<Part>;
   }>,
   session: SessionMeta,
   query: string,
   type: string,
   role: string,
   limit: number,
+  before?: number,
+  after?: number,
+  width?: number,
 ): { results: SearchResult[]; total: number } {
   const results: SearchResult[] = [];
   let total = 0;
 
   for (const msg of messages) {
     if (results.length >= limit) break;
+    const ts = msg.info.time.created;
+    if (before && ts >= before) continue;
+    if (after && ts <= after) continue;
     if (role !== "all" && msg.info.role !== role) continue;
 
     for (const part of msg.parts) {
@@ -70,7 +77,7 @@ function scan(
             partID: part.id,
             partType: part.type,
             pruned: pruned(part),
-            snippet: snippet(text, query),
+            snippet: snippet(text, query, width),
             toolName: part.type === "tool" ? part.tool : undefined,
           });
         }
@@ -130,6 +137,20 @@ Start with scope "session" (fastest). Widen to "project" if not found. Use sessi
         .string()
         .optional()
         .describe("Filter sessions by title"),
+      before: tool.schema
+        .number()
+        .optional()
+        .describe("Only match messages before this timestamp (ms epoch)"),
+      after: tool.schema
+        .number()
+        .optional()
+        .describe("Only match messages after this timestamp (ms epoch)"),
+      width: tool.schema
+        .number()
+        .min(50)
+        .max(1000)
+        .default(200)
+        .describe("Snippet width in characters"),
     },
     async execute(args, ctx: ToolContext): Promise<string> {
       ctx.metadata({ title: `Searching ${args.scope} for "${args.query}"` });
@@ -217,18 +238,21 @@ Start with scope "session" (fastest). Widen to "project" if not found. Use sessi
             }),
           );
 
-          for (const { session: sess, messages } of loaded) {
+          for (const { session: sess, messages: msgs } of loaded) {
             if (collected.length >= args.results) {
               early = true;
               break;
             }
             const result = scan(
-              messages,
+              msgs,
               sess,
               args.query,
               args.type,
               args.role,
               remaining,
+              args.before,
+              args.after,
+              args.width,
             );
             collected.push(...result.results);
             total += result.total;

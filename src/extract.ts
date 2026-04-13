@@ -1,7 +1,20 @@
-import type { Part, ToolStateCompleted } from "@opencode-ai/sdk/v2";
-import type { PartOutput } from "./types.js";
+import type {
+  Part,
+  ToolStateCompleted,
+  Message,
+  AssistantMessage,
+  UserMessage,
+} from "@opencode-ai/sdk/v2";
+import type { PartOutput, MessageItem } from "./types.js";
 
 const INPUT_SEARCH_LIMIT = 10_000;
+
+function input(val: unknown): string {
+  const raw = JSON.stringify(val);
+  return raw.length > INPUT_SEARCH_LIMIT
+    ? raw.slice(0, INPUT_SEARCH_LIMIT)
+    : raw;
+}
 
 export function searchable(part: Part): string[] {
   switch (part.type) {
@@ -14,35 +27,14 @@ export function searchable(part: Part): string[] {
       if (state.status === "completed") {
         if (state.output) result.push(state.output);
         if (state.title) result.push(state.title);
-        if (state.input) {
-          const raw = JSON.stringify(state.input);
-          result.push(
-            raw.length > INPUT_SEARCH_LIMIT
-              ? raw.slice(0, INPUT_SEARCH_LIMIT)
-              : raw,
-          );
-        }
+        if (state.input) result.push(input(state.input));
       }
       if (state.status === "error") {
         if (state.error) result.push(state.error);
-        if (state.input) {
-          const raw = JSON.stringify(state.input);
-          result.push(
-            raw.length > INPUT_SEARCH_LIMIT
-              ? raw.slice(0, INPUT_SEARCH_LIMIT)
-              : raw,
-          );
-        }
+        if (state.input) result.push(input(state.input));
       }
       if (state.status === "running" || state.status === "pending") {
-        if (state.input) {
-          const raw = JSON.stringify(state.input);
-          result.push(
-            raw.length > INPUT_SEARCH_LIMIT
-              ? raw.slice(0, INPUT_SEARCH_LIMIT)
-              : raw,
-          );
-        }
+        if (state.input) result.push(input(state.input));
       }
       return result;
     }
@@ -134,4 +126,25 @@ export function format(part: Part): PartOutput {
     default:
       return { ...base, content: `[${(part as Part).type}]` };
   }
+}
+
+export function formatMsg(msg: {
+  info: Message;
+  parts: Array<Part>;
+}): MessageItem {
+  const info = msg.info;
+  let model: string | undefined;
+  if (info.role === "assistant") model = (info as AssistantMessage).modelID;
+  else model = (info as UserMessage).model.modelID;
+
+  return {
+    message: {
+      id: info.id,
+      role: info.role,
+      time: info.time.created,
+      agent: info.agent,
+      model,
+    },
+    parts: msg.parts.map(format),
+  };
 }

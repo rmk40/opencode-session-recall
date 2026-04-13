@@ -3,13 +3,21 @@ import { createOpencodeClient } from "@opencode-ai/sdk/v2";
 import { sessions } from "./sessions.js";
 import { search } from "./search.js";
 import { get } from "./get.js";
+import { context } from "./context.js";
+import { messages } from "./messages.js";
 
 type Options = {
   primary?: boolean;
   global?: boolean;
 };
 
-const TOOLS = ["recall", "recall_get", "recall_sessions"];
+const TOOLS = [
+  "recall",
+  "recall_get",
+  "recall_sessions",
+  "recall_context",
+  "recall_messages",
+];
 
 const server: Plugin = async (ctx, options) => {
   const opts = (options ?? {}) as Options;
@@ -21,7 +29,19 @@ const server: Plugin = async (ctx, options) => {
   // no network socket. We reuse it to create v2 clients that have proper
   // support for limit/search/cursor query params.
   const inner = (ctx.client as any)._client;
+  if (!inner?.getConfig)
+    throw new Error(
+      "opencode-recall: SDK internals changed — cannot extract fetch transport",
+    );
   const cfg = inner.getConfig();
+  if (!cfg.fetch)
+    throw new Error("opencode-recall: SDK client has no custom fetch");
+
+  // Strip only the directory header for the unscoped client, keep auth etc.
+  const { "x-opencode-directory": _, ...rest } = (cfg.headers ?? {}) as Record<
+    string,
+    string
+  >;
 
   // Project-scoped client: includes directory header so session.list/get
   // are scoped to the current project
@@ -33,10 +53,11 @@ const server: Plugin = async (ctx, options) => {
   });
 
   // Unscoped client: no directory header, so experimental.session.list
-  // returns sessions across ALL projects
+  // returns sessions across ALL projects. Preserves other headers (auth etc).
   const unscoped = createOpencodeClient({
     baseUrl: cfg.baseUrl,
     fetch: cfg.fetch,
+    headers: rest,
   });
 
   return {
@@ -44,6 +65,8 @@ const server: Plugin = async (ctx, options) => {
       recall_sessions: sessions(client, unscoped, global),
       recall: search(client, unscoped, global),
       recall_get: get(client),
+      recall_context: context(client),
+      recall_messages: messages(client),
     },
     ...(primary && {
       config: async (c: any) => {

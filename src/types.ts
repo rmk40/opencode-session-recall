@@ -48,6 +48,44 @@ export type PartOutput = {
   error?: string;
 };
 
+export type MessageItem = {
+  message: {
+    id: string;
+    role: "user" | "assistant";
+    time: number;
+    agent?: string;
+    model?: string;
+  };
+  parts: PartOutput[];
+  center?: boolean;
+};
+
+export type ContextOutput = {
+  ok: true;
+  messages: MessageItem[];
+  context: {
+    sessionTitle?: string;
+    directory?: string;
+  };
+  hasMoreBefore: boolean;
+  hasMoreAfter: boolean;
+};
+
+export type MessagesOutput = {
+  ok: true;
+  messages: MessageItem[];
+  context: {
+    sessionTitle?: string;
+    directory?: string;
+  };
+  pagination: {
+    offset: number;
+    returned: number;
+    total: number;
+    hasMore: boolean;
+  };
+};
+
 export type SessionItem = {
   id: string;
   title: string;
@@ -72,6 +110,10 @@ export type ErrorOutput = {
 export function errmsg(e: unknown): string {
   if (e instanceof Error) return e.message;
   if (typeof e === "string") return e;
+  if (e && typeof e === "object" && "data" in e) {
+    const data = (e as any).data;
+    if (data?.message) return data.message;
+  }
   try {
     return JSON.stringify(e);
   } catch {

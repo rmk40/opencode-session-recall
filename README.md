@@ -45,16 +45,19 @@ Search conversation history. The primary tool.
 
 **Parameters:**
 
-| Name        | Type                                       | Default     | Description                                 |
-| ----------- | ------------------------------------------ | ----------- | ------------------------------------------- |
-| `query`     | `string`                                   | required    | Text to search for (case-insensitive)       |
-| `scope`     | `"session" \| "project" \| "global"`       | `"session"` | How far to search                           |
-| `sessionID` | `string?`                                  | —           | Target a specific session (overrides scope) |
-| `type`      | `"text" \| "tool" \| "reasoning" \| "all"` | `"all"`     | Filter by part type                         |
-| `role`      | `"user" \| "assistant" \| "all"`           | `"all"`     | Filter by message role                      |
-| `sessions`  | `number`                                   | `10`        | Max sessions to scan (1-50)                 |
-| `results`   | `number`                                   | `10`        | Max results to return (1-50)                |
-| `title`     | `string?`                                  | —           | Filter sessions by title                    |
+| Name        | Type                                       | Default     | Description                                          |
+| ----------- | ------------------------------------------ | ----------- | ---------------------------------------------------- |
+| `query`     | `string`                                   | required    | Text to search for (case-insensitive)                |
+| `scope`     | `"session" \| "project" \| "global"`       | `"session"` | How far to search                                    |
+| `sessionID` | `string?`                                  | —           | Target a specific session (overrides scope)          |
+| `type`      | `"text" \| "tool" \| "reasoning" \| "all"` | `"all"`     | Filter by part type                                  |
+| `role`      | `"user" \| "assistant" \| "all"`           | `"all"`     | Filter by message role                               |
+| `sessions`  | `number`                                   | `10`        | Max sessions to scan (1-50)                          |
+| `results`   | `number`                                   | `10`        | Max results to return (1-50)                         |
+| `title`     | `string?`                                  | —           | Filter sessions by title                             |
+| `before`    | `number?`                                  | —           | Only match messages before this timestamp (ms epoch) |
+| `after`     | `number?`                                  | —           | Only match messages after this timestamp (ms epoch)  |
+| `width`     | `number`                                   | `200`       | Snippet width in characters (50-1000)                |
 
 **Searches:** text parts, tool outputs, tool inputs, tool titles, reasoning text, subtask descriptions.
 
@@ -73,6 +76,36 @@ Retrieve full message content by ID. Use after `recall` to get the complete cont
 
 **Returns:** JSON with full message info and all parts (text, tool outputs, reasoning, etc). Tool outputs are returned in full — even if they were pruned from context.
 
+### `recall_context`
+
+Get messages surrounding a specific message. Use after `recall` finds a match and you need conversation context.
+
+**Parameters:**
+
+| Name        | Type     | Default  | Description                                            |
+| ----------- | -------- | -------- | ------------------------------------------------------ |
+| `sessionID` | `string` | required | Session containing the message                         |
+| `messageID` | `string` | required | Center message to get context around                   |
+| `window`    | `number` | `3`      | Messages to include before AND after the target (0-10) |
+
+**Returns:** JSON with message window, `center: true` on the target message, and `hasMoreBefore`/`hasMoreAfter` boundary indicators.
+
+### `recall_messages`
+
+Browse messages in a session with pagination. Use to play back conversation history chronologically.
+
+**Parameters:**
+
+| Name        | Type                             | Default  | Description                                    |
+| ----------- | -------------------------------- | -------- | ---------------------------------------------- |
+| `sessionID` | `string`                         | required | Session to browse                              |
+| `offset`    | `number`                         | `0`      | Skip this many messages                        |
+| `limit`     | `number`                         | `10`     | Max messages to return (1-50)                  |
+| `role`      | `"user" \| "assistant" \| "all"` | `"all"`  | Filter by message role                         |
+| `reverse`   | `boolean`                        | `false`  | If true, newest first (offset 0 = most recent) |
+
+**Returns:** JSON with messages and pagination metadata (`offset`, `returned`, `total`, `hasMore`). Role filter is applied before pagination.
+
 ### `recall_sessions`
 
 List sessions for discovery. Use before `recall` to find the right session.
@@ -87,33 +120,44 @@ List sessions for discovery. Use before `recall` to find the right session.
 
 **Returns:** JSON with session metadata (IDs, titles, directories, timestamps).
 
-## Usage Examples
+## Usage Patterns
 
-### Recover pruned tool output from current session
-
-```
-recall({ query: "error", scope: "session", type: "tool" })
-  → finds compacted tool parts with error output
-recall_get({ sessionID: "ses_abc", messageID: "msg_def" })
-  → returns original error text
-```
-
-### Find how something was done in another session
+### Temporal search
 
 ```
-recall_sessions({ search: "CI", scope: "project" })
-  → finds "Set up GitHub Actions CI" session
-recall({ query: "workflow", sessionID: "ses_xyz" })
-  → finds tool outputs with YAML content
-recall_get({ sessionID: "ses_xyz", messageID: "msg_uvw" })
-  → returns the full workflow file
+recall({ query: "error", after: 1712764200000, scope: "session" })
+  → only recent errors, not the whole session history
 ```
 
-### Find the original user requirement after compaction
+### Context expansion
 
 ```
-recall({ query: "requirement", scope: "session", role: "user" })
-  → finds user messages from before compaction
+recall({ query: "kickout" })
+  → finds a match at msg_X
+recall_context({ sessionID: "ses_abc", messageID: "msg_X", window: 3 })
+  → see 3 messages before and after the match
+```
+
+### Conversation playback
+
+```
+recall_messages({ sessionID: "ses_abc", limit: 5, role: "user", reverse: true })
+  → last 5 user messages (most recent first)
+recall_messages({ sessionID: "ses_abc", offset: 0, limit: 10 })
+  → read the beginning of the session
+```
+
+### Progressive exploration
+
+```
+recall_sessions({ scope: "global", search: "auth" })
+  → find the auth session
+recall_messages({ sessionID: "ses_xyz", limit: 5, reverse: true })
+  → see where it left off
+recall({ query: "JWT", sessionID: "ses_xyz" })
+  → find the specific implementation
+recall_context({ sessionID: "ses_xyz", messageID: "msg_uvw", window: 5 })
+  → see the full implementation flow
 ```
 
 ### Cross-project search (requires `global: true`)
