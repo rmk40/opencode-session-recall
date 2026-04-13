@@ -123,13 +123,13 @@ Start with scope "session" (fastest). Widen to "project" if not found. Use sessi
         .number()
         .min(1)
         .max(limits.maxSessions)
-        .default(10)
+        .default(Math.min(10, limits.maxSessions))
         .describe("Max sessions to scan"),
       results: tool.schema
         .number()
         .min(1)
         .max(limits.maxResults)
-        .default(10)
+        .default(Math.min(10, limits.maxResults))
         .describe("Max results to return"),
       title: tool.schema
         .string()
@@ -146,7 +146,7 @@ Start with scope "session" (fastest). Widen to "project" if not found. Use sessi
       width: tool.schema
         .number()
         .min(50)
-        .max(1000)
+        .max(Math.max(limits.defaultWidth, 1000))
         .default(limits.defaultWidth)
         .describe("Snippet width in characters"),
     },

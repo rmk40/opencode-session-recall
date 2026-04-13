@@ -29,7 +29,7 @@ export function context(
         .number()
         .min(0)
         .max(limits.maxWindow)
-        .default(3)
+        .default(Math.min(3, limits.maxWindow))
         .describe(
           "Number of messages to include before AND after the target (symmetric). Overridden by before/after if set.",
         ),

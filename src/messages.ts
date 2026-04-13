@@ -45,7 +45,7 @@ export function messages(
         .number()
         .min(1)
         .max(limits.maxMessages)
-        .default(10)
+        .default(Math.min(10, limits.maxMessages))
         .describe("Max messages to return"),
       role: tool.schema
         .enum(["user", "assistant", "all"])

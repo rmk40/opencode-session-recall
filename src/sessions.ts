@@ -33,7 +33,7 @@ export function sessions(
         .number()
         .min(1)
         .max(limits.maxSessionList)
-        .default(20)
+        .default(Math.min(20, limits.maxSessionList))
         .describe("Max sessions to return"),
     },
     async execute(args, ctx: ToolContext): Promise<string> {

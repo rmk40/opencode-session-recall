@@ -17,14 +17,17 @@ const server: Plugin = async (ctx, options) => {
   const primary = opts.primary !== false;
   const global = opts.global === true;
 
+  const clamp = (val: number | undefined, fallback: number, min = 1) =>
+    Math.max(min, Math.floor(val ?? fallback));
+
   const limits: Limits = {
-    concurrency: opts.concurrency ?? DEFAULTS.concurrency,
-    maxSessions: opts.maxSessions ?? DEFAULTS.maxSessions,
-    maxResults: opts.maxResults ?? DEFAULTS.maxResults,
-    maxSessionList: opts.maxSessionList ?? DEFAULTS.maxSessionList,
-    maxMessages: opts.maxMessages ?? DEFAULTS.maxMessages,
-    maxWindow: opts.maxWindow ?? DEFAULTS.maxWindow,
-    defaultWidth: opts.defaultWidth ?? DEFAULTS.defaultWidth,
+    concurrency: clamp(opts.concurrency, DEFAULTS.concurrency),
+    maxSessions: clamp(opts.maxSessions, DEFAULTS.maxSessions),
+    maxResults: clamp(opts.maxResults, DEFAULTS.maxResults),
+    maxSessionList: clamp(opts.maxSessionList, DEFAULTS.maxSessionList),
+    maxMessages: clamp(opts.maxMessages, DEFAULTS.maxMessages),
+    maxWindow: clamp(opts.maxWindow, DEFAULTS.maxWindow),
+    defaultWidth: clamp(opts.defaultWidth, DEFAULTS.defaultWidth, 50),
   };
 
   // Extract the in-process fetch from the v1 client's internals.
