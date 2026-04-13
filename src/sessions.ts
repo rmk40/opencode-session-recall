@@ -19,7 +19,7 @@ export function sessions(
   limits: Limits,
 ): ToolDefinition {
   return tool({
-    description: `List sessions from the opencode database. Use this FIRST to discover which sessions exist, then search their content with recall. Returns session titles, directories, and timestamps. For cross-project discovery, use scope "global" (requires plugin option global: true).
+    description: `List sessions from the opencode database. Use this FIRST to discover which sessions exist, then search their content with recall. Returns session titles, directories, and timestamps. For cross-project discovery, use scope "global" (enabled by default, disable with plugin option global: false).
 
 Search filters by session title only (case-insensitive substring match — use recall for content search). Sessions are returned newest-updated first. This is a cheap metadata-only call.
 
@@ -50,8 +50,7 @@ Returns { ok, sessions: [{ id, title, directory, time, archived }], returned, sc
       if (args.scope === "global" && !global) {
         const err: ErrorOutput = {
           ok: false,
-          error:
-            "Global scope disabled. Enable via plugin option: global: true",
+          error: "Global scope disabled via plugin option: global: false",
         };
         return JSON.stringify(err);
       }

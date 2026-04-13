@@ -29,8 +29,8 @@ No embeddings. No vector store. No data duplication. No setup. Just install the 
   "plugin": [
     "opencode-session-recall",
 
-    // Enable cross-project search
-    ["opencode-session-recall", { "global": true }],
+    // Disable cross-project search if needed
+    ["opencode-session-recall", { "global": false }],
   ],
 }
 ```
@@ -129,7 +129,7 @@ Five tool calls, complete narrative reconstructed across projects.
 | Option    | Type      | Default | Description                                         |
 | --------- | --------- | ------- | --------------------------------------------------- |
 | `primary` | `boolean` | `true`  | Register tools as primary (available to all agents) |
-| `global`  | `boolean` | `false` | Enable cross-project search via `scope: "global"`   |
+| `global`  | `boolean` | `true`  | Allow cross-project search via `scope: "global"`    |
 
 ## How it works
 

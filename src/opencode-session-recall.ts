@@ -15,7 +15,7 @@ type Options = {
 const server: Plugin = async (ctx, options) => {
   const opts = (options ?? {}) as Options;
   const primary = opts.primary !== false;
-  const global = opts.global === true;
+  const global = opts.global !== false;
 
   const clamp = (val: number | undefined, fallback: number, min = 1) =>
     Math.max(min, Math.floor(val ?? fallback));

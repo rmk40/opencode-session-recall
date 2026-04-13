@@ -170,8 +170,7 @@ This tool's own outputs are excluded from search results to prevent recursive no
       if (args.scope === "global" && !args.sessionID && !global) {
         const err: ErrorOutput = {
           ok: false,
-          error:
-            "Global scope disabled. Enable via plugin option: global: true",
+          error: "Global scope disabled via plugin option: global: false",
         };
         return JSON.stringify(err);
       }
