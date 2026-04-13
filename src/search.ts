@@ -19,6 +19,11 @@ import { searchable, snippet, pruned } from "./extract.js";
 
 const CONCURRENCY = 3;
 
+type MsgWithParts = {
+  info: { id: string; role: "user" | "assistant"; time: { created: number } };
+  parts: Array<Part>;
+};
+
 type SessionMeta = { id: string; title: string; directory: string };
 
 function meta(s: Session | GlobalSession): SessionMeta {
@@ -30,10 +35,7 @@ function matches(text: string, query: string): boolean {
 }
 
 function scan(
-  messages: Array<{
-    info: { id: string; role: "user" | "assistant"; time: { created: number } };
-    parts: Array<Part>;
-  }>,
+  messages: MsgWithParts[],
   session: SessionMeta,
   query: string,
   type: string,
@@ -49,8 +51,8 @@ function scan(
   for (const msg of messages) {
     if (results.length >= limit) break;
     const ts = msg.info.time.created;
-    if (before && ts >= before) continue;
-    if (after && ts <= after) continue;
+    if (before != null && ts >= before) continue;
+    if (after != null && ts <= after) continue;
     if (role !== "all" && msg.info.role !== role) continue;
 
     for (const part of msg.parts) {
@@ -200,12 +202,26 @@ Start with scope "session" (fastest). Widen to "project" if not found. Use sessi
             search: args.title,
             limit: args.sessions,
           });
+          if (resp.error) {
+            const err: ErrorOutput = {
+              ok: false,
+              error: `Failed to list sessions: ${errmsg(resp.error)}`,
+            };
+            return JSON.stringify(err);
+          }
           if (resp.data) targets = resp.data.map(meta);
         } else {
           const resp = await unscoped.experimental.session.list({
             search: args.title,
             limit: args.sessions,
           });
+          if (resp.error) {
+            const err: ErrorOutput = {
+              ok: false,
+              error: `Failed to list sessions: ${errmsg(resp.error)}`,
+            };
+            return JSON.stringify(err);
+          }
           if (resp.data) targets = resp.data.map(meta);
         }
 
@@ -233,7 +249,7 @@ Start with scope "session" (fastest). Widen to "project" if not found. Use sessi
                 const resp = await client.session.messages({ sessionID: t.id });
                 return { session: t, messages: resp.data ?? [] };
               } catch {
-                return { session: t, messages: [] as Array<any> };
+                return { session: t, messages: [] as MsgWithParts[] };
               }
             }),
           );
