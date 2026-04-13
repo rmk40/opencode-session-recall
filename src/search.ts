@@ -91,7 +91,7 @@ export function search(
   limits: Limits,
 ): ToolDefinition {
   return tool({
-    description: `Search your conversation history in the opencode database. Use this to recover context lost to compaction — original tool outputs, earlier messages, reasoning, and user instructions that were pruned from your context window.
+    description: `Search your conversation history in the opencode database. Use this to recover context lost to compaction — original tool outputs, earlier messages, reasoning, and user instructions that were pruned from your context window. Before debugging an issue or implementing a feature, check whether prior sessions already tackled it — the history shows whether an approach succeeded or was abandoned.
 
 Searches text content, tool inputs/outputs, and reasoning via case-insensitive substring matching. Returns matching snippets with session/message IDs you can pass to recall_get for full content, or recall_context if you need surrounding messages.
 
@@ -101,7 +101,7 @@ Scope costs: "session" scans 1 session. "project" scans up to \`sessions\` sessi
 
 Returns { ok, results: [{ sessionID, messageID, role, time, partID, partType, pruned, snippet, toolName? }], scanned, total, truncated }. Each result includes a pruned flag — if true, the content was compacted from your context window and recall_get will return the original full output. Check truncated to know if more matches exist beyond your results limit.
 
-This tool's own outputs are excluded from search results to prevent recursive noise, but remain visible via recall_get, recall_context, and recall_messages.`,
+This tool's own outputs are excluded from search results to prevent recursive noise; use recall_get or recall_context to retrieve any message directly.`,
     args: {
       query: tool.schema
         .string()

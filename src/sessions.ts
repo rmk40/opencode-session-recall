@@ -19,7 +19,7 @@ export function sessions(
   limits: Limits,
 ): ToolDefinition {
   return tool({
-    description: `List sessions from the opencode database. Use this FIRST to discover which sessions exist, then search their content with recall. Returns session titles, directories, and timestamps. For cross-project discovery, use scope "global" (enabled by default, disable with plugin option global: false).
+    description: `List sessions from the opencode database. Use this FIRST to discover which sessions exist, then search their content with recall. Also use at session start to check if related work exists in other sessions or projects.
 
 Search filters by session title only (case-insensitive substring match — use recall for content search). Sessions are returned newest-updated first. This is a cheap metadata-only call.
 
