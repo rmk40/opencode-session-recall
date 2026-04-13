@@ -16,10 +16,17 @@ const server: Plugin = async (ctx, options) => {
   const primary = opts.primary !== false;
   const global = opts.global === true;
 
-  // Create a v2 SDK client — the v1 client from ctx.client doesn't support
-  // limit/search/cursor params on session.list or experimental.session.list
+  // Extract the in-process fetch and config from the v1 client's internals.
+  // The v1 client uses Server.Default().app.fetch — a direct in-process call,
+  // no network socket. We reuse it to create a v2 client that has proper
+  // support for limit/search/cursor query params on session.list etc.
+  const inner = (ctx.client as any)._client;
+  const cfg = inner.getConfig();
+
   const client = createOpencodeClient({
-    baseUrl: ctx.serverUrl.toString(),
+    baseUrl: cfg.baseUrl,
+    fetch: cfg.fetch,
+    headers: cfg.headers,
     directory: ctx.directory,
   });
 
@@ -30,12 +37,12 @@ const server: Plugin = async (ctx, options) => {
       recall_get: get(client),
     },
     ...(primary && {
-      config: async (cfg: any) => {
-        cfg.experimental ??= {};
-        const existing: string[] = cfg.experimental.primary_tools ?? [];
+      config: async (c: any) => {
+        c.experimental ??= {};
+        const existing: string[] = c.experimental.primary_tools ?? [];
         const deduped = new Set(existing);
         for (const t of TOOLS) deduped.add(t);
-        cfg.experimental.primary_tools = [...deduped];
+        c.experimental.primary_tools = [...deduped];
       },
     }),
   };
