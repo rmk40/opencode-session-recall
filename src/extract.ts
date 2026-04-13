@@ -59,7 +59,7 @@ export function snippet(text: string, query: string, width = 200): string {
 
   const half = Math.floor(width / 2);
   let start = Math.max(0, idx - half);
-  let end = Math.min(text.length, start + width);
+  const end = Math.min(text.length, start + width);
   if (end - start < width && start > 0) start = Math.max(0, end - width);
 
   let result = text.slice(start, end);

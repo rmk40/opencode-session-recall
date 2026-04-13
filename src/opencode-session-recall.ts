@@ -31,6 +31,7 @@ const server: Plugin = async (ctx, options) => {
   };
 
   // Extract the in-process fetch from the v1 client's internals.
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- SDK internals not typed
   const inner = (ctx.client as any)._client;
   if (!inner?.getConfig)
     throw new Error(
@@ -40,6 +41,7 @@ const server: Plugin = async (ctx, options) => {
   if (!cfg.fetch)
     throw new Error("opencode-session-recall: SDK client has no custom fetch");
 
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
   const { "x-opencode-directory": _, ...rest } = (cfg.headers ?? {}) as Record<
     string,
     string
@@ -67,6 +69,7 @@ const server: Plugin = async (ctx, options) => {
       recall_messages: messages(client, limits),
     },
     ...(primary && {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any -- opencode config type not exported
       config: async (c: any) => {
         c.experimental ??= {};
         const existing: string[] = c.experimental.primary_tools ?? [];

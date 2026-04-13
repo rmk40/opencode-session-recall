@@ -139,7 +139,7 @@ export function errmsg(e: unknown): string {
   if (e instanceof Error) return e.message;
   if (typeof e === "string") return e;
   if (e && typeof e === "object" && "data" in e) {
-    const data = (e as any).data;
+    const data = (e as { data?: { message?: string } }).data;
     if (data?.message) return data.message;
   }
   try {
