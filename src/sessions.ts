@@ -2,9 +2,10 @@ import { tool, type ToolDefinition } from "@opencode-ai/plugin";
 import type { OpencodeClient } from "@opencode-ai/sdk/v2";
 import type { SessionItem, SessionsOutput, ErrorOutput } from "./types.js";
 
-type Client = OpencodeClient;
-
-export function sessions(client: Client, global: boolean): ToolDefinition {
+export function sessions(
+  client: OpencodeClient,
+  global: boolean,
+): ToolDefinition {
   return tool({
     description: `List sessions from the opencode database. Use this FIRST to discover which sessions exist, then search their content with recall. Returns session titles, directories, and timestamps. For cross-project discovery, use scope "global" (requires plugin option global: true).`,
     args: {
@@ -41,6 +42,13 @@ export function sessions(client: Client, global: boolean): ToolDefinition {
             search: args.search,
             limit: args.limit,
           });
+          if (result.error) {
+            const err: ErrorOutput = {
+              ok: false,
+              error: `Failed to list sessions: ${String(result.error)}`,
+            };
+            return JSON.stringify(err);
+          }
           if (result.data) {
             for (const s of result.data) {
               items.push({
@@ -60,6 +68,13 @@ export function sessions(client: Client, global: boolean): ToolDefinition {
             search: args.search,
             limit: args.limit,
           });
+          if (result.error) {
+            const err: ErrorOutput = {
+              ok: false,
+              error: `Failed to list sessions: ${String(result.error)}`,
+            };
+            return JSON.stringify(err);
+          }
           if (result.data) {
             for (const s of result.data) {
               items.push({

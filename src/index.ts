@@ -9,6 +9,8 @@ type Options = {
   global?: boolean;
 };
 
+const TOOLS = ["recall", "recall_get", "recall_sessions"];
+
 const server: Plugin = async (ctx, options) => {
   const opts = (options ?? {}) as Options;
   const primary = opts.primary !== false;
@@ -26,16 +28,11 @@ const server: Plugin = async (ctx, options) => {
     },
     ...(primary && {
       config: async (cfg: any) => {
-        const existing = cfg.experimental?.primary_tools ?? [];
-        cfg.experimental = {
-          ...cfg.experimental,
-          primary_tools: [
-            ...existing,
-            "recall",
-            "recall_get",
-            "recall_sessions",
-          ],
-        };
+        cfg.experimental ??= {};
+        const existing: string[] = cfg.experimental.primary_tools ?? [];
+        const deduped = new Set(existing);
+        for (const t of TOOLS) deduped.add(t);
+        cfg.experimental.primary_tools = [...deduped];
       },
     }),
   };

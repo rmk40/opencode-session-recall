@@ -8,8 +8,6 @@ import type {
 import type { SearchResult, SearchOutput, ErrorOutput } from "./types.js";
 import { searchable, snippet, pruned } from "./extract.js";
 
-type Client = OpencodeClient;
-
 const CONCURRENCY = 3;
 
 type SessionMeta = { id: string; title: string; directory: string };
@@ -22,20 +20,21 @@ function matches(text: string, query: string): boolean {
   return text.toLowerCase().includes(query.toLowerCase());
 }
 
-async function scan(
-  client: Client,
+function scan(
+  messages: Array<{
+    info: { id: string; role: "user" | "assistant"; time: { created: number } };
+    parts: Array<any>;
+  }>,
   session: SessionMeta,
   query: string,
   type: string,
   role: string,
-  results: SearchResult[],
   limit: number,
-): Promise<number> {
+): { results: SearchResult[]; total: number } {
+  const results: SearchResult[] = [];
   let total = 0;
-  const resp = await client.session.messages({ sessionID: session.id });
-  if (!resp.data) return 0;
 
-  for (const msg of resp.data) {
+  for (const msg of messages) {
     if (results.length >= limit) break;
     if (role !== "all" && msg.info.role !== role) continue;
 
@@ -49,7 +48,7 @@ async function scan(
       for (const text of texts) {
         if (!matches(text, query)) continue;
         total++;
-        if (matched) continue; // dedup: one result per part
+        if (matched) continue;
         matched = true;
 
         if (results.length < limit) {
@@ -70,10 +69,13 @@ async function scan(
       }
     }
   }
-  return total;
+  return { results, total };
 }
 
-export function search(client: Client, global: boolean): ToolDefinition {
+export function search(
+  client: OpencodeClient,
+  global: boolean,
+): ToolDefinition {
   return tool({
     description: `Search your conversation history in the opencode database. Use this to recover context lost to compaction — original tool outputs, earlier messages, reasoning, and user instructions that were pruned from your context window.
 
@@ -131,15 +133,10 @@ Start with scope "session" (fastest). Widen to "project" if not found. Use sessi
       }
 
       try {
-        const results: SearchResult[] = [];
-        let scanned = 0;
-        let total = 0;
-
         // Build session list
         let targets: SessionMeta[] = [];
 
         if (args.sessionID) {
-          // Explicit session target
           let title = "";
           let directory = "";
           try {
@@ -181,39 +178,65 @@ Start with scope "session" (fastest). Widen to "project" if not found. Use sessi
           if (resp.data) targets = resp.data.map(meta);
         }
 
-        // Process in batches with bounded concurrency
-        for (let i = 0; i < targets.length; i += CONCURRENCY) {
-          if (ctx.abort.aborted) break;
-          if (results.length >= args.results) break;
+        // Collect results per-session then merge to avoid race conditions
+        const collected: SearchResult[] = [];
+        let scanned = 0;
+        let total = 0;
+        let early = false;
 
+        for (let i = 0; i < targets.length; i += CONCURRENCY) {
+          if (ctx.abort.aborted) {
+            early = true;
+            break;
+          }
+          if (collected.length >= args.results) {
+            early = true;
+            break;
+          }
+
+          const remaining = args.results - collected.length;
           const batch = targets.slice(i, i + CONCURRENCY);
-          const counts = await Promise.all(
+
+          // Load messages in parallel, scan sequentially per-session
+          const loaded = await Promise.all(
             batch.map(async (t) => {
               try {
-                return await scan(
-                  client,
-                  t,
-                  args.query,
-                  args.type,
-                  args.role,
-                  results,
-                  args.results,
-                );
+                const resp = await client.session.messages({ sessionID: t.id });
+                return { session: t, messages: resp.data ?? [] };
               } catch {
-                return 0; // skip failed sessions
+                return { session: t, messages: [] as Array<any> };
               }
             }),
           );
+
+          for (const { session: sess, messages } of loaded) {
+            if (collected.length >= args.results) {
+              early = true;
+              break;
+            }
+            const result = scan(
+              messages,
+              sess,
+              args.query,
+              args.type,
+              args.role,
+              remaining,
+            );
+            collected.push(...result.results);
+            total += result.total;
+          }
           scanned += batch.length;
-          for (const c of counts) total += c;
         }
+
+        // Trim to limit (in case last batch produced excess)
+        const final = collected.slice(0, args.results);
 
         const out: SearchOutput = {
           ok: true,
-          results,
+          results: final,
           scanned,
           total,
-          truncated: results.length >= args.results || ctx.abort.aborted,
+          truncated: early || total > final.length,
         };
         return JSON.stringify(out);
       } catch (e) {

@@ -1,14 +1,11 @@
 import type { Part, ToolStateCompleted } from "@opencode-ai/sdk/v2";
 import type { PartOutput } from "./types.js";
 
-const TRUNCATE_LIMIT = 10_000;
-const TRUNCATE_HEAD = 5_000;
-const TRUNCATE_TAIL = 2_000;
+const INPUT_SEARCH_LIMIT = 10_000;
 
 export function searchable(part: Part): string[] {
   switch (part.type) {
     case "text":
-      return part.text ? [part.text] : [];
     case "reasoning":
       return part.text ? [part.text] : [];
     case "tool": {
@@ -17,19 +14,40 @@ export function searchable(part: Part): string[] {
       if (state.status === "completed") {
         if (state.output) result.push(state.output);
         if (state.title) result.push(state.title);
-        if (state.input) result.push(JSON.stringify(state.input));
+        if (state.input) {
+          const raw = JSON.stringify(state.input);
+          result.push(
+            raw.length > INPUT_SEARCH_LIMIT
+              ? raw.slice(0, INPUT_SEARCH_LIMIT)
+              : raw,
+          );
+        }
       }
       if (state.status === "error") {
         if (state.error) result.push(state.error);
-        if (state.input) result.push(JSON.stringify(state.input));
+        if (state.input) {
+          const raw = JSON.stringify(state.input);
+          result.push(
+            raw.length > INPUT_SEARCH_LIMIT
+              ? raw.slice(0, INPUT_SEARCH_LIMIT)
+              : raw,
+          );
+        }
       }
       if (state.status === "running" || state.status === "pending") {
-        if (state.input) result.push(JSON.stringify(state.input));
+        if (state.input) {
+          const raw = JSON.stringify(state.input);
+          result.push(
+            raw.length > INPUT_SEARCH_LIMIT
+              ? raw.slice(0, INPUT_SEARCH_LIMIT)
+              : raw,
+          );
+        }
       }
       return result;
     }
     case "subtask":
-      return [part.description, part.prompt].filter(Boolean);
+      return [part.description, part.prompt];
     default:
       return [];
   }
@@ -58,22 +76,11 @@ export function pruned(part: Part): boolean {
   return (part.state as ToolStateCompleted).time.compacted != null;
 }
 
-function truncate(text: string): string {
-  if (text.length <= TRUNCATE_LIMIT) return text;
-  const omitted = text.length - TRUNCATE_HEAD - TRUNCATE_TAIL;
-  return (
-    text.slice(0, TRUNCATE_HEAD) +
-    `\n...[truncated ${omitted} chars]...\n` +
-    text.slice(-TRUNCATE_TAIL)
-  );
-}
-
 export function format(part: Part): PartOutput {
   const base = { id: part.id, type: part.type, pruned: pruned(part) };
 
   switch (part.type) {
     case "text":
-      return { ...base, content: part.text };
     case "reasoning":
       return { ...base, content: part.text };
     case "tool": {
@@ -84,7 +91,7 @@ export function format(part: Part): PartOutput {
           toolName: part.tool,
           title: state.title,
           input: state.input,
-          output: truncate(state.output),
+          output: state.output,
         };
       if (state.status === "error")
         return {

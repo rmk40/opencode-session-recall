@@ -24,7 +24,7 @@ export type MessageOutput = {
   ok: true;
   message: {
     id: string;
-    role: string;
+    role: "user" | "assistant";
     time: number;
     agent?: string;
     model?: string;

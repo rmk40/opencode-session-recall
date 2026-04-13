@@ -1,13 +1,15 @@
 import { tool, type ToolDefinition } from "@opencode-ai/plugin";
-import type { OpencodeClient } from "@opencode-ai/sdk/v2";
+import type {
+  OpencodeClient,
+  AssistantMessage,
+  UserMessage,
+} from "@opencode-ai/sdk/v2";
 import type { MessageOutput, ErrorOutput } from "./types.js";
 import { format } from "./extract.js";
 
-type Client = OpencodeClient;
-
-export function get(client: Client): ToolDefinition {
+export function get(client: OpencodeClient): ToolDefinition {
   return tool({
-    description: `Retrieve the full content of a specific message from any session, including all parts (text, tool outputs, reasoning, etc). Use after recall to get the complete content of a search result. For tool parts, returns the original output even if it was pruned from your context window.`,
+    description: `Retrieve the full content of a specific message from any session, including all parts (text, tool outputs, reasoning, etc). Use after recall to get the complete content of a search result. For tool parts, returns the original output even if it was pruned from your context window. Large outputs may be truncated by the opencode runtime.`,
     args: {
       sessionID: tool.schema
         .string()
@@ -21,16 +23,21 @@ export function get(client: Client): ToolDefinition {
           messageID: args.messageID,
         });
         if (!result.data) {
-          const err: ErrorOutput = {
-            ok: false,
-            error: `Message not found: ${args.messageID} in session ${args.sessionID}`,
-          };
+          const msg = result.error
+            ? String(result.error)
+            : `Message not found: ${args.messageID}`;
+          const err: ErrorOutput = { ok: false, error: msg };
           return JSON.stringify(err);
         }
 
-        const msg = result.data;
-        const info = msg.info;
-        const parts = msg.parts.map(format);
+        const info = result.data.info;
+        const parts = result.data.parts.map(format);
+
+        // Extract model ID safely from the union type
+        let model: string | undefined;
+        if (info.role === "assistant")
+          model = (info as AssistantMessage).modelID;
+        else model = (info as UserMessage).model.modelID;
 
         // Try to get session context, gracefully degrade on failure
         let title: string | undefined;
@@ -52,8 +59,7 @@ export function get(client: Client): ToolDefinition {
             role: info.role,
             time: info.time.created,
             agent: info.agent,
-            model:
-              info.role === "assistant" ? info.modelID : info.model.modelID,
+            model,
           },
           parts,
           context: { sessionTitle: title, directory },
