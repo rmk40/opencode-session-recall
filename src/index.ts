@@ -31,11 +31,11 @@ const server: Plugin = async (ctx, options) => {
   const inner = (ctx.client as any)._client;
   if (!inner?.getConfig)
     throw new Error(
-      "opencode-recall: SDK internals changed — cannot extract fetch transport",
+      "opencode-session-recall: SDK internals changed — cannot extract fetch transport",
     );
   const cfg = inner.getConfig();
   if (!cfg.fetch)
-    throw new Error("opencode-recall: SDK client has no custom fetch");
+    throw new Error("opencode-session-recall: SDK client has no custom fetch");
 
   // Strip only the directory header for the unscoped client, keep auth etc.
   const { "x-opencode-directory": _, ...rest } = (cfg.headers ?? {}) as Record<
@@ -81,6 +81,6 @@ const server: Plugin = async (ctx, options) => {
 };
 
 export default {
-  id: "opencode-recall",
+  id: "opencode-session-recall",
   server,
 };

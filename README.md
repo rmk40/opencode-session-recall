@@ -1,10 +1,10 @@
-# opencode-recall
+# opencode-session-recall
 
 **Give your agent a memory that survives compaction — without building another memory system.**
 
 Most agent "memory" solutions add a new subsystem: vector databases, embedding pipelines, separate knowledge stores. They duplicate your data into yet another place that needs to be maintained, synced, and debugged.
 
-`opencode-recall` takes a different approach: **your conversation history is already the richest source of context you have.** opencode stores every message, every tool output, every reasoning trace in its database — even after compaction prunes them from the agent's context window. This plugin simply gives the agent tools to search and retrieve what's already there.
+`opencode-session-recall` takes a different approach: **your conversation history is already the richest source of context you have.** opencode stores every message, every tool output, every reasoning trace in its database — even after compaction prunes them from the agent's context window. This plugin simply gives the agent tools to search and retrieve what's already there.
 
 No embeddings. No vector store. No data duplication. Just direct access to the context your agent already generated.
 
@@ -25,10 +25,10 @@ No embeddings. No vector store. No data duplication. Just direct access to the c
 ```jsonc
 {
   "plugin": [
-    "opencode-recall",
+    "opencode-session-recall",
 
     // Enable cross-project search
-    ["opencode-recall", { "global": true }],
+    ["opencode-session-recall", { "global": true }],
   ],
 }
 ```
