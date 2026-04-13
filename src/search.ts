@@ -82,6 +82,7 @@ function scan(
 
 export function search(
   client: OpencodeClient,
+  unscoped: OpencodeClient,
   global: boolean,
 ): ToolDefinition {
   return tool({
@@ -180,7 +181,7 @@ Start with scope "session" (fastest). Widen to "project" if not found. Use sessi
           });
           if (resp.data) targets = resp.data.map(meta);
         } else {
-          const resp = await client.experimental.session.list({
+          const resp = await unscoped.experimental.session.list({
             search: args.title,
             limit: args.sessions,
           });

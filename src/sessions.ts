@@ -13,6 +13,7 @@ import {
 
 export function sessions(
   client: OpencodeClient,
+  unscoped: OpencodeClient,
   global: boolean,
 ): ToolDefinition {
   return tool({
@@ -53,7 +54,7 @@ export function sessions(
         const items: SessionItem[] = [];
 
         if (args.scope === "global") {
-          const result = await client.experimental.session.list({
+          const result = await unscoped.experimental.session.list({
             search: args.search,
             limit: args.limit,
           });

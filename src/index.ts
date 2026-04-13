@@ -16,13 +16,15 @@ const server: Plugin = async (ctx, options) => {
   const primary = opts.primary !== false;
   const global = opts.global === true;
 
-  // Extract the in-process fetch and config from the v1 client's internals.
+  // Extract the in-process fetch from the v1 client's internals.
   // The v1 client uses Server.Default().app.fetch — a direct in-process call,
-  // no network socket. We reuse it to create a v2 client that has proper
-  // support for limit/search/cursor query params on session.list etc.
+  // no network socket. We reuse it to create v2 clients that have proper
+  // support for limit/search/cursor query params.
   const inner = (ctx.client as any)._client;
   const cfg = inner.getConfig();
 
+  // Project-scoped client: includes directory header so session.list/get
+  // are scoped to the current project
   const client = createOpencodeClient({
     baseUrl: cfg.baseUrl,
     fetch: cfg.fetch,
@@ -30,10 +32,17 @@ const server: Plugin = async (ctx, options) => {
     directory: ctx.directory,
   });
 
+  // Unscoped client: no directory header, so experimental.session.list
+  // returns sessions across ALL projects
+  const unscoped = createOpencodeClient({
+    baseUrl: cfg.baseUrl,
+    fetch: cfg.fetch,
+  });
+
   return {
     tool: {
-      recall_sessions: sessions(client, global),
-      recall: search(client, global),
+      recall_sessions: sessions(client, unscoped, global),
+      recall: search(client, unscoped, global),
       recall_get: get(client),
     },
     ...(primary && {
