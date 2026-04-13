@@ -4,10 +4,18 @@ import {
   type ToolContext,
 } from "@opencode-ai/plugin";
 import type { OpencodeClient } from "@opencode-ai/sdk/v2";
-import { errmsg, type ContextOutput, type ErrorOutput } from "./types.js";
+import {
+  errmsg,
+  type ContextOutput,
+  type ErrorOutput,
+  type Limits,
+} from "./types.js";
 import { formatMsg } from "./extract.js";
 
-export function context(client: OpencodeClient): ToolDefinition {
+export function context(
+  client: OpencodeClient,
+  limits: Limits,
+): ToolDefinition {
   return tool({
     description: `Get messages surrounding a specific message in a session. Use after recall finds a match and you need conversation context — what was asked before, what came after. Returns a window of messages centered on the target.`,
     args: {
@@ -20,7 +28,7 @@ export function context(client: OpencodeClient): ToolDefinition {
       window: tool.schema
         .number()
         .min(0)
-        .max(10)
+        .max(limits.maxWindow)
         .default(3)
         .describe(
           "Number of messages to include before AND after the target (symmetric). Overridden by before/after if set.",
@@ -28,7 +36,7 @@ export function context(client: OpencodeClient): ToolDefinition {
       before: tool.schema
         .number()
         .min(0)
-        .max(10)
+        .max(limits.maxWindow)
         .optional()
         .describe(
           "Messages to include before the target (overrides window for the before side)",
@@ -36,7 +44,7 @@ export function context(client: OpencodeClient): ToolDefinition {
       after: tool.schema
         .number()
         .min(0)
-        .max(10)
+        .max(limits.maxWindow)
         .optional()
         .describe(
           "Messages to include after the target (overrides window for the after side)",

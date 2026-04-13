@@ -6,6 +6,26 @@ export const TOOLS = [
   "recall_messages",
 ] as const;
 
+export type Limits = {
+  concurrency: number;
+  maxSessions: number;
+  maxResults: number;
+  maxSessionList: number;
+  maxMessages: number;
+  maxWindow: number;
+  defaultWidth: number;
+};
+
+export const DEFAULTS: Limits = {
+  concurrency: 3,
+  maxSessions: 50,
+  maxResults: 50,
+  maxSessionList: 100,
+  maxMessages: 50,
+  maxWindow: 10,
+  defaultWidth: 200,
+};
+
 export type SearchResult = {
   sessionID: string;
   sessionTitle: string;

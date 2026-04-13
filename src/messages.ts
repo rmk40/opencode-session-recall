@@ -4,7 +4,12 @@ import {
   type ToolContext,
 } from "@opencode-ai/plugin";
 import type { OpencodeClient, Part } from "@opencode-ai/sdk/v2";
-import { errmsg, type MessagesOutput, type ErrorOutput } from "./types.js";
+import {
+  errmsg,
+  type MessagesOutput,
+  type ErrorOutput,
+  type Limits,
+} from "./types.js";
 import { formatMsg, searchable, matches } from "./extract.js";
 
 function msgMatches(msg: { parts: Array<Part> }, query: string): boolean {
@@ -16,7 +21,10 @@ function msgMatches(msg: { parts: Array<Part> }, query: string): boolean {
   return false;
 }
 
-export function messages(client: OpencodeClient): ToolDefinition {
+export function messages(
+  client: OpencodeClient,
+  limits: Limits,
+): ToolDefinition {
   return tool({
     description: `Browse messages in a session chronologically with pagination. Use to play back conversation history, see what happened in order, or find the user's original requirements. Use reverse=true to start from the most recent messages (offset 0 = newest). Use offset to paginate through results.`,
     args: {
@@ -36,7 +44,7 @@ export function messages(client: OpencodeClient): ToolDefinition {
       limit: tool.schema
         .number()
         .min(1)
-        .max(50)
+        .max(limits.maxMessages)
         .default(10)
         .describe("Max messages to return"),
       role: tool.schema

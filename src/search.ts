@@ -14,10 +14,9 @@ import {
   type SearchResult,
   type SearchOutput,
   type ErrorOutput,
+  type Limits,
 } from "./types.js";
 import { searchable, snippet, pruned, matches } from "./extract.js";
-
-const CONCURRENCY = 3;
 
 type MsgWithParts = {
   info: { id: string; role: "user" | "assistant"; time: { created: number } };
@@ -89,6 +88,7 @@ export function search(
   client: OpencodeClient,
   unscoped: OpencodeClient,
   global: boolean,
+  limits: Limits,
 ): ToolDefinition {
   return tool({
     description: `Search your conversation history in the opencode database. Use this to recover context lost to compaction — original tool outputs, earlier messages, reasoning, and user instructions that were pruned from your context window.
@@ -122,13 +122,13 @@ Start with scope "session" (fastest). Widen to "project" if not found. Use sessi
       sessions: tool.schema
         .number()
         .min(1)
-        .max(50)
+        .max(limits.maxSessions)
         .default(10)
         .describe("Max sessions to scan"),
       results: tool.schema
         .number()
         .min(1)
-        .max(50)
+        .max(limits.maxResults)
         .default(10)
         .describe("Max results to return"),
       title: tool.schema
@@ -147,7 +147,7 @@ Start with scope "session" (fastest). Widen to "project" if not found. Use sessi
         .number()
         .min(50)
         .max(1000)
-        .default(200)
+        .default(limits.defaultWidth)
         .describe("Snippet width in characters"),
     },
     async execute(args, ctx: ToolContext): Promise<string> {
@@ -226,7 +226,7 @@ Start with scope "session" (fastest). Widen to "project" if not found. Use sessi
         let total = 0;
         let early = false;
 
-        for (let i = 0; i < targets.length; i += CONCURRENCY) {
+        for (let i = 0; i < targets.length; i += limits.concurrency) {
           if (ctx.abort.aborted) {
             early = true;
             break;
@@ -237,7 +237,7 @@ Start with scope "session" (fastest). Widen to "project" if not found. Use sessi
           }
 
           const remaining = args.results - collected.length;
-          const batch = targets.slice(i, i + CONCURRENCY);
+          const batch = targets.slice(i, i + limits.concurrency);
 
           const loaded = await Promise.all(
             batch.map(async (t) => {

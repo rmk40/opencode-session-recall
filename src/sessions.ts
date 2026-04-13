@@ -9,12 +9,14 @@ import {
   type SessionItem,
   type SessionsOutput,
   type ErrorOutput,
+  type Limits,
 } from "./types.js";
 
 export function sessions(
   client: OpencodeClient,
   unscoped: OpencodeClient,
   global: boolean,
+  limits: Limits,
 ): ToolDefinition {
   return tool({
     description: `List sessions from the opencode database. Use this FIRST to discover which sessions exist, then search their content with recall. Returns session titles, directories, and timestamps. For cross-project discovery, use scope "global" (requires plugin option global: true).`,
@@ -30,7 +32,7 @@ export function sessions(
       limit: tool.schema
         .number()
         .min(1)
-        .max(100)
+        .max(limits.maxSessionList)
         .default(20)
         .describe("Max sessions to return"),
     },
