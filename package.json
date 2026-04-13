@@ -1,0 +1,64 @@
+{
+  "$schema": "https://json.schemastore.org/package.json",
+  "name": "opencode-session-recall",
+  "version": "0.3.0",
+  "type": "module",
+  "description": "Agent memory without a memory system — search and retrieve opencode conversation history that was lost to compaction, across sessions and projects",
+  "main": "./dist/opencode-session-recall.js",
+  "exports": {
+    ".": {
+      "types": "./dist/opencode-session-recall.d.ts",
+      "import": "./dist/opencode-session-recall.js"
+    },
+    "./server": {
+      "types": "./dist/opencode-session-recall.d.ts",
+      "import": "./dist/opencode-session-recall.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "dev": "opencode plugin dev",
+    "typecheck": "tsc --noEmit",
+    "compile": "tsup src/opencode-session-recall.ts --format esm && tsc --emitDeclarationOnly --outDir dist",
+    "prepublishOnly": "npm run typecheck && npm run compile"
+  },
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "plugin",
+    "recall",
+    "history",
+    "compaction",
+    "context",
+    "search",
+    "memory"
+  ],
+  "author": "maelos",
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/rmk40/opencode-session-recall.git"
+  },
+  "homepage": "https://github.com/rmk40/opencode-session-recall#readme",
+  "bugs": {
+    "url": "https://github.com/rmk40/opencode-session-recall/issues"
+  },
+  "license": "MIT",
+  "peerDependencies": {
+    "@opencode-ai/plugin": ">=1.2.0"
+  },
+  "dependencies": {
+    "@opencode-ai/sdk": "^1.3.2",
+    "zod": "^4.3.6"
+  },
+  "devDependencies": {
+    "@opencode-ai/plugin": "^1.4.3",
+    "tsup": "^8.5.1",
+    "typescript": "^6.0.2"
+  }
+}
