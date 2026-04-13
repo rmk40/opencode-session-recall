@@ -93,14 +93,20 @@ export function search(
   return tool({
     description: `Search your conversation history in the opencode database. Use this to recover context lost to compaction — original tool outputs, earlier messages, reasoning, and user instructions that were pruned from your context window.
 
-Searches text content, tool inputs/outputs, and reasoning. Returns matching snippets with session/message IDs you can pass to recall_get for full content.
+Searches text content, tool inputs/outputs, and reasoning via case-insensitive substring matching. Returns matching snippets with session/message IDs you can pass to recall_get for full content, or recall_context if you need surrounding messages.
 
-Start with scope "session" (fastest). Widen to "project" if not found. Use sessionID param to target a specific session found via recall_sessions. Use role "user" to find original requirements.`,
+Start with scope "session" (fastest). Widen to "project" if not found. Use sessionID param to target a specific session found via recall_sessions. Use role "user" to find original requirements.
+
+Scope costs: "session" scans 1 session. "project" scans up to \`sessions\` sessions (default 10). "global" scans across all projects.
+
+Returns { ok, results: [{ sessionID, messageID, role, time, partID, partType, pruned, snippet, toolName? }], scanned, total, truncated }. Each result includes a pruned flag — if true, the content was compacted from your context window and recall_get will return the original full output. Check truncated to know if more matches exist beyond your results limit.
+
+This tool's own outputs are excluded from search results to prevent recursive noise, but remain visible via recall_get, recall_context, and recall_messages.`,
     args: {
       query: tool.schema
         .string()
         .min(1)
-        .describe("Text to search for (case-insensitive)"),
+        .describe("Text to search for (case-insensitive substring match)"),
       scope: tool.schema
         .enum(["session", "project", "global"])
         .default("session")
@@ -124,17 +130,23 @@ Start with scope "session" (fastest). Widen to "project" if not found. Use sessi
         .min(1)
         .max(limits.maxSessions)
         .default(Math.min(10, limits.maxSessions))
-        .describe("Max sessions to scan"),
+        .describe(
+          "Max sessions to scan (controls cost for project/global scope)",
+        ),
       results: tool.schema
         .number()
         .min(1)
         .max(limits.maxResults)
         .default(Math.min(10, limits.maxResults))
-        .describe("Max results to return"),
+        .describe(
+          "Max results to return. Check truncated in response for more.",
+        ),
       title: tool.schema
         .string()
         .optional()
-        .describe("Filter sessions by title"),
+        .describe(
+          "Filter sessions by title before scanning (same as recall_sessions search)",
+        ),
       before: tool.schema
         .number()
         .optional()
@@ -148,7 +160,9 @@ Start with scope "session" (fastest). Widen to "project" if not found. Use sessi
         .min(50)
         .max(Math.max(limits.defaultWidth, 1000))
         .default(limits.defaultWidth)
-        .describe("Snippet width in characters"),
+        .describe(
+          "Characters of context around each match in the returned snippet. Only a snippet is returned — use recall_get for full content.",
+        ),
     },
     async execute(args, ctx: ToolContext): Promise<string> {
       ctx.metadata({ title: `Searching ${args.scope} for "${args.query}"` });

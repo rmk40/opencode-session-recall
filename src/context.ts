@@ -17,7 +17,11 @@ export function context(
   limits: Limits,
 ): ToolDefinition {
   return tool({
-    description: `Get messages surrounding a specific message in a session. Use after recall finds a match and you need conversation context — what was asked before, what came after. Returns a window of messages centered on the target.`,
+    description: `Get messages surrounding a specific message in a session. Use after recall finds a match and you need conversation context — what was asked before, what came after. Returns a chronological window of full messages (with all parts) centered on the target.
+
+Returns { ok, messages: [{ message, parts, center? }], context, hasMoreBefore, hasMoreAfter }. The center message is marked with center: true. Use hasMoreBefore/hasMoreAfter with asymmetric before/after params to expand in either direction. window=3 returns up to 3 before + target + 3 after = 7 messages. window=0 returns only the target.
+
+Use recall_get for a single message without neighbors. Use recall_messages for paginated browsing of an entire session.`,
     args: {
       sessionID: tool.schema
         .string()
@@ -31,7 +35,7 @@ export function context(
         .max(limits.maxWindow)
         .default(Math.min(3, limits.maxWindow))
         .describe(
-          "Number of messages to include before AND after the target (symmetric). Overridden by before/after if set.",
+          "Messages on each side of target (window=3 → up to 7 total). Overridden by before/after if set.",
         ),
       before: tool.schema
         .number()
@@ -39,7 +43,7 @@ export function context(
         .max(limits.maxWindow)
         .optional()
         .describe(
-          "Messages to include before the target (overrides window for the before side)",
+          "Messages before the target (overrides window for before side). Set before=0, after=5 to see only what followed.",
         ),
       after: tool.schema
         .number()
@@ -47,7 +51,7 @@ export function context(
         .max(limits.maxWindow)
         .optional()
         .describe(
-          "Messages to include after the target (overrides window for the after side)",
+          "Messages after the target (overrides window for after side)",
         ),
     },
     async execute(args, ctx: ToolContext): Promise<string> {

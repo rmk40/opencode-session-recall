@@ -19,7 +19,11 @@ export function sessions(
   limits: Limits,
 ): ToolDefinition {
   return tool({
-    description: `List sessions from the opencode database. Use this FIRST to discover which sessions exist, then search their content with recall. Returns session titles, directories, and timestamps. For cross-project discovery, use scope "global" (requires plugin option global: true).`,
+    description: `List sessions from the opencode database. Use this FIRST to discover which sessions exist, then search their content with recall. Returns session titles, directories, and timestamps. For cross-project discovery, use scope "global" (requires plugin option global: true).
+
+Search filters by session title only (case-insensitive substring match — use recall for content search). Sessions are returned newest-updated first. This is a cheap metadata-only call.
+
+Returns { ok, sessions: [{ id, title, directory, time, archived }], returned, scope }. All tools return JSON with ok: true on success or ok: false with error on failure.`,
     args: {
       scope: tool.schema
         .enum(["project", "global"])
@@ -28,13 +32,13 @@ export function sessions(
       search: tool.schema
         .string()
         .optional()
-        .describe("Filter by session title"),
+        .describe("Case-insensitive substring match on session title"),
       limit: tool.schema
         .number()
         .min(1)
         .max(limits.maxSessionList)
         .default(Math.min(20, limits.maxSessionList))
-        .describe("Max sessions to return"),
+        .describe("Max sessions to return (newest first)"),
     },
     async execute(args, ctx: ToolContext): Promise<string> {
       ctx.metadata({

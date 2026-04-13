@@ -26,7 +26,11 @@ export function messages(
   limits: Limits,
 ): ToolDefinition {
   return tool({
-    description: `Browse messages in a session chronologically with pagination. Use to play back conversation history, see what happened in order, or find the user's original requirements. Use reverse=true to start from the most recent messages (offset 0 = newest). Use offset to paginate through results.`,
+    description: `Browse messages in a session chronologically with pagination. Unlike recall (which searches for specific text and returns snippets), this returns full messages with all parts in chronological order. Use it to replay a session when you don't have a specific search term, or when you need complete message content rather than search hits.
+
+Use reverse=true to start from the most recent messages (offset 0 = newest). Use offset to paginate through results. Good for finding the user's original requirements at the start of a session.
+
+Returns { messages: [{ message: { id, role, time }, parts: [...] }], pagination: { offset, returned, total, hasMore } }. The query and role params filter client-side after fetching, so they may return fewer results than limit. pagination.total reflects the count after filtering.`,
     args: {
       sessionID: tool.schema
         .string()
@@ -50,7 +54,9 @@ export function messages(
       role: tool.schema
         .enum(["user", "assistant", "all"])
         .default("all")
-        .describe("Filter by message role"),
+        .describe(
+          "Filter by message role (client-side, may return fewer than limit)",
+        ),
       reverse: tool.schema
         .boolean()
         .default(false)
@@ -60,7 +66,7 @@ export function messages(
         .min(1)
         .optional()
         .describe(
-          "Only include messages containing this text (searches all parts)",
+          "Case-insensitive substring filter on message content (client-side, may return fewer than limit)",
         ),
     },
     async execute(args, ctx: ToolContext): Promise<string> {
