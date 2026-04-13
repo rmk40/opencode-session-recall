@@ -3,7 +3,7 @@
   "name": "opencode-recall",
   "version": "0.1.0",
   "type": "module",
-  "description": "Give your opencode agent a memory that survives compaction — search and retrieve conversation history across sessions and projects",
+  "description": "Agent memory without a memory system — search and retrieve opencode conversation history that was lost to compaction, across sessions and projects",
   "main": "./dist/index.js",
   "exports": {
     ".": {

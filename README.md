@@ -1,10 +1,12 @@
 # opencode-recall
 
-**Give your agent a memory that survives compaction.**
+**Give your agent a memory that survives compaction — without building another memory system.**
 
-When opencode compacts a session, everything before the boundary disappears from the agent's context: tool outputs get replaced with `"[Old tool result content cleared]"`, earlier messages are filtered out, and the original user requirements vanish. The agent forgets what it already solved, what errors it already debugged, what the user originally asked for.
+Most agent "memory" solutions add a new subsystem: vector databases, embedding pipelines, separate knowledge stores. They duplicate your data into yet another place that needs to be maintained, synced, and debugged.
 
-But all of that data is still in the database. `opencode-recall` gives the agent tools to search and retrieve it.
+`opencode-recall` takes a different approach: **your conversation history is already the richest source of context you have.** opencode stores every message, every tool output, every reasoning trace in its database — even after compaction prunes them from the agent's context window. This plugin simply gives the agent tools to search and retrieve what's already there.
+
+No embeddings. No vector store. No data duplication. Just direct access to the context your agent already generated.
 
 ## What this enables
 
@@ -129,9 +131,12 @@ Five tool calls, complete narrative reconstructed across projects.
 
 ## How it works
 
-- Uses the opencode SDK client for all data access (no direct database queries)
-- opencode preserves all message and part data in the database, even after compaction prunes it from the agent's context window
-- Search is client-side substring matching — no server-side full-text index needed
+This plugin doesn't create a separate memory store. It reads what opencode already has.
+
+When opencode compacts a session, it doesn't delete anything. Tool outputs get a `compacted` timestamp and are replaced with placeholder text in the LLM's context — but the original data stays in the database. Messages before a compaction boundary are skipped when building the LLM context — but they're still there. The plugin accesses all of this through the opencode SDK.
+
+- Uses the opencode SDK client (no direct database queries, no separate storage)
+- Zero setup — no embeddings to generate, no indexes to build, no data to sync
 - Sessions are scanned newest-first with bounded concurrency
 - Respects abort signals for long-running searches
 - Global scope is disabled by default
