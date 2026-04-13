@@ -24,6 +24,12 @@ No embeddings. No vector store. No data duplication. No setup. Just install the 
 
 ## Install
 
+```bash
+opencode plugin opencode-session-recall
+```
+
+Or add it to your `opencode.json` manually:
+
 ```jsonc
 {
   "plugin": [
@@ -141,7 +147,7 @@ When opencode compacts a session, it doesn't delete anything. Tool outputs get a
 - Zero setup — no embeddings to generate, no indexes to build, no data to sync
 - Sessions are scanned newest-first with bounded concurrency
 - Respects abort signals for long-running searches
-- Global scope is disabled by default
+- Cross-project search enabled by default (disable with `global: false`)
 
 ## License
 
