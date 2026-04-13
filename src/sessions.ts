@@ -19,9 +19,9 @@ export function sessions(
   limits: Limits,
 ): ToolDefinition {
   return tool({
-    description: `List sessions from the opencode database. Use this FIRST to discover which sessions exist, then search their content with recall. Also use at session start to check if related work exists in other sessions or projects.
+    description: `List sessions from the opencode database. Returns session titles, directories, and timestamps. For cross-project discovery, use scope "global" (enabled by default, disable with plugin option global: false).
 
-Search filters by session title only (case-insensitive substring match — use recall for content search). Sessions are returned newest-updated first. This is a cheap metadata-only call.
+This is a metadata-only listing tool, NOT a content search. Session titles are usually auto-generated timestamps and won't match topic keywords. To find prior work on a topic, use recall (content search) instead — it searches inside actual messages and tool outputs. Use recall_sessions to browse recent sessions by project, check session recency, or get session IDs for recall_messages.
 
 Returns { ok, sessions: [{ id, title, directory, time, archived }], returned, scope }. All tools return JSON with ok: true on success or ok: false with error on failure.`,
     args: {

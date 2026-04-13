@@ -1,7 +1,7 @@
 {
   "$schema": "https://json.schemastore.org/package.json",
   "name": "opencode-session-recall",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "type": "module",
   "description": "Agent memory without a memory system — search and retrieve opencode conversation history that was lost to compaction, across sessions and projects",
   "main": "./dist/opencode-session-recall.js",

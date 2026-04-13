@@ -91,13 +91,13 @@ export function search(
   limits: Limits,
 ): ToolDefinition {
   return tool({
-    description: `Search your conversation history in the opencode database. Use this to recover context lost to compaction — original tool outputs, earlier messages, reasoning, and user instructions that were pruned from your context window. Before debugging an issue or implementing a feature, check whether prior sessions already tackled it — the history shows whether an approach succeeded or was abandoned. If you have access to a memory system, add useful findings to memory so they're available directly next time without searching history.
+    description: `Search your conversation history in the opencode database. This is the primary discovery tool — use it before recall_sessions, which only searches titles. Before debugging an issue or implementing a feature, check whether prior sessions already tackled it — the history shows whether an approach succeeded or was abandoned. If you have access to a memory system, add useful findings to memory so they're available directly next time without searching history.
 
 Searches text content, tool inputs/outputs, and reasoning via case-insensitive substring matching. Returns matching snippets with session/message IDs you can pass to recall_get for full content, or recall_context if you need surrounding messages.
 
-Start with scope "session" (fastest). Widen to "project" if not found. Use sessionID param to target a specific session found via recall_sessions. Use role "user" to find original requirements.
+Searches globally by default — this is fast and finds results across all projects. Results are ordered by session recency (newest first). Try multiple query terms before concluding no prior work exists. Use role "user" to find original requirements.
 
-Scope costs: "session" scans 1 session. "project" scans up to \`sessions\` sessions (default 10). "global" scans across all projects.
+Scope costs: all scopes scan up to \`sessions\` sessions (default 10). "session" scans 1. "project" and "global" scan up to 10 newest. Increase \`sessions\` if nothing found.
 
 Returns { ok, results: [{ sessionID, messageID, role, time, partID, partType, pruned, snippet, toolName? }], scanned, total, truncated }. Each result includes a pruned flag — if true, the content was compacted from your context window and recall_get will return the original full output. Check truncated to know if more matches exist beyond your results limit.
 
@@ -109,9 +109,9 @@ This tool's own outputs are excluded from search results to prevent recursive no
         .describe("Text to search for (case-insensitive substring match)"),
       scope: tool.schema
         .enum(["session", "project", "global"])
-        .default("session")
+        .default("global")
         .describe(
-          "session = current, project = all project sessions, global = all",
+          "global = all projects (default), project = current project, session = current only. Searching broadly is fast.",
         ),
       sessionID: tool.schema
         .string()
@@ -131,7 +131,7 @@ This tool's own outputs are excluded from search results to prevent recursive no
         .max(limits.maxSessions)
         .default(Math.min(10, limits.maxSessions))
         .describe(
-          "Max sessions to scan (controls cost for project/global scope)",
+          "Max sessions to scan. Increase if nothing found — default 10 may miss older sessions.",
         ),
       results: tool.schema
         .number()
@@ -145,7 +145,7 @@ This tool's own outputs are excluded from search results to prevent recursive no
         .string()
         .optional()
         .describe(
-          "Filter sessions by title before scanning (same as recall_sessions search)",
+          "Filter sessions by title before scanning (rarely useful — titles are usually auto-generated)",
         ),
       before: tool.schema
         .number()
