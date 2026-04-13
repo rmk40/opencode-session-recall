@@ -5,6 +5,7 @@ import type {
   UserMessage,
 } from "@opencode-ai/sdk/v2";
 import type { MessageOutput, ErrorOutput } from "./types.js";
+import { errmsg } from "./types.js";
 import { format } from "./extract.js";
 
 export function get(client: OpencodeClient): ToolDefinition {
@@ -24,7 +25,7 @@ export function get(client: OpencodeClient): ToolDefinition {
         });
         if (!result.data) {
           const msg = result.error
-            ? String(result.error)
+            ? errmsg(result.error)
             : `Message not found: ${args.messageID}`;
           const err: ErrorOutput = { ok: false, error: msg };
           return JSON.stringify(err);
@@ -68,7 +69,7 @@ export function get(client: OpencodeClient): ToolDefinition {
       } catch (e) {
         const err: ErrorOutput = {
           ok: false,
-          error: e instanceof Error ? e.message : String(e),
+          error: errmsg(e),
         };
         return JSON.stringify(err);
       }

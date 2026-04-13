@@ -5,7 +5,12 @@ import type {
   Session,
   GlobalSession,
 } from "@opencode-ai/sdk/v2";
-import type { SearchResult, SearchOutput, ErrorOutput } from "./types.js";
+import {
+  errmsg,
+  type SearchResult,
+  type SearchOutput,
+  type ErrorOutput,
+} from "./types.js";
 import { searchable, snippet, pruned } from "./extract.js";
 
 const CONCURRENCY = 3;
@@ -242,7 +247,7 @@ Start with scope "session" (fastest). Widen to "project" if not found. Use sessi
       } catch (e) {
         const err: ErrorOutput = {
           ok: false,
-          error: e instanceof Error ? e.message : String(e),
+          error: errmsg(e),
         };
         return JSON.stringify(err);
       }

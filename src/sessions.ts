@@ -1,6 +1,11 @@
 import { tool, type ToolDefinition } from "@opencode-ai/plugin";
 import type { OpencodeClient } from "@opencode-ai/sdk/v2";
-import type { SessionItem, SessionsOutput, ErrorOutput } from "./types.js";
+import {
+  errmsg,
+  type SessionItem,
+  type SessionsOutput,
+  type ErrorOutput,
+} from "./types.js";
 
 export function sessions(
   client: OpencodeClient,
@@ -45,7 +50,7 @@ export function sessions(
           if (result.error) {
             const err: ErrorOutput = {
               ok: false,
-              error: `Failed to list sessions: ${String(result.error)}`,
+              error: `Failed to list sessions: ${errmsg(result.error)}`,
             };
             return JSON.stringify(err);
           }
@@ -71,7 +76,7 @@ export function sessions(
           if (result.error) {
             const err: ErrorOutput = {
               ok: false,
-              error: `Failed to list sessions: ${String(result.error)}`,
+              error: `Failed to list sessions: ${errmsg(result.error)}`,
             };
             return JSON.stringify(err);
           }
@@ -98,7 +103,7 @@ export function sessions(
       } catch (e) {
         const err: ErrorOutput = {
           ok: false,
-          error: e instanceof Error ? e.message : String(e),
+          error: errmsg(e),
         };
         return JSON.stringify(err);
       }
