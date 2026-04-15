@@ -18,7 +18,7 @@ export type Limits = {
 
 export const DEFAULTS: Limits = {
   concurrency: 3,
-  maxSessions: 50,
+  maxSessions: Infinity,
   maxResults: 50,
   maxSessionList: 100,
   maxMessages: 50,

@@ -167,7 +167,7 @@ recall({ query: "prefiltr", match: "fuzzy", scope: "session", explain: true })
 | `role`           | `"all"`     | `"user"`, `"assistant"`, or `"all"`                                                                                                                                          |
 | `before`/`after` | —           | Timestamp filters (ms epoch)                                                                                                                                                 |
 | `width`          | `200`       | Snippet size (50–1000 chars)                                                                                                                                                 |
-| `sessions`       | `10`        | Max sessions to scan                                                                                                                                                         |
+| `sessions`       | `1000`      | Max sessions to scan (no upper limit)                                                                                                                                        |
 | `title`          | —           | Filter by session title substring (rarely needed)                                                                                                                            |
 | `group`          | `"part"`    | `"part"` or `"session"` — when `"session"`, collapses results by session (one entry per session with the best-scoring or most-recent hit as representative, plus `hitCount`) |
 | `results`        | `10`        | Max results to return                                                                                                                                                        |

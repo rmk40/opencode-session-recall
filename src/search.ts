@@ -325,7 +325,7 @@ Use \`group: "session"\` to collapse results by session — returns one entry pe
 
 Searches globally by default — this is fast and finds results across all projects. Results are ordered by session recency (newest first) for literal, or by relevance score for smart/fuzzy. Try multiple query terms before concluding no prior work exists. Use role "user" to find original requirements.
 
-Scope costs: all scopes scan up to \`sessions\` sessions (default 10). "session" scans 1. "project" and "global" scan up to 10 newest. Increase \`sessions\` if nothing found.
+Scope costs: all scopes scan up to \`sessions\` sessions (default 1000). "session" scans 1. Reduce \`sessions\` for faster searches if needed.
 
 Returns { ok, results: [{ sessionID, messageID, role, time, partID, partType, pruned, snippet, toolName? }], scanned, total, truncated }. Each result includes a pruned flag — if true, the content was compacted from your context window and recall_get will return the original full output. Check truncated to know if more matches exist beyond your results limit.
 
@@ -374,10 +374,9 @@ This tool's own outputs are excluded from search results to prevent recursive no
       sessions: tool.schema
         .number()
         .min(1)
-        .max(limits.maxSessions)
-        .default(Math.min(10, limits.maxSessions))
+        .default(1000)
         .describe(
-          "Max sessions to scan. Increase if nothing found — default 10 may miss older sessions.",
+          "Max sessions to scan. Default 1000 covers deep history. Reduce for faster searches if needed.",
         ),
       results: tool.schema
         .number()
