@@ -1,12 +1,10 @@
 # opencode-session-recall
 
-**Everything your agent ever did is already in the database. It's just not looking.**
+**Every conversation your agent has ever had — across every session, every project — is already in the database. It's just not looking.**
 
-OpenCode stores the full conversation history your agent worked through — messages, tool calls, tool outputs, reasoning traces — even after compaction removes them from the active context window. As conversations get long, OpenCode shrinks what the model can see. The old content is still stored, just no longer visible to the agent.
+[OpenCode](https://github.com/opencode-ai/opencode) stores the full conversation history from every session your agent has ever run — messages, tool calls, tool outputs, reasoning traces. All of it. Not just the current session. Not just the current project. Every project on the machine. Even after compaction shrinks what the model can see, the original content stays in the database — just no longer visible to the agent.
 
-This plugin gives the agent five tools to search and retrieve all of it on demand — within the current session, across every session in the project, or across every project on the machine.
-
-[OpenCode](https://github.com/opencode-ai/opencode) is an open-source AI coding agent that runs in your terminal.
+This plugin gives the agent five tools to search and retrieve all of it on demand.
 
 **No new database.**
 **No embeddings.**
@@ -14,11 +12,13 @@ This plugin gives the agent five tools to search and retrieve all of it on deman
 **No duplication.**
 **No overhead.**
 
-Just install the plugin. The agent can search its own history.
+Just install the plugin. The agent gains access to its entire history.
 
 ## The problem is absurd when you think about it
 
 Your agent solves a tricky build error. Twenty minutes later, compaction runs. An hour later, the same error shows up. The agent starts from zero — debugging something it already figured out, while the answer sits in the database it's connected to.
+
+You built rate-limiting middleware in your API project last week. Now you need it in another project. The agent has no idea it ever existed — while the original implementation, the requirements discussion, the edge cases you worked through, all of it is sitting in the same database, in a session from a different project.
 
 You're 200 tool calls and 3 compactions deep. The agent has drifted from your original request. Your exact words are gone from context. But they're not gone — they're in the database. The agent just can't see them.
 
