@@ -308,17 +308,20 @@ export function search(
   return tool({
     description: `Search your conversation history in the opencode database. This is the primary discovery tool — use it before recall_sessions, which only searches titles. Before debugging an issue or implementing a feature, check whether prior sessions already tackled it — the history shows whether an approach succeeded or was abandoned. If you have access to a memory system, add useful findings to memory so they're available directly next time without searching history.
 
-Searches text content, tool inputs/outputs, and reasoning via case-insensitive substring matching. Returns matching snippets with session/message IDs you can pass to recall_get for full content, or recall_context if you need surrounding messages.
+Supports three matching strategies via the \`match\` parameter:
+- "literal" (default): case-insensitive substring matching. Works across all scopes. Fast and predictable.
+- "smart": fuzzy ranked search using Fuse.js. Handles typos, separator differences (rate-limit vs rateLimit), and ranks results by relevance. Currently available for scope:"session" only.
+- "fuzzy": looser fuzzy search with a higher match threshold. Same scope restriction as smart.
 
-Searches globally by default — this is fast and finds results across all projects. Results are ordered by session recency (newest first). Try multiple query terms before concluding no prior work exists. Use role "user" to find original requirements.
+When using smart or fuzzy, results include a relevance \`score\` (0-1, higher is better) and \`matchedTerms\`. Add \`explain: true\` for detailed scoring breakdowns via \`matchReasons\`. If smart/fuzzy finds no matches, it automatically falls back to literal search.
+
+Searches globally by default — this is fast and finds results across all projects. Results are ordered by session recency (newest first) for literal, or by relevance score for smart/fuzzy. Try multiple query terms before concluding no prior work exists. Use role "user" to find original requirements.
 
 Scope costs: all scopes scan up to \`sessions\` sessions (default 10). "session" scans 1. "project" and "global" scan up to 10 newest. Increase \`sessions\` if nothing found.
 
 Returns { ok, results: [{ sessionID, messageID, role, time, partID, partType, pruned, snippet, toolName? }], scanned, total, truncated }. Each result includes a pruned flag — if true, the content was compacted from your context window and recall_get will return the original full output. Check truncated to know if more matches exist beyond your results limit.
 
-This tool's own outputs are excluded from search results to prevent recursive noise; use recall_get or recall_context to retrieve any message directly.
-
-Use match:"smart" for fuzzy search when exact wording is uncertain — it handles typos, separator differences (rate-limit vs rateLimit), and ranks results by relevance. Currently available for scope:"session" only.`,
+This tool's own outputs are excluded from search results to prevent recursive noise; use recall_get or recall_context to retrieve any message directly.`,
     args: {
       query: tool.schema
         .string()
