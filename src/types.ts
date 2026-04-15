@@ -28,6 +28,7 @@ export const DEFAULTS: Limits = {
 
 export type MatchMode = "literal" | "smart" | "fuzzy";
 export type DegradeKind = "none" | "time" | "budget" | "fallback";
+export type GroupMode = "part" | "session";
 
 export type SearchResult = {
   sessionID: string;
@@ -49,6 +50,8 @@ export type SearchResult = {
   matchedTerms?: string[];
   /** Present when explain=true */
   matchReasons?: string[];
+  /** Present when group:"session" — number of part-level hits in this session */
+  hitCount?: number;
 };
 
 export type SearchOutput = {
@@ -61,6 +64,8 @@ export type SearchOutput = {
   matchMode?: MatchMode;
   /** What happened during ranking */
   degradeKind?: DegradeKind;
+  /** Which grouping was applied */
+  group?: GroupMode;
 };
 
 export type MessageOutput = {

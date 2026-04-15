@@ -79,9 +79,17 @@ recall({ query: "prefiltr", match: "fuzzy", scope: "session" })
 
 Fuzzy search finds `prefilter` even when the agent misremembers the exact spelling. Results ranked by relevance, not just recency.
 
+**"Which sessions touched this topic?"**
+
+```
+recall({ query: "rate limiting", scope: "global", match: "smart", group: "session" })
+```
+
+4 sessions across 3 projects, each with `hitCount` and best representative snippet. One call to discover everywhere a topic came up.
+
 ## Smart and fuzzy search
 
-Version 0.8.0 adds ranked fuzzy retrieval via [Fuse.js](https://www.fusejs.io/). Three matching strategies:
+Ranked fuzzy retrieval powered by [Fuse.js](https://www.fusejs.io/). Three matching strategies:
 
 | Mode                | Behavior                            | Best for                                        |
 | ------------------- | ----------------------------------- | ----------------------------------------------- |
@@ -90,7 +98,7 @@ Version 0.8.0 adds ranked fuzzy retrieval via [Fuse.js](https://www.fusejs.io/).
 | `fuzzy`             | Looser fuzzy search (threshold 0.5) | Very approximate queries, exploratory search    |
 
 ```
-recall({ query: "rate limit middleware", match: "smart", scope: "session" })
+recall({ query: "rate limit middleware", match: "smart", scope: "project" })
 ```
 
 Smart and fuzzy modes:
@@ -102,7 +110,7 @@ Smart and fuzzy modes:
 - **Time-budget degradation** — if ranking takes too long, returns prefilter-ranked results instead of timing out
 - **Explain mode** — add `explain: true` to see scoring breakdowns via `matchReasons`
 
-Currently available for `scope: "session"` only. Other scopes will be enabled as benchmarked.
+Available across all scopes — `"session"`, `"project"`, and `"global"`.
 
 ## Recall is not memory
 
@@ -144,40 +152,43 @@ The primary tool. Full-text search across messages, tool outputs, tool inputs, r
 recall({ query: "authentication", scope: "project" })
 recall({ query: "error", type: "tool", scope: "session" })
 recall({ query: "JWT", sessionID: "ses_from_another_project" })
-recall({ query: "rate limit", match: "smart", scope: "session" })
+recall({ query: "rate limit", match: "smart", scope: "global", group: "session" })
 recall({ query: "prefiltr", match: "fuzzy", scope: "session", explain: true })
 ```
 
-| Param            | Default     | Description                                                      |
-| ---------------- | ----------- | ---------------------------------------------------------------- |
-| `query`          | required    | Text to search for                                               |
-| `scope`          | `"global"`  | `"session"`, `"project"`, or `"global"`                          |
-| `match`          | `"literal"` | `"literal"`, `"smart"`, or `"fuzzy"` (smart/fuzzy: session only) |
-| `explain`        | `false`     | Include scoring metadata in results                              |
-| `sessionID`      | —           | Target a specific session (overrides scope)                      |
-| `type`           | `"all"`     | `"text"`, `"tool"`, `"reasoning"`, or `"all"`                    |
-| `role`           | `"all"`     | `"user"`, `"assistant"`, or `"all"`                              |
-| `before`/`after` | —           | Timestamp filters (ms epoch)                                     |
-| `width`          | `200`       | Snippet size (50–1000 chars)                                     |
-| `sessions`       | `10`        | Max sessions to scan                                             |
-| `title`          | —           | Filter by session title substring (rarely needed)                |
-| `results`        | `10`        | Max results to return                                            |
+| Param            | Default     | Description                                                                                                                                                                  |
+| ---------------- | ----------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `query`          | required    | Text to search for                                                                                                                                                           |
+| `scope`          | `"global"`  | `"session"`, `"project"`, or `"global"`                                                                                                                                      |
+| `match`          | `"literal"` | `"literal"`, `"smart"`, or `"fuzzy"`                                                                                                                                         |
+| `explain`        | `false`     | Include scoring metadata in results                                                                                                                                          |
+| `sessionID`      | —           | Target a specific session (overrides scope)                                                                                                                                  |
+| `type`           | `"all"`     | `"text"`, `"tool"`, `"reasoning"`, or `"all"`                                                                                                                                |
+| `role`           | `"all"`     | `"user"`, `"assistant"`, or `"all"`                                                                                                                                          |
+| `before`/`after` | —           | Timestamp filters (ms epoch)                                                                                                                                                 |
+| `width`          | `200`       | Snippet size (50–1000 chars)                                                                                                                                                 |
+| `sessions`       | `10`        | Max sessions to scan                                                                                                                                                         |
+| `title`          | —           | Filter by session title substring (rarely needed)                                                                                                                            |
+| `group`          | `"part"`    | `"part"` or `"session"` — when `"session"`, collapses results by session (one entry per session with the best-scoring or most-recent hit as representative, plus `hitCount`) |
+| `results`        | `10`        | Max results to return                                                                                                                                                        |
 
 Smart/fuzzy results include additional fields:
 
-| Field          | Description                                   |
-| -------------- | --------------------------------------------- |
-| `score`        | Relevance score (0–1, higher is better)       |
-| `matchMode`    | Which strategy produced this result           |
-| `matchedTerms` | Query tokens found in the candidate           |
-| `matchReasons` | Scoring breakdown (only when `explain: true`) |
+| Field          | Description                                                              |
+| -------------- | ------------------------------------------------------------------------ |
+| `score`        | Relevance score (0–1, higher is better)                                  |
+| `matchMode`    | Which strategy produced this result                                      |
+| `matchedTerms` | Query tokens found in the candidate                                      |
+| `matchReasons` | Scoring breakdown (only when `explain: true`)                            |
+| `hitCount`     | Number of part-level hits in this session (only when `group: "session"`) |
 
 Response-level metadata for smart/fuzzy:
 
-| Field         | Description                                         |
-| ------------- | --------------------------------------------------- |
-| `matchMode`   | `"smart"`, `"fuzzy"`, or `"literal"` (if fell back) |
-| `degradeKind` | `"none"`, `"time"`, `"budget"`, or `"fallback"`     |
+| Field         | Description                                                |
+| ------------- | ---------------------------------------------------------- |
+| `matchMode`   | `"smart"`, `"fuzzy"`, or `"literal"` (if fell back)        |
+| `degradeKind` | `"none"`, `"time"`, `"budget"`, or `"fallback"`            |
+| `group`       | `"part"` or `"session"` — echoes back the grouping applied |
 
 ### `recall_get` — Retrieve
 
@@ -249,6 +260,7 @@ This plugin reads all of it through the OpenCode SDK:
 - Sessions scanned newest-first with bounded concurrency
 - Respects abort signals for long-running searches
 - Cross-project search enabled by default (disable with `global: false`)
+- Smart and fuzzy ranking works across all scopes — session, project, and global
 
 ### Smart/fuzzy pipeline
 

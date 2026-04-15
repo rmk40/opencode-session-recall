@@ -72,9 +72,9 @@ The plugin registers five tools via the OpenCode plugin API. All data access goe
 | Module                       | Lines | Purpose                                                                                  |
 | ---------------------------- | ----- | ---------------------------------------------------------------------------------------- |
 | `opencode-session-recall.ts` | 87    | Plugin entry point. Creates SDK clients, registers tools, injects `primary_tools` config |
-| `search.ts`                  | ~650  | `recall` tool. Literal scan path + smart/fuzzy pipeline orchestration                    |
+| `search.ts`                  | ~680  | `recall` tool. Literal scan, smart/fuzzy pipeline, session grouping                      |
 | `extract.ts`                 | 156   | Text extraction from message parts. `searchable()`, `matches()`, `snippet()`, `pruned()` |
-| `types.ts`                   | 165   | Shared types: `SearchResult`, `SearchOutput`, `MatchMode`, `DegradeKind`, `Limits`       |
+| `types.ts`                   | 170   | Shared types: `SearchResult`, `SearchOutput`, `MatchMode`, `DegradeKind`, `GroupMode`    |
 | `sessions.ts`                | 129   | `recall_sessions` tool                                                                   |
 | `get.ts`                     | 77    | `recall_get` tool                                                                        |
 | `context.ts`                 | 125   | `recall_context` tool                                                                    |
@@ -96,28 +96,37 @@ flowchart TB
     Start["recall(query, match, ...)"] --> Guard{"match = literal?"}
 
     Guard -->|Yes| Literal["Literal scan path"]
-    Guard -->|No| ScopeCheck{"Scope promoted?"}
-
-    ScopeCheck -->|No| Reject["Error: scope not supported"]
-    ScopeCheck -->|Yes| Smart["Smart/fuzzy pipeline"]
+    Guard -->|No| Smart["Smart/fuzzy pipeline"]
 
     Literal --> LitScan["scan() in search.ts"]
     LitScan --> LitMatch["matches() in extract.ts"]
     LitMatch --> LitSnip["snippet() in extract.ts"]
-    LitSnip --> LitOut["SearchOutput"]
+    LitSnip --> GroupCheck1{"group = session?"}
 
     Smart --> Pipeline["smartScan()"]
-    Pipeline --> SmartOut["SearchOutput + metadata"]
+    Pipeline --> SmartOut["Ranked results"]
 
     SmartOut --> FallbackCheck{"Zero results?"}
     FallbackCheck -->|Yes| Fallback["Literal fallback"]
-    FallbackCheck -->|No| Done["Return results"]
+    FallbackCheck -->|No| GroupCheck2{"group = session?"}
     Fallback --> LitScan
+
+    GroupCheck1 -->|Yes| Group1["groupBySession()"]
+    GroupCheck1 -->|No| Slice1["Slice to limit"]
+    GroupCheck2 -->|Yes| Group2["groupBySession()"]
+    GroupCheck2 -->|No| Slice2["Slice to limit"]
+
+    Group1 --> Out1["SearchOutput"]
+    Slice1 --> Out1
+    Group2 --> Out2["SearchOutput + metadata"]
+    Slice2 --> Out2
 ```
 
-**Literal path** (`match: "literal"`, the default): Uses the original `scan()` function. Iterates messages → parts → `searchable()` → `matches()` (case-insensitive `includes`). Stops early when the result limit is reached. Available for all scopes.
+**Literal path** (`match: "literal"`, the default): Uses the original `scan()` function. Iterates messages → parts → `searchable()` → `matches()` (case-insensitive `includes`). Stops early when the result limit is reached (or collects up to 1000 when grouping by session). Available for all scopes.
 
-**Smart/fuzzy path** (`match: "smart"` or `"fuzzy"`): Uses the multi-stage `smartScan()` pipeline. Currently restricted to `scope: "session"` (controlled by `PROMOTED_SCOPES`). Falls back to literal if zero results.
+**Smart/fuzzy path** (`match: "smart"` or `"fuzzy"`): Uses the multi-stage `smartScan()` pipeline. Returns all ranked results; the caller handles slicing and optional session grouping. Available for all scopes. Falls back to literal if zero results.
+
+**Session grouping** (`group: "session"`): After results are collected, `groupBySession()` collapses them — one entry per session with the best-scoring (smart/fuzzy) or most-recent (literal) hit as representative, plus `hitCount` showing how many part-level hits that session had.
 
 ### Smart/fuzzy pipeline
 
@@ -292,6 +301,7 @@ classDiagram
         +MatchMode matchMode
         +string[] matchedTerms
         +string[] matchReasons
+        +number hitCount
     }
 
     class SearchOutput {
@@ -302,6 +312,7 @@ classDiagram
         +boolean truncated
         +MatchMode matchMode
         +DegradeKind degradeKind
+        +GroupMode group
     }
 
     class Candidate {
@@ -330,11 +341,14 @@ classDiagram
 
 ### Extending
 
-#### Adding a new scope to smart/fuzzy
+#### Adding smart/fuzzy performance benchmarks for new scopes
 
-1. Run the benchmark suite against the new scope
-2. Add the scope string to `PROMOTED_SCOPES` in `search.ts`
-3. Test with the rollout criteria in `SMART_RECALL_PLAN.md`
+Smart/fuzzy search works across all scopes. When optimizing for larger scopes (more sessions), benchmark:
+
+1. Candidate construction time and memory at scale
+2. Prefilter survival rates for broad queries
+3. Fuse.js indexing cost at high candidate counts
+4. End-to-end latency within the 2-second time budget
 
 #### Tuning ranking
 

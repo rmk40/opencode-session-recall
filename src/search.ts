@@ -17,6 +17,7 @@ import {
   type Limits,
   type MatchMode,
   type DegradeKind,
+  type GroupMode,
 } from "./types.js";
 import { searchable, snippet, pruned, matches } from "./extract.js";
 import { parseQuery } from "./query.js";
@@ -32,16 +33,16 @@ import { fuseSearch, type FuseHit } from "./fuse.js";
 import { rank, rankDegraded, type RankedResult } from "./rank.js";
 import { smartSnippet } from "./snippet.js";
 
-// ── Promoted scopes for smart/fuzzy mode ─────────────────────────────
-
-/** Scopes where smart/fuzzy is allowed. Expand as benchmarked. */
-const PROMOTED_SCOPES = new Set(["session"]);
-
 /** Post-fetch time budget for the entire ranking pipeline (ms) */
 const TIME_BUDGET_MS = 2000;
 
 /** Pre-Fuse.js early-exit threshold (ms). Skip Fuse if prefilter alone takes this long. */
 const PREFUSE_BUDGET_MS = 1500;
+
+/** Max literal results to collect when grouping by session.
+ *  Must be high enough to get representative hits from many sessions,
+ *  but bounded to prevent unbounded memory growth on broad queries. */
+const MAX_GROUPED_LITERAL_RESULTS = 1000;
 
 // ── Types ────────────────────────────────────────────────────────────
 
@@ -115,6 +116,7 @@ function scan(
 
 // ── Smart/fuzzy scan ─────────────────────────────────────────────────
 
+/** smartScan returns ALL ranked results (caller handles slicing/grouping). */
 function smartScan(
   allMessages: Array<{
     session: SessionMetaInternal;
@@ -123,7 +125,6 @@ function smartScan(
   query: string,
   type: string,
   role: string,
-  limit: number,
   explain: boolean,
   mode: "smart" | "fuzzy",
   before?: number,
@@ -174,7 +175,7 @@ function smartScan(
   // ── 2. Prefilter ──────────────────────────────────────────────────
   let filtered = prefilter(allCandidates, pq);
 
-  // Keep highest prefilter scores if over per-session or total cap
+  // Keep highest prefilter scores if over total cap
   if (filtered.length > DEFAULT_BUDGETS.maxCandidatesTotal) {
     filtered.sort((a, b) => b.prefilterScore - a.prefilterScore);
     filtered = filtered.slice(0, DEFAULT_BUDGETS.maxCandidatesTotal);
@@ -187,16 +188,10 @@ function smartScan(
   if (prefuseTime > PREFUSE_BUDGET_MS) {
     // Time-budget degradation: skip Fuse.js, return prefilter-ranked
     const ranked = rankDegraded(filtered, pq, explain);
-    const results = rankedToSearchResults(
-      ranked.slice(0, limit),
-      mode,
-      explain,
-      pq,
-      width,
-    );
+    const results = rankedToSearchResults(ranked, mode, explain, pq, width);
     return {
       results,
-      total: filtered.length,
+      total: results.length,
       degradeKind: "time",
       matchMode: mode,
     };
@@ -210,46 +205,27 @@ function smartScan(
   const fuseCandidates = filtered.map((f) => f.candidate);
 
   // ── 5. Run Fuse.js (no limit — we need accurate total count) ────
-  // Always use fuseSearch. Explain mode adds matchReasons from rank(),
-  // not from Fuse.js match ranges (which reference normalized fields,
-  // not raw text).
   const hits: FuseHit[] = fuseSearch(fuseCandidates, pq, mode);
 
   const totalTime = performance.now() - startTime;
 
   // ── 6. Rank ───────────────────────────────────────────────────────
   const ranked = rank(hits, pq, explain);
-  const fuseTotal = ranked.length;
+  const allResults = rankedToSearchResults(ranked, mode, explain, pq, width);
 
   // Check if total pipeline exceeded budget
   if (totalTime > TIME_BUDGET_MS) {
-    // Still return what we have, but mark as time-degraded
-    const results = rankedToSearchResults(
-      ranked.slice(0, limit),
-      mode,
-      explain,
-      pq,
-      width,
-    );
     return {
-      results,
-      total: fuseTotal,
+      results: allResults,
+      total: allResults.length,
       degradeKind: "time",
       matchMode: mode,
     };
   }
 
-  const results = rankedToSearchResults(
-    ranked.slice(0, limit),
-    mode,
-    explain,
-    pq,
-    width,
-  );
-
   return {
-    results,
-    total: fuseTotal,
+    results: allResults,
+    total: allResults.length,
     degradeKind: anyBudgetHit ? "budget" : "none",
     matchMode: mode,
   };
@@ -297,6 +273,36 @@ function rankedToSearchResults(
   });
 }
 
+// ── Group results by session ─────────────────────────────────────────
+
+function groupBySession(results: SearchResult[]): SearchResult[] {
+  const groups = new Map<string, { best: SearchResult; count: number }>();
+
+  for (const r of results) {
+    const existing = groups.get(r.sessionID);
+    if (!existing) {
+      groups.set(r.sessionID, { best: r, count: 1 });
+    } else {
+      existing.count++;
+      // Pick best representative:
+      // - Smart/fuzzy: highest score wins
+      // - Literal (no score): most recent time wins
+      if (r.score != null && existing.best.score != null) {
+        if (r.score > existing.best.score) {
+          existing.best = r;
+        }
+      } else if (r.time > existing.best.time) {
+        existing.best = r;
+      }
+    }
+  }
+
+  return [...groups.values()].map(({ best, count }) => ({
+    ...best,
+    hitCount: count,
+  }));
+}
+
 // ── Main export ──────────────────────────────────────────────────────
 
 export function search(
@@ -310,10 +316,12 @@ export function search(
 
 Supports three matching strategies via the \`match\` parameter:
 - "literal" (default): case-insensitive substring matching. Works across all scopes. Fast and predictable.
-- "smart": fuzzy ranked search using Fuse.js. Handles typos, separator differences (rate-limit vs rateLimit), and ranks results by relevance. Currently available for scope:"session" only.
-- "fuzzy": looser fuzzy search with a higher match threshold. Same scope restriction as smart.
+- "smart": fuzzy ranked search using Fuse.js. Handles typos, separator differences (rate-limit vs rateLimit), and ranks results by relevance. Works across all scopes.
+- "fuzzy": looser fuzzy search with a higher match threshold. Works across all scopes.
 
 When using smart or fuzzy, results include a relevance \`score\` (0-1, higher is better) and \`matchedTerms\`. Add \`explain: true\` for detailed scoring breakdowns via \`matchReasons\`. If smart/fuzzy finds no matches, it automatically falls back to literal search.
+
+Use \`group: "session"\` to collapse results by session — returns one entry per session with the best-scoring hit as representative (or most recent for literal), plus a \`hitCount\` showing how many part-level hits that session had. Useful for cross-project discovery: "which sessions are about this topic?"
 
 Searches globally by default — this is fast and finds results across all projects. Results are ordered by session recency (newest first) for literal, or by relevance score for smart/fuzzy. Try multiple query terms before concluding no prior work exists. Use role "user" to find original requirements.
 
@@ -337,13 +345,19 @@ This tool's own outputs are excluded from search results to prevent recursive no
         .enum(["literal", "smart", "fuzzy"])
         .default("literal")
         .describe(
-          'Matching strategy: "literal" = exact substring (default), "smart" = fuzzy ranked search (session scope only), "fuzzy" = looser fuzzy search (session scope only)',
+          'Matching strategy: "literal" = exact substring (default), "smart" = fuzzy ranked search, "fuzzy" = looser fuzzy search. All work across all scopes.',
         ),
       explain: tool.schema
         .boolean()
         .default(false)
         .describe(
           "Return scoring metadata for debugging. Adds matchReasons to each result.",
+        ),
+      group: tool.schema
+        .enum(["part", "session"])
+        .default("part")
+        .describe(
+          '"part" (default) = one result per matching part. "session" = collapse by session, returning one entry per session with best-scoring (smart/fuzzy) or most-recent (literal) hit and a hitCount.',
         ),
       sessionID: tool.schema
         .string()
@@ -402,18 +416,6 @@ This tool's own outputs are excluded from search results to prevent recursive no
       ctx.metadata({
         title: `Searching ${args.scope} for "${args.query}"${matchMode !== "literal" ? ` (${matchMode})` : ""}`,
       });
-
-      // ── Scope guard for smart/fuzzy ─────────────────────────────────
-      if (matchMode !== "literal") {
-        const effectiveScope = args.sessionID ? "session" : args.scope;
-        if (!PROMOTED_SCOPES.has(effectiveScope)) {
-          const err: ErrorOutput = {
-            ok: false,
-            error: `match:"${matchMode}" is not yet available for scope:"${effectiveScope}". Try scope:"session" or use match:"literal" for broader searches.`,
-          };
-          return JSON.stringify(err);
-        }
-      }
 
       if (args.scope === "global" && !args.sessionID && !global) {
         const err: ErrorOutput = {
@@ -519,19 +521,23 @@ This tool's own outputs are excluded from search results to prevent recursive no
           return JSON.stringify(err);
         }
 
-        // ── Route: literal or smart/fuzzy ─────────────────────────────
-        if (matchMode === "literal") {
-          // Original literal path
+        const groupMode: GroupMode = args.group;
+        const isGrouped = groupMode === "session";
+
+        // ── Helper: run literal scan (full or limited) ───────────────
+        const literalScan = (
+          scanLimit: number,
+        ): { collected: SearchResult[]; total: number; early: boolean } => {
           const collected: SearchResult[] = [];
           let total = 0;
           let early = false;
 
           for (const { session: sess, messages: msgs } of allLoaded) {
-            if (collected.length >= args.results) {
+            if (collected.length >= scanLimit) {
               early = true;
               break;
             }
-            const remaining = args.results - collected.length;
+            const remaining = scanLimit - collected.length;
             const result = scan(
               msgs,
               sess,
@@ -546,19 +552,56 @@ This tool's own outputs are excluded from search results to prevent recursive no
             collected.push(...result.results);
             total += result.total;
           }
+          return { collected, total, early };
+        };
 
-          const final = collected.slice(0, args.results);
+        // ── Helper: apply grouping and slicing ───────────────────────
+        const applyGroupAndSlice = (
+          results: SearchResult[],
+          partTotal: number,
+          earlyExit: boolean,
+        ): { final: SearchResult[]; total: number; truncated: boolean } => {
+          if (isGrouped) {
+            const grouped = groupBySession(results);
+            const final = grouped.slice(0, args.results);
+            return {
+              final,
+              total: grouped.length,
+              truncated: earlyExit || grouped.length > final.length,
+            };
+          }
+          const final = results.slice(0, args.results);
+          return {
+            final,
+            total: partTotal,
+            truncated: earlyExit || partTotal > final.length,
+          };
+        };
 
+        // ── Route: literal or smart/fuzzy ─────────────────────────────
+        if (matchMode === "literal") {
+          // When grouping by session, scan all sessions (no early exit)
+          // so we get representative hits from every matching session
+          const limit = isGrouped ? MAX_GROUPED_LITERAL_RESULTS : args.results;
+          const { collected, total, early } = literalScan(limit);
+          const {
+            final,
+            total: outTotal,
+            truncated,
+          } = applyGroupAndSlice(collected, total, early);
+
+          const unit = isGrouped ? "session" : "result";
           ctx.metadata({
-            title: `Found ${final.length} result${final.length !== 1 ? "s" : ""} for "${args.query}" (${scanned} session${scanned !== 1 ? "s" : ""} searched)`,
+            title: `Found ${final.length} ${unit}${final.length !== 1 ? "s" : ""} for "${args.query}" (${scanned} session${scanned !== 1 ? "s" : ""} searched)`,
           });
 
           const out: SearchOutput = {
             ok: true,
             results: final,
             scanned,
-            total,
-            truncated: early || total > final.length,
+            total: outTotal,
+            truncated,
+            group: groupMode,
           };
           return JSON.stringify(out);
         }
@@ -569,7 +612,6 @@ This tool's own outputs are excluded from search results to prevent recursive no
           args.query,
           args.type,
           args.role,
-          args.results,
           args.explain,
           matchMode,
           args.before,
@@ -579,65 +621,55 @@ This tool's own outputs are excluded from search results to prevent recursive no
 
         // ── Fallback to literal if smart returns nothing ────────────
         if (smartResult.results.length === 0) {
-          // Try literal fallback
-          const collected: SearchResult[] = [];
-          let total = 0;
-          let early = false;
-
-          for (const { session: sess, messages: msgs } of allLoaded) {
-            if (collected.length >= args.results) {
-              early = true;
-              break;
-            }
-            const remaining = args.results - collected.length;
-            const result = scan(
-              msgs,
-              sess,
-              args.query,
-              args.type,
-              args.role,
-              remaining,
-              args.before,
-              args.after,
-              args.width,
-            );
-            collected.push(...result.results);
-            total += result.total;
-          }
-
-          const final = collected.slice(0, args.results);
+          const limit = isGrouped ? MAX_GROUPED_LITERAL_RESULTS : args.results;
+          const { collected, total, early } = literalScan(limit);
+          const {
+            final,
+            total: outTotal,
+            truncated,
+          } = applyGroupAndSlice(collected, total, early);
 
           if (final.length > 0) {
+            const unit = isGrouped ? "session" : "result";
             ctx.metadata({
-              title: `Found ${final.length} result${final.length !== 1 ? "s" : ""} for "${args.query}" (literal fallback, ${scanned} session${scanned !== 1 ? "s" : ""})`,
+              title: `Found ${final.length} ${unit}${final.length !== 1 ? "s" : ""} for "${args.query}" (literal fallback, ${scanned} session${scanned !== 1 ? "s" : ""})`,
             });
 
             const out: SearchOutput = {
               ok: true,
               results: final,
               scanned,
-              total,
-              truncated: early || total > final.length,
+              total: outTotal,
+              truncated,
               matchMode: "literal",
               degradeKind: "fallback",
+              group: groupMode,
             };
             return JSON.stringify(out);
           }
         }
 
         // ── Return smart/fuzzy results ──────────────────────────────
+        const {
+          final,
+          total: outTotal,
+          truncated,
+        } = applyGroupAndSlice(smartResult.results, smartResult.total, false);
+
+        const unit = isGrouped ? "session" : "result";
         ctx.metadata({
-          title: `Found ${smartResult.results.length} result${smartResult.results.length !== 1 ? "s" : ""} for "${args.query}" (${matchMode}, ${scanned} session${scanned !== 1 ? "s" : ""})`,
+          title: `Found ${final.length} ${unit}${final.length !== 1 ? "s" : ""} for "${args.query}" (${matchMode}, ${scanned} session${scanned !== 1 ? "s" : ""})`,
         });
 
         const out: SearchOutput = {
           ok: true,
-          results: smartResult.results,
+          results: final,
           scanned,
-          total: smartResult.total,
-          truncated: smartResult.total > smartResult.results.length,
+          total: outTotal,
+          truncated,
           matchMode: smartResult.matchMode,
           degradeKind: smartResult.degradeKind,
+          group: groupMode,
         };
         return JSON.stringify(out);
       } catch (e) {
