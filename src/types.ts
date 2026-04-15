@@ -26,6 +26,9 @@ export const DEFAULTS: Limits = {
   defaultWidth: 200,
 };
 
+export type MatchMode = "literal" | "smart" | "fuzzy";
+export type DegradeKind = "none" | "time" | "budget" | "fallback";
+
 export type SearchResult = {
   sessionID: string;
   sessionTitle: string;
@@ -38,6 +41,14 @@ export type SearchResult = {
   pruned: boolean;
   snippet: string;
   toolName?: string;
+  /** Present for smart/fuzzy results */
+  score?: number;
+  /** Present for smart/fuzzy results */
+  matchMode?: MatchMode;
+  /** Present for smart/fuzzy results */
+  matchedTerms?: string[];
+  /** Present when explain=true */
+  matchReasons?: string[];
 };
 
 export type SearchOutput = {
@@ -46,6 +57,10 @@ export type SearchOutput = {
   scanned: number;
   total: number;
   truncated: boolean;
+  /** Which strategy produced the returned results */
+  matchMode?: MatchMode;
+  /** What happened during ranking */
+  degradeKind?: DegradeKind;
 };
 
 export type MessageOutput = {
