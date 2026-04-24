@@ -57,6 +57,10 @@ function meta(s: Session | GlobalSession): SessionMetaInternal {
   return { id: s.id, title: s.title, directory: s.directory };
 }
 
+function timestampFilter(value: number | undefined): number | undefined {
+  return value != null && value > 0 ? value : undefined;
+}
+
 // ── Literal scan (preserved from original) ──────────────────────────
 
 function scan(
@@ -411,6 +415,8 @@ This tool's own outputs are excluded from search results to prevent recursive no
     },
     async execute(args, ctx: ToolContext): Promise<string> {
       const matchMode: MatchMode = args.match;
+      const before = timestampFilter(args.before);
+      const after = timestampFilter(args.after);
 
       ctx.metadata({
         title: `Searching ${args.scope} for "${args.query}"${matchMode !== "literal" ? ` (${matchMode})` : ""}`,
@@ -544,8 +550,8 @@ This tool's own outputs are excluded from search results to prevent recursive no
               args.type,
               args.role,
               remaining,
-              args.before,
-              args.after,
+              before,
+              after,
               args.width,
             );
             collected.push(...result.results);
@@ -613,8 +619,8 @@ This tool's own outputs are excluded from search results to prevent recursive no
           args.role,
           args.explain,
           matchMode,
-          args.before,
-          args.after,
+          before,
+          after,
           args.width,
         );
 
