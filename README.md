@@ -162,13 +162,13 @@ recall({ query: "prefiltr", match: "fuzzy", scope: "session", explain: true })
 | `scope`          | `"global"`  | `"session"`, `"project"`, or `"global"`                                                                                                                                      |
 | `match`          | `"literal"` | `"literal"`, `"smart"`, or `"fuzzy"`                                                                                                                                         |
 | `explain`        | `false`     | Include scoring metadata in results                                                                                                                                          |
-| `sessionID`      | —           | Target a specific session (overrides scope)                                                                                                                                  |
+| `sessionID`      | —           | Target a specific session (overrides scope); blank values are ignored                                                                                                        |
 | `type`           | `"all"`     | `"text"`, `"tool"`, `"reasoning"`, or `"all"`                                                                                                                                |
 | `role`           | `"all"`     | `"user"`, `"assistant"`, or `"all"`                                                                                                                                          |
-| `before`/`after` | —           | Timestamp filters (ms epoch)                                                                                                                                                 |
+| `before`/`after` | —           | Timestamp filters (ms epoch); nonpositive values are ignored                                                                                                                 |
 | `width`          | `200`       | Snippet size (50–1000 chars)                                                                                                                                                 |
 | `sessions`       | `1000`      | Max sessions to scan (no upper limit)                                                                                                                                        |
-| `title`          | —           | Filter by session title substring (rarely needed)                                                                                                                            |
+| `title`          | —           | Filter by session title substring; blank values are ignored                                                                                                                  |
 | `group`          | `"part"`    | `"part"` or `"session"` — when `"session"`, collapses results by session (one entry per session with the best-scoring or most-recent hit as representative, plus `hitCount`) |
 | `results`        | `10`        | Max results to return                                                                                                                                                        |
 
@@ -182,13 +182,15 @@ Smart/fuzzy results include additional fields:
 | `matchReasons` | Scoring breakdown (only when `explain: true`)                            |
 | `hitCount`     | Number of part-level hits in this session (only when `group: "session"`) |
 
-Response-level metadata for smart/fuzzy:
+Response metadata:
 
-| Field         | Description                                                |
-| ------------- | ---------------------------------------------------------- |
-| `matchMode`   | `"smart"`, `"fuzzy"`, or `"literal"` (if fell back)        |
-| `degradeKind` | `"none"`, `"time"`, `"budget"`, or `"fallback"`            |
-| `group`       | `"part"` or `"session"` — echoes back the grouping applied |
+| Field            | Description                                                                   |
+| ---------------- | ----------------------------------------------------------------------------- |
+| `loadErrorCount` | Number of scanned sessions that failed to load; omitted when zero             |
+| `loadErrors`     | Sample load failures; use this to distinguish load failures from zero matches |
+| `matchMode`      | `"smart"`, `"fuzzy"`, or `"literal"` (if fell back)                           |
+| `degradeKind`    | `"none"`, `"time"`, `"budget"`, or `"fallback"`                               |
+| `group`          | `"part"` or `"session"` — echoes back the grouping applied                    |
 
 ### `recall_get` — Retrieve
 
@@ -220,6 +222,7 @@ recall_messages({ query: "npm", role: "user", reverse: true })
 ```
 
 Defaults to the current session. Pagination metadata includes `total`, `hasMore`, and `offset`.
+Blank `sessionID` or `query` values are treated as omitted.
 
 ### `recall_sessions` — Discover
 
@@ -229,6 +232,8 @@ List sessions by title. The starting point for cross-session and cross-project w
 recall_sessions({ scope: "project", search: "auth" })
 recall_sessions({ scope: "global", search: "deployment" })
 ```
+
+Blank `search` values are treated as omitted.
 
 ## Options
 

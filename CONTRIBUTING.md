@@ -72,13 +72,13 @@ The plugin registers five tools via the OpenCode plugin API. All data access goe
 | Module                       | Lines | Purpose                                                                                  |
 | ---------------------------- | ----- | ---------------------------------------------------------------------------------------- |
 | `opencode-session-recall.ts` | 87    | Plugin entry point. Creates SDK clients, registers tools, injects `primary_tools` config |
-| `search.ts`                  | ~680  | `recall` tool. Literal scan, smart/fuzzy pipeline, session grouping                      |
+| `search.ts`                  | 726   | `recall` tool. Literal scan, smart/fuzzy pipeline, session grouping, load-error metadata |
 | `extract.ts`                 | 156   | Text extraction from message parts. `searchable()`, `matches()`, `snippet()`, `pruned()` |
-| `types.ts`                   | 170   | Shared types: `SearchResult`, `SearchOutput`, `MatchMode`, `DegradeKind`, `GroupMode`    |
-| `sessions.ts`                | 129   | `recall_sessions` tool                                                                   |
+| `types.ts`                   | 179   | Shared types: `SearchResult`, `SearchOutput`, `MatchMode`, `DegradeKind`, `GroupMode`    |
+| `sessions.ts`                | 132   | `recall_sessions` tool                                                                   |
 | `get.ts`                     | 77    | `recall_get` tool                                                                        |
 | `context.ts`                 | 125   | `recall_context` tool                                                                    |
-| `messages.ts`                | 139   | `recall_messages` tool                                                                   |
+| `messages.ts`                | 140   | `recall_messages` tool                                                                   |
 | `normalize.ts`               | 23    | Two-stage text normalization: `tokenize()` (stage 1) and `normalize()` (stage 2)         |
 | `query.ts`                   | 44    | Query parsing: `parseQuery()` → `ParsedQuery` with raw, lower, tokens, phrases           |
 | `candidates.ts`              | 186   | Candidate construction from messages/parts with budget enforcement                       |

@@ -58,10 +58,13 @@ function meta(s: Session | GlobalSession): SessionMetaInternal {
   return { id: s.id, title: s.title, directory: s.directory };
 }
 
-function timestampFilter(value: number | undefined): number | undefined {
+function positiveTimestampOrUndefined(
+  value: number | undefined,
+): number | undefined {
   return value != null && value > 0 ? value : undefined;
 }
 
+/** Cap sample size only; loadErrorCount still reports all failures. */
 const MAX_LOAD_ERROR_SAMPLES = 5;
 
 // ── Literal scan (preserved from original) ──────────────────────────
@@ -420,8 +423,8 @@ This tool's own outputs are excluded from search results to prevent recursive no
       const matchMode: MatchMode = args.match;
       const sessionID = optionalString(args.sessionID);
       const title = optionalString(args.title);
-      const before = timestampFilter(args.before);
-      const after = timestampFilter(args.after);
+      const before = positiveTimestampOrUndefined(args.before);
+      const after = positiveTimestampOrUndefined(args.after);
 
       ctx.metadata({
         title: `Searching ${args.scope} for "${args.query}"${matchMode !== "literal" ? ` (${matchMode})` : ""}`,
@@ -562,10 +565,13 @@ This tool's own outputs are excluded from search results to prevent recursive no
         const groupMode: GroupMode = args.group;
         const isGrouped = groupMode === "session";
         const incomplete = loadErrorCount > 0;
+        const loadErrorSuffix = incomplete
+          ? `, ${loadErrorCount} load error${loadErrorCount !== 1 ? "s" : ""}`
+          : "";
         const includeLoadErrors = <T extends SearchOutput>(out: T): T => {
           if (!incomplete) return out;
           out.loadErrorCount = loadErrorCount;
-          out.loadErrors = loadErrors;
+          out.loadErrors = [...loadErrors];
           return out;
         };
 
@@ -637,7 +643,7 @@ This tool's own outputs are excluded from search results to prevent recursive no
 
           const unit = isGrouped ? "session" : "result";
           ctx.metadata({
-            title: `Found ${final.length} ${unit}${final.length !== 1 ? "s" : ""} for "${args.query}" (${scanned} session${scanned !== 1 ? "s" : ""} searched${incomplete ? `, ${loadErrorCount} load error${loadErrorCount !== 1 ? "s" : ""}` : ""})`,
+            title: `Found ${final.length} ${unit}${final.length !== 1 ? "s" : ""} for "${args.query}" (${scanned} session${scanned !== 1 ? "s" : ""} searched${loadErrorSuffix})`,
           });
 
           const out: SearchOutput = {
@@ -677,7 +683,7 @@ This tool's own outputs are excluded from search results to prevent recursive no
           if (final.length > 0) {
             const unit = isGrouped ? "session" : "result";
             ctx.metadata({
-              title: `Found ${final.length} ${unit}${final.length !== 1 ? "s" : ""} for "${args.query}" (literal fallback, ${scanned} session${scanned !== 1 ? "s" : ""}${incomplete ? `, ${loadErrorCount} load error${loadErrorCount !== 1 ? "s" : ""}` : ""})`,
+              title: `Found ${final.length} ${unit}${final.length !== 1 ? "s" : ""} for "${args.query}" (literal fallback, ${scanned} session${scanned !== 1 ? "s" : ""}${loadErrorSuffix})`,
             });
 
             const out: SearchOutput = {
@@ -703,7 +709,7 @@ This tool's own outputs are excluded from search results to prevent recursive no
 
         const unit = isGrouped ? "session" : "result";
         ctx.metadata({
-          title: `Found ${final.length} ${unit}${final.length !== 1 ? "s" : ""} for "${args.query}" (${matchMode}, ${scanned} session${scanned !== 1 ? "s" : ""}${incomplete ? `, ${loadErrorCount} load error${loadErrorCount !== 1 ? "s" : ""}` : ""})`,
+          title: `Found ${final.length} ${unit}${final.length !== 1 ? "s" : ""} for "${args.query}" (${matchMode}, ${scanned} session${scanned !== 1 ? "s" : ""}${loadErrorSuffix})`,
         });
 
         const out: SearchOutput = {
