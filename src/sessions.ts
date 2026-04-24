@@ -6,6 +6,7 @@ import {
 import type { OpencodeClient } from "@opencode-ai/sdk/v2";
 import {
   errmsg,
+  optionalString,
   type SessionItem,
   type SessionsOutput,
   type ErrorOutput,
@@ -41,9 +42,11 @@ Returns { ok, sessions: [{ id, title, directory, time, archived }], returned, sc
         .describe("Max sessions to return (newest first)"),
     },
     async execute(args, ctx: ToolContext): Promise<string> {
+      const search = optionalString(args.search);
+
       ctx.metadata({
-        title: args.search
-          ? `Listing ${args.scope} sessions matching "${args.search}"`
+        title: search
+          ? `Listing ${args.scope} sessions matching "${search}"`
           : `Listing ${args.scope} sessions`,
       });
 
@@ -60,7 +63,7 @@ Returns { ok, sessions: [{ id, title, directory, time, archived }], returned, sc
 
         if (args.scope === "global") {
           const result = await unscoped.experimental.session.list({
-            search: args.search,
+            search,
             limit: args.limit,
           });
           if (result.error) {
@@ -86,7 +89,7 @@ Returns { ok, sessions: [{ id, title, directory, time, archived }], returned, sc
           }
         } else {
           const result = await client.session.list({
-            search: args.search,
+            search,
             limit: args.limit,
           });
           if (result.error) {
@@ -110,7 +113,7 @@ Returns { ok, sessions: [{ id, title, directory, time, archived }], returned, sc
         }
 
         ctx.metadata({
-          title: `Found ${items.length} ${args.scope} sessions${args.search ? ` matching "${args.search}"` : ""}`,
+          title: `Found ${items.length} ${args.scope} sessions${search ? ` matching "${search}"` : ""}`,
         });
 
         const out: SessionsOutput = {

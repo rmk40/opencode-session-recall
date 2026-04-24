@@ -11,6 +11,7 @@ import type {
 } from "@opencode-ai/sdk/v2";
 import {
   errmsg,
+  optionalString,
   type SearchResult,
   type SearchOutput,
   type ErrorOutput,
@@ -60,6 +61,8 @@ function meta(s: Session | GlobalSession): SessionMetaInternal {
 function timestampFilter(value: number | undefined): number | undefined {
   return value != null && value > 0 ? value : undefined;
 }
+
+const MAX_LOAD_ERROR_SAMPLES = 5;
 
 // ── Literal scan (preserved from original) ──────────────────────────
 
@@ -331,7 +334,7 @@ Searches globally by default — this is fast and finds results across all proje
 
 Scope costs: all scopes scan up to \`sessions\` sessions (default 1000). "session" scans 1. Reduce \`sessions\` for faster searches if needed.
 
-Returns { ok, results: [{ sessionID, messageID, role, time, partID, partType, pruned, snippet, toolName? }], scanned, total, truncated }. Each result includes a pruned flag — if true, the content was compacted from your context window and recall_get will return the original full output. Check truncated to know if more matches exist beyond your results limit.
+Returns { ok, results: [{ sessionID, messageID, role, time, partID, partType, pruned, snippet, toolName? }], scanned, total, truncated }. If some sessions could not be loaded, the response includes loadErrorCount and loadErrors so transport failures are not confused with no matches. Each result includes a pruned flag — if true, the content was compacted from your context window and recall_get will return the original full output. Check truncated to know if more matches exist beyond your results limit.
 
 This tool's own outputs are excluded from search results to prevent recursive noise; use recall_get or recall_context to retrieve any message directly.`,
     args: {
@@ -415,6 +418,8 @@ This tool's own outputs are excluded from search results to prevent recursive no
     },
     async execute(args, ctx: ToolContext): Promise<string> {
       const matchMode: MatchMode = args.match;
+      const sessionID = optionalString(args.sessionID);
+      const title = optionalString(args.title);
       const before = timestampFilter(args.before);
       const after = timestampFilter(args.after);
 
@@ -422,7 +427,7 @@ This tool's own outputs are excluded from search results to prevent recursive no
         title: `Searching ${args.scope} for "${args.query}"${matchMode !== "literal" ? ` (${matchMode})` : ""}`,
       });
 
-      if (args.scope === "global" && !args.sessionID && !global) {
+      if (args.scope === "global" && !sessionID && !global) {
         const err: ErrorOutput = {
           ok: false,
           error: "Global scope disabled via plugin option: global: false",
@@ -433,12 +438,12 @@ This tool's own outputs are excluded from search results to prevent recursive no
       try {
         let targets: SessionMetaInternal[] = [];
 
-        if (args.sessionID) {
+        if (sessionID) {
           let title = "";
           let directory = "";
           try {
             const sess = await client.session.get({
-              sessionID: args.sessionID,
+              sessionID,
             });
             if (sess.data) {
               title = sess.data.title;
@@ -447,8 +452,16 @@ This tool's own outputs are excluded from search results to prevent recursive no
           } catch {
             // Can't get metadata, proceed anyway
           }
-          targets = [{ id: args.sessionID, title, directory }];
+          targets = [{ id: sessionID, title, directory }];
         } else if (args.scope === "session") {
+          if (!ctx.sessionID) {
+            const err: ErrorOutput = {
+              ok: false,
+              error: "No sessionID provided and no current session available",
+            };
+            return JSON.stringify(err);
+          }
+
           let title = "";
           let directory = "";
           try {
@@ -463,7 +476,7 @@ This tool's own outputs are excluded from search results to prevent recursive no
           targets = [{ id: ctx.sessionID, title, directory }];
         } else if (args.scope === "project") {
           const resp = await client.session.list({
-            search: args.title,
+            search: title,
             limit: args.sessions,
           });
           if (resp.error) {
@@ -476,7 +489,7 @@ This tool's own outputs are excluded from search results to prevent recursive no
           if (resp.data) targets = resp.data.map(meta);
         } else {
           const resp = await unscoped.experimental.session.list({
-            search: args.title,
+            search: title,
             limit: args.sessions,
           });
           if (resp.error) {
@@ -494,6 +507,8 @@ This tool's own outputs are excluded from search results to prevent recursive no
           session: SessionMetaInternal;
           messages: MsgWithParts[];
         }> = [];
+        const loadErrors: string[] = [];
+        let loadErrorCount = 0;
         let scanned = 0;
 
         for (let i = 0; i < targets.length; i += limits.concurrency) {
@@ -507,11 +522,29 @@ This tool's own outputs are excluded from search results to prevent recursive no
                 const resp = await client.session.messages({
                   sessionID: t.id,
                 });
+                if (resp.error) {
+                  loadErrorCount++;
+                  if (loadErrors.length < MAX_LOAD_ERROR_SAMPLES) {
+                    loadErrors.push(`${t.id}: ${errmsg(resp.error)}`);
+                  }
+                  return { session: t, messages: [] as MsgWithParts[] };
+                }
+                if (!resp.data) {
+                  loadErrorCount++;
+                  if (loadErrors.length < MAX_LOAD_ERROR_SAMPLES) {
+                    loadErrors.push(`${t.id}: no messages returned`);
+                  }
+                  return { session: t, messages: [] as MsgWithParts[] };
+                }
                 return {
                   session: t,
-                  messages: (resp.data ?? []) as MsgWithParts[],
+                  messages: resp.data as MsgWithParts[],
                 };
-              } catch {
+              } catch (e) {
+                loadErrorCount++;
+                if (loadErrors.length < MAX_LOAD_ERROR_SAMPLES) {
+                  loadErrors.push(`${t.id}: ${errmsg(e)}`);
+                }
                 return { session: t, messages: [] as MsgWithParts[] };
               }
             }),
@@ -528,6 +561,13 @@ This tool's own outputs are excluded from search results to prevent recursive no
 
         const groupMode: GroupMode = args.group;
         const isGrouped = groupMode === "session";
+        const incomplete = loadErrorCount > 0;
+        const includeLoadErrors = <T extends SearchOutput>(out: T): T => {
+          if (!incomplete) return out;
+          out.loadErrorCount = loadErrorCount;
+          out.loadErrors = loadErrors;
+          return out;
+        };
 
         // ── Helper: run literal scan (full or limited) ───────────────
         const literalScan = (
@@ -597,7 +637,7 @@ This tool's own outputs are excluded from search results to prevent recursive no
 
           const unit = isGrouped ? "session" : "result";
           ctx.metadata({
-            title: `Found ${final.length} ${unit}${final.length !== 1 ? "s" : ""} for "${args.query}" (${scanned} session${scanned !== 1 ? "s" : ""} searched)`,
+            title: `Found ${final.length} ${unit}${final.length !== 1 ? "s" : ""} for "${args.query}" (${scanned} session${scanned !== 1 ? "s" : ""} searched${incomplete ? `, ${loadErrorCount} load error${loadErrorCount !== 1 ? "s" : ""}` : ""})`,
           });
 
           const out: SearchOutput = {
@@ -608,7 +648,7 @@ This tool's own outputs are excluded from search results to prevent recursive no
             truncated,
             group: groupMode,
           };
-          return JSON.stringify(out);
+          return JSON.stringify(includeLoadErrors(out));
         }
 
         // ── Smart/fuzzy path ────────────────────────────────────────
@@ -637,7 +677,7 @@ This tool's own outputs are excluded from search results to prevent recursive no
           if (final.length > 0) {
             const unit = isGrouped ? "session" : "result";
             ctx.metadata({
-              title: `Found ${final.length} ${unit}${final.length !== 1 ? "s" : ""} for "${args.query}" (literal fallback, ${scanned} session${scanned !== 1 ? "s" : ""})`,
+              title: `Found ${final.length} ${unit}${final.length !== 1 ? "s" : ""} for "${args.query}" (literal fallback, ${scanned} session${scanned !== 1 ? "s" : ""}${incomplete ? `, ${loadErrorCount} load error${loadErrorCount !== 1 ? "s" : ""}` : ""})`,
             });
 
             const out: SearchOutput = {
@@ -650,7 +690,7 @@ This tool's own outputs are excluded from search results to prevent recursive no
               degradeKind: "fallback",
               group: groupMode,
             };
-            return JSON.stringify(out);
+            return JSON.stringify(includeLoadErrors(out));
           }
         }
 
@@ -663,7 +703,7 @@ This tool's own outputs are excluded from search results to prevent recursive no
 
         const unit = isGrouped ? "session" : "result";
         ctx.metadata({
-          title: `Found ${final.length} ${unit}${final.length !== 1 ? "s" : ""} for "${args.query}" (${matchMode}, ${scanned} session${scanned !== 1 ? "s" : ""})`,
+          title: `Found ${final.length} ${unit}${final.length !== 1 ? "s" : ""} for "${args.query}" (${matchMode}, ${scanned} session${scanned !== 1 ? "s" : ""}${incomplete ? `, ${loadErrorCount} load error${loadErrorCount !== 1 ? "s" : ""}` : ""})`,
         });
 
         const out: SearchOutput = {
@@ -676,7 +716,7 @@ This tool's own outputs are excluded from search results to prevent recursive no
           degradeKind: smartResult.degradeKind,
           group: groupMode,
         };
-        return JSON.stringify(out);
+        return JSON.stringify(includeLoadErrors(out));
       } catch (e) {
         const err: ErrorOutput = { ok: false, error: errmsg(e) };
         return JSON.stringify(err);

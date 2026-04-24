@@ -6,6 +6,7 @@ import {
 import type { OpencodeClient, Part } from "@opencode-ai/sdk/v2";
 import {
   errmsg,
+  optionalString,
   type MessagesOutput,
   type ErrorOutput,
   type Limits,
@@ -70,7 +71,8 @@ Returns { messages: [{ message: { id, role, time }, parts: [...] }], pagination:
         ),
     },
     async execute(args, ctx: ToolContext): Promise<string> {
-      const sid = args.sessionID ?? ctx.sessionID;
+      const sid = optionalString(args.sessionID) ?? ctx.sessionID;
+      const query = optionalString(args.query);
       if (!sid) {
         const err: ErrorOutput = {
           ok: false,
@@ -95,8 +97,7 @@ Returns { messages: [{ message: { id, role, time }, parts: [...] }], pagination:
         let filtered = resp.data;
         if (args.role !== "all")
           filtered = filtered.filter((m) => m.info.role === args.role);
-        if (args.query)
-          filtered = filtered.filter((m) => msgMatches(m, args.query!));
+        if (query) filtered = filtered.filter((m) => msgMatches(m, query));
 
         const ordered = args.reverse ? [...filtered].reverse() : filtered;
         const slice = ordered.slice(args.offset, args.offset + args.limit);

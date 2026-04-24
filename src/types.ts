@@ -60,6 +60,10 @@ export type SearchOutput = {
   scanned: number;
   total: number;
   truncated: boolean;
+  /** Number of sessions whose messages could not be loaded */
+  loadErrorCount?: number;
+  /** Sample message-load failures; omitted when all scanned sessions loaded */
+  loadErrors?: string[];
   /** Which strategy produced the returned results */
   matchMode?: MatchMode;
   /** What happened during ranking */
@@ -167,4 +171,9 @@ export function errmsg(e: unknown): string {
   } catch {
     return String(e);
   }
+}
+
+export function optionalString(value: string | undefined): string | undefined {
+  const trimmed = value?.trim();
+  return trimmed ? trimmed : undefined;
 }
