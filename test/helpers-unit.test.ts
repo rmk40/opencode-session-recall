@@ -34,6 +34,7 @@ function candidate(overrides: Partial<Candidate> & { rawText: string }): Candida
     partType: "text",
     isPruned: false,
     rawText,
+    fieldTexts: [{ field: "text", text: rawText }],
     tokens: tokenize(rawText),
     ...rest,
   };
@@ -84,6 +85,7 @@ describe("extract helpers", () => {
     expect(searchable(completed)).toEqual([
       "completed output",
       "completed title",
+      "npm test",
       '{"command":"npm test"}',
     ]);
 
@@ -94,9 +96,11 @@ describe("extract helpers", () => {
     expect(searchable(errored)).toEqual(["failed", '{"path":"src"}']);
 
     expect(searchable(runningToolPart("p4", "s", "m", { command: "run" }))).toEqual([
+      "run",
       '{"command":"run"}',
     ]);
     expect(searchable(pendingToolPart("p5", "s", "m", { command: "wait" }))).toEqual([
+      "wait",
       '{"command":"wait"}',
     ]);
     expect(searchable(subtaskPart("p6", "s", "m", "desc", "prompt"))).toEqual(["desc", "prompt"]);

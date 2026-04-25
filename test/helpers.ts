@@ -496,3 +496,18 @@ export async function runTool<T extends { ok: boolean }>(
   expect(parsed).toHaveProperty("ok");
   return parsed;
 }
+
+/**
+ * Run a tool without applying Zod defaults, simulating the live MCP host which
+ * forwards raw caller args. Used to assert the plugin's defensive defaults.
+ */
+export async function runToolRaw<T extends { ok: boolean }>(
+  definition: ToolDefinition,
+  rawArgs: Record<string, unknown>,
+  ctx = makeContext().ctx,
+): Promise<T> {
+  const raw = await definition.execute(rawArgs as Parameters<typeof definition.execute>[0], ctx);
+  const parsed = JSON.parse(raw) as T;
+  expect(parsed).toHaveProperty("ok");
+  return parsed;
+}

@@ -5,14 +5,31 @@ import type {
   AssistantMessage,
   UserMessage,
 } from "@opencode-ai/sdk/v2";
-import { TOOLS, type PartOutput, type MessageItem } from "./types.js";
+import { TOOLS, type PartOutput, type MessageItem, type ResultWhy } from "./types.js";
 
 const INPUT_SEARCH_LIMIT = 10_000;
 const SELF = new Set<string>(TOOLS);
+export type SearchableField = { field: ResultWhy["matchedFields"][number]; text: string };
 
 function input(val: unknown): string {
   const raw = JSON.stringify(val);
   return raw.length > INPUT_SEARCH_LIMIT ? raw.slice(0, INPUT_SEARCH_LIMIT) : raw;
+}
+
+function stringInputField(val: unknown, key: string): string | undefined {
+  if (!val || typeof val !== "object") return undefined;
+  const field = (val as Record<string, unknown>)[key];
+  return typeof field === "string" && field.trim() ? field : undefined;
+}
+
+function toolInputTexts(val: unknown): SearchableField[] {
+  const result: SearchableField[] = [];
+  const command = stringInputField(val, "command");
+  const cwd = stringInputField(val, "cwd");
+  if (command) result.push({ field: "command", text: command });
+  if (cwd) result.push({ field: "cwd", text: cwd });
+  result.push({ field: "command", text: input(val) });
+  return result;
 }
 
 export function matches(text: string, query: string): boolean {
@@ -20,30 +37,38 @@ export function matches(text: string, query: string): boolean {
 }
 
 export function searchable(part: Part): string[] {
+  return searchableFields(part).map((field) => field.text);
+}
+
+export function searchableFields(part: Part): SearchableField[] {
   if (part.type === "tool" && SELF.has(part.tool)) return [];
   switch (part.type) {
     case "text":
+      return part.text ? [{ field: "text", text: part.text }] : [];
     case "reasoning":
-      return part.text ? [part.text] : [];
+      return part.text ? [{ field: "reasoning", text: part.text }] : [];
     case "tool": {
-      const result: string[] = [];
+      const result: SearchableField[] = [];
       const state = part.state;
       if (state.status === "completed") {
-        if (state.output) result.push(state.output);
-        if (state.title) result.push(state.title);
-        if (state.input) result.push(input(state.input));
+        if (state.output) result.push({ field: "stdout", text: state.output });
+        if (state.title) result.push({ field: "toolName", text: state.title });
+        if (state.input) result.push(...toolInputTexts(state.input));
       }
       if (state.status === "error") {
-        if (state.error) result.push(state.error);
-        if (state.input) result.push(input(state.input));
+        if (state.error) result.push({ field: "stderr", text: state.error });
+        if (state.input) result.push(...toolInputTexts(state.input));
       }
       if (state.status === "running" || state.status === "pending") {
-        if (state.input) result.push(input(state.input));
+        if (state.input) result.push(...toolInputTexts(state.input));
       }
       return result;
     }
     case "subtask":
-      return [part.description, part.prompt];
+      return [
+        { field: "text", text: part.description },
+        { field: "text", text: part.prompt },
+      ];
     default:
       return [];
   }

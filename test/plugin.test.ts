@@ -109,16 +109,17 @@ describe("plugin entry", () => {
     });
 
     const recallArgs = tool.schema.object(mustTool(hooks.tool?.recall).args);
-    expect(recallArgs.parse({ query: "rate" }).sessions).toBe(2);
+    expect(recallArgs.parse({ query: "rate" }).sessions).toBeUndefined();
     expect(() => recallArgs.parse({ query: "rate", results: 2 })).not.toThrow();
     expect(() => recallArgs.parse({ query: "rate", results: 3 })).toThrow();
     expect(() => recallArgs.parse({ query: "rate", sessions: 2 })).not.toThrow();
     expect(() => recallArgs.parse({ query: "rate", sessions: 3 })).toThrow();
     expect(recallArgs.parse({ query: "rate" }).window).toBe(1);
     expect(() => recallArgs.parse({ query: "rate", window: 1 })).not.toThrow();
-    expect(() => recallArgs.parse({ query: "rate", window: 2 })).toThrow();
+    expect(() => recallArgs.parse({ query: "rate", window: 2 })).not.toThrow();
+    expect(() => recallArgs.parse({ query: "rate", window: "auto" })).not.toThrow();
     expect(() => recallArgs.parse({ query: "rate", expandResults: 3 })).not.toThrow();
-    expect(() => recallArgs.parse({ query: "rate", expandResults: 4 })).toThrow();
+    expect(() => recallArgs.parse({ query: "rate", expandResults: 4 })).not.toThrow();
 
     const messagesArgs = tool.schema.object(mustTool(hooks.tool?.recall_messages).args);
     expect(() => messagesArgs.parse({ limit: 3 })).not.toThrow();

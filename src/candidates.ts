@@ -1,11 +1,13 @@
 import type { Part } from "@opencode-ai/sdk/v2";
 import { tokenize, normalize } from "./normalize.js";
-import { searchable, pruned } from "./extract.js";
+import { searchableFields, pruned, type SearchableField } from "./extract.js";
+import type { DirectoryRelevance, ResultSource, ResultWhy } from "./types.js";
 
 export type SessionMeta = {
   id: string;
   title: string;
   directory: string;
+  directoryRelevance?: DirectoryRelevance;
 };
 
 export type MsgInfo = {
@@ -27,6 +29,11 @@ export type Candidate = {
   isPruned: boolean;
   toolName?: string;
   rawText: string;
+  fieldTexts: SearchableField[];
+  source?: ResultSource;
+  why?: ResultWhy;
+  directoryRelevance?: DirectoryRelevance;
+  titleMatch?: { title: string; matchedTerms?: string[] };
 
   // Stage 1: lightweight tokens for prefiltering
   tokens: string[];
@@ -112,11 +119,11 @@ export function buildCandidates(
 
       partsProcessed++;
 
-      const texts = searchable(part);
-      if (texts.length === 0) continue;
+      const fields = searchableFields(part);
+      if (fields.length === 0) continue;
 
       // Join all searchable texts so smart mode searches the same content as literal
-      let rawText = texts.join("\n\n");
+      let rawText = fields.map((field) => field.text).join("\n\n");
 
       // Truncate at per-candidate char budget
       if (rawText.length > budgets.maxCharsPerCandidate) {
@@ -141,7 +148,13 @@ export function buildCandidates(
         partType: part.type,
         isPruned: pruned(part),
         rawText,
+        fieldTexts: fields,
         tokens: tokenize(rawText),
+        source: part.type === "tool" ? "tool" : part.type === "reasoning" ? "reasoning" : "message",
+        directoryRelevance: session.directoryRelevance,
+        why: {
+          matchedFields: [],
+        },
       };
 
       if (part.type === "tool") {
@@ -172,6 +185,37 @@ export function buildCandidates(
     partsProcessed,
     charsUsed,
     budgetHit,
+  };
+}
+
+export function buildTitleCandidate(
+  session: SessionMeta,
+  representative: MsgInfo,
+): Candidate | undefined {
+  const title = session.title.trim();
+  if (!title) return undefined;
+
+  return {
+    sessionID: session.id,
+    sessionTitle: session.title,
+    directory: session.directory,
+    messageID: representative.id,
+    role: representative.role,
+    time: representative.time.created,
+    partID: `${session.id}:title`,
+    partType: "title",
+    isPruned: false,
+    rawText: title,
+    fieldTexts: [{ field: "title", text: title }],
+    tokens: tokenize(title),
+    source: "title",
+    directoryRelevance: session.directoryRelevance,
+    why: {
+      matchedFields: ["title"],
+      directoryRelevance: session.directoryRelevance,
+      confidence: "medium",
+    },
+    titleMatch: { title: session.title },
   };
 }
 

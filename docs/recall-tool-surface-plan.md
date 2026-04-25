@@ -6,13 +6,13 @@ Reduce turns after a useful `recall` hit while keeping the tool surface small an
 
 The common flow is `recall` to find a hit, then `recall_context` or `recall_get` to inspect enough evidence. The highest-value change is letting `recall` optionally return that evidence in the same call.
 
-Status: implemented. The README documents the public `recall` parameters and the optional `expanded` response metadata.
+Status: implemented, then extended by the search UX contract. The README is the canonical user-facing reference for current `recall` parameters, warnings, coverage, result evidence metadata, and optional `expanded` response data.
 
 ## Constraints
 
 - Keep the existing five-tool surface.
 - Avoid embeddings, generated summaries, or separate storage/indexing infrastructure.
-- Preserve current defaults; new behavior is opt-in.
+- Keep expansion opt-in. Search now scans all eligible sessions by default unless caller or configuration caps it.
 - Keep expansion fanout bounded so `recall` cannot dump whole sessions accidentally. `expand: "message"` intentionally matches `recall_get` semantics for a small number of opted-in hits.
 - Keep memory writes outside this plugin.
 - Keep tool descriptions concise enough to stay within the token budget.
@@ -26,8 +26,14 @@ Added these parameters to `recall`:
 - `window`
 - `since`
 - `until`
+- `last`
+- `from`
+- `to`
 - `directory`
+- `fallback`
 - `toolName`
+- `expandBudgetMessages`
+- `expandBudgetChars`
 
 Defer these ideas:
 
@@ -69,7 +75,7 @@ Controls how many final results are expanded when `expand !== "none"`. Ignored w
 
 ### `window`
 
-Type: integer number
+Type: integer number or `"auto"`
 
 Default: `Math.min(3, limits.maxWindow)`, same as `recall_context`
 
@@ -77,30 +83,32 @@ Min: `0`
 
 Semantics:
 
-Controls messages before and after each expanded hit when `expand: "context"`. It has the same semantics and `limits.maxWindow` clamp as `recall_context.window`, and does not affect normal snippets.
+Controls messages before and after each expanded hit when `expand: "context"`. Numeric values use the same semantics and `limits.maxWindow` clamp as `recall_context.window`. `"auto"` fits as much context as possible under the expansion budgets. This setting does not affect normal snippets.
 
 Output cap:
 
-- Reject `expand: "context"` when `expandResults * (2 * window + 1) > 30` with an error that says to reduce `expandResults` or `window`.
+- Return partial expansion with `warnings` when requested context exceeds `expandBudgetMessages`, `expandBudgetChars`, or configured limits.
 - Include `hasMoreBefore` / `hasMoreAfter` for each expanded context entry.
 
-For `expand: "message"`, return the same formatted message shape as `recall_get` for up to `expandResults` hits. Do not add a separate truncation scheme in iteration 1.
+For `expand: "message"`, return the same formatted message shape as `recall_get` for up to `expandResults` hits, bounded by expansion budgets.
 
-### `since` / `until`
+### `last` / `from` / `to` / `since` / `until`
 
 Type: string
 
-Accepted forms: positive integers with `h`, `d`, or `w`, such as `"2h"`, `"7d"`, `"3w"`. `0h`, minutes (`m`), months (`mo`), and years (`y`) are invalid in iteration 1.
+Accepted forms include durations such as `"2h"`, `"7d"`, and `"3w"`, date-like strings, and search-oriented strings such as `"30d ago"` or `"now"` where the parameter supports them.
 
 Semantics:
 
 - Relative durations are resolved against execution time (`Date.now()`).
-- `since` maps to an `after` timestamp.
-- `until` maps to a `before` timestamp.
-- Invalid strings return a clear error.
-- If a positive numeric `after` is supplied with `since`, return an error.
-- If a positive numeric `before` is supplied with `until`, return an error.
+- `last` is the preferred recent-history lower bound.
+- `from` and `to` are explicit search-window bounds.
+- `since` remains a compatibility alias for `last`.
+- `until` remains a compatibility relative upper bound.
+- Optional malformed filters warn and are ignored or normalized when safe.
 - Nonpositive numeric `before` / `after` keep current `positiveTimestampOrUndefined` behavior and are ignored.
+- Multiple valid bounds choose the most restrictive safe window and warn.
+- Valid filters that normalize to an impossible window remain hard errors.
 
 Bounds use existing recall semantics: `after` excludes messages at or before the timestamp; `before` excludes messages at or after the timestamp.
 
@@ -111,6 +119,8 @@ Type: string
 Semantics:
 
 Filter target sessions by normalized directory before loading messages. Match exact directory or descendant path only: `dir === target || dir.startsWith(target + pathSeparator)` after normalization. Avoid arbitrary substring matching to reduce cross-project false positives.
+
+When `fallback: true`, fill remaining results from exact directory matches, then same-project/worktree matches, then global history when allowed. Results include `directoryRelevance` labels: `"exact"`, `"project"`, `"global"`, or `"unknown"`.
 
 ### `toolName`
 
@@ -123,12 +133,13 @@ Filter searchable tool parts by exact tool name, such as `"bash"`.
 - Valid only when `type` is `"all"` or `"tool"`.
 - When provided with `type: "all"`, non-tool parts are excluded; only tool parts with the matching tool name are eligible.
 - If `type` is `"text"` or `"reasoning"`, return a clear error.
+- Tool-input `command` and `cwd` values are searched explicitly even without a `toolName` filter.
 
 ## Output Shape
 
 ### `expanded`
 
-When `expand !== "none"`, `SearchOutput` gains `expanded?: ExpandedResult[]`. Entries are ordered by final result order and may be sparse if an expansion cannot be produced:
+When `expand !== "none"`, `SearchOutput` gains `expanded?: ExpandedResult[]`. Entries are ordered by final result order and may be sparse when budgets or load failures prevent full expansion:
 
 ```ts
 type ExpandedResult = {
@@ -147,7 +158,9 @@ For `expand: "context"`, use `messages` plus boundary flags.
 
 For `expand: "message"`, use `message`.
 
-If a result cannot be expanded because its messages failed to load, omit that expanded entry; `resultIndex` preserves alignment, and the existing `loadErrorCount` / `loadErrors` fields still explain partial failures.
+If a result cannot be expanded because its messages failed to load or expansion budgets are exhausted, omit or truncate that expanded entry; `resultIndex` preserves alignment. `warnings`, `coverage`, and `loadErrorCount` / `loadErrors` explain partial failures.
+
+Current `recall` responses may also include `warnings`, `suggestions`, `coverage`, and `nearMisses`. Results may include `source`, `why`, `titleMatch`, and `directoryRelevance`.
 
 ## Testing Coverage
 
@@ -157,13 +170,17 @@ Behavior-focused tests cover:
 - `expand: "context"` returns bounded surrounding messages for top results.
 - `expand: "message"` returns the full target message.
 - `expandResults` caps expansion count.
-- `window` controls context expansion and enforces the total expanded-message cap.
+- `window` controls context expansion; `window: "auto"` fits context under expansion budgets.
+- expansion budget exhaustion returns base results plus partial expansion and warnings.
 - grouped expansion targets the grouped representative.
-- `since` / `until` parse valid relative durations and reject invalid strings.
-- positive numeric `before` / `after` conflict with `until` / `since`.
+- `last`, `from`, `to`, `since`, and `until` normalize to expected bounds.
+- malformed optional time filters warn and search when safe.
+- string `before` / `after` values parse as date bounds.
 - nonpositive numeric `before` / `after` remain ignored.
 - `directory` filters sessions before loading messages.
+- `fallback: true` fills from exact/project/global buckets and labels `directoryRelevance`.
 - `toolName` filters tool parts and rejects incompatible `type` values.
+- command and `cwd` tool inputs are searchable evidence.
 - generated tool-definition size remains under the 2,000-2,200 token target using the existing measurement script pattern from prior tool-size checks.
 
 ## Documentation Notes
@@ -171,8 +188,8 @@ Behavior-focused tests cover:
 The README includes concise examples for:
 
 - `expand: "context"` to avoid follow-up calls;
-- `since: "7d"` for recent-history searches;
-- `directory` and `toolName` for narrowed searches.
+- `last: "7d"` and `from` / `to` for recent-history searches;
+- `directory` with `fallback: true` and `toolName` for narrowed searches.
 
 Keep future README updates concise. Avoid re-expanding the full tool instruction prose.
 

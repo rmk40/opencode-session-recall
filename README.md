@@ -148,7 +148,7 @@ Five tools, designed around how agents actually navigate conversation history:
 
 ### `recall` — Search
 
-The primary tool. Full-text search across messages, tool outputs, tool inputs, reasoning, and subtask descriptions. Searches globally by default, or narrow to the current project or session.
+The primary tool. Full-text search across session titles, messages, tool outputs, tool-input commands and `cwd` values, reasoning, and subtask descriptions. Searches globally by default, or narrow to the current project or session.
 
 Use before real work when prior history could change the approach: debugging, unexpected behavior, feature work, architecture or configuration changes, past commands, root causes, decisions, or "what did we do last time?" questions.
 
@@ -161,46 +161,58 @@ recall({ query: "JWT", sessionID: "ses_from_another_project" })
 recall({ query: "rate limit", match: "smart", scope: "session", group: "session" })
 recall({ query: "prefiltr", match: "fuzzy", scope: "session", explain: true })
 recall({ query: "unauthorized", expand: "context", window: 1 })
-recall({ query: "migration", since: "7d", directory: "/workspace/project" })
-recall({ query: "legacy config", until: "3w" })
+recall({ query: "auth failure", expand: "context", window: "auto" })
+recall({ query: "migration", last: "7d", directory: "/workspace/project" })
+recall({ query: "release notes", from: "30d ago", to: "now" })
+recall({ query: "legacy config", before: "2026-01-01" })
+recall({ query: "deploy", directory: "/workspace/project", fallback: true })
 recall({ query: "npm test", type: "tool", toolName: "bash" })
 ```
 
-First call guidance: use `match: "smart"` for topic discovery, naming variants, and likely typos. Use `group: "session"` for broad discovery. Add `expand: "context"` or `expand: "message"` when you already know you need evidence from the top hit. Reserve literal matching for exact errors, commands, function names, or file paths.
+First call guidance: omit `sessions` unless you need a hard scan cap; the default scans all eligible sessions subject to configured and provider limits. Use `match: "smart"` for topic discovery, naming variants, and likely typos. Use `group: "session"` for broad discovery. Add `expand: "context"` or `expand: "message"` when you already know you need evidence from the top hit. Reserve literal matching for exact errors, commands, function names, or file paths.
 
-| Param            | Default                  | Description                                                                                                                                                                  |
-| ---------------- | ------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `query`          | required                 | Text to search for                                                                                                                                                           |
-| `scope`          | `"global"`               | `"session"`, `"project"`, or `"global"`                                                                                                                                      |
-| `match`          | `"literal"`              | `"literal"`, `"smart"`, or `"fuzzy"`                                                                                                                                         |
-| `explain`        | `false`                  | Include scoring metadata in results                                                                                                                                          |
-| `sessionID`      | —                        | Target a specific session (overrides scope); blank values are ignored                                                                                                        |
-| `type`           | `"all"`                  | `"text"`, `"tool"`, `"reasoning"`, or `"all"`                                                                                                                                |
-| `role`           | `"all"`                  | `"user"`, `"assistant"`, or `"all"`                                                                                                                                          |
-| `before`/`after` | —                        | Timestamp filters (ms epoch); nonpositive values are ignored                                                                                                                 |
-| `since`/`until`  | —                        | Relative time filters like `"2h"`, `"7d"`, or `"3w"`; `since` means newer than, `until` means older than                                                                     |
-| `directory`      | —                        | Filter sessions by exact directory or descendant path                                                                                                                        |
-| `toolName`       | —                        | Exact tool-name filter; only valid with `type: "all"` or `type: "tool"`                                                                                                      |
-| `expand`         | `"none"`                 | `"none"`, `"context"`, or `"message"`; inlines bounded evidence from top results                                                                                             |
-| `expandResults`  | `1`                      | Number of results to expand, max `3`                                                                                                                                         |
-| `window`         | `3`                      | Messages on each side for `expand: "context"`, capped by plugin `maxWindow`                                                                                                  |
-| `width`          | `200`                    | Snippet size (50–1000 chars)                                                                                                                                                 |
-| `sessions`       | `min(1000, maxSessions)` | Max sessions to scan, capped by plugin `maxSessions`                                                                                                                         |
-| `title`          | —                        | Filter by session title substring; blank values are ignored                                                                                                                  |
-| `group`          | `"part"`                 | `"part"` or `"session"` — when `"session"`, collapses results by session (one entry per session with the best-scoring or most-recent hit as representative, plus `hitCount`) |
-| `results`        | `10`                     | Max results to return                                                                                                                                                        |
+| Param                  | Default      | Description                                                                                                                                                                  |
+| ---------------------- | ------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `query`                | required     | Text to search for                                                                                                                                                           |
+| `scope`                | `"global"`   | `"session"`, `"project"`, or `"global"`                                                                                                                                      |
+| `match`                | `"literal"`  | `"literal"`, `"smart"`, or `"fuzzy"`                                                                                                                                         |
+| `explain`              | `false`      | Include scoring metadata in results                                                                                                                                          |
+| `sessionID`            | —            | Target a specific session (overrides scope); blank values are ignored                                                                                                        |
+| `type`                 | `"all"`      | `"text"`, `"tool"`, `"reasoning"`, or `"all"`                                                                                                                                |
+| `role`                 | `"all"`      | `"user"`, `"assistant"`, or `"all"`                                                                                                                                          |
+| `before`/`after`       | —            | Time bounds as ms epoch or dates like `"2026-01-01"`; nonpositive numbers are ignored                                                                                        |
+| `last`                 | —            | Recent-history lower bound like `"2h"`, `"7d"`, or `"3w"`                                                                                                                    |
+| `from`/`to`            | —            | Explicit time bounds like `"365d ago"` and `"now"`                                                                                                                           |
+| `since`/`until`        | —            | Compatibility relative filters; prefer `last`, `from`/`to`, or `before`/`after` in new calls                                                                                 |
+| `directory`            | —            | Filter sessions by exact directory or descendant path                                                                                                                        |
+| `fallback`             | `false`      | With `directory`, fill remaining results from same project/worktree and then global history                                                                                  |
+| `toolName`             | —            | Exact tool-name filter; only valid with `type: "all"` or `type: "tool"`                                                                                                      |
+| `expand`               | `"none"`     | `"none"`, `"context"`, or `"message"`; inlines bounded evidence from top results                                                                                             |
+| `expandResults`        | `1`          | Number of results to expand; oversized values are clamped to the safe maximum                                                                                                |
+| `window`               | `3`          | Messages on each side for `expand: "context"`, or `"auto"`; oversized values are clamped to plugin `maxWindow`                                                               |
+| `expandBudgetMessages` | `30`         | Total context messages to inline across expanded results                                                                                                                     |
+| `expandBudgetChars`    | `30000`      | Total expanded text budget                                                                                                                                                   |
+| `width`                | `200`        | Snippet size (50–1000 chars)                                                                                                                                                 |
+| `sessions`             | all eligible | Optional max sessions to scan, capped by plugin `maxSessions`                                                                                                                |
+| `title`                | —            | Filter by session title substring; blank values are ignored                                                                                                                  |
+| `group`                | `"part"`     | `"part"` or `"session"` — when `"session"`, collapses results by session (one entry per session with the best-scoring or most-recent hit as representative, plus `hitCount`) |
+| `results`              | `10`         | Max results to return                                                                                                                                                        |
 
-Blank optional filters are ignored. `toolName` is exact; if unsure, run a broad `type: "tool"` search first and inspect returned `toolName` values. Combining `since` and `until` is allowed only when the resulting time window is valid.
+Blank optional filters are ignored. Malformed optional time filters are ignored or normalized with `warnings` when safe. `toolName` is exact; if unsure, run a broad `type: "tool"` search first and inspect returned `toolName` values. Combining time bounds is allowed only when the resulting time window is valid.
 
-Smart/fuzzy results include additional fields:
+Result entries can include these fields. Ranked-mode fields are present for smart/fuzzy matches; evidence fields explain why any result matched.
 
-| Field          | Description                                                              |
-| -------------- | ------------------------------------------------------------------------ |
-| `score`        | Relevance score (0–1, higher is better)                                  |
-| `matchMode`    | Which strategy produced this result                                      |
-| `matchedTerms` | Query tokens found in the candidate                                      |
-| `matchReasons` | Scoring breakdown (only when `explain: true`)                            |
-| `hitCount`     | Number of part-level hits in this session (only when `group: "session"`) |
+| Field                | Description                                                              |
+| -------------------- | ------------------------------------------------------------------------ |
+| `score`              | Relevance score (0–1, higher is better)                                  |
+| `matchMode`          | Which strategy produced this result                                      |
+| `matchedTerms`       | Query tokens found in the candidate                                      |
+| `matchReasons`       | Scoring breakdown (only when `explain: true`)                            |
+| `hitCount`           | Number of part-level hits in this session (only when `group: "session"`) |
+| `source`             | `"message"`, `"title"`, `"tool"`, or `"reasoning"`                       |
+| `why`                | Compact match explanation: matched fields, terms, confidence, recency    |
+| `directoryRelevance` | `"exact"`, `"project"`, `"global"`, or `"unknown"`                       |
+| `titleMatch`         | Title evidence when a session title matched                              |
 
 Response metadata:
 
@@ -212,8 +224,12 @@ Response metadata:
 | `degradeKind`    | `"none"`, `"time"`, `"budget"`, or `"fallback"`                               |
 | `group`          | `"part"` or `"session"` — echoes back the grouping applied                    |
 | `expanded`       | Bounded `context` or `message` entries when `expand` is not `"none"`          |
+| `warnings`       | Safe downgrades, clamped options, expansion caps, fallback broadening         |
+| `suggestions`    | Actionable next steps for empty or weak searches                              |
+| `coverage`       | Sessions/messages/parts searched, skipped reasons, and limiting factors       |
+| `nearMisses`     | Closest searched sessions for empty results when cheap to report              |
 
-Expanded entries inline full message structure, but large text/output/error fields are truncated with a `[truncated by recall expansion]` marker to keep recall responses bounded. Once the shared expansion budget is exhausted, later large fields may be omitted.
+Expanded entries inline full message structure, but large text/output/error fields are truncated with a `[truncated by recall expansion]` marker to keep recall responses bounded. If context expansion exceeds message or text budgets, `recall` returns the base hits plus as much expansion as fits and reports the cap in `warnings`; it does not hard-fail a successful base search because expansion was too large.
 
 ### `recall_get` — Retrieve
 
@@ -249,7 +265,7 @@ Blank `sessionID` or `query` values are treated as omitted.
 
 ### `recall_sessions` — Discover
 
-List sessions by title. The starting point for cross-session and cross-project work.
+List sessions by title. Use this for lightweight recent-session browsing or recency checks. For topical discovery, prefer `recall`; it searches titles and content together and labels title-only hits.
 
 ```
 recall_sessions({ scope: "project", search: "auth" })
@@ -285,7 +301,7 @@ This plugin reads all of it through the OpenCode SDK:
 
 - No direct database queries, no separate storage
 - Zero setup — no embeddings to generate, no indexes to build, no data to sync
-- Sessions scanned newest-first with bounded concurrency
+- Eligible sessions scanned newest-first with bounded concurrency; `maxSessions` is the hard safety cap
 - Respects abort signals for long-running searches
 - Cross-project search enabled by default (disable with `global: false`)
 - Smart and fuzzy ranking works across all scopes — session, project, and global
@@ -294,7 +310,7 @@ This plugin reads all of it through the OpenCode SDK:
 
 When `match` is `"smart"` or `"fuzzy"`, the search goes through a multi-stage ranking pipeline:
 
-1. **Candidate construction** — Messages are scanned newest-first. Each part's searchable text is extracted and tokenized. Per-session and global budgets cap the candidate pool.
+1. **Candidate construction** — Messages are scanned newest-first. Session titles and each part's searchable text are extracted and tokenized. Per-session and global budgets cap the candidate pool.
 2. **Prefiltering** — Cheap lexical gate using exact substring, quoted phrase, token overlap, and bounded edit-distance (Levenshtein ≤ 1 for tokens ≥ 4 chars). Only candidates with at least one match survive.
 3. **Normalization** — Surviving candidates get full stage-2 normalization (camelCase splitting, separator normalization, whitespace collapse) for Fuse.js field matching.
 4. **Fuse.js ranking** — Weighted search across primary text (0.65), project directory (0.20), session title (0.10), and tool name (0.05). Returns all matches above the mode threshold.

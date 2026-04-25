@@ -29,7 +29,8 @@ describe("recall smart fallback", () => {
     const candidates = firstCall[0] as unknown[];
     expect(candidates.length).toBeGreaterThan(0);
     expect(firstCall[2]).toBe("smart");
-    expect(out.results).toHaveLength(2);
+    expect(out.results).toHaveLength(3);
+    expect(out.results.some((result) => result.source === "title")).toBe(true);
     expect(out.matchMode).toBe("literal");
     expect(out.degradeKind).toBe("fallback");
   });

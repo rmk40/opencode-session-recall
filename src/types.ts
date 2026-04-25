@@ -29,6 +29,66 @@ export const DEFAULTS: Limits = {
 export type MatchMode = "literal" | "smart" | "fuzzy";
 export type DegradeKind = "none" | "time" | "budget" | "fallback";
 export type GroupMode = "part" | "session";
+export type ResultSource = "message" | "title" | "tool" | "reasoning";
+export type DirectoryRelevance = "exact" | "project" | "global" | "unknown";
+
+export type SearchSuggestion = {
+  reason: string;
+  action: string;
+  example?: Record<string, unknown>;
+};
+
+export type SearchCoverage = {
+  totalSessionsAvailable?: number;
+  totalSessionsKnown: boolean;
+  sessionsDiscovered: number;
+  sessionsEligible: number;
+  sessionsSearched: number;
+  messagesSearched: number;
+  partsSearched: number;
+  sessionsSkipped: number;
+  skippedByReason?: Record<string, number>;
+  directoryBucketsSearched?: Array<"exact" | "project" | "global">;
+  directoryBucketCounts?: {
+    exact?: number;
+    project?: number;
+    global?: number;
+  };
+  limitedBy?: Array<
+    | "scope"
+    | "sessionID"
+    | "title"
+    | "directory"
+    | "time"
+    | "type"
+    | "role"
+    | "sessionsLimit"
+    | "maxSessions"
+    | "providerLimit"
+    | "loadError"
+    | "rankingBudget"
+    | "timeBudget"
+    | "abortSignal"
+  >;
+};
+
+export type ResultWhy = {
+  matchedFields: Array<
+    "title" | "text" | "command" | "stdout" | "stderr" | "cwd" | "toolName" | "reasoning"
+  >;
+  matchedTerms?: string[];
+  directoryRelevance?: DirectoryRelevance;
+  recency?: "recent" | "older" | "unknown";
+  confidence?: "high" | "medium" | "low";
+};
+
+export type NearMiss = {
+  sessionID: string;
+  title?: string;
+  directory?: string;
+  reason: string;
+  terms?: string[];
+};
 
 export type SearchResult = {
   sessionID: string;
@@ -52,6 +112,13 @@ export type SearchResult = {
   matchReasons?: string[];
   /** Present when group:"session" — number of part-level hits in this session */
   hitCount?: number;
+  source?: ResultSource;
+  why?: ResultWhy;
+  directoryRelevance?: DirectoryRelevance;
+  titleMatch?: {
+    title: string;
+    matchedTerms?: string[];
+  };
 };
 
 export type SearchOutput = {
@@ -71,6 +138,10 @@ export type SearchOutput = {
   degradeKind?: DegradeKind;
   /** Which grouping was applied */
   group?: GroupMode;
+  warnings?: string[];
+  suggestions?: SearchSuggestion[];
+  coverage?: SearchCoverage;
+  nearMisses?: NearMiss[];
 };
 
 export type ExpandedResult = {

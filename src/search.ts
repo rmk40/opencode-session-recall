@@ -13,10 +13,21 @@ import {
   type MatchMode,
   type DegradeKind,
   type GroupMode,
+  type SearchCoverage,
+  type SearchSuggestion,
+  type NearMiss,
+  type DirectoryRelevance,
+  type ResultSource,
+  type ResultWhy,
 } from "./types.js";
-import { searchable, snippet, pruned, matches, formatMsg } from "./extract.js";
+import { searchableFields, snippet, pruned, matches, formatMsg } from "./extract.js";
 import { parseQuery } from "./query.js";
-import { buildCandidates, populateNormalized, DEFAULT_BUDGETS } from "./candidates.js";
+import {
+  buildCandidates,
+  buildTitleCandidate,
+  populateNormalized,
+  DEFAULT_BUDGETS,
+} from "./candidates.js";
 import { prefilter } from "./prefilter.js";
 import { fuseSearch, type FuseHit } from "./fuse.js";
 import { rank, rankDegraded, type RankedResult } from "./rank.js";
@@ -38,10 +49,14 @@ const MAX_EXPANDED_CONTEXT_MESSAGES = 30;
 const MAX_EXPANDED_TOTAL_TEXT_CHARS = 30_000;
 const MAX_EXPANDED_FIELD_CHARS = 4_000;
 const DIRECTORY_FILTER_LIST_LIMIT = 5000;
+const MAX_WARNINGS = 5;
+const MAX_SUGGESTIONS = 3;
+const MAX_NEAR_MISSES = 3;
 const EXPANSION_TRUNCATED = "\n[truncated by recall expansion]";
 
 type ExpandMode = "none" | "context" | "message";
-type ExpansionBudget = { remaining: number };
+type ExpansionBudget = { remaining: number; truncated: boolean };
+type TimeValue = number | string | undefined;
 
 // ── Types ────────────────────────────────────────────────────────────
 
@@ -50,37 +65,48 @@ type MsgWithParts = {
   parts: Array<Part>;
 };
 
-type SessionMetaInternal = { id: string; title: string; directory: string };
+type SessionMetaInternal = {
+  id: string;
+  title: string;
+  directory: string;
+  updated: number;
+  projectID?: string;
+  projectWorktree?: string;
+  directoryRelevance?: DirectoryRelevance;
+};
 
 function meta(s: Session | GlobalSession): SessionMetaInternal {
-  return { id: s.id, title: s.title, directory: s.directory };
+  const project = "project" in s ? s.project : undefined;
+  return {
+    id: s.id,
+    title: s.title,
+    directory: s.directory,
+    updated: s.time.updated,
+    projectID: s.projectID,
+    projectWorktree: project?.worktree,
+  };
 }
 
-function positiveTimestampOrUndefined(value: number | undefined): number | undefined {
-  return value != null && value > 0 ? value : undefined;
+function positiveTimestampOrUndefined(value: TimeValue): number | undefined {
+  if (typeof value === "number") return value > 0 ? value : undefined;
+  return undefined;
 }
 
-function parseRelativeTimestamp(
-  label: string,
-  value: string | undefined,
-  now = Date.now(),
-): number | undefined {
-  const raw = optionalString(value);
-  if (!raw) return undefined;
-
-  const match = /^(\d+)([hdw])$/.exec(raw);
-  if (!match) {
-    throw new Error(`${label} must be a positive duration like 2h, 7d, or 3w`);
-  }
+function parseDurationMs(value: string): number | undefined {
+  const match = /^(\d+)([hdw])(?:\s+ago)?$/i.exec(value.trim());
+  if (!match) return undefined;
 
   const amount = Number(match[1]);
-  if (!Number.isSafeInteger(amount) || amount <= 0) {
-    throw new Error(`${label} must be a positive duration like 2h, 7d, or 3w`);
-  }
+  if (!Number.isSafeInteger(amount) || amount < 0) return undefined;
 
-  const unit = match[2];
+  const unit = match[2]?.toLowerCase();
   const hours = unit === "h" ? amount : unit === "d" ? amount * 24 : amount * 24 * 7;
-  return now - hours * 60 * 60 * 1000;
+  return hours * 60 * 60 * 1000;
+}
+
+function parseDateString(value: string): number | undefined {
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : undefined;
 }
 
 function normalizeDirectoryPath(value: string): string {
@@ -95,14 +121,405 @@ function directoryMatches(directory: string, target: string): boolean {
   return dir === filter || dir.startsWith(`${filter}/`);
 }
 
+function sourceForPartType(partType: string): ResultSource {
+  if (partType === "title") return "title";
+  if (partType === "tool") return "tool";
+  if (partType === "reasoning") return "reasoning";
+  return "message";
+}
+
+function defaultMatchedFields(partType: string): ResultWhy["matchedFields"] {
+  if (partType === "title") return ["title"];
+  if (partType === "tool") return [];
+  if (partType === "reasoning") return ["reasoning"];
+  return ["text"];
+}
+
+function recencyLabel(time: number): ResultWhy["recency"] {
+  if (!Number.isFinite(time) || time <= 0) return "unknown";
+  return Date.now() - time <= 7 * 24 * 60 * 60 * 1000 ? "recent" : "older";
+}
+
+function annotateResult(result: SearchResult): SearchResult {
+  const source = result.source ?? sourceForPartType(result.partType);
+  const confidence = source === "title" ? "medium" : "high";
+  return {
+    ...result,
+    source,
+    directoryRelevance: result.directoryRelevance ?? "unknown",
+    why: {
+      matchedFields: defaultMatchedFields(result.partType),
+      matchedTerms: result.matchedTerms,
+      directoryRelevance: result.directoryRelevance ?? "unknown",
+      recency: recencyLabel(result.time),
+      confidence,
+      ...result.why,
+    },
+  };
+}
+
+function pushUnique<T>(values: T[], value: T): void {
+  if (!values.includes(value)) values.push(value);
+}
+
+type TimeCandidate = { label: string; timestamp: number };
+
+type NormalizedSearchOptions = {
+  before?: number;
+  after?: number;
+  expandResults: number;
+  window: number;
+  expandBudgetMessages: number;
+  expandBudgetChars: number;
+  warnings: string[];
+  limitedBy: NonNullable<SearchCoverage["limitedBy"]>;
+};
+
+function parseLowerTime(
+  label: string,
+  value: TimeValue,
+  now: number,
+  warnings: string[],
+): number | undefined {
+  if (typeof value === "number") return positiveTimestampOrUndefined(value);
+
+  const raw = optionalString(value);
+  if (!raw) return undefined;
+
+  const acceptsDuration = label === "from" || label === "last" || label === "since";
+  const duration = parseDurationMs(raw);
+  if (duration != null) {
+    if (!acceptsDuration) {
+      warnings.push(`Ignored ${label}:"${raw}"; use ${label}:"2025-01-01" or last:"7d".`);
+      return undefined;
+    }
+    if (duration === 0) {
+      warnings.push(`Ignored ${label}:"${raw}"; zero-width lower bounds are omitted.`);
+      return undefined;
+    }
+    return now - duration;
+  }
+
+  if (raw.toLowerCase() === "now") return now;
+
+  const date = parseDateString(raw);
+  if (date != null) return date;
+
+  warnings.push(
+    `Ignored ${label}:"${raw}"; use last:"7d", from:"365d ago", or after:"2025-01-01".`,
+  );
+  return undefined;
+}
+
+function parseUpperTime(
+  label: string,
+  value: TimeValue,
+  now: number,
+  warnings: string[],
+): number | undefined {
+  if (typeof value === "number") return positiveTimestampOrUndefined(value);
+
+  const raw = optionalString(value);
+  if (!raw) return undefined;
+
+  if (raw.toLowerCase() === "now") return now;
+
+  const acceptsDuration = label === "until";
+  const duration = parseDurationMs(raw);
+  if (duration != null) {
+    if (!acceptsDuration) {
+      warnings.push(`Ignored ${label}:"${raw}"; use ${label}:"2026-01-01" or until:"3w".`);
+      return undefined;
+    }
+    if (duration === 0) {
+      warnings.push(`Normalized ${label}:"${raw}" to to:"now".`);
+      return now;
+    }
+    return now - duration;
+  }
+
+  const date = parseDateString(raw);
+  if (date != null) return date;
+
+  warnings.push(`Ignored ${label}:"${raw}"; use to:"now", before:"2026-01-01", or until:"3w".`);
+  return undefined;
+}
+
+function chooseLower(candidates: TimeCandidate[], warnings: string[]): number | undefined {
+  if (candidates.length === 0) return undefined;
+  const sorted = [...candidates].sort((a, b) => b.timestamp - a.timestamp);
+  const chosen = sorted[0]!;
+  const ignored = sorted.filter((candidate) => candidate.timestamp !== chosen.timestamp);
+  if (ignored.length > 0) {
+    warnings.push(
+      `Used ${chosen.label} as the lower time bound; ignored less restrictive ${ignored.map((candidate) => candidate.label).join(", ")}.`,
+    );
+  }
+  return chosen.timestamp;
+}
+
+function chooseUpper(candidates: TimeCandidate[], warnings: string[]): number | undefined {
+  if (candidates.length === 0) return undefined;
+  const sorted = [...candidates].sort((a, b) => a.timestamp - b.timestamp);
+  const chosen = sorted[0]!;
+  const ignored = sorted.filter((candidate) => candidate.timestamp !== chosen.timestamp);
+  if (ignored.length > 0) {
+    warnings.push(
+      `Used ${chosen.label} as the upper time bound; ignored less restrictive ${ignored.map((candidate) => candidate.label).join(", ")}.`,
+    );
+  }
+  return chosen.timestamp;
+}
+
+function clampNumber(
+  label: string,
+  value: number,
+  min: number,
+  max: number,
+  warnings: string[],
+): number {
+  if (value < min) {
+    warnings.push(`Clamped ${label} from ${value} to ${min}.`);
+    return min;
+  }
+  if (value > max) {
+    warnings.push(`Clamped ${label} from ${value} to ${max}.`);
+    return max;
+  }
+  return value;
+}
+
+function normalizeSearchOptions(
+  args: {
+    after?: TimeValue;
+    before?: TimeValue;
+    since?: string;
+    until?: string;
+    last?: string;
+    from?: string;
+    to?: string;
+    expandResults: number;
+    window: number | "auto";
+    expandBudgetMessages?: number;
+    expandBudgetChars?: number;
+  },
+  limits: Limits,
+): NormalizedSearchOptions | ErrorOutput {
+  const warnings: string[] = [];
+  const limitedBy: NonNullable<SearchCoverage["limitedBy"]> = [];
+  const now = Date.now();
+
+  const lowerCandidates: TimeCandidate[] = [];
+  const upperCandidates: TimeCandidate[] = [];
+  const addLower = (label: string, value: TimeValue): void => {
+    const timestamp = parseLowerTime(label, value, now, warnings);
+    if (timestamp != null) lowerCandidates.push({ label, timestamp });
+  };
+  const addUpper = (label: string, value: TimeValue): void => {
+    const timestamp = parseUpperTime(label, value, now, warnings);
+    if (timestamp != null) upperCandidates.push({ label, timestamp });
+  };
+
+  addLower("after", args.after);
+  addLower("from", args.from);
+  addLower("last", args.last);
+  addLower("since", args.since);
+  addUpper("before", args.before);
+  addUpper("to", args.to);
+  addUpper("until", args.until);
+
+  const after = chooseLower(lowerCandidates, warnings);
+  const before = chooseUpper(upperCandidates, warnings);
+  if (after != null || before != null) pushUnique(limitedBy, "time");
+
+  if (after != null && before != null && after >= before) {
+    return {
+      ok: false,
+      error: `Time filters produce an empty window: after ${after} must be older than before ${before}. Try last:"7d" or from:"365d ago", to:"now".`,
+    };
+  }
+
+  const expandResults = clampNumber(
+    "expandResults",
+    Math.trunc(args.expandResults),
+    1,
+    MAX_EXPANDED_RESULTS,
+    warnings,
+  );
+
+  const expandBudgetMessages = clampNumber(
+    "expandBudgetMessages",
+    Math.trunc(args.expandBudgetMessages ?? MAX_EXPANDED_CONTEXT_MESSAGES),
+    1,
+    MAX_EXPANDED_CONTEXT_MESSAGES,
+    warnings,
+  );
+
+  const expandBudgetChars = clampNumber(
+    "expandBudgetChars",
+    Math.trunc(args.expandBudgetChars ?? MAX_EXPANDED_TOTAL_TEXT_CHARS),
+    1,
+    MAX_EXPANDED_TOTAL_TEXT_CHARS,
+    warnings,
+  );
+
+  let window: number;
+  if (args.window === "auto") {
+    const messagesPerResult = Math.max(1, Math.floor(expandBudgetMessages / expandResults));
+    window = Math.min(limits.maxWindow, Math.max(0, Math.floor((messagesPerResult - 1) / 2)));
+  } else {
+    window = clampNumber("window", Math.trunc(args.window), 0, limits.maxWindow, warnings);
+  }
+
+  return {
+    before,
+    after,
+    expandResults,
+    window,
+    expandBudgetMessages,
+    expandBudgetChars,
+    warnings,
+    limitedBy,
+  };
+}
+
 function partEligible(part: Part, type: string, toolName: string | undefined): boolean {
   if (toolName) return part.type === "tool" && part.tool === toolName;
   return type === "all" || part.type === type;
 }
 
-function listLimitForDirectoryFilter(argsLimit: number, configuredLimit: number): number {
+function findRepresentativeMessage(
+  messages: MsgWithParts[],
+  role: string,
+  before?: number,
+  after?: number,
+): MsgWithParts | undefined {
+  for (let index = messages.length - 1; index >= 0; index--) {
+    const msg = messages[index]!;
+    const ts = msg.info.time.created;
+    if (before != null && ts >= before) continue;
+    if (after != null && ts <= after) continue;
+    if (role !== "all" && msg.info.role !== role) continue;
+    return msg;
+  }
+  return undefined;
+}
+
+function titleSearchResult(
+  session: SessionMetaInternal,
+  representative: MsgWithParts,
+  query: string,
+  width?: number,
+): SearchResult {
+  return annotateResult({
+    sessionID: session.id,
+    sessionTitle: session.title,
+    directory: session.directory,
+    messageID: representative.info.id,
+    role: representative.info.role,
+    time: representative.info.time.created,
+    partID: `${session.id}:title`,
+    partType: "title",
+    pruned: false,
+    snippet: snippet(session.title, query, width),
+    source: "title",
+    directoryRelevance: session.directoryRelevance ?? "unknown",
+    titleMatch: { title: session.title },
+    why: {
+      matchedFields: ["title"],
+      directoryRelevance: session.directoryRelevance ?? "unknown",
+      recency: recencyLabel(representative.info.time.created),
+      confidence: "medium",
+    },
+  });
+}
+
+function canSearchTitles(type: string, toolName: string | undefined): boolean {
+  return type === "all" && !toolName;
+}
+
+function countSearchCoverage(
+  loaded: Array<{ messages: MsgWithParts[] }>,
+  type: string,
+  role: string,
+  toolName: string | undefined,
+  before?: number,
+  after?: number,
+): { messagesSearched: number; partsSearched: number } {
+  let messagesSearched = 0;
+  let partsSearched = 0;
+
+  for (const { messages } of loaded) {
+    for (const msg of messages) {
+      const ts = msg.info.time.created;
+      if (before != null && ts >= before) continue;
+      if (after != null && ts <= after) continue;
+      if (role !== "all" && msg.info.role !== role) continue;
+      messagesSearched++;
+
+      for (const part of msg.parts) {
+        if (!partEligible(part, type, toolName)) continue;
+        partsSearched++;
+      }
+    }
+  }
+
+  return { messagesSearched, partsSearched };
+}
+
+function sameProjectOrWorktree(
+  session: SessionMetaInternal,
+  worktree: string | undefined,
+): boolean {
+  const rawWorktree = optionalString(worktree);
+  if (!rawWorktree) return false;
+  const normalizedWorktree = normalizeDirectoryPath(rawWorktree);
+  if (
+    session.projectWorktree &&
+    normalizeDirectoryPath(session.projectWorktree) === normalizedWorktree
+  ) {
+    return true;
+  }
+  const sessionDir = normalizeDirectoryPath(session.directory);
+  return sessionDir === normalizedWorktree || sessionDir.startsWith(`${normalizedWorktree}/`);
+}
+
+function classifyDirectoryRelevance(
+  session: SessionMetaInternal,
+  directory: string | undefined,
+  worktree: string | undefined,
+): DirectoryRelevance {
+  if (!directory) return "unknown";
+  if (directoryMatches(session.directory, directory)) return "exact";
+  if (sameProjectOrWorktree(session, worktree)) return "project";
+  return "global";
+}
+
+function withDirectoryRelevance(
+  session: SessionMetaInternal,
+  relevance: DirectoryRelevance,
+): SessionMetaInternal {
+  return { ...session, directoryRelevance: relevance };
+}
+
+function dedupeSessions(sessions: SessionMetaInternal[]): SessionMetaInternal[] {
+  const seen = new Set<string>();
+  const result: SessionMetaInternal[] = [];
+  for (const session of sessions) {
+    if (seen.has(session.id)) continue;
+    seen.add(session.id);
+    result.push(session);
+  }
+  return result;
+}
+
+function listLimitForDirectoryFilter(
+  argsLimit: number | undefined,
+  configuredLimit: number,
+): number | undefined {
   // A finite maxSessions is a hard plugin safety cap; broaden only within it.
   if (Number.isFinite(configuredLimit)) return configuredLimit;
+  if (argsLimit == null) return undefined;
   return Math.max(argsLimit, DIRECTORY_FILTER_LIST_LIMIT);
 }
 
@@ -111,7 +528,10 @@ function truncateExpandedText(
   budget: ExpansionBudget,
 ): string | undefined {
   if (value == null) return undefined;
-  if (budget.remaining <= 0) return undefined;
+  if (budget.remaining <= 0) {
+    budget.truncated = true;
+    return undefined;
+  }
 
   const allowed = Math.min(MAX_EXPANDED_FIELD_CHARS, budget.remaining);
   if (value.length <= allowed) {
@@ -119,10 +539,14 @@ function truncateExpandedText(
     return value;
   }
 
-  if (allowed <= EXPANSION_TRUNCATED.length) return undefined;
+  if (allowed <= EXPANSION_TRUNCATED.length) {
+    budget.truncated = true;
+    return undefined;
+  }
 
   const sliceLength = allowed - EXPANSION_TRUNCATED.length;
   budget.remaining -= allowed;
+  budget.truncated = true;
   return `${value.slice(0, sliceLength)}${EXPANSION_TRUNCATED}`;
 }
 
@@ -174,29 +598,39 @@ function scan(
       if (results.length >= limit) break;
       if (!partEligible(part, type, toolName)) continue;
 
-      const texts = searchable(part);
+      const fields = searchableFields(part);
       let matched = false;
 
-      for (const text of texts) {
-        if (!matches(text, query)) continue;
+      for (const field of fields) {
+        if (!matches(field.text, query)) continue;
         total++;
         if (matched) continue;
         matched = true;
 
         if (results.length < limit) {
-          results.push({
-            sessionID: session.id,
-            sessionTitle: session.title,
-            directory: session.directory,
-            messageID: msg.info.id,
-            role: msg.info.role,
-            time: msg.info.time.created,
-            partID: part.id,
-            partType: part.type,
-            pruned: pruned(part),
-            snippet: snippet(text, query, width),
-            toolName: part.type === "tool" ? part.tool : undefined,
-          });
+          results.push(
+            annotateResult({
+              sessionID: session.id,
+              sessionTitle: session.title,
+              directory: session.directory,
+              messageID: msg.info.id,
+              role: msg.info.role,
+              time: msg.info.time.created,
+              partID: part.id,
+              partType: part.type,
+              pruned: pruned(part),
+              snippet: snippet(field.text, query, width),
+              toolName: part.type === "tool" ? part.tool : undefined,
+              source: sourceForPartType(part.type),
+              directoryRelevance: session.directoryRelevance ?? "unknown",
+              why: {
+                matchedFields: [field.field],
+                directoryRelevance: session.directoryRelevance ?? "unknown",
+                recency: recencyLabel(msg.info.time.created),
+                confidence: "high",
+              },
+            }),
+          );
         }
       }
     }
@@ -236,6 +670,16 @@ function smartScan(
   let anyBudgetHit = false;
 
   for (const { session, messages } of allMessages) {
+    if (canSearchTitles(type, toolName)) {
+      const representative = findRepresentativeMessage(messages, role, before, after);
+      if (representative) {
+        const titleCandidate = buildTitleCandidate(session, representative.info);
+        if (titleCandidate) {
+          allCandidates.push(titleCandidate);
+        }
+      }
+    }
+
     const { candidates, charsUsed, budgetHit } = buildCandidates(
       messages,
       session,
@@ -338,7 +782,7 @@ function rankedToSearchResults(
     // used directly against rawText without position mapping.
     const snip = smartSnippet(c.rawText, query, width);
 
-    const result: SearchResult = {
+    const result: SearchResult = annotateResult({
       sessionID: c.sessionID,
       sessionTitle: c.sessionTitle,
       directory: c.directory,
@@ -353,7 +797,17 @@ function rankedToSearchResults(
       score: r.score,
       matchMode: mode,
       matchedTerms: r.matchedTerms,
-    };
+      source: c.source,
+      why: {
+        ...c.why,
+        matchedFields:
+          r.matchedFields.length > 0
+            ? r.matchedFields
+            : (c.why?.matchedFields ?? defaultMatchedFields(c.partType)),
+      },
+      directoryRelevance: c.directoryRelevance ?? "unknown",
+      titleMatch: c.titleMatch,
+    });
 
     if (explain && r.matchReasons.length > 0) {
       result.matchReasons = r.matchReasons;
@@ -366,18 +820,27 @@ function rankedToSearchResults(
 // ── Group results by session ─────────────────────────────────────────
 
 function groupBySession(results: SearchResult[]): SearchResult[] {
-  const groups = new Map<string, { best: SearchResult; count: number }>();
+  const groups = new Map<
+    string,
+    { best: SearchResult; count: number; titleMatch?: SearchResult["titleMatch"] }
+  >();
 
   for (const r of results) {
     const existing = groups.get(r.sessionID);
     if (!existing) {
-      groups.set(r.sessionID, { best: r, count: 1 });
+      groups.set(r.sessionID, { best: r, count: 1, titleMatch: r.titleMatch });
     } else {
       existing.count++;
+      existing.titleMatch ??= r.titleMatch;
       // Pick best representative:
+      // - Prefer content/tool/reasoning over title-only metadata when both exist
       // - Smart/fuzzy: highest score wins
       // - Literal (no score): most recent time wins
-      if (r.score != null && existing.best.score != null) {
+      if (existing.best.source === "title" && r.source !== "title") {
+        existing.best = r;
+      } else if (r.source === "title" && existing.best.source !== "title") {
+        continue;
+      } else if (r.score != null && existing.best.score != null) {
         if (r.score > existing.best.score) {
           existing.best = r;
         }
@@ -387,9 +850,10 @@ function groupBySession(results: SearchResult[]): SearchResult[] {
     }
   }
 
-  return [...groups.values()].map(({ best, count }) => ({
+  return [...groups.values()].map(({ best, count, titleMatch }) => ({
     ...best,
     hitCount: count,
+    titleMatch: best.titleMatch ?? titleMatch,
   }));
 }
 
@@ -399,16 +863,28 @@ function expandSearchResults(
   mode: ExpandMode,
   expandResults: number,
   window: number,
-): ExpandedResult[] | undefined {
-  if (mode === "none") return undefined;
+  expandBudgetMessages: number,
+  expandBudgetChars: number,
+): { expanded?: ExpandedResult[]; warnings: string[] } {
+  if (mode === "none") return { warnings: [] };
 
   const bySession = new Map(loaded.map((entry) => [entry.session.id, entry.messages]));
   const expanded: ExpandedResult[] = [];
-  const budget: ExpansionBudget = { remaining: MAX_EXPANDED_TOTAL_TEXT_CHARS };
-  const count = Math.min(expandResults, results.length);
+  const budget: ExpansionBudget = { remaining: expandBudgetChars, truncated: false };
+  const expandable = results
+    .map((result, resultIndex) => ({ result, resultIndex }))
+    .filter((entry) => entry.result.source !== "title")
+    .slice(0, expandResults);
+  const count = expandable.length;
+  const warnings: string[] = [];
+  let remainingContextMessages = expandBudgetMessages;
+  let contextCapped = false;
 
-  for (let resultIndex = 0; resultIndex < count; resultIndex++) {
-    const result = results[resultIndex]!;
+  if (count === 0 && results.some((result) => result.source === "title")) {
+    warnings.push("Expansion skipped title-only hits; title results do not have matched parts.");
+  }
+
+  for (const { result, resultIndex } of expandable) {
     const messages = bySession.get(result.sessionID);
     if (!messages) continue;
 
@@ -426,9 +902,23 @@ function expandSearchResults(
       continue;
     }
 
-    const start = Math.max(0, messageIndex - window);
-    const end = Math.min(messages.length, messageIndex + window + 1);
+    if (remainingContextMessages <= 0) {
+      contextCapped = true;
+      break;
+    }
+
+    const desiredStart = Math.max(0, messageIndex - window);
+    const desiredEnd = Math.min(messages.length, messageIndex + window + 1);
+    const desiredCount = desiredEnd - desiredStart;
+    const allowedCount = Math.min(desiredCount, remainingContextMessages);
+    if (allowedCount < desiredCount) contextCapped = true;
+
+    const half = Math.floor((allowedCount - 1) / 2);
+    let start = Math.max(desiredStart, messageIndex - half);
+    const end = Math.min(desiredEnd, start + allowedCount);
+    start = Math.max(desiredStart, end - allowedCount);
     const slice = messages.slice(start, end);
+    remainingContextMessages -= slice.length;
     const items: MessageItem[] = slice.map((msg) => {
       const item = formatExpandedMsg(msg, budget);
       return { ...item, center: msg.info.id === result.messageID };
@@ -445,7 +935,164 @@ function expandSearchResults(
     });
   }
 
-  return expanded;
+  if (contextCapped) {
+    warnings.push(
+      `Context expansion capped at ${expandBudgetMessages} messages; expanded ${expanded.length} of ${count} requested results. Reduce window or expandResults to include more hits.`,
+    );
+  }
+  if (budget.truncated) {
+    warnings.push(
+      `Expanded text budget capped at ${expandBudgetChars} characters; some expanded fields were truncated or omitted.`,
+    );
+  }
+
+  return { expanded: expanded.length > 0 ? expanded : undefined, warnings };
+}
+
+function directoryRank(relevance: DirectoryRelevance | undefined): number {
+  if (relevance === "exact") return 0;
+  if (relevance === "project") return 1;
+  if (relevance === "global") return 2;
+  return 3;
+}
+
+function orderForDirectoryFallback(results: SearchResult[], enabled: boolean): SearchResult[] {
+  if (!enabled) return results;
+  return [...results].sort((a, b) => {
+    const rankDiff = directoryRank(a.directoryRelevance) - directoryRank(b.directoryRelevance);
+    if (rankDiff !== 0) return rankDiff;
+    const scoreDiff = (b.score ?? 0) - (a.score ?? 0);
+    if (scoreDiff !== 0) return scoreDiff;
+    return b.time - a.time;
+  });
+}
+
+function countDirectoryBuckets(
+  results: SearchResult[],
+): SearchCoverage["directoryBucketCounts"] | undefined {
+  const counts: NonNullable<SearchCoverage["directoryBucketCounts"]> = {};
+  for (const result of results) {
+    if (
+      result.directoryRelevance === "exact" ||
+      result.directoryRelevance === "project" ||
+      result.directoryRelevance === "global"
+    ) {
+      counts[result.directoryRelevance] = (counts[result.directoryRelevance] ?? 0) + 1;
+    }
+  }
+  return Object.keys(counts).length > 0 ? counts : undefined;
+}
+
+function capWarnings(warnings: string[]): string[] | undefined {
+  const unique = [...new Set(warnings.map((warning) => warning.trim()).filter(Boolean))];
+  return unique.length > 0 ? unique.slice(0, MAX_WARNINGS) : undefined;
+}
+
+function buildSuggestions(input: {
+  results: SearchResult[];
+  coverage: SearchCoverage;
+  directory?: string;
+  fallback: boolean;
+  matchMode: MatchMode;
+  type: string | undefined;
+}): SearchSuggestion[] | undefined {
+  const suggestions: SearchSuggestion[] = [];
+  const onlyTitleHits =
+    input.results.length > 0 && input.results.every((result) => result.source === "title");
+  const typeFilter = input.type && input.type !== "all" ? input.type : undefined;
+
+  if (onlyTitleHits) {
+    suggestions.push({
+      reason: "Only session-title hits matched; no message content matched the query.",
+      action:
+        'Inspect the returned sessions, try group:"session", or use match:"smart" with broader terms.',
+      example: { group: "session" },
+    });
+  }
+
+  if (input.results.length === 0 && input.directory && !input.fallback) {
+    suggestions.push({
+      reason: "The directory filter may be excluding useful history.",
+      action: "Retry with fallback:true to broaden from this directory to project/global history.",
+      example: { directory: input.directory, fallback: true },
+    });
+  }
+
+  if (input.results.length === 0 && input.matchMode === "literal") {
+    suggestions.push({
+      reason: "Literal search found no hits.",
+      action: 'Try match:"smart" or match:"fuzzy" for typos and naming variants.',
+      example: { match: "smart" },
+    });
+  }
+
+  if (input.results.length === 0 && typeFilter) {
+    suggestions.push({
+      reason: `The type:${JSON.stringify(typeFilter)} filter may be hiding other evidence.`,
+      action: 'Retry with type:"all" to include text, reasoning, and tool output.',
+      example: { type: "all" },
+    });
+  }
+
+  if (input.results.length === 0 && input.coverage.sessionsSearched <= 4) {
+    const count = input.coverage.sessionsSearched;
+    const noun = count === 1 ? "session" : "sessions";
+    const verb = count === 1 ? "was" : "were";
+    suggestions.push({
+      reason: `Only ${count} ${noun} ${verb} searched.`,
+      action: "Remove narrowing filters or increase the sessions limit.",
+    });
+  }
+
+  return suggestions.length > 0 ? suggestions.slice(0, MAX_SUGGESTIONS) : undefined;
+}
+
+function buildNearMisses(
+  results: SearchResult[],
+  loaded: Array<{ session: SessionMetaInternal; messages: MsgWithParts[] }>,
+): NearMiss[] | undefined {
+  if (results.length > 0) return undefined;
+  const misses = loaded
+    .filter((entry) => entry.session.title || entry.session.directory)
+    .slice(0, MAX_NEAR_MISSES)
+    .map((entry) => ({
+      sessionID: entry.session.id,
+      title: entry.session.title || undefined,
+      directory: entry.session.directory || undefined,
+      reason: "Session was searched but no searchable part matched the query.",
+    }));
+  return misses.length > 0 ? misses : undefined;
+}
+
+function attachCommonOutput<T extends SearchOutput>(
+  out: T,
+  input: {
+    final: SearchResult[];
+    allLoaded: Array<{ session: SessionMetaInternal; messages: MsgWithParts[] }>;
+    coverage: SearchCoverage;
+    warnings: string[];
+    directory?: string;
+    fallback: boolean;
+    matchMode: MatchMode;
+    type: string | undefined;
+  },
+): T {
+  input.coverage.directoryBucketCounts = countDirectoryBuckets(input.final);
+  out.coverage = input.coverage;
+  const warnings = capWarnings(input.warnings);
+  if (warnings) out.warnings = warnings;
+  const suggestions = buildSuggestions({
+    results: input.final,
+    coverage: input.coverage,
+    directory: input.directory,
+    fallback: input.fallback,
+    matchMode: input.matchMode,
+    type: input.type,
+  });
+  if (suggestions) out.suggestions = suggestions;
+  const nearMisses = buildNearMisses(input.final, input.allLoaded);
+  if (nearMisses) out.nearMisses = nearMisses;
+  return out;
 }
 
 // ── Main export ──────────────────────────────────────────────────────
@@ -493,7 +1140,7 @@ Modes: literal exact substring; smart ranked fuzzy; fuzzy looser. Smart/fuzzy in
         .number()
         .min(1)
         .max(limits.maxSessions)
-        .default(Math.min(1000, limits.maxSessions))
+        .optional()
         .describe("Max sessions to scan"),
       results: tool.schema
         .number()
@@ -502,30 +1149,43 @@ Modes: literal exact substring; smart ranked fuzzy; fuzzy looser. Smart/fuzzy in
         .default(Math.min(10, limits.maxResults))
         .describe("Max returned results"),
       title: tool.schema.string().optional().describe("Pre-filter by session title"),
-      before: tool.schema.number().optional().describe("Only messages before ms epoch"),
-      after: tool.schema.number().optional().describe("Only messages after ms epoch"),
-      since: tool.schema.string().min(1).optional().describe("Newer-than filter: 2h, 7d, 3w"),
-      until: tool.schema.string().min(1).optional().describe("Older-than filter: 2h, 7d, 3w"),
-      directory: tool.schema.string().min(1).optional().describe("Exact or descendant session dir"),
-      toolName: tool.schema.string().min(1).optional().describe("Exact tool name; tool parts only"),
+      before: tool.schema
+        .union([tool.schema.number(), tool.schema.string()])
+        .optional()
+        .describe("Only messages before ms epoch or date"),
+      after: tool.schema
+        .union([tool.schema.number(), tool.schema.string()])
+        .optional()
+        .describe("Only messages after ms epoch or date"),
+      since: tool.schema.string().optional().describe("Compatibility alias for last: 2h, 7d, 3w"),
+      until: tool.schema.string().optional().describe("Older-than relative filter: 2h, 7d, 3w"),
+      last: tool.schema.string().optional().describe("Recent-history lower bound: 2h, 7d, 3w"),
+      from: tool.schema.string().optional().describe("Lower bound like '365d ago' or date"),
+      to: tool.schema.string().optional().describe("Upper bound like 'now' or date"),
+      directory: tool.schema.string().optional().describe("Exact or descendant session dir"),
+      fallback: tool.schema.boolean().default(false).describe("Broaden directory search if needed"),
+      toolName: tool.schema.string().optional().describe("Exact tool name; tool parts only"),
       expand: tool.schema
         .enum(["none", "context", "message"])
         .default("none")
         .describe("Inline none/context/message"),
-      expandResults: tool.schema
+      expandResults: tool.schema.number().int().min(1).default(1).describe("Expanded result count"),
+      window: tool.schema
+        .union([tool.schema.number().int().min(0), tool.schema.literal("auto")])
+        .default(Math.min(3, limits.maxWindow))
+        .describe("Context messages each side"),
+      expandBudgetMessages: tool.schema
         .number()
         .int()
         .min(1)
-        .max(MAX_EXPANDED_RESULTS)
-        .default(1)
-        .describe("Expanded result count"),
-      window: tool.schema
+        .optional()
+        .describe("Total context messages to expand"),
+      expandBudgetChars: tool.schema
         .number()
         .int()
-        .min(0)
-        .max(limits.maxWindow)
-        .default(Math.min(3, limits.maxWindow))
-        .describe("Context messages each side"),
+        .min(1)
+        .optional()
+        .describe("Total expanded text budget"),
       width: tool.schema
         .number()
         .min(50)
@@ -534,61 +1194,173 @@ Modes: literal exact substring; smart ranked fuzzy; fuzzy looser. Smart/fuzzy in
         .describe("Snippet context chars"),
     },
     async execute(args, ctx: ToolContext): Promise<string> {
-      const matchMode: MatchMode = args.match;
+      // Defensive defaults and validation: some callers (e.g. live MCP) may
+      // bypass Zod and forward raw caller args. Coerce missing values to safe
+      // defaults and clamp/whitelist invalid values rather than trusting Zod.
+      const defenseWarnings: string[] = [];
+      const pickEnum = <T extends string>(
+        label: string,
+        value: unknown,
+        allowed: readonly T[],
+        fallbackValue: T,
+      ): T => {
+        if (typeof value !== "string") return fallbackValue;
+        if ((allowed as readonly string[]).includes(value)) return value as T;
+        defenseWarnings.push(
+          `Ignored ${label}:${JSON.stringify(value)}; using ${label}:${JSON.stringify(fallbackValue)}.`,
+        );
+        return fallbackValue;
+      };
+      const pickNumber = (
+        label: string,
+        value: unknown,
+        min: number,
+        max: number,
+        fallbackValue: number,
+      ): number => {
+        if (value == null) return fallbackValue;
+        if (typeof value !== "number" || !Number.isFinite(value)) {
+          // JSON.stringify(NaN) is the string "null", which is misleading in a
+          // warning. Render numbers via String() so NaN/Infinity stay literal.
+          defenseWarnings.push(
+            `Ignored ${label}:${typeof value === "number" ? String(value) : JSON.stringify(value)}; using ${label}:${fallbackValue}.`,
+          );
+          return fallbackValue;
+        }
+        return clampNumber(label, Math.trunc(value), min, max, defenseWarnings);
+      };
+
+      const scope = pickEnum(
+        "scope",
+        args.scope,
+        ["session", "project", "global"] as const,
+        "global",
+      );
+      const matchMode = pickEnum(
+        "match",
+        args.match,
+        ["literal", "smart", "fuzzy"] as const,
+        "literal",
+      ) as MatchMode;
+      const explain = typeof args.explain === "boolean" ? args.explain : false;
+      const groupArg = pickEnum("group", args.group, ["part", "session"] as const, "part");
+      const partType = pickEnum(
+        "type",
+        args.type,
+        ["text", "tool", "reasoning", "all"] as const,
+        "all",
+      );
+      const role = pickEnum("role", args.role, ["user", "assistant", "all"] as const, "all");
+      const fallback = typeof args.fallback === "boolean" ? args.fallback : false;
+      const expandMode = pickEnum(
+        "expand",
+        args.expand,
+        ["none", "context", "message"] as const,
+        "none",
+      ) as ExpandMode;
+      const expandResultsArg = pickNumber(
+        "expandResults",
+        args.expandResults,
+        1,
+        Number.MAX_SAFE_INTEGER,
+        1,
+      );
+      const windowArg =
+        args.window === "auto"
+          ? "auto"
+          : pickNumber(
+              "window",
+              args.window,
+              0,
+              Number.MAX_SAFE_INTEGER,
+              Math.min(3, limits.maxWindow),
+            );
+      const widthArg = pickNumber(
+        "width",
+        args.width,
+        50,
+        Math.max(limits.defaultWidth, 1000),
+        limits.defaultWidth,
+      );
+      const resultsArg = pickNumber(
+        "results",
+        args.results,
+        1,
+        limits.maxResults,
+        Math.min(10, limits.maxResults),
+      );
+      // For the budget fields we keep `undefined` distinct from a clamped value
+      // so `normalizeSearchOptions` can apply its own default. `pickNumber` only
+      // runs when a non-null value is supplied, and its upper bound is
+      // intentionally loose — the real per-budget cap lives in normalization
+      // (one clamp warning per oversized request, not two).
+      const expandBudgetMessagesArg =
+        args.expandBudgetMessages == null
+          ? undefined
+          : pickNumber(
+              "expandBudgetMessages",
+              args.expandBudgetMessages,
+              1,
+              Number.MAX_SAFE_INTEGER,
+              MAX_EXPANDED_CONTEXT_MESSAGES,
+            );
+      const expandBudgetCharsArg =
+        args.expandBudgetChars == null
+          ? undefined
+          : pickNumber(
+              "expandBudgetChars",
+              args.expandBudgetChars,
+              1,
+              Number.MAX_SAFE_INTEGER,
+              MAX_EXPANDED_TOTAL_TEXT_CHARS,
+            );
+
       const sessionID = optionalString(args.sessionID);
       const title = optionalString(args.title);
       const directory = optionalString(args.directory);
       const toolName = optionalString(args.toolName);
-      const expandMode: ExpandMode = args.expand;
+      const requestedSessions =
+        args.sessions == null
+          ? undefined
+          : pickNumber("sessions", args.sessions, 1, limits.maxSessions, limits.maxSessions);
       const sessionListLimit = directory
-        ? listLimitForDirectoryFilter(args.sessions, limits.maxSessions)
-        : args.sessions;
+        ? listLimitForDirectoryFilter(requestedSessions, limits.maxSessions)
+        : (requestedSessions ??
+          (Number.isFinite(limits.maxSessions) ? limits.maxSessions : undefined));
 
       const fail = (error: string): string =>
         JSON.stringify({ ok: false, error } satisfies ErrorOutput);
 
-      if (toolName && args.type !== "all" && args.type !== "tool") {
+      if (toolName && partType !== "all" && partType !== "tool") {
         return fail('toolName can only be used with type:"all" or type:"tool"');
       }
 
-      let before = positiveTimestampOrUndefined(args.before);
-      let after = positiveTimestampOrUndefined(args.after);
-      try {
-        const now = Date.now();
-        const relativeAfter = parseRelativeTimestamp("since", args.since, now);
-        const relativeBefore = parseRelativeTimestamp("until", args.until, now);
-
-        if (after != null && relativeAfter != null) {
-          return fail("after and since cannot both be positive filters");
-        }
-        if (before != null && relativeBefore != null) {
-          return fail("before and until cannot both be positive filters");
-        }
-
-        after ??= relativeAfter;
-        before ??= relativeBefore;
-      } catch (e) {
-        return fail(errmsg(e));
-      }
-
-      if (after != null && before != null && after >= before) {
-        return fail("after/since must be older than before/until; check the time window");
-      }
-
-      if (
-        expandMode === "context" &&
-        args.expandResults * (2 * args.window + 1) > MAX_EXPANDED_CONTEXT_MESSAGES
-      ) {
-        return fail(
-          `expand context is capped at ${MAX_EXPANDED_CONTEXT_MESSAGES} messages; reduce expandResults or window`,
-        );
-      }
+      const normalized = normalizeSearchOptions(
+        {
+          after: args.after,
+          before: args.before,
+          since: args.since,
+          until: args.until,
+          last: args.last,
+          from: args.from,
+          to: args.to,
+          expandResults: expandResultsArg,
+          window: windowArg,
+          expandBudgetMessages: expandBudgetMessagesArg,
+          expandBudgetChars: expandBudgetCharsArg,
+        },
+        limits,
+      );
+      if ("ok" in normalized) return fail(normalized.error);
+      // Surface defensive-default warnings alongside time/expansion warnings.
+      normalized.warnings.unshift(...defenseWarnings);
+      const { before, after } = normalized;
 
       ctx.metadata({
-        title: `Searching ${args.scope} for "${args.query}"${matchMode !== "literal" ? ` (${matchMode})` : ""}`,
+        title: `Searching ${scope} for "${args.query}"${matchMode !== "literal" ? ` (${matchMode})` : ""}`,
       });
 
-      if (args.scope === "global" && !sessionID && !global) {
+      if (scope === "global" && !sessionID && !global) {
         const err: ErrorOutput = {
           ok: false,
           error: "Global scope disabled via plugin option: global: false",
@@ -602,19 +1374,26 @@ Modes: literal exact substring; smart ranked fuzzy; fuzzy looser. Smart/fuzzy in
         if (sessionID) {
           let title = "";
           let directory = "";
+          let updated = 0;
+          let projectID: string | undefined;
+          let projectWorktree: string | undefined;
           try {
             const sess = await client.session.get({
               sessionID,
             });
             if (sess.data) {
-              title = sess.data.title;
-              directory = sess.data.directory;
+              const data = sess.data as Session | GlobalSession;
+              title = data.title;
+              directory = data.directory;
+              updated = data.time.updated;
+              projectID = data.projectID;
+              projectWorktree = "project" in data ? data.project?.worktree : undefined;
             }
           } catch {
             // Can't get metadata, proceed anyway
           }
-          targets = [{ id: sessionID, title, directory }];
-        } else if (args.scope === "session") {
+          targets = [{ id: sessionID, title, directory, updated, projectID, projectWorktree }];
+        } else if (scope === "session") {
           if (!ctx.sessionID) {
             const err: ErrorOutput = {
               ok: false,
@@ -625,17 +1404,24 @@ Modes: literal exact substring; smart ranked fuzzy; fuzzy looser. Smart/fuzzy in
 
           let title = "";
           let directory = "";
+          let updated = 0;
+          let projectID: string | undefined;
+          let projectWorktree: string | undefined;
           try {
             const sess = await client.session.get({ sessionID: ctx.sessionID });
             if (sess.data) {
-              title = sess.data.title;
-              directory = sess.data.directory;
+              const data = sess.data as Session | GlobalSession;
+              title = data.title;
+              directory = data.directory;
+              updated = data.time.updated;
+              projectID = data.projectID;
+              projectWorktree = "project" in data ? data.project?.worktree : undefined;
             }
           } catch {
             // proceed without metadata
           }
-          targets = [{ id: ctx.sessionID, title, directory }];
-        } else if (args.scope === "project") {
+          targets = [{ id: ctx.sessionID, title, directory, updated, projectID, projectWorktree }];
+        } else if (scope === "project") {
           const resp = await client.session.list({
             search: title,
             limit: sessionListLimit,
@@ -663,11 +1449,83 @@ Modes: literal exact substring; smart ranked fuzzy; fuzzy looser. Smart/fuzzy in
           if (resp.data) targets = resp.data.map(meta);
         }
 
-        if (directory) {
-          targets = targets
-            .filter((target) => directoryMatches(target.directory, directory))
-            .slice(0, args.sessions);
+        if (directory && fallback && !sessionID && scope === "project" && global) {
+          const resp = await unscoped.experimental.session.list({
+            search: title,
+            limit: sessionListLimit,
+          });
+          if (resp.data) targets = dedupeSessions([...targets, ...resp.data.map(meta)]);
+          if (resp.error) {
+            normalized.warnings.push(
+              `Directory fallback could not list global sessions: ${errmsg(resp.error)}.`,
+            );
+          }
         }
+
+        const discoveredTargets = dedupeSessions(targets);
+        const skippedByReason: Record<string, number> = {};
+        let directoryBucketsSearched: SearchCoverage["directoryBucketsSearched"];
+        let sessionsEligible = discoveredTargets.length;
+        if (directory) {
+          pushUnique(normalized.limitedBy, "directory");
+          const fallbackWorktree = optionalString(ctx.worktree) ?? optionalString(ctx.directory);
+          if (fallback && !fallbackWorktree) {
+            normalized.warnings.push(
+              "Directory fallback could not identify a project/worktree bucket; using exact and global buckets only.",
+            );
+          }
+          const bucketed = discoveredTargets.map((target) =>
+            withDirectoryRelevance(
+              target,
+              classifyDirectoryRelevance(target, directory, fallbackWorktree),
+            ),
+          );
+          const exact = bucketed.filter((target) => target.directoryRelevance === "exact");
+          const project = bucketed.filter((target) => target.directoryRelevance === "project");
+          const fallbackGlobal = bucketed.filter(
+            (target) => target.directoryRelevance === "global",
+          );
+
+          if (fallback) {
+            targets = [...exact, ...project, ...fallbackGlobal];
+            sessionsEligible = targets.length;
+            directoryBucketsSearched = [
+              ...(exact.length > 0 ? (["exact"] as const) : []),
+              ...(project.length > 0 ? (["project"] as const) : []),
+              ...(fallbackGlobal.length > 0 ? (["global"] as const) : []),
+            ];
+            if (project.length > 0 || fallbackGlobal.length > 0) {
+              normalized.warnings.push(
+                "Directory fallback broadened the search beyond exact matches.",
+              );
+            }
+          } else {
+            targets = exact;
+            sessionsEligible = targets.length;
+            const skipped = discoveredTargets.length - targets.length;
+            if (skipped > 0) skippedByReason.directory = skipped;
+            directoryBucketsSearched = exact.length > 0 ? ["exact"] : [];
+          }
+
+          if (requestedSessions != null && targets.length > requestedSessions) {
+            skippedByReason.sessionsLimit =
+              (skippedByReason.sessionsLimit ?? 0) + (targets.length - requestedSessions);
+            targets = targets.slice(0, requestedSessions);
+          }
+        } else {
+          targets = discoveredTargets.map((target) => withDirectoryRelevance(target, "unknown"));
+          sessionsEligible = targets.length;
+        }
+
+        if (requestedSessions != null && sessionsEligible > requestedSessions) {
+          pushUnique(normalized.limitedBy, "sessionsLimit");
+        }
+        if (Number.isFinite(limits.maxSessions) && discoveredTargets.length >= limits.maxSessions) {
+          pushUnique(normalized.limitedBy, "maxSessions");
+        }
+        if (title) pushUnique(normalized.limitedBy, "title");
+        if (sessionID) pushUnique(normalized.limitedBy, "sessionID");
+        else if (scope !== "global") pushUnique(normalized.limitedBy, "scope");
 
         // ── Load messages ─────────────────────────────────────────────
         const allLoaded: Array<{
@@ -726,7 +1584,37 @@ Modes: literal exact substring; smart ranked fuzzy; fuzzy looser. Smart/fuzzy in
           return JSON.stringify(err);
         }
 
-        const groupMode: GroupMode = args.group;
+        if (loadErrorCount > 0) pushUnique(normalized.limitedBy, "loadError");
+        const { messagesSearched, partsSearched } = countSearchCoverage(
+          allLoaded,
+          partType,
+          role,
+          toolName,
+          before,
+          after,
+        );
+        const sessionsDiscovered = discoveredTargets.length;
+        const sessionsSkipped = sessionsDiscovered - scanned;
+        if (sessionsSkipped > 0) {
+          const accounted = Object.values(skippedByReason).reduce((sum, value) => sum + value, 0);
+          if (accounted < sessionsSkipped) {
+            skippedByReason.filtered = sessionsSkipped - accounted;
+          }
+        }
+        const coverage: SearchCoverage = {
+          totalSessionsKnown: false,
+          sessionsDiscovered,
+          sessionsEligible,
+          sessionsSearched: scanned,
+          messagesSearched,
+          partsSearched,
+          sessionsSkipped,
+          skippedByReason: Object.keys(skippedByReason).length > 0 ? skippedByReason : undefined,
+          directoryBucketsSearched,
+          limitedBy: normalized.limitedBy.length > 0 ? normalized.limitedBy : undefined,
+        };
+
+        const groupMode: GroupMode = groupArg;
         const isGrouped = groupMode === "session";
         const incomplete = loadErrorCount > 0;
         const loadErrorSuffix = incomplete
@@ -738,16 +1626,47 @@ Modes: literal exact substring; smart ranked fuzzy; fuzzy looser. Smart/fuzzy in
           out.loadErrors = [...loadErrors];
           return out;
         };
-        const includeExpansion = <T extends SearchOutput>(out: T, final: SearchResult[]): T => {
-          const expanded = expandSearchResults(
+        const includeExpansion = <T extends SearchOutput>(
+          out: T,
+          final: SearchResult[],
+          warnings: string[],
+        ): T => {
+          const expansion = expandSearchResults(
             final,
             allLoaded,
             expandMode,
-            args.expandResults,
-            args.window,
+            normalized.expandResults,
+            normalized.window,
+            normalized.expandBudgetMessages,
+            normalized.expandBudgetChars,
           );
-          if (expanded) out.expanded = expanded;
+          if (expansion.expanded) out.expanded = expansion.expanded;
+          warnings.push(...expansion.warnings);
           return out;
+        };
+        const finish = <T extends SearchOutput>(
+          out: T,
+          final: SearchResult[],
+          effectiveMatchMode: MatchMode,
+        ): T => {
+          const warnings = [...normalized.warnings];
+          if (incomplete) {
+            warnings.push(
+              `${loadErrorCount} session${loadErrorCount === 1 ? "" : "s"} failed to load; results may be partial.`,
+            );
+          }
+          return includeLoadErrors(
+            attachCommonOutput(includeExpansion(out, final, warnings), {
+              final,
+              allLoaded,
+              coverage,
+              warnings,
+              directory,
+              fallback,
+              matchMode: effectiveMatchMode,
+              type: partType,
+            }),
+          );
         };
 
         // ── Helper: run literal scan (full or limited) ───────────────
@@ -768,16 +1687,28 @@ Modes: literal exact substring; smart ranked fuzzy; fuzzy looser. Smart/fuzzy in
               msgs,
               sess,
               args.query,
-              args.type,
-              args.role,
+              partType,
+              role,
               remaining,
               before,
               after,
-              args.width,
+              widthArg,
               toolName,
             );
             collected.push(...result.results);
             total += result.total;
+
+            if (
+              canSearchTitles(partType, toolName) &&
+              matches(sess.title, args.query) &&
+              collected.length < scanLimit
+            ) {
+              const representative = findRepresentativeMessage(msgs, role, before, after);
+              if (representative) {
+                collected.push(titleSearchResult(sess, representative, args.query, widthArg));
+                total++;
+              }
+            }
           }
           return { collected, total, early };
         };
@@ -789,15 +1720,19 @@ Modes: literal exact substring; smart ranked fuzzy; fuzzy looser. Smart/fuzzy in
           earlyExit: boolean,
         ): { final: SearchResult[]; total: number; truncated: boolean } => {
           if (isGrouped) {
-            const grouped = groupBySession(results);
-            const final = grouped.slice(0, args.results);
+            const grouped = orderForDirectoryFallback(
+              groupBySession(results),
+              Boolean(directory && fallback),
+            );
+            const final = grouped.slice(0, resultsArg);
             return {
               final,
               total: grouped.length,
               truncated: earlyExit || grouped.length > final.length,
             };
           }
-          const final = results.slice(0, args.results);
+          const ordered = orderForDirectoryFallback(results, Boolean(directory && fallback));
+          const final = ordered.slice(0, resultsArg);
           return {
             final,
             total: partTotal,
@@ -809,7 +1744,7 @@ Modes: literal exact substring; smart ranked fuzzy; fuzzy looser. Smart/fuzzy in
         if (matchMode === "literal") {
           // When grouping by session, scan all sessions (no early exit)
           // so we get representative hits from every matching session
-          const limit = isGrouped ? MAX_GROUPED_LITERAL_RESULTS : args.results;
+          const limit = isGrouped ? MAX_GROUPED_LITERAL_RESULTS : resultsArg;
           const { collected, total, early } = literalScan(limit);
           const { final, total: outTotal, truncated } = applyGroupAndSlice(collected, total, early);
 
@@ -826,26 +1761,28 @@ Modes: literal exact substring; smart ranked fuzzy; fuzzy looser. Smart/fuzzy in
             truncated,
             group: groupMode,
           };
-          return JSON.stringify(includeLoadErrors(includeExpansion(out, final)));
+          return JSON.stringify(finish(out, final, "literal"));
         }
 
         // ── Smart/fuzzy path ────────────────────────────────────────
         const smartResult = smartScan(
           allLoaded,
           args.query,
-          args.type,
-          args.role,
-          args.explain,
+          partType,
+          role,
+          explain,
           matchMode,
           before,
           after,
-          args.width,
+          widthArg,
           toolName,
         );
+        if (smartResult.degradeKind === "budget") pushUnique(normalized.limitedBy, "rankingBudget");
+        if (smartResult.degradeKind === "time") pushUnique(normalized.limitedBy, "timeBudget");
 
         // ── Fallback to literal if smart returns nothing ────────────
         if (smartResult.results.length === 0) {
-          const limit = isGrouped ? MAX_GROUPED_LITERAL_RESULTS : args.results;
+          const limit = isGrouped ? MAX_GROUPED_LITERAL_RESULTS : resultsArg;
           const { collected, total, early } = literalScan(limit);
           const { final, total: outTotal, truncated } = applyGroupAndSlice(collected, total, early);
 
@@ -865,7 +1802,7 @@ Modes: literal exact substring; smart ranked fuzzy; fuzzy looser. Smart/fuzzy in
               degradeKind: "fallback",
               group: groupMode,
             };
-            return JSON.stringify(includeLoadErrors(includeExpansion(out, final)));
+            return JSON.stringify(finish(out, final, "literal"));
           }
         }
 
@@ -891,7 +1828,7 @@ Modes: literal exact substring; smart ranked fuzzy; fuzzy looser. Smart/fuzzy in
           degradeKind: smartResult.degradeKind,
           group: groupMode,
         };
-        return JSON.stringify(includeLoadErrors(includeExpansion(out, final)));
+        return JSON.stringify(finish(out, final, smartResult.matchMode));
       } catch (e) {
         const err: ErrorOutput = { ok: false, error: errmsg(e) };
         return JSON.stringify(err);

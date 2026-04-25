@@ -2,6 +2,8 @@ import { distance } from "fastest-levenshtein";
 import type { FuseHit } from "./fuse.js";
 import type { Candidate } from "./candidates.js";
 import type { ParsedQuery } from "./query.js";
+import { tokenize } from "./normalize.js";
+import type { ResultWhy } from "./types.js";
 
 // ── Tuning constants ────────────────────────────────────────────────
 
@@ -53,6 +55,7 @@ export type RankedResult = {
   candidate: Candidate;
   score: number;
   matchedTerms: string[];
+  matchedFields: ResultWhy["matchedFields"];
   matchReasons: string[];
 };
 
@@ -89,6 +92,17 @@ function findMatchedTerms(
     }
   }
   return matched;
+}
+
+function findMatchedFields(query: ParsedQuery, candidate: Candidate): ResultWhy["matchedFields"] {
+  const fields = new Set<ResultWhy["matchedFields"][number]>();
+  for (const field of candidate.fieldTexts) {
+    const lower = field.text.toLowerCase();
+    const phraseMatched = query.phrases.some((phrase) => lower.includes(phrase));
+    const termsMatched = findMatchedTerms(query.tokens, tokenize(field.text)).length > 0;
+    if (phraseMatched || termsMatched) fields.add(field.field);
+  }
+  return [...fields];
 }
 
 function sortResults(results: RankedResult[]): RankedResult[] {
@@ -135,6 +149,7 @@ export function rank(hits: FuseHit[], query: ParsedQuery, explain: boolean): Ran
 
     // ── All tokens matched ──────────────────────────────────────────
     const matchedTerms = findMatchedTerms(query.tokens, candidate.tokens);
+    const matchedFields = findMatchedFields(query, candidate);
     const allTokensMatched = query.tokens.length > 0 && matchedTerms.length === query.tokens.length;
 
     if (allTokensMatched) {
@@ -203,6 +218,7 @@ export function rank(hits: FuseHit[], query: ParsedQuery, explain: boolean): Ran
       candidate,
       score,
       matchedTerms,
+      matchedFields,
       matchReasons: explain ? reasons : [],
     });
   }
@@ -246,11 +262,13 @@ export function rankDegraded(
     score = clamp01(score);
 
     const matchedTerms = findMatchedTerms(query.tokens, candidate.tokens);
+    const matchedFields = findMatchedFields(query, candidate);
 
     results.push({
       candidate,
       score,
       matchedTerms,
+      matchedFields,
       matchReasons: explain ? reasons : [],
     });
   }
