@@ -308,99 +308,59 @@ export function search(
   limits: Limits,
 ): ToolDefinition {
   return tool({
-    description: `Search your conversation history in the opencode database. This is the primary discovery tool — use it before recall_sessions, which only searches titles. Before debugging an issue or implementing a feature, check whether prior sessions already tackled it — the history shows whether an approach succeeded or was abandoned. If you have access to a memory system, add useful findings to memory so they're available directly next time without searching history.
+    description: `Search prior opencode conversations by message/tool-output content. Primary history-discovery tool; prefer over recall_sessions for topical discovery (titles only).
 
-Supports three matching strategies via the \`match\` parameter:
-- "literal" (default): case-insensitive substring matching. Works across all scopes. Fast and predictable.
-- "smart": fuzzy ranked search using Fuse.js. Handles typos, separator differences (rate-limit vs rateLimit), and ranks results by relevance. Works across all scopes.
-- "fuzzy": looser fuzzy search with a higher match threshold. Works across all scopes.
+Call when history could change the approach: debugging errors, investigating behavior, non-trivial feature work in areas with likely prior history, changing architecture/config, answering "last time/before", recovering commands/root causes/decisions, or checking if an approach worked or failed. Also call before substantive work in an unfamiliar area of this project.
 
-When using smart or fuzzy, results include a relevance \`score\` (0-1, higher is better) and \`matchedTerms\`. Add \`explain: true\` for detailed scoring breakdowns via \`matchReasons\`. If smart/fuzzy finds no matches, it automatically falls back to literal search.
+Skip trivial commands, simple local code/file lookup, simple edits with full context, ordinary code tasks where prior history would not change the approach, or anything not helped by past conversations.
 
-Use \`group: "session"\` to collapse results by session — returns one entry per session with the best-scoring hit as representative (or most recent for literal), plus a \`hitCount\` showing how many part-level hits that session had. Useful for cross-project discovery: "which sessions are about this topic?"
+First call: for broad discovery use match:"smart", group:"session", scope:"global" (default), 5-10 results, and short terms from error text/feature/config/file/decision. Use role:"user" to filter out assistant/tool noise and surface original requirements or decisions. Try 2-3 query variants, then inspect promising hits with recall_get or recall_context.
 
-Searches globally by default — this is fast and finds results across all projects. Results are ordered by session recency (newest first) for literal, or by relevance score for smart/fuzzy. Try multiple query terms before concluding no prior work exists. Use role "user" to find original requirements.
+If memory exists, store only durable findings: preferences, project decisions, reusable root causes, environment facts, behavior corrections, or repeatable success/failure. Do not store ephemeral details, one-off commands, transient errors, or implementation minutiae.
 
-Scope costs: all scopes scan up to \`sessions\` sessions (default 1000). "session" scans 1. Reduce \`sessions\` for faster searches if needed.
-
-Returns { ok, results: [{ sessionID, messageID, role, time, partID, partType, pruned, snippet, toolName? }], scanned, total, truncated }. If some sessions could not be loaded, the response includes loadErrorCount and loadErrors so transport failures are not confused with no matches. Each result includes a pruned flag — if true, the content was compacted from your context window and recall_get will return the original full output. Check truncated to know if more matches exist beyond your results limit.
-
-This tool's own outputs are excluded from search results to prevent recursive noise; use recall_get or recall_context to retrieve any message directly.`,
+Modes: literal exact substring; smart ranked fuzzy; fuzzy looser. Smart/fuzzy include score/matchedTerms and fall back to literal. Results are snippets; use recall_get/context for full content. loadErrorCount/loadErrors indicate partial session-load failures.`,
     args: {
-      query: tool.schema
-        .string()
-        .min(1)
-        .describe("Text to search for (case-insensitive substring match)"),
+      query: tool.schema.string().min(1).describe("Search text"),
       scope: tool.schema
         .enum(["session", "project", "global"])
         .default("global")
-        .describe(
-          "global = all projects (default), project = current project, session = current only. Searching broadly is fast.",
-        ),
+        .describe("global=all projects, project=current project, session=current only"),
       match: tool.schema
         .enum(["literal", "smart", "fuzzy"])
         .default("literal")
-        .describe(
-          'Matching strategy: "literal" = exact substring (default), "smart" = fuzzy ranked search, "fuzzy" = looser fuzzy search. All work across all scopes.',
-        ),
-      explain: tool.schema
-        .boolean()
-        .default(false)
-        .describe("Return scoring metadata for debugging. Adds matchReasons to each result."),
+        .describe("literal=exact, smart=ranked fuzzy, fuzzy=looser"),
+      explain: tool.schema.boolean().default(false).describe("Include matchReasons"),
       group: tool.schema
         .enum(["part", "session"])
         .default("part")
-        .describe(
-          '"part" (default) = one result per matching part. "session" = collapse by session, returning one entry per session with best-scoring (smart/fuzzy) or most-recent (literal) hit and a hitCount.',
-        ),
-      sessionID: tool.schema
-        .string()
-        .optional()
-        .describe("Search a specific session (overrides scope)"),
+        .describe("part=per hit, session=one per session with hitCount"),
+      sessionID: tool.schema.string().optional().describe("Specific session; overrides scope"),
       type: tool.schema
         .enum(["text", "tool", "reasoning", "all"])
         .default("all")
-        .describe("Filter by part type"),
-      role: tool.schema
-        .enum(["user", "assistant", "all"])
-        .default("all")
-        .describe("Filter by message role"),
+        .describe("Part type filter"),
+      role: tool.schema.enum(["user", "assistant", "all"]).default("all").describe("Role filter"),
       sessions: tool.schema
         .number()
         .min(1)
         .max(limits.maxSessions)
         .default(Math.min(1000, limits.maxSessions))
-        .describe(
-          "Max sessions to scan. Default 1000 covers deep history. Reduce for faster searches if needed.",
-        ),
+        .describe("Max sessions to scan"),
       results: tool.schema
         .number()
         .min(1)
         .max(limits.maxResults)
         .default(Math.min(10, limits.maxResults))
-        .describe("Max results to return. Check truncated in response for more."),
-      title: tool.schema
-        .string()
-        .optional()
-        .describe(
-          "Filter sessions by title before scanning (rarely useful — titles are usually auto-generated)",
-        ),
-      before: tool.schema
-        .number()
-        .optional()
-        .describe("Only match messages before this timestamp (ms epoch)"),
-      after: tool.schema
-        .number()
-        .optional()
-        .describe("Only match messages after this timestamp (ms epoch)"),
+        .describe("Max returned results"),
+      title: tool.schema.string().optional().describe("Pre-filter by session title"),
+      before: tool.schema.number().optional().describe("Only messages before ms epoch"),
+      after: tool.schema.number().optional().describe("Only messages after ms epoch"),
       width: tool.schema
         .number()
         .min(50)
         .max(Math.max(limits.defaultWidth, 1000))
         .default(limits.defaultWidth)
-        .describe(
-          "Characters of context around each match in the returned snippet. Only a snippet is returned — use recall_get for full content.",
-        ),
+        .describe("Snippet context chars"),
     },
     async execute(args, ctx: ToolContext): Promise<string> {
       const matchMode: MatchMode = args.match;

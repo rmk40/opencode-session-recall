@@ -116,7 +116,9 @@ Available across all scopes — `"session"`, `"project"`, and `"global"`.
 
 This is not a memory system. Memory is selective and curated. Recall is raw history retrieval — verbatim, exhaustive, on demand.
 
-If you use a persistent memory system alongside this plugin, recall gives it source material. The agent searches history, finds something useful, and stores it deliberately. Discovery first, then permanent memory.
+If you use a persistent memory system alongside this plugin, recall gives it source material. The agent searches history, follows promising hits with `recall_get` or `recall_context`, then stores only durable findings deliberately.
+
+Good memory candidates: user preferences, project decisions, reusable root causes, environment facts, corrections, and approaches that clearly succeeded or failed. Do not store ephemeral session details, one-off commands, transient errors, or implementation minutiae.
 
 ## Install
 
@@ -148,13 +150,19 @@ Five tools, designed around how agents actually navigate conversation history:
 
 The primary tool. Full-text search across messages, tool outputs, tool inputs, reasoning, and subtask descriptions. Searches globally by default, or narrow to the current project or session.
 
+Use before real work when prior history could change the approach: debugging, unexpected behavior, feature work, architecture or configuration changes, past commands, root causes, decisions, or "what did we do last time?" questions.
+
+Do not call it for every request. Skip it for trivial commands, local file/code inspection, simple edits with complete context, and questions that do not benefit from prior conversations. Use code search for the current codebase.
+
 ```
 recall({ query: "authentication", scope: "project" })
 recall({ query: "error", type: "tool", scope: "session" })
 recall({ query: "JWT", sessionID: "ses_from_another_project" })
-recall({ query: "rate limit", match: "smart", scope: "global", group: "session" })
+recall({ query: "rate limit", match: "smart", scope: "session", group: "session" })
 recall({ query: "prefiltr", match: "fuzzy", scope: "session", explain: true })
 ```
+
+First call guidance: use `match: "smart"` for topic discovery, naming variants, and likely typos. Use `group: "session"` for broad discovery, then call `recall_get` or `recall_context` on promising hits. Reserve literal matching for exact errors, commands, function names, or file paths.
 
 | Param            | Default                  | Description                                                                                                                                                                  |
 | ---------------- | ------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |

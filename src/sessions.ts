@@ -16,26 +16,19 @@ export function sessions(
   limits: Limits,
 ): ToolDefinition {
   return tool({
-    description: `List sessions from the opencode database. Returns session titles, directories, and timestamps. For cross-project discovery, use scope "global" (enabled by default, disable with plugin option global: false).
-
-This is a metadata-only listing tool, NOT a content search. Session titles are usually auto-generated timestamps and won't match topic keywords. To find prior work on a topic, use recall (content search) instead — it searches inside actual messages and tool outputs. Use recall_sessions to browse recent sessions by project, check session recency, or get session IDs for recall_messages.
-
-Returns { ok, sessions: [{ id, title, directory, time, archived }], returned, scope }. All tools return JSON with ok: true on success or ok: false with error on failure.`,
+    description: `List session metadata: titles, directories, timestamps, archival state. Use only for recent-session browsing, finding a session ID/title/timeframe, or recency checks. Not content search; for topical discovery use recall.`,
     args: {
       scope: tool.schema
         .enum(["project", "global"])
         .default("project")
-        .describe("project = current project, global = all projects"),
-      search: tool.schema
-        .string()
-        .optional()
-        .describe("Case-insensitive substring match on session title"),
+        .describe("project=current project, global=all projects"),
+      search: tool.schema.string().optional().describe("Title substring"),
       limit: tool.schema
         .number()
         .min(1)
         .max(limits.maxSessionList)
         .default(Math.min(20, limits.maxSessionList))
-        .describe("Max sessions to return (newest first)"),
+        .describe("Max sessions returned"),
     },
     async execute(args, ctx: ToolContext): Promise<string> {
       const search = optionalString(args.search);

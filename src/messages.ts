@@ -20,42 +20,19 @@ function msgMatches(msg: { parts: Array<Part> }, query: string): boolean {
 
 export function messages(client: OpencodeClient, limits: Limits): ToolDefinition {
   return tool({
-    description: `Browse messages in a session chronologically with pagination. Unlike recall (which searches for specific text and returns snippets), this returns full messages with all parts in chronological order. Use it to replay a session when you don't have a specific search term, or when you need complete message content rather than search hits.
-
-Use reverse=true to start from the most recent messages (offset 0 = newest). Use offset to paginate through results. Good for finding the user's original requirements at the start of a session.
-
-Returns { messages: [{ message: { id, role, time }, parts: [...] }], pagination: { offset, returned, total, hasMore } }. The query and role params filter client-side after fetching, so they may return fewer results than limit. pagination.total reflects the count after filtering.`,
+    description: `Browse a known session chronologically with full messages and pagination. Use after you know the session and need to replay, inspect beginning/end, or filter within it. For topical discovery across sessions use recall first. reverse=true starts newest.`,
     args: {
-      sessionID: tool.schema
-        .string()
-        .optional()
-        .describe("Session to browse. Defaults to current session if not provided."),
-      offset: tool.schema
-        .number()
-        .min(0)
-        .default(0)
-        .describe("Skip this many messages from the start (or end if reversed)"),
+      sessionID: tool.schema.string().optional().describe("Session to browse; default current"),
+      offset: tool.schema.number().min(0).default(0).describe("Messages to skip"),
       limit: tool.schema
         .number()
         .min(1)
         .max(limits.maxMessages)
         .default(Math.min(10, limits.maxMessages))
-        .describe("Max messages to return"),
-      role: tool.schema
-        .enum(["user", "assistant", "all"])
-        .default("all")
-        .describe("Filter by message role (client-side, may return fewer than limit)"),
-      reverse: tool.schema
-        .boolean()
-        .default(false)
-        .describe("If true, start from most recent messages"),
-      query: tool.schema
-        .string()
-        .min(1)
-        .optional()
-        .describe(
-          "Case-insensitive substring filter on message content (client-side, may return fewer than limit)",
-        ),
+        .describe("Max messages returned"),
+      role: tool.schema.enum(["user", "assistant", "all"]).default("all").describe("Role filter"),
+      reverse: tool.schema.boolean().default(false).describe("Newest first"),
+      query: tool.schema.string().min(1).optional().describe("Message content substring filter"),
     },
     async execute(args, ctx: ToolContext): Promise<string> {
       const sid = optionalString(args.sessionID) ?? ctx.sessionID;

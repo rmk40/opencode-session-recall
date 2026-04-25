@@ -5,11 +5,9 @@ import { formatMsg } from "./extract.js";
 
 export function context(client: OpencodeClient, limits: Limits): ToolDefinition {
   return tool({
-    description: `Get messages surrounding a specific message in a session. Use after recall finds a match and you need conversation context — what was asked before, what came after. Returns a chronological window of full messages (with all parts) centered on the target.
+    description: `Get messages around a recall hit to see what was asked before, what happened after, and whether the approach worked. Use recall_get for only the single message.
 
-Returns { ok, messages: [{ message, parts, center? }], context, hasMoreBefore, hasMoreAfter }. The center message is marked with center: true. Use hasMoreBefore/hasMoreAfter with asymmetric before/after params to expand in either direction. window=3 returns up to 3 before + target + 3 after = 7 messages. window=0 returns only the target.
-
-Use recall_get for a single message without neighbors. Use recall_messages for paginated browsing of an entire session.`,
+If memory exists, store only durable findings surfaced here; skip ephemeral details/minutiae.`,
     args: {
       sessionID: tool.schema.string().describe("Session containing the message"),
       messageID: tool.schema.string().describe("Center message to get context around"),
@@ -18,23 +16,19 @@ Use recall_get for a single message without neighbors. Use recall_messages for p
         .min(0)
         .max(limits.maxWindow)
         .default(Math.min(3, limits.maxWindow))
-        .describe(
-          "Messages on each side of target (window=3 → up to 7 total). Overridden by before/after if set.",
-        ),
+        .describe("Messages on each side; overridden by before/after"),
       before: tool.schema
         .number()
         .min(0)
         .max(limits.maxWindow)
         .optional()
-        .describe(
-          "Messages before the target (overrides window for before side). Set before=0, after=5 to see only what followed.",
-        ),
+        .describe("Messages before target; 0 allowed"),
       after: tool.schema
         .number()
         .min(0)
         .max(limits.maxWindow)
         .optional()
-        .describe("Messages after the target (overrides window for after side)"),
+        .describe("Messages after target"),
     },
     async execute(args, ctx: ToolContext): Promise<string> {
       ctx.metadata({ title: "Getting context around message..." });

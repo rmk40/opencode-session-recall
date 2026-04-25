@@ -6,16 +6,12 @@ import { formatMsg } from "./extract.js";
 
 export function get(client: OpencodeClient): ToolDefinition {
   return tool({
-    description: `Retrieve the full content of a specific message from any session, including all parts (text, tool outputs, reasoning, etc). Use after recall to get the complete content of a search result. For tool parts, returns the original output even if it was pruned from your context window. Large outputs may be truncated by the opencode runtime.
+    description: `Retrieve one full message from recall results, including text, reasoning, tool inputs/outputs, and pruned tool output. Use recall_context for surrounding conversation.
 
-Returns { message: { id, role, time, model }, parts: [{ type, content, toolName, input, output, pruned, ... }], context: { sessionTitle, directory } }. Each part has a pruned flag indicating whether it was compacted.
-
-Use recall_context instead if you need surrounding messages for context, not just a single message. Use sessionID and messageID from recall search results.`,
+If memory exists, store only durable findings surfaced here; skip ephemeral details/minutiae.`,
     args: {
-      sessionID: tool.schema
-        .string()
-        .describe("Session containing the message (from recall search results)"),
-      messageID: tool.schema.string().describe("Message to retrieve (from recall search results)"),
+      sessionID: tool.schema.string().describe("Session containing the message"),
+      messageID: tool.schema.string().describe("Message to retrieve"),
     },
     async execute(args, ctx: ToolContext): Promise<string> {
       ctx.metadata({
