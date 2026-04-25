@@ -175,11 +175,7 @@ export function buildCandidates(
 export function populateNormalized(candidate: Candidate): void {
   candidate.primaryText = normalize(candidate.rawText);
   // secondaryText: directory path provides cross-project search context
-  candidate.secondaryText = candidate.directory
-    ? normalize(candidate.directory)
-    : "";
-  candidate.titleText = candidate.sessionTitle
-    ? normalize(candidate.sessionTitle)
-    : "";
+  candidate.secondaryText = candidate.directory ? normalize(candidate.directory) : "";
+  candidate.titleText = candidate.sessionTitle ? normalize(candidate.sessionTitle) : "";
   candidate.hintText = candidate.toolName ? normalize(candidate.toolName) : "";
 }

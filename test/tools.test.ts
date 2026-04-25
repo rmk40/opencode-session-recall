@@ -12,12 +12,7 @@ import type {
   SearchOutput,
   SessionsOutput,
 } from "../src/types.js";
-import {
-  TEST_LIMITS,
-  makeContext,
-  makeFakeHarness,
-  runTool,
-} from "./helpers.js";
+import { TEST_LIMITS, makeContext, makeFakeHarness, runTool } from "./helpers.js";
 
 describe("recall_sessions", () => {
   it("lists project sessions with schema defaults", async () => {
@@ -40,17 +35,9 @@ describe("recall_sessions", () => {
     );
 
     expect(h.calls.globalList).toEqual([{ search: undefined, limit: 20 }]);
-    expect(out.sessions.map((s) => s.id)).toEqual([
-      "s-other",
-      "s-current",
-      "s-project-2",
-    ]);
-    expect(out.sessions.find((s) => s.id === "s-project-2")?.archived).toBe(
-      true,
-    );
-    expect(out.sessions.find((s) => s.id === "s-other")?.project?.name).toBe(
-      "other",
-    );
+    expect(out.sessions.map((s) => s.id)).toEqual(["s-other", "s-current", "s-project-2"]);
+    expect(out.sessions.find((s) => s.id === "s-project-2")?.archived).toBe(true);
+    expect(out.sessions.find((s) => s.id === "s-other")?.project?.name).toBe("other");
   });
 
   it("filters titles and handles disabled global/list errors", async () => {
@@ -74,26 +61,18 @@ describe("recall_sessions", () => {
       sessionsTool(errored.client, errored.unscoped, true, TEST_LIMITS),
       {},
     );
-    expect(out.error).toContain(
-      "Failed to list sessions: database unavailable",
-    );
+    expect(out.error).toContain("Failed to list sessions: database unavailable");
   });
 });
 
 describe("recall_messages", () => {
   it("browses current-session messages chronologically with pagination", async () => {
     const h = makeFakeHarness();
-    const out = await runTool<MessagesOutput>(
-      messagesTool(h.client, TEST_LIMITS),
-      {
-        limit: 2,
-      },
-    );
+    const out = await runTool<MessagesOutput>(messagesTool(h.client, TEST_LIMITS), {
+      limit: 2,
+    });
 
-    expect(out.messages.map((m) => m.message.id)).toEqual([
-      "m-current-1",
-      "m-current-2",
-    ]);
+    expect(out.messages.map((m) => m.message.id)).toEqual(["m-current-1", "m-current-2"]);
     expect(out.pagination).toEqual({
       offset: 0,
       returned: 2,
@@ -125,13 +104,10 @@ describe("recall_messages", () => {
 
   it("normalizes blank query and handles missing/error/no-data sessions", async () => {
     const blank = makeFakeHarness();
-    const blankOut = await runTool<MessagesOutput>(
-      messagesTool(blank.client, TEST_LIMITS),
-      {
-        query: "   ",
-        limit: 50,
-      },
-    );
+    const blankOut = await runTool<MessagesOutput>(messagesTool(blank.client, TEST_LIMITS), {
+      query: "   ",
+      limit: 50,
+    });
     expect(blankOut.pagination.total).toBe(6);
 
     const missing = await runTool<ErrorOutput>(
@@ -144,17 +120,11 @@ describe("recall_messages", () => {
     const errored = makeFakeHarness({
       messageErrors: { "s-current": "Unauthorized" },
     });
-    const errorOut = await runTool<ErrorOutput>(
-      messagesTool(errored.client, TEST_LIMITS),
-      {},
-    );
+    const errorOut = await runTool<ErrorOutput>(messagesTool(errored.client, TEST_LIMITS), {});
     expect(errorOut.error).toContain("Unauthorized");
 
     const noData = makeFakeHarness({ noMessageData: new Set(["s-current"]) });
-    const noDataOut = await runTool<ErrorOutput>(
-      messagesTool(noData.client, TEST_LIMITS),
-      {},
-    );
+    const noDataOut = await runTool<ErrorOutput>(messagesTool(noData.client, TEST_LIMITS), {});
     expect(noDataOut.error).toBe("No messages returned");
   });
 });
@@ -257,9 +227,7 @@ describe("recall_context", () => {
       "m-current-3",
       "m-current-4",
     ]);
-    expect(around.messages.find((m) => m.center)?.message.id).toBe(
-      "m-current-3",
-    );
+    expect(around.messages.find((m) => m.center)?.message.id).toBe("m-current-3");
     expect(around.hasMoreBefore).toBe(true);
     expect(around.hasMoreAfter).toBe(true);
 
@@ -268,9 +236,7 @@ describe("recall_context", () => {
       messageID: "m-current-3",
       window: 0,
     });
-    expect(onlyTarget.messages.map((m) => m.message.id)).toEqual([
-      "m-current-3",
-    ]);
+    expect(onlyTarget.messages.map((m) => m.message.id)).toEqual(["m-current-3"]);
 
     const afterOnly = await runTool<ContextOutput>(tool, {
       sessionID: "s-current",
@@ -278,10 +244,7 @@ describe("recall_context", () => {
       before: 0,
       after: 1,
     });
-    expect(afterOnly.messages.map((m) => m.message.id)).toEqual([
-      "m-current-3",
-      "m-current-4",
-    ]);
+    expect(afterOnly.messages.map((m) => m.message.id)).toEqual(["m-current-3", "m-current-4"]);
   });
 
   it("sets boundary hasMore flags at the first and last message", async () => {
@@ -309,35 +272,26 @@ describe("recall_context", () => {
 
   it("handles message-not-found, returned errors, and no-data errors", async () => {
     const h = makeFakeHarness();
-    const notFound = await runTool<ErrorOutput>(
-      contextTool(h.client, TEST_LIMITS),
-      {
-        sessionID: "s-current",
-        messageID: "missing",
-      },
-    );
+    const notFound = await runTool<ErrorOutput>(contextTool(h.client, TEST_LIMITS), {
+      sessionID: "s-current",
+      messageID: "missing",
+    });
     expect(notFound.error).toBe("Message not found: missing");
 
     const errored = makeFakeHarness({
       messageErrors: { "s-current": "Unauthorized" },
     });
-    const errorOut = await runTool<ErrorOutput>(
-      contextTool(errored.client, TEST_LIMITS),
-      {
-        sessionID: "s-current",
-        messageID: "m-current-1",
-      },
-    );
+    const errorOut = await runTool<ErrorOutput>(contextTool(errored.client, TEST_LIMITS), {
+      sessionID: "s-current",
+      messageID: "m-current-1",
+    });
     expect(errorOut.error).toContain("Unauthorized");
 
     const noData = makeFakeHarness({ noMessageData: new Set(["s-current"]) });
-    const noDataOut = await runTool<ErrorOutput>(
-      contextTool(noData.client, TEST_LIMITS),
-      {
-        sessionID: "s-current",
-        messageID: "m-current-1",
-      },
-    );
+    const noDataOut = await runTool<ErrorOutput>(contextTool(noData.client, TEST_LIMITS), {
+      sessionID: "s-current",
+      messageID: "m-current-1",
+    });
     expect(noDataOut.error).toBe("No messages returned");
   });
 });
@@ -353,8 +307,6 @@ describe("LLM-facing schemas", () => {
     await expect(
       runTool<SearchOutput>(recall, { query: "rate", scope: "everywhere" }),
     ).rejects.toThrow();
-    await expect(
-      runTool<SearchOutput>(recall, { query: "rate", results: 3 }),
-    ).rejects.toThrow();
+    await expect(runTool<SearchOutput>(recall, { query: "rate", results: 3 })).rejects.toThrow();
   });
 });

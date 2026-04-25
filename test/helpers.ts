@@ -1,9 +1,5 @@
 import { expect } from "vitest";
-import {
-  tool,
-  type ToolContext,
-  type ToolDefinition,
-} from "@opencode-ai/plugin";
+import { tool, type ToolContext, type ToolDefinition } from "@opencode-ai/plugin";
 import type {
   AssistantMessage,
   GlobalSession,
@@ -97,11 +93,7 @@ export function globalSessionFrom(s: Session): GlobalSession {
   } as GlobalSession;
 }
 
-export function userMessage(
-  id: string,
-  sessionID: string,
-  created: number,
-): UserMessage {
+export function userMessage(id: string, sessionID: string, created: number): UserMessage {
   return {
     id,
     sessionID,
@@ -112,11 +104,7 @@ export function userMessage(
   };
 }
 
-export function assistantMessage(
-  id: string,
-  sessionID: string,
-  created: number,
-): AssistantMessage {
+export function assistantMessage(id: string, sessionID: string, created: number): AssistantMessage {
   return {
     id,
     sessionID,
@@ -133,12 +121,7 @@ export function assistantMessage(
   };
 }
 
-export function textPart(
-  id: string,
-  sessionID: string,
-  messageID: string,
-  text: string,
-): Part {
+export function textPart(id: string, sessionID: string, messageID: string, text: string): Part {
   return { id, sessionID, messageID, type: "text", text };
 }
 
@@ -275,12 +258,7 @@ export function makeFixture(now = Date.now()): {
   globalSessions: GlobalSession[];
   messagesBySession: Record<string, MessageBundle[]>;
 } {
-  const current = session(
-    "s-current",
-    "Current Debugging Session",
-    PROJECT_DIR,
-    now - 1_000,
-  );
+  const current = session("s-current", "Current Debugging Session", PROJECT_DIR, now - 1_000);
   const projectTwo = session(
     "s-project-2",
     "Checkout Cache Investigation",
@@ -288,12 +266,7 @@ export function makeFixture(now = Date.now()): {
     now - 2_000,
     now - 500,
   );
-  const other = session(
-    "s-other",
-    "Actualyze Walkthrough",
-    OTHER_DIR,
-    now - 500,
-  );
+  const other = session("s-other", "Actualyze Walkthrough", OTHER_DIR, now - 500);
 
   const currentMessages = [
     bundle(userMessage("m-current-1", current.id, now - 90_000), [
@@ -377,12 +350,7 @@ export function makeFixture(now = Date.now()): {
 
   const otherMessages = [
     bundle(userMessage("m-other-1", other.id, now - 75_000), [
-      textPart(
-        "p-other-1",
-        other.id,
-        "m-other-1",
-        "Plan walkthrough pages for demo.actualyze.ai.",
-      ),
+      textPart("p-other-1", other.id, "m-other-1", "Plan walkthrough pages for demo.actualyze.ai."),
     ]),
     bundle(assistantMessage("m-other-2", other.id, now - 65_000), [
       textPart(
@@ -411,9 +379,7 @@ function filtered<T extends Session | GlobalSession>(
   limit: number | undefined,
 ): T[] {
   const matching = search
-    ? sessions.filter((s) =>
-        s.title.toLowerCase().includes(search.toLowerCase()),
-      )
+    ? sessions.filter((s) => s.title.toLowerCase().includes(search.toLowerCase()))
     : sessions;
   return matching.slice(0, limit);
 }
@@ -435,26 +401,21 @@ export function makeFakeHarness(options: FakeOptions = {}): FakeHarness {
           search: params?.search,
           limit: params?.limit,
         });
-        if (options.projectListError)
-          return { error: apiFailure(options.projectListError) };
+        if (options.projectListError) return { error: apiFailure(options.projectListError) };
         return {
           data: filtered(fixture.sessions, params?.search, params?.limit),
         };
       },
       get: async ({ sessionID }: { sessionID: string }) => {
         calls.get.push({ sessionID });
-        if (options.getThrows?.has(sessionID))
-          throw new Error(`get failed: ${sessionID}`);
+        if (options.getThrows?.has(sessionID)) throw new Error(`get failed: ${sessionID}`);
         const found = fixture.globalSessions.find((s) => s.id === sessionID);
-        return found
-          ? { data: found }
-          : { error: apiFailure(`Session not found: ${sessionID}`) };
+        return found ? { data: found } : { error: apiFailure(`Session not found: ${sessionID}`) };
       },
       messages: async ({ sessionID }: { sessionID: string }) => {
         calls.messages.push({ sessionID });
         options.afterMessagesCall?.(sessionID);
-        if (options.messageThrows?.has(sessionID))
-          throw new Error(`thrown messages: ${sessionID}`);
+        if (options.messageThrows?.has(sessionID)) throw new Error(`thrown messages: ${sessionID}`);
         if (options.messageErrors?.[sessionID]) {
           return { error: apiFailure(options.messageErrors[sessionID]) };
         }
@@ -462,25 +423,15 @@ export function makeFakeHarness(options: FakeOptions = {}): FakeHarness {
         const data = fixture.messagesBySession[sessionID];
         return data ? { data } : { error: apiFailure(`Unauthorized`) };
       },
-      message: async ({
-        sessionID,
-        messageID,
-      }: {
-        sessionID: string;
-        messageID: string;
-      }) => {
+      message: async ({ sessionID, messageID }: { sessionID: string; messageID: string }) => {
         calls.message.push({ sessionID, messageID });
         const key = `${sessionID}:${messageID}`;
         if (options.messageLookupErrors?.[key]) {
           return { error: apiFailure(options.messageLookupErrors[key]) };
         }
         if (options.noSingleMessageData?.has(key)) return {};
-        const found = fixture.messagesBySession[sessionID]?.find(
-          (m) => m.info.id === messageID,
-        );
-        return found
-          ? { data: found }
-          : { error: apiFailure(`Message not found: ${messageID}`) };
+        const found = fixture.messagesBySession[sessionID]?.find((m) => m.info.id === messageID);
+        return found ? { data: found } : { error: apiFailure(`Message not found: ${messageID}`) };
       },
     },
   };
@@ -493,14 +444,9 @@ export function makeFakeHarness(options: FakeOptions = {}): FakeHarness {
             search: params?.search,
             limit: params?.limit,
           });
-          if (options.globalListError)
-            return { error: apiFailure(options.globalListError) };
+          if (options.globalListError) return { error: apiFailure(options.globalListError) };
           return {
-            data: filtered(
-              fixture.globalSessions,
-              params?.search,
-              params?.limit,
-            ),
+            data: filtered(fixture.globalSessions, params?.search, params?.limit),
           };
         },
       },

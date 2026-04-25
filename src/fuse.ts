@@ -36,11 +36,7 @@ function thresholdFor(mode: FuseMode): number {
  * Candidates MUST have stage-2 fields populated (primaryText etc.) before calling.
  * Returns ALL matches above threshold so callers can compute accurate totals.
  */
-export function fuseSearch(
-  candidates: Candidate[],
-  query: ParsedQuery,
-  mode: FuseMode,
-): FuseHit[] {
+export function fuseSearch(candidates: Candidate[], query: ParsedQuery, mode: FuseMode): FuseHit[] {
   const fuse = new Fuse(candidates, {
     includeScore: true,
     ignoreLocation: true,

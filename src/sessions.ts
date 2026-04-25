@@ -1,8 +1,4 @@
-import {
-  tool,
-  type ToolDefinition,
-  type ToolContext,
-} from "@opencode-ai/plugin";
+import { tool, type ToolDefinition, type ToolContext } from "@opencode-ai/plugin";
 import type { OpencodeClient } from "@opencode-ai/sdk/v2";
 import {
   errmsg,

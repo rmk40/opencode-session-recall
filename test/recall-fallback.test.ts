@@ -18,10 +18,10 @@ describe("recall smart fallback", () => {
 
   it("falls back to literal search when smart matching finds no results", async () => {
     const h = makeFakeHarness();
-    const out = await runTool<SearchOutput>(
-      search(h.client, h.unscoped, true, TEST_LIMITS),
-      { query: "walkthrough", match: "smart" },
-    );
+    const out = await runTool<SearchOutput>(search(h.client, h.unscoped, true, TEST_LIMITS), {
+      query: "walkthrough",
+      match: "smart",
+    });
 
     expect(fuseSearch).toHaveBeenCalled();
     const firstCall = fuseSearch.mock.calls[0] as unknown[] | undefined;

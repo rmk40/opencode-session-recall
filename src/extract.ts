@@ -12,9 +12,7 @@ const SELF = new Set<string>(TOOLS);
 
 function input(val: unknown): string {
   const raw = JSON.stringify(val);
-  return raw.length > INPUT_SEARCH_LIMIT
-    ? raw.slice(0, INPUT_SEARCH_LIMIT)
-    : raw;
+  return raw.length > INPUT_SEARCH_LIMIT ? raw.slice(0, INPUT_SEARCH_LIMIT) : raw;
 }
 
 export function matches(text: string, query: string): boolean {
@@ -54,8 +52,7 @@ export function searchable(part: Part): string[] {
 export function snippet(text: string, query: string, width = 200): string {
   const lower = text.toLowerCase();
   const idx = lower.indexOf(query.toLowerCase());
-  if (idx === -1)
-    return text.slice(0, width) + (text.length > width ? "..." : "");
+  if (idx === -1) return text.slice(0, width) + (text.length > width ? "..." : "");
 
   const half = Math.floor(width / 2);
   let start = Math.max(0, idx - half);
@@ -134,10 +131,7 @@ export function format(part: Part): PartOutput {
   }
 }
 
-export function formatMsg(msg: {
-  info: Message;
-  parts: Array<Part>;
-}): MessageItem {
+export function formatMsg(msg: { info: Message; parts: Array<Part> }): MessageItem {
   const info = msg.info;
   let model: string | undefined;
   if (info.role === "assistant") model = (info as AssistantMessage).modelID;

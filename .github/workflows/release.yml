@@ -17,16 +17,13 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: "24"
+          node-version: 24
+          cache: npm
           registry-url: "https://registry.npmjs.org"
 
-      - uses: oven-sh/setup-bun@v2
+      - run: npm ci
 
-      - run: bun install
-
-      - run: bun run typecheck
-
-      - run: bun run compile
+      - run: npm run ci
 
       - name: Publish to npm
         run: npm publish --access public

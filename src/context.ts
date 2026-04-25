@@ -1,21 +1,9 @@
-import {
-  tool,
-  type ToolDefinition,
-  type ToolContext,
-} from "@opencode-ai/plugin";
+import { tool, type ToolDefinition, type ToolContext } from "@opencode-ai/plugin";
 import type { OpencodeClient } from "@opencode-ai/sdk/v2";
-import {
-  errmsg,
-  type ContextOutput,
-  type ErrorOutput,
-  type Limits,
-} from "./types.js";
+import { errmsg, type ContextOutput, type ErrorOutput, type Limits } from "./types.js";
 import { formatMsg } from "./extract.js";
 
-export function context(
-  client: OpencodeClient,
-  limits: Limits,
-): ToolDefinition {
+export function context(client: OpencodeClient, limits: Limits): ToolDefinition {
   return tool({
     description: `Get messages surrounding a specific message in a session. Use after recall finds a match and you need conversation context — what was asked before, what came after. Returns a chronological window of full messages (with all parts) centered on the target.
 
@@ -23,12 +11,8 @@ Returns { ok, messages: [{ message, parts, center? }], context, hasMoreBefore, h
 
 Use recall_get for a single message without neighbors. Use recall_messages for paginated browsing of an entire session.`,
     args: {
-      sessionID: tool.schema
-        .string()
-        .describe("Session containing the message"),
-      messageID: tool.schema
-        .string()
-        .describe("Center message to get context around"),
+      sessionID: tool.schema.string().describe("Session containing the message"),
+      messageID: tool.schema.string().describe("Center message to get context around"),
       window: tool.schema
         .number()
         .min(0)
@@ -50,9 +34,7 @@ Use recall_get for a single message without neighbors. Use recall_messages for p
         .min(0)
         .max(limits.maxWindow)
         .optional()
-        .describe(
-          "Messages after the target (overrides window for after side)",
-        ),
+        .describe("Messages after the target (overrides window for after side)"),
     },
     async execute(args, ctx: ToolContext): Promise<string> {
       ctx.metadata({ title: "Getting context around message..." });

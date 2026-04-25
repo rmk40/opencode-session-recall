@@ -1,12 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { buildCandidates, type Candidate } from "../src/candidates.js";
-import {
-  format,
-  formatMsg,
-  pruned,
-  searchable,
-  snippet,
-} from "../src/extract.js";
+import { format, formatMsg, pruned, searchable, snippet } from "../src/extract.js";
 import { prefilter } from "../src/prefilter.js";
 import { parseQuery } from "../src/query.js";
 import { rank, rankDegraded } from "../src/rank.js";
@@ -27,9 +21,7 @@ import {
   userMessage,
 } from "./helpers.js";
 
-function candidate(
-  overrides: Partial<Candidate> & { rawText: string },
-): Candidate {
+function candidate(overrides: Partial<Candidate> & { rawText: string }): Candidate {
   const { rawText, ...rest } = overrides;
   return {
     sessionID: "s",
@@ -66,14 +58,8 @@ describe("string and error helpers", () => {
     expect(splitCamelCase("rateLimit getHTTPResponse XMLParser")).toBe(
       "rate Limit get HTTPResponse XMLParser",
     );
-    expect(tokenize("rate-limit/rate_limit.foo rateLimit")).toEqual([
-      "rate",
-      "limit",
-      "foo",
-    ]);
-    expect(normalize(" rate-limit\nrateLimit.foo ")).toBe(
-      "rate limit rate limit foo",
-    );
+    expect(tokenize("rate-limit/rate_limit.foo rateLimit")).toEqual(["rate", "limit", "foo"]);
+    expect(normalize(" rate-limit\nrateLimit.foo ")).toBe("rate limit rate limit foo");
 
     expect(parseQuery('find "exact phrase" exact "" phrase')).toEqual({
       raw: 'find "exact phrase" exact "" phrase',
@@ -104,46 +90,25 @@ describe("extract helpers", () => {
     const self = completedToolPart("p2", "s", "m", "recall", {}, "self output");
     expect(searchable(self)).toEqual([]);
 
-    const errored = errorToolPart(
-      "p3",
-      "s",
-      "m",
-      "bash",
-      { path: "src" },
-      "failed",
-    );
+    const errored = errorToolPart("p3", "s", "m", "bash", { path: "src" }, "failed");
     expect(searchable(errored)).toEqual(["failed", '{"path":"src"}']);
 
-    expect(
-      searchable(runningToolPart("p4", "s", "m", { command: "run" })),
-    ).toEqual(['{"command":"run"}']);
-    expect(
-      searchable(pendingToolPart("p5", "s", "m", { command: "wait" })),
-    ).toEqual(['{"command":"wait"}']);
-    expect(searchable(subtaskPart("p6", "s", "m", "desc", "prompt"))).toEqual([
-      "desc",
-      "prompt",
+    expect(searchable(runningToolPart("p4", "s", "m", { command: "run" }))).toEqual([
+      '{"command":"run"}',
     ]);
+    expect(searchable(pendingToolPart("p5", "s", "m", { command: "wait" }))).toEqual([
+      '{"command":"wait"}',
+    ]);
+    expect(searchable(subtaskPart("p6", "s", "m", "desc", "prompt"))).toEqual(["desc", "prompt"]);
 
     const long = "x".repeat(10_100);
-    const truncated = completedToolPart(
-      "p7",
-      "s",
-      "m",
-      "bash",
-      { long },
-      "out",
-    );
+    const truncated = completedToolPart("p7", "s", "m", "bash", { long }, "out");
     expect(searchable(truncated)[2]?.length).toBe(10_000);
   });
 
   it("builds snippets and pruned flags at important boundaries", () => {
-    expect(snippet("needle at start and more", "needle", 12)).toBe(
-      "needle at st...",
-    );
-    expect(snippet("more text with needle", "needle", 12)).toBe(
-      "... with needle",
-    );
+    expect(snippet("needle at start and more", "needle", 12)).toBe("needle at st...");
+    expect(snippet("more text with needle", "needle", 12)).toBe("... with needle");
     expect(snippet("abcdef", "missing", 3)).toBe("abc...");
 
     const compacted = completedToolPart("p", "s", "m", "bash", {}, "out", {
@@ -152,9 +117,7 @@ describe("extract helpers", () => {
     const notCompacted = completedToolPart("p2", "s", "m", "bash", {}, "out");
     expect(pruned(compacted)).toBe(true);
     expect(pruned(notCompacted)).toBe(false);
-    expect(pruned(errorToolPart("p3", "s", "m", "bash", {}, "err"))).toBe(
-      false,
-    );
+    expect(pruned(errorToolPart("p3", "s", "m", "bash", {}, "err"))).toBe(false);
   });
 
   it("formats messages and non-search part types for retrieval", () => {
@@ -271,15 +234,11 @@ describe("search ranking helpers", () => {
     ];
 
     expect(
-      prefilter(candidates, parseQuery('"rate limit"')).map(
-        (r) => r.candidate.rawText,
-      ),
+      prefilter(candidates, parseQuery('"rate limit"')).map((r) => r.candidate.rawText),
     ).toEqual(["rate limit cache"]);
-    expect(
-      prefilter(candidates, parseQuery("walthrough")).map(
-        (r) => r.candidate.rawText,
-      ),
-    ).toEqual(["walkthrough guide"]);
+    expect(prefilter(candidates, parseQuery("walthrough")).map((r) => r.candidate.rawText)).toEqual(
+      ["walkthrough guide"],
+    );
   });
 
   it("ranks with explainable boosts, penalties, and time tie-breaks", () => {
@@ -318,22 +277,16 @@ describe("search ranking helpers", () => {
     ];
 
     const ranked = rank(hits, query, true);
-    const errorResult = ranked.find(
-      (r) => r.candidate.rawText === "rate limit cache error",
-    );
+    const errorResult = ranked.find((r) => r.candidate.rawText === "rate limit cache error");
     expect(errorResult?.matchReasons.join(" ")).toContain("Exact phrase match");
     expect(errorResult?.matchReasons.join(" ")).toContain("Error text boost");
     expect(errorResult?.matchReasons.join(" ")).toContain("User text boost");
     expect(
-      ranked
-        .find((r) => r.candidate.partType === "reasoning")
-        ?.matchReasons.join(" "),
+      ranked.find((r) => r.candidate.partType === "reasoning")?.matchReasons.join(" "),
     ).toContain("Reasoning part boost");
-    expect(
-      ranked
-        .find((r) => r.candidate.rawText === "rate")
-        ?.matchReasons.join(" "),
-    ).toContain("Poor query coverage");
+    expect(ranked.find((r) => r.candidate.rawText === "rate")?.matchReasons.join(" ")).toContain(
+      "Poor query coverage",
+    );
 
     const weak = rank(
       [
@@ -346,9 +299,7 @@ describe("search ranking helpers", () => {
       parseQuery("rate"),
       true,
     );
-    expect(weak[0]?.matchReasons.join(" ")).toContain(
-      "Weak single-token fuzzy",
-    );
+    expect(weak[0]?.matchReasons.join(" ")).toContain("Weak single-token fuzzy");
 
     const tied = rank(
       [
@@ -379,9 +330,7 @@ describe("search ranking helpers", () => {
 
     expect(smartSnippet("", parseQuery("rate"), 10)).toBe("");
     expect(smartSnippet("abcdef", parseQuery("zzz"), 3)).toBe("abc...");
-    expect(
-      smartSnippet("aaa rate bbb limit ccc", parseQuery("rate limit"), 12),
-    ).toContain("rate");
+    expect(smartSnippet("aaa rate bbb limit ccc", parseQuery("rate limit"), 12)).toContain("rate");
   });
 
   it("builds candidates with role/type/time filters", () => {

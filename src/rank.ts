@@ -105,11 +105,7 @@ function sortResults(results: RankedResult[]): RankedResult[] {
  * Apply structural boosts/penalties and produce final ranked results.
  * Results are sorted by score descending, then by time descending for ties.
  */
-export function rank(
-  hits: FuseHit[],
-  query: ParsedQuery,
-  explain: boolean,
-): RankedResult[] {
+export function rank(hits: FuseHit[], query: ParsedQuery, explain: boolean): RankedResult[] {
   const results: RankedResult[] = [];
 
   for (const hit of hits) {
@@ -139,15 +135,12 @@ export function rank(
 
     // ── All tokens matched ──────────────────────────────────────────
     const matchedTerms = findMatchedTerms(query.tokens, candidate.tokens);
-    const allTokensMatched =
-      query.tokens.length > 0 && matchedTerms.length === query.tokens.length;
+    const allTokensMatched = query.tokens.length > 0 && matchedTerms.length === query.tokens.length;
 
     if (allTokensMatched) {
       score += ALL_TOKENS_BOOST;
       if (explain) {
-        reasons.push(
-          `All query tokens matched: +${ALL_TOKENS_BOOST.toFixed(2)}`,
-        );
+        reasons.push(`All query tokens matched: +${ALL_TOKENS_BOOST.toFixed(2)}`);
       }
     }
 
@@ -159,10 +152,7 @@ export function rank(
       }
     }
 
-    if (
-      candidate.partType === "tool" &&
-      containsErrorPattern(candidate.rawText)
-    ) {
+    if (candidate.partType === "tool" && containsErrorPattern(candidate.rawText)) {
       score += ERROR_TEXT_BOOST;
       if (explain) {
         reasons.push(`Error text boost: +${ERROR_TEXT_BOOST.toFixed(2)}`);
@@ -194,22 +184,15 @@ export function rank(
     ) {
       score += WEAK_FUZZY_PENALTY;
       if (explain) {
-        reasons.push(
-          `Weak single-token fuzzy: ${WEAK_FUZZY_PENALTY.toFixed(2)}`,
-        );
+        reasons.push(`Weak single-token fuzzy: ${WEAK_FUZZY_PENALTY.toFixed(2)}`);
       }
     }
 
     // ── Poor query coverage penalty ─────────────────────────────────
-    if (
-      query.tokens.length > 1 &&
-      matchedTerms.length < query.tokens.length / 2
-    ) {
+    if (query.tokens.length > 1 && matchedTerms.length < query.tokens.length / 2) {
       score += POOR_COVERAGE_PENALTY;
       if (explain) {
-        reasons.push(
-          `Poor query coverage: ${POOR_COVERAGE_PENALTY.toFixed(2)}`,
-        );
+        reasons.push(`Poor query coverage: ${POOR_COVERAGE_PENALTY.toFixed(2)}`);
       }
     }
 
@@ -248,9 +231,7 @@ export function rankDegraded(
     let score = Math.min(1, prefilterScore / MAX_PREFILTER_SCORE);
 
     if (explain) {
-      reasons.push(
-        `Degraded mode: prefilter score ${prefilterScore} → ${score.toFixed(2)}`,
-      );
+      reasons.push(`Degraded mode: prefilter score ${prefilterScore} → ${score.toFixed(2)}`);
     }
 
     // Recency boost

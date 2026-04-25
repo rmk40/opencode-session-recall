@@ -1,8 +1,4 @@
-import {
-  tool,
-  type ToolDefinition,
-  type ToolContext,
-} from "@opencode-ai/plugin";
+import { tool, type ToolDefinition, type ToolContext } from "@opencode-ai/plugin";
 import type { OpencodeClient } from "@opencode-ai/sdk/v2";
 import type { MessageOutput, ErrorOutput } from "./types.js";
 import { errmsg } from "./types.js";
@@ -18,12 +14,8 @@ Use recall_context instead if you need surrounding messages for context, not jus
     args: {
       sessionID: tool.schema
         .string()
-        .describe(
-          "Session containing the message (from recall search results)",
-        ),
-      messageID: tool.schema
-        .string()
-        .describe("Message to retrieve (from recall search results)"),
+        .describe("Session containing the message (from recall search results)"),
+      messageID: tool.schema.string().describe("Message to retrieve (from recall search results)"),
     },
     async execute(args, ctx: ToolContext): Promise<string> {
       ctx.metadata({
@@ -36,9 +28,7 @@ Use recall_context instead if you need surrounding messages for context, not jus
           messageID: args.messageID,
         });
         if (!result.data) {
-          const msg = result.error
-            ? errmsg(result.error)
-            : `Message not found: ${args.messageID}`;
+          const msg = result.error ? errmsg(result.error) : `Message not found: ${args.messageID}`;
           const err: ErrorOutput = { ok: false, error: msg };
           return JSON.stringify(err);
         }

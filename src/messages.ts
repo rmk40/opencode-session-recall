@@ -1,8 +1,4 @@
-import {
-  tool,
-  type ToolDefinition,
-  type ToolContext,
-} from "@opencode-ai/plugin";
+import { tool, type ToolDefinition, type ToolContext } from "@opencode-ai/plugin";
 import type { OpencodeClient, Part } from "@opencode-ai/sdk/v2";
 import {
   errmsg,
@@ -22,10 +18,7 @@ function msgMatches(msg: { parts: Array<Part> }, query: string): boolean {
   return false;
 }
 
-export function messages(
-  client: OpencodeClient,
-  limits: Limits,
-): ToolDefinition {
+export function messages(client: OpencodeClient, limits: Limits): ToolDefinition {
   return tool({
     description: `Browse messages in a session chronologically with pagination. Unlike recall (which searches for specific text and returns snippets), this returns full messages with all parts in chronological order. Use it to replay a session when you don't have a specific search term, or when you need complete message content rather than search hits.
 
@@ -36,16 +29,12 @@ Returns { messages: [{ message: { id, role, time }, parts: [...] }], pagination:
       sessionID: tool.schema
         .string()
         .optional()
-        .describe(
-          "Session to browse. Defaults to current session if not provided.",
-        ),
+        .describe("Session to browse. Defaults to current session if not provided."),
       offset: tool.schema
         .number()
         .min(0)
         .default(0)
-        .describe(
-          "Skip this many messages from the start (or end if reversed)",
-        ),
+        .describe("Skip this many messages from the start (or end if reversed)"),
       limit: tool.schema
         .number()
         .min(1)
@@ -55,9 +44,7 @@ Returns { messages: [{ message: { id, role, time }, parts: [...] }], pagination:
       role: tool.schema
         .enum(["user", "assistant", "all"])
         .default("all")
-        .describe(
-          "Filter by message role (client-side, may return fewer than limit)",
-        ),
+        .describe("Filter by message role (client-side, may return fewer than limit)"),
       reverse: tool.schema
         .boolean()
         .default(false)
@@ -95,8 +82,7 @@ Returns { messages: [{ message: { id, role, time }, parts: [...] }], pagination:
         }
 
         let filtered = resp.data;
-        if (args.role !== "all")
-          filtered = filtered.filter((m) => m.info.role === args.role);
+        if (args.role !== "all") filtered = filtered.filter((m) => m.info.role === args.role);
         if (query) filtered = filtered.filter((m) => msgMatches(m, query));
 
         const ordered = args.reverse ? [...filtered].reverse() : filtered;

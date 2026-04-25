@@ -1,15 +1,9 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import {
-  tool,
-  type PluginInput,
-  type ToolDefinition,
-} from "@opencode-ai/plugin";
+import { tool, type PluginInput, type ToolDefinition } from "@opencode-ai/plugin";
 import { TOOLS } from "../src/types.js";
 import { PROJECT_DIR } from "./helpers.js";
 
-const createOpencodeClient = vi.hoisted(() =>
-  vi.fn((options: unknown) => options),
-);
+const createOpencodeClient = vi.hoisted(() => vi.fn((options: unknown) => options));
 
 vi.mock("@opencode-ai/sdk/v2", () => ({ createOpencodeClient }));
 
@@ -72,17 +66,11 @@ describe("plugin entry", () => {
       experimental: { primary_tools: ["existing_tool", "recall"] },
     };
     await hooks.config?.(config);
-    expect(config.experimental.primary_tools).toEqual([
-      "existing_tool",
-      ...TOOLS,
-    ]);
+    expect(config.experimental.primary_tools).toEqual(["existing_tool", ...TOOLS]);
 
-    const withoutPrimary = await plugin.default.server(
-      ctx({ fetch: vi.fn() }),
-      {
-        primary: false,
-      },
-    );
+    const withoutPrimary = await plugin.default.server(ctx({ fetch: vi.fn() }), {
+      primary: false,
+    });
     expect(withoutPrimary.config).toBeUndefined();
   });
 
@@ -99,36 +87,20 @@ describe("plugin entry", () => {
     expect(recallArgs.parse({ query: "rate" }).sessions).toBe(2);
     expect(() => recallArgs.parse({ query: "rate", results: 2 })).not.toThrow();
     expect(() => recallArgs.parse({ query: "rate", results: 3 })).toThrow();
-    expect(() =>
-      recallArgs.parse({ query: "rate", sessions: 2 }),
-    ).not.toThrow();
+    expect(() => recallArgs.parse({ query: "rate", sessions: 2 })).not.toThrow();
     expect(() => recallArgs.parse({ query: "rate", sessions: 3 })).toThrow();
 
-    const messagesArgs = tool.schema.object(
-      mustTool(hooks.tool?.recall_messages).args,
-    );
+    const messagesArgs = tool.schema.object(mustTool(hooks.tool?.recall_messages).args);
     expect(() => messagesArgs.parse({ limit: 3 })).not.toThrow();
     expect(() => messagesArgs.parse({ limit: 4 })).toThrow();
 
-    const contextArgs = tool.schema.object(
-      mustTool(hooks.tool?.recall_context).args,
-    );
-    expect(() =>
-      contextArgs.parse({ sessionID: "s", messageID: "m", window: 1 }),
-    ).not.toThrow();
-    expect(() =>
-      contextArgs.parse({ sessionID: "s", messageID: "m", window: 2 }),
-    ).toThrow();
-    expect(() =>
-      contextArgs.parse({ sessionID: "s", messageID: "m", before: 2 }),
-    ).toThrow();
-    expect(() =>
-      contextArgs.parse({ sessionID: "s", messageID: "m", after: 2 }),
-    ).toThrow();
+    const contextArgs = tool.schema.object(mustTool(hooks.tool?.recall_context).args);
+    expect(() => contextArgs.parse({ sessionID: "s", messageID: "m", window: 1 })).not.toThrow();
+    expect(() => contextArgs.parse({ sessionID: "s", messageID: "m", window: 2 })).toThrow();
+    expect(() => contextArgs.parse({ sessionID: "s", messageID: "m", before: 2 })).toThrow();
+    expect(() => contextArgs.parse({ sessionID: "s", messageID: "m", after: 2 })).toThrow();
 
-    const sessionsArgs = tool.schema.object(
-      mustTool(hooks.tool?.recall_sessions).args,
-    );
+    const sessionsArgs = tool.schema.object(mustTool(hooks.tool?.recall_sessions).args);
     expect(() => sessionsArgs.parse({ limit: 4 })).not.toThrow();
     expect(() => sessionsArgs.parse({ limit: 5 })).toThrow();
   });

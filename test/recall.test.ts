@@ -15,11 +15,7 @@ import {
   textPart,
 } from "./helpers.js";
 
-function recallTool(
-  h = makeFakeHarness(),
-  global = true,
-  limits = TEST_LIMITS,
-) {
+function recallTool(h = makeFakeHarness(), global = true, limits = TEST_LIMITS) {
   return search(h.client, h.unscoped, global, limits);
 }
 
@@ -28,11 +24,8 @@ function messageTime(
   sessionID: string,
   messageID: string,
 ): number {
-  const msg = h.messagesBySession[sessionID]?.find(
-    (m) => m.info.id === messageID,
-  );
-  if (!msg)
-    throw new Error(`missing fixture message ${sessionID}:${messageID}`);
+  const msg = h.messagesBySession[sessionID]?.find((m) => m.info.id === messageID);
+  if (!msg) throw new Error(`missing fixture message ${sessionID}:${messageID}`);
   return msg.info.time.created;
 }
 
@@ -74,10 +67,7 @@ describe("recall", () => {
       scope: "project",
       sessionID: "s-other",
     });
-    expect(explicit.results.map((r) => r.sessionID)).toEqual([
-      "s-other",
-      "s-other",
-    ]);
+    expect(explicit.results.map((r) => r.sessionID)).toEqual(["s-other", "s-other"]);
     expect(h.calls.get.some((c) => c.sessionID === "s-other")).toBe(true);
   });
 
@@ -148,9 +138,7 @@ describe("recall", () => {
       after: -1,
     });
 
-    expect(zero.results.map((r) => r.messageID)).toEqual(
-      baseline.results.map((r) => r.messageID),
-    );
+    expect(zero.results.map((r) => r.messageID)).toEqual(baseline.results.map((r) => r.messageID));
     expect(negative.results.map((r) => r.messageID)).toEqual(
       baseline.results.map((r) => r.messageID),
     );

@@ -38,14 +38,10 @@ const server: Plugin = async (ctx, options) => {
       "opencode-session-recall: SDK internals changed — cannot extract fetch transport",
     );
   const cfg = inner.getConfig();
-  if (!cfg.fetch)
-    throw new Error("opencode-session-recall: SDK client has no custom fetch");
+  if (!cfg.fetch) throw new Error("opencode-session-recall: SDK client has no custom fetch");
 
   // eslint-disable-next-line @typescript-eslint/no-unused-vars
-  const { "x-opencode-directory": _, ...rest } = (cfg.headers ?? {}) as Record<
-    string,
-    string
-  >;
+  const { "x-opencode-directory": _, ...rest } = (cfg.headers ?? {}) as Record<string, string>;
 
   const client = createOpencodeClient({
     baseUrl: cfg.baseUrl,

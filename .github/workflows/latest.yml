@@ -17,11 +17,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: oven-sh/setup-bun@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
 
-      - run: bun install
+      - run: npm ci
 
-      - run: bun run typecheck
+      - run: npm run ci
 
       - name: Delete previous latest release
         run: |

@@ -1,14 +1,5 @@
-import {
-  tool,
-  type ToolDefinition,
-  type ToolContext,
-} from "@opencode-ai/plugin";
-import type {
-  OpencodeClient,
-  Session,
-  GlobalSession,
-  Part,
-} from "@opencode-ai/sdk/v2";
+import { tool, type ToolDefinition, type ToolContext } from "@opencode-ai/plugin";
+import type { OpencodeClient, Session, GlobalSession, Part } from "@opencode-ai/sdk/v2";
 import {
   errmsg,
   optionalString,
@@ -26,7 +17,6 @@ import {
   buildCandidates,
   populateNormalized,
   DEFAULT_BUDGETS,
-  type SessionMeta,
   type MsgInfo,
 } from "./candidates.js";
 import { prefilter } from "./prefilter.js";
@@ -58,9 +48,7 @@ function meta(s: Session | GlobalSession): SessionMetaInternal {
   return { id: s.id, title: s.title, directory: s.directory };
 }
 
-function positiveTimestampOrUndefined(
-  value: number | undefined,
-): number | undefined {
+function positiveTimestampOrUndefined(value: number | undefined): number | undefined {
   return value != null && value > 0 ? value : undefined;
 }
 
@@ -150,9 +138,7 @@ function smartScan(
   const startTime = performance.now();
 
   // ── 1. Build candidates across all sessions ───────────────────────
-  const allCandidates: Array<
-    ReturnType<typeof buildCandidates>["candidates"][number]
-  > = [];
+  const allCandidates: Array<ReturnType<typeof buildCandidates>["candidates"][number]> = [];
   let totalCharsUsed = 0;
   let anyBudgetHit = false;
 
@@ -360,9 +346,7 @@ This tool's own outputs are excluded from search results to prevent recursive no
       explain: tool.schema
         .boolean()
         .default(false)
-        .describe(
-          "Return scoring metadata for debugging. Adds matchReasons to each result.",
-        ),
+        .describe("Return scoring metadata for debugging. Adds matchReasons to each result."),
       group: tool.schema
         .enum(["part", "session"])
         .default("part")
@@ -394,9 +378,7 @@ This tool's own outputs are excluded from search results to prevent recursive no
         .min(1)
         .max(limits.maxResults)
         .default(Math.min(10, limits.maxResults))
-        .describe(
-          "Max results to return. Check truncated in response for more.",
-        ),
+        .describe("Max results to return. Check truncated in response for more."),
       title: tool.schema
         .string()
         .optional()
@@ -636,11 +618,7 @@ This tool's own outputs are excluded from search results to prevent recursive no
           // so we get representative hits from every matching session
           const limit = isGrouped ? MAX_GROUPED_LITERAL_RESULTS : args.results;
           const { collected, total, early } = literalScan(limit);
-          const {
-            final,
-            total: outTotal,
-            truncated,
-          } = applyGroupAndSlice(collected, total, early);
+          const { final, total: outTotal, truncated } = applyGroupAndSlice(collected, total, early);
 
           const unit = isGrouped ? "session" : "result";
           ctx.metadata({
@@ -675,11 +653,7 @@ This tool's own outputs are excluded from search results to prevent recursive no
         if (smartResult.results.length === 0) {
           const limit = isGrouped ? MAX_GROUPED_LITERAL_RESULTS : args.results;
           const { collected, total, early } = literalScan(limit);
-          const {
-            final,
-            total: outTotal,
-            truncated,
-          } = applyGroupAndSlice(collected, total, early);
+          const { final, total: outTotal, truncated } = applyGroupAndSlice(collected, total, early);
 
           if (final.length > 0) {
             const unit = isGrouped ? "session" : "result";

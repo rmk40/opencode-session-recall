@@ -8,10 +8,7 @@ export type PrefilterResult = {
 };
 
 /** Check if a query token matches any candidate token (exact substring or typo) */
-function tokenMatches(
-  qt: string,
-  candidateTokens: readonly string[],
-): "exact" | "typo" | "none" {
+function tokenMatches(qt: string, candidateTokens: readonly string[]): "exact" | "typo" | "none" {
   for (const ct of candidateTokens) {
     if (ct.includes(qt)) return "exact";
   }
@@ -28,10 +25,7 @@ function tokenMatches(
  * Score a candidate for degraded-mode ranking.
  * Deliberately crude — just good enough for degraded output.
  */
-export function prefilterScore(
-  candidate: Candidate,
-  query: ParsedQuery,
-): number {
+export function prefilterScore(candidate: Candidate, query: ParsedQuery): number {
   const rawLower = candidate.rawText.toLowerCase();
   let score = 0;
 
@@ -78,10 +72,7 @@ export function prefilterScore(
  * 3. At least one query token found as exact substring in candidate tokens
  * 4. At least one query token of length >= 4 has edit-distance <= 1 to any candidate token
  */
-export function prefilter(
-  candidates: Candidate[],
-  query: ParsedQuery,
-): PrefilterResult[] {
+export function prefilter(candidates: Candidate[], query: ParsedQuery): PrefilterResult[] {
   const results: PrefilterResult[] = [];
 
   for (const candidate of candidates) {

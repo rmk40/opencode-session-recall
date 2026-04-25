@@ -8,12 +8,7 @@ interface TokenPosition {
 /**
  * Add ellipsis prefix/suffix based on window boundaries.
  */
-function frame(
-  text: string,
-  start: number,
-  end: number,
-  fullLength: number,
-): string {
+function frame(text: string, start: number, end: number, fullLength: number): string {
   let result = text;
   if (start > 0) result = "..." + result;
   if (end < fullLength) result = result + "...";
@@ -31,11 +26,7 @@ function headSlice(rawText: string, width: number): string {
 /**
  * Clamp a snippet window to valid bounds and extract the framed text.
  */
-function extractWindow(
-  rawText: string,
-  idealStart: number,
-  width: number,
-): string {
+function extractWindow(rawText: string, idealStart: number, width: number): string {
   const start = Math.max(0, Math.min(idealStart, rawText.length - width));
   const end = Math.min(rawText.length, start + width);
   return frame(rawText.slice(start, end), start, end, rawText.length);
@@ -65,11 +56,7 @@ function findAllPositions(haystack: string, needle: string): number[] {
  * For smart/fuzzy mode: finds the window with the most query token matches.
  * Falls back to centering on the first token match if no dense window found.
  */
-export function smartSnippet(
-  rawText: string,
-  query: ParsedQuery,
-  width: number = 200,
-): string {
+export function smartSnippet(rawText: string, query: ParsedQuery, width: number = 200): string {
   if (rawText.length === 0) return "";
   if (rawText.length <= width) return rawText;
 
@@ -120,10 +107,7 @@ export function smartSnippet(
     const distinct = seen.size;
     const spread = maxPos - minPos;
 
-    if (
-      distinct > bestDistinct ||
-      (distinct === bestDistinct && spread < bestSpread)
-    ) {
+    if (distinct > bestDistinct || (distinct === bestDistinct && spread < bestSpread)) {
       bestDistinct = distinct;
       bestSpread = spread;
       bestStart = windowStart;
