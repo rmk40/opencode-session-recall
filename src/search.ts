@@ -384,7 +384,8 @@ This tool's own outputs are excluded from search results to prevent recursive no
       sessions: tool.schema
         .number()
         .min(1)
-        .default(1000)
+        .max(limits.maxSessions)
+        .default(Math.min(1000, limits.maxSessions))
         .describe(
           "Max sessions to scan. Default 1000 covers deep history. Reduce for faster searches if needed.",
         ),

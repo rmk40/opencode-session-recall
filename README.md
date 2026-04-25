@@ -156,21 +156,21 @@ recall({ query: "rate limit", match: "smart", scope: "global", group: "session" 
 recall({ query: "prefiltr", match: "fuzzy", scope: "session", explain: true })
 ```
 
-| Param            | Default     | Description                                                                                                                                                                  |
-| ---------------- | ----------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `query`          | required    | Text to search for                                                                                                                                                           |
-| `scope`          | `"global"`  | `"session"`, `"project"`, or `"global"`                                                                                                                                      |
-| `match`          | `"literal"` | `"literal"`, `"smart"`, or `"fuzzy"`                                                                                                                                         |
-| `explain`        | `false`     | Include scoring metadata in results                                                                                                                                          |
-| `sessionID`      | —           | Target a specific session (overrides scope); blank values are ignored                                                                                                        |
-| `type`           | `"all"`     | `"text"`, `"tool"`, `"reasoning"`, or `"all"`                                                                                                                                |
-| `role`           | `"all"`     | `"user"`, `"assistant"`, or `"all"`                                                                                                                                          |
-| `before`/`after` | —           | Timestamp filters (ms epoch); nonpositive values are ignored                                                                                                                 |
-| `width`          | `200`       | Snippet size (50–1000 chars)                                                                                                                                                 |
-| `sessions`       | `1000`      | Max sessions to scan (no upper limit)                                                                                                                                        |
-| `title`          | —           | Filter by session title substring; blank values are ignored                                                                                                                  |
-| `group`          | `"part"`    | `"part"` or `"session"` — when `"session"`, collapses results by session (one entry per session with the best-scoring or most-recent hit as representative, plus `hitCount`) |
-| `results`        | `10`        | Max results to return                                                                                                                                                        |
+| Param            | Default                  | Description                                                                                                                                                                  |
+| ---------------- | ------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `query`          | required                 | Text to search for                                                                                                                                                           |
+| `scope`          | `"global"`               | `"session"`, `"project"`, or `"global"`                                                                                                                                      |
+| `match`          | `"literal"`              | `"literal"`, `"smart"`, or `"fuzzy"`                                                                                                                                         |
+| `explain`        | `false`                  | Include scoring metadata in results                                                                                                                                          |
+| `sessionID`      | —                        | Target a specific session (overrides scope); blank values are ignored                                                                                                        |
+| `type`           | `"all"`                  | `"text"`, `"tool"`, `"reasoning"`, or `"all"`                                                                                                                                |
+| `role`           | `"all"`                  | `"user"`, `"assistant"`, or `"all"`                                                                                                                                          |
+| `before`/`after` | —                        | Timestamp filters (ms epoch); nonpositive values are ignored                                                                                                                 |
+| `width`          | `200`                    | Snippet size (50–1000 chars)                                                                                                                                                 |
+| `sessions`       | `min(1000, maxSessions)` | Max sessions to scan, capped by plugin `maxSessions`                                                                                                                         |
+| `title`          | —                        | Filter by session title substring; blank values are ignored                                                                                                                  |
+| `group`          | `"part"`                 | `"part"` or `"session"` — when `"session"`, collapses results by session (one entry per session with the best-scoring or most-recent hit as representative, plus `hitCount`) |
+| `results`        | `10`                     | Max results to return                                                                                                                                                        |
 
 Smart/fuzzy results include additional fields:
 
@@ -244,15 +244,15 @@ Blank `search` values are treated as omitted.
 
 Advanced limits (all have sensible defaults):
 
-| Option           | Default | Description             |
-| ---------------- | ------- | ----------------------- |
-| `concurrency`    | `3`     | Parallel session loads  |
-| `maxSessions`    | `50`    | Max sessions per search |
-| `maxResults`     | `50`    | Max results per search  |
-| `maxSessionList` | `100`   | Max sessions in listing |
-| `maxMessages`    | `50`    | Max messages per browse |
-| `maxWindow`      | `10`    | Max context window size |
-| `defaultWidth`   | `200`   | Default snippet width   |
+| Option           | Default   | Description                                                    |
+| ---------------- | --------- | -------------------------------------------------------------- |
+| `concurrency`    | `3`       | Parallel session loads                                         |
+| `maxSessions`    | unlimited | Max sessions per search; caps the `recall` `sessions` argument |
+| `maxResults`     | `50`      | Max results per search                                         |
+| `maxSessionList` | `100`     | Max sessions in listing                                        |
+| `maxMessages`    | `50`      | Max messages per browse                                        |
+| `maxWindow`      | `10`      | Max context window size                                        |
+| `defaultWidth`   | `200`     | Default snippet width                                          |
 
 ## How it works
 
