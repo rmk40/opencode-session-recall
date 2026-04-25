@@ -5,14 +5,17 @@ import type { SearchOutput, ErrorOutput } from "../src/types.js";
 import {
   PROJECT_DIR,
   TEST_LIMITS,
+  OTHER_DIR,
   assistantMessage,
   bundle,
+  completedToolPart,
   globalSessionFrom,
   makeContext,
   makeFakeHarness,
   runTool,
   session,
   textPart,
+  userMessage,
 } from "./helpers.js";
 
 function recallTool(h = makeFakeHarness(), global = true, limits = TEST_LIMITS) {
@@ -115,6 +118,178 @@ describe("recall", () => {
     });
   });
 
+  it("filters by relative time windows", async () => {
+    const h = makeFakeHarness();
+    const tool = recallTool(h);
+
+    const recent = await runTool<SearchOutput>(tool, {
+      query: "walkthrough",
+      since: "2h",
+    });
+    expect(recent.results.map((r) => r.sessionID)).toEqual(["s-other", "s-other"]);
+
+    const old = await runTool<SearchOutput>(tool, {
+      query: "walkthrough",
+      until: "2h",
+    });
+    expect(old.results).toEqual([]);
+
+    const invalid = await runTool<ErrorOutput>(tool, {
+      query: "walkthrough",
+      since: "30m",
+    });
+    expect(invalid.error).toContain("since must be a positive duration");
+
+    const conflict = await runTool<ErrorOutput>(tool, {
+      query: "walkthrough",
+      after: Date.now() - 5_000,
+      since: "2h",
+    });
+    expect(conflict.error).toContain("after and since cannot both");
+
+    const impossible = await runTool<ErrorOutput>(tool, {
+      query: "walkthrough",
+      since: "2h",
+      until: "3h",
+    });
+    expect(impossible.error).toContain("after/since must be older than before/until");
+
+    const zeroWidth = await runTool<ErrorOutput>(tool, {
+      query: "walkthrough",
+      since: "2h",
+      until: "2h",
+    });
+    expect(zeroWidth.error).toContain("after/since must be older than before/until");
+  });
+
+  it("applies relative time filters to actual message ages", async () => {
+    const now = Date.now();
+    const h = makeFakeHarness();
+    const old = session("s-old-relative", "Old Relative", PROJECT_DIR, now - 3 * 86_400_000);
+    const recent = session("s-recent-relative", "Recent Relative", PROJECT_DIR, now - 3_600_000);
+
+    h.sessions.push(old, recent);
+    h.messagesBySession[old.id] = [
+      bundle(userMessage("m-old-relative", old.id, now - 3 * 86_400_000), [
+        textPart("p-old-relative", old.id, "m-old-relative", "relative-token old"),
+      ]),
+    ];
+    h.messagesBySession[recent.id] = [
+      bundle(userMessage("m-recent-relative", recent.id, now - 3_600_000), [
+        textPart("p-recent-relative", recent.id, "m-recent-relative", "relative-token recent"),
+      ]),
+    ];
+
+    const dateNow = vi.spyOn(Date, "now").mockReturnValue(now);
+    try {
+      const since = await runTool<SearchOutput>(recallTool(h), {
+        query: "relative-token",
+        scope: "project",
+        since: "1d",
+      });
+      expect(since.results.map((r) => r.sessionID)).toEqual(["s-recent-relative"]);
+
+      const until = await runTool<SearchOutput>(recallTool(h), {
+        query: "relative-token",
+        scope: "project",
+        until: "1d",
+      });
+      expect(until.results.map((r) => r.sessionID)).toEqual(["s-old-relative"]);
+    } finally {
+      dateNow.mockRestore();
+    }
+  });
+
+  it("filters sessions by exact or descendant directory", async () => {
+    const h = makeFakeHarness();
+    const archive = session(
+      "s-projectish",
+      "Project Archive",
+      `${PROJECT_DIR}-archive`,
+      Date.now(),
+    );
+    const nested = session("s-nested", "Nested Project", `${PROJECT_DIR}/nested`, Date.now());
+
+    h.globalSessions.push(globalSessionFrom(archive), globalSessionFrom(nested));
+    h.messagesBySession[archive.id] = [
+      bundle(userMessage("m-archive-1", archive.id, Date.now()), [
+        textPart("p-archive-1", archive.id, "m-archive-1", "rate archive false positive"),
+      ]),
+    ];
+    h.messagesBySession[nested.id] = [
+      bundle(userMessage("m-nested-1", nested.id, Date.now()), [
+        textPart("p-nested-1", nested.id, "m-nested-1", "rate nested descendant"),
+      ]),
+    ];
+
+    const out = await runTool<SearchOutput>(recallTool(h), {
+      query: "rate",
+      directory: PROJECT_DIR,
+      results: 10,
+    });
+
+    expect(out.results.some((r) => r.sessionID === "s-current")).toBe(true);
+    expect(out.results.some((r) => r.sessionID === "s-nested")).toBe(true);
+    expect(out.results.some((r) => r.sessionID === "s-projectish")).toBe(false);
+
+    const other = await runTool<SearchOutput>(recallTool(h), {
+      query: "walkthrough",
+      directory: OTHER_DIR,
+    });
+    expect(other.results.map((r) => r.sessionID)).toEqual(["s-other", "s-other"]);
+
+    const capped = await runTool<SearchOutput>(recallTool(h), {
+      query: "rate",
+      directory: PROJECT_DIR,
+      sessions: 1,
+    });
+    expect(capped.scanned).toBe(1);
+    expect(capped.results[0]?.sessionID).toBe("s-current");
+    expect(capped.results.every((result) => result.sessionID === "s-current")).toBe(true);
+    expect(h.calls.globalList.at(-1)?.limit).toBeGreaterThan(1);
+  });
+
+  it("filters tool parts by exact tool name", async () => {
+    const h = makeFakeHarness();
+    const tool = recallTool(h);
+
+    const bash = await runTool<SearchOutput>(tool, {
+      query: "unauthorized",
+      scope: "project",
+      toolName: "bash",
+    });
+    expect(bash.results).toHaveLength(1);
+    expect(bash.results[0]).toMatchObject({ partType: "tool", toolName: "bash" });
+
+    const noMatch = await runTool<SearchOutput>(tool, {
+      query: "unauthorized",
+      scope: "project",
+      toolName: "playwright",
+    });
+    expect(noMatch.results).toEqual([]);
+
+    const invalid = await runTool<ErrorOutput>(tool, {
+      query: "unauthorized",
+      scope: "project",
+      type: "text",
+      toolName: "bash",
+    });
+    expect(invalid.error).toContain("toolName can only be used");
+  });
+
+  it("applies toolName filtering to smart-ranked searches", async () => {
+    const h = makeFakeHarness();
+    const out = await runTool<SearchOutput>(recallTool(h), {
+      query: "checkout cache",
+      scope: "project",
+      match: "smart",
+      toolName: "bash",
+      results: 10,
+    });
+
+    expect(out.results.map((r) => `${r.partType}:${r.toolName ?? ""}`)).toEqual(["tool:bash"]);
+  });
+
   it("treats zero, negative, and blank optional filters as omitted", async () => {
     const h = makeFakeHarness();
     const tool = recallTool(h);
@@ -192,6 +367,180 @@ describe("recall", () => {
       sessionID: "s-current",
       hitCount: 3,
     });
+  });
+
+  it("omits expansions by default and expands full messages when requested", async () => {
+    const h = makeFakeHarness();
+    const tool = recallTool(h);
+
+    const baseline = await runTool<SearchOutput>(tool, {
+      query: "unauthorized",
+      scope: "project",
+    });
+    expect(baseline.expanded).toBeUndefined();
+
+    const expanded = await runTool<SearchOutput>(tool, {
+      query: "unauthorized",
+      scope: "project",
+      expand: "message",
+    });
+    expect(expanded.expanded).toHaveLength(1);
+    expect(expanded.expanded?.[0]).toMatchObject({
+      resultIndex: 0,
+      sessionID: "s-current",
+      messageID: "m-current-3",
+      mode: "message",
+      message: {
+        message: { id: "m-current-3" },
+        parts: [{ type: "tool", toolName: "bash" }],
+      },
+    });
+  });
+
+  it("truncates large expanded text fields with an explicit marker", async () => {
+    const h = makeFakeHarness();
+    const current = h.sessions.find((s) => s.id === "s-current");
+    if (!current) throw new Error("missing current session fixture");
+
+    h.messagesBySession[current.id]?.push(
+      bundle(assistantMessage("m-large-expand", current.id, Date.now()), [
+        completedToolPart(
+          "p-large-expand",
+          current.id,
+          "m-large-expand",
+          "bash",
+          { command: "npm test" },
+          `large-expand-token ${"x".repeat(50_000)}`,
+        ),
+      ]),
+    );
+
+    const out = await runTool<SearchOutput>(recallTool(h), {
+      query: "large-expand-token",
+      scope: "project",
+      expand: "message",
+    });
+
+    const output = out.expanded?.[0]?.message?.parts[0]?.output;
+    expect(output).toContain("[truncated by recall expansion]");
+    expect(output?.length).toBeLessThan(5_000);
+  });
+
+  it("enforces a shared expanded text budget across message parts", async () => {
+    const h = makeFakeHarness();
+    const current = h.sessions.find((s) => s.id === "s-current");
+    if (!current) throw new Error("missing current session fixture");
+
+    h.messagesBySession[current.id]?.push(
+      bundle(
+        assistantMessage("m-budget-expand", current.id, Date.now()),
+        Array.from({ length: 10 }, (_, index) =>
+          completedToolPart(
+            `p-budget-expand-${index}`,
+            current.id,
+            "m-budget-expand",
+            "bash",
+            { command: `command ${index}` },
+            `budget-expand-token ${index} ${"x".repeat(5_000)}`,
+          ),
+        ),
+      ),
+    );
+
+    const out = await runTool<SearchOutput>(recallTool(h), {
+      query: "budget-expand-token",
+      scope: "project",
+      expand: "message",
+    });
+    const outputs =
+      out.expanded?.[0]?.message?.parts
+        .map((part) => part.output)
+        .filter((output): output is string => typeof output === "string") ?? [];
+
+    expect(outputs.join("").length).toBeLessThanOrEqual(30_000);
+    expect(outputs.length).toBeLessThan(10);
+    expect(outputs.join("")).not.toContain("budget exhausted");
+  });
+
+  it("expands bounded context windows with boundary flags", async () => {
+    const h = makeFakeHarness();
+    const out = await runTool<SearchOutput>(recallTool(h), {
+      query: "unauthorized",
+      scope: "project",
+      expand: "context",
+      window: 1,
+    });
+
+    expect(out.expanded).toHaveLength(1);
+    expect(out.expanded?.[0]).toMatchObject({
+      resultIndex: 0,
+      sessionID: "s-current",
+      messageID: "m-current-3",
+      mode: "context",
+      hasMoreBefore: true,
+      hasMoreAfter: true,
+    });
+    expect(out.expanded?.[0]?.messages?.map((m) => m.message.id)).toEqual([
+      "m-current-2",
+      "m-current-3",
+      "m-current-4",
+    ]);
+    expect(out.expanded?.[0]?.messages?.find((m) => m.center)?.message.id).toBe("m-current-3");
+  });
+
+  it("supports zero-width context expansion around only the matching message", async () => {
+    const h = makeFakeHarness();
+    const out = await runTool<SearchOutput>(recallTool(h), {
+      query: "unauthorized",
+      scope: "project",
+      expand: "context",
+      window: 0,
+    });
+
+    expect(out.expanded?.[0]?.messages?.map((m) => [m.message.id, m.center])).toEqual([
+      ["m-current-3", true],
+    ]);
+  });
+
+  it("caps expansion count and rejects oversized context expansion", async () => {
+    const h = makeFakeHarness();
+    const expanded = await runTool<SearchOutput>(recallTool(h), {
+      query: "rate",
+      scope: "project",
+      results: 10,
+      expand: "message",
+      expandResults: 2,
+    });
+    expect(expanded.results.length).toBeGreaterThan(2);
+    expect(expanded.expanded).toHaveLength(2);
+    expect(expanded.expanded?.map((entry) => entry.resultIndex)).toEqual([0, 1]);
+
+    const tooLarge = await runTool<ErrorOutput>(recallTool(h), {
+      query: "rate",
+      scope: "project",
+      expand: "context",
+      expandResults: 3,
+      window: 5,
+    });
+    expect(tooLarge.error).toContain("reduce expandResults or window");
+  });
+
+  it("expands grouped representatives", async () => {
+    const h = makeFakeHarness();
+    const out = await runTool<SearchOutput>(recallTool(h), {
+      query: "rate",
+      scope: "project",
+      group: "session",
+      results: 2,
+      expand: "message",
+      expandResults: 2,
+    });
+
+    expect(out.results).toHaveLength(2);
+    expect(out.expanded).toHaveLength(2);
+    expect(out.expanded?.map((entry) => entry.messageID)).toEqual(
+      out.results.map((result) => result.messageID),
+    );
   });
 
   it("returns smart and fuzzy ranked metadata without pinning score constants", async () => {

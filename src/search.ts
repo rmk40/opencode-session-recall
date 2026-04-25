@@ -1,8 +1,11 @@
 import { tool, type ToolDefinition, type ToolContext } from "@opencode-ai/plugin";
-import type { OpencodeClient, Session, GlobalSession, Part } from "@opencode-ai/sdk/v2";
+import type { OpencodeClient, Session, GlobalSession, Part, Message } from "@opencode-ai/sdk/v2";
 import {
   errmsg,
   optionalString,
+  type ExpandedResult,
+  type MessageItem,
+  type PartOutput,
   type SearchResult,
   type SearchOutput,
   type ErrorOutput,
@@ -11,14 +14,9 @@ import {
   type DegradeKind,
   type GroupMode,
 } from "./types.js";
-import { searchable, snippet, pruned, matches } from "./extract.js";
+import { searchable, snippet, pruned, matches, formatMsg } from "./extract.js";
 import { parseQuery } from "./query.js";
-import {
-  buildCandidates,
-  populateNormalized,
-  DEFAULT_BUDGETS,
-  type MsgInfo,
-} from "./candidates.js";
+import { buildCandidates, populateNormalized, DEFAULT_BUDGETS } from "./candidates.js";
 import { prefilter } from "./prefilter.js";
 import { fuseSearch, type FuseHit } from "./fuse.js";
 import { rank, rankDegraded, type RankedResult } from "./rank.js";
@@ -35,10 +33,20 @@ const PREFUSE_BUDGET_MS = 1500;
  *  but bounded to prevent unbounded memory growth on broad queries. */
 const MAX_GROUPED_LITERAL_RESULTS = 1000;
 
+const MAX_EXPANDED_RESULTS = 3;
+const MAX_EXPANDED_CONTEXT_MESSAGES = 30;
+const MAX_EXPANDED_TOTAL_TEXT_CHARS = 30_000;
+const MAX_EXPANDED_FIELD_CHARS = 4_000;
+const DIRECTORY_FILTER_LIST_LIMIT = 5000;
+const EXPANSION_TRUNCATED = "\n[truncated by recall expansion]";
+
+type ExpandMode = "none" | "context" | "message";
+type ExpansionBudget = { remaining: number };
+
 // ── Types ────────────────────────────────────────────────────────────
 
 type MsgWithParts = {
-  info: MsgInfo;
+  info: Message;
   parts: Array<Part>;
 };
 
@@ -50,6 +58,89 @@ function meta(s: Session | GlobalSession): SessionMetaInternal {
 
 function positiveTimestampOrUndefined(value: number | undefined): number | undefined {
   return value != null && value > 0 ? value : undefined;
+}
+
+function parseRelativeTimestamp(
+  label: string,
+  value: string | undefined,
+  now = Date.now(),
+): number | undefined {
+  const raw = optionalString(value);
+  if (!raw) return undefined;
+
+  const match = /^(\d+)([hdw])$/.exec(raw);
+  if (!match) {
+    throw new Error(`${label} must be a positive duration like 2h, 7d, or 3w`);
+  }
+
+  const amount = Number(match[1]);
+  if (!Number.isSafeInteger(amount) || amount <= 0) {
+    throw new Error(`${label} must be a positive duration like 2h, 7d, or 3w`);
+  }
+
+  const unit = match[2];
+  const hours = unit === "h" ? amount : unit === "d" ? amount * 24 : amount * 24 * 7;
+  return now - hours * 60 * 60 * 1000;
+}
+
+function normalizeDirectoryPath(value: string): string {
+  const normalized = value.trim().replace(/\\/g, "/").replace(/\/+/g, "/");
+  return normalized.length > 1 ? normalized.replace(/\/+$/, "") : normalized;
+}
+
+function directoryMatches(directory: string, target: string): boolean {
+  const dir = normalizeDirectoryPath(directory);
+  const filter = normalizeDirectoryPath(target);
+  if (filter === "/") return dir === "/" || dir.startsWith("/");
+  return dir === filter || dir.startsWith(`${filter}/`);
+}
+
+function partEligible(part: Part, type: string, toolName: string | undefined): boolean {
+  if (toolName) return part.type === "tool" && part.tool === toolName;
+  return type === "all" || part.type === type;
+}
+
+function listLimitForDirectoryFilter(argsLimit: number, configuredLimit: number): number {
+  // A finite maxSessions is a hard plugin safety cap; broaden only within it.
+  if (Number.isFinite(configuredLimit)) return configuredLimit;
+  return Math.max(argsLimit, DIRECTORY_FILTER_LIST_LIMIT);
+}
+
+function truncateExpandedText(
+  value: string | undefined,
+  budget: ExpansionBudget,
+): string | undefined {
+  if (value == null) return undefined;
+  if (budget.remaining <= 0) return undefined;
+
+  const allowed = Math.min(MAX_EXPANDED_FIELD_CHARS, budget.remaining);
+  if (value.length <= allowed) {
+    budget.remaining -= value.length;
+    return value;
+  }
+
+  if (allowed <= EXPANSION_TRUNCATED.length) return undefined;
+
+  const sliceLength = allowed - EXPANSION_TRUNCATED.length;
+  budget.remaining -= allowed;
+  return `${value.slice(0, sliceLength)}${EXPANSION_TRUNCATED}`;
+}
+
+function truncateExpandedPart(part: PartOutput, budget: ExpansionBudget): PartOutput {
+  return {
+    ...part,
+    content: truncateExpandedText(part.content, budget),
+    output: truncateExpandedText(part.output, budget),
+    error: truncateExpandedText(part.error, budget),
+  };
+}
+
+function formatExpandedMsg(msg: MsgWithParts, budget: ExpansionBudget): MessageItem {
+  const item = formatMsg(msg);
+  return {
+    ...item,
+    parts: item.parts.map((part) => truncateExpandedPart(part, budget)),
+  };
 }
 
 /** Cap sample size only; loadErrorCount still reports all failures. */
@@ -67,6 +158,7 @@ function scan(
   before?: number,
   after?: number,
   width?: number,
+  toolName?: string,
 ): { results: SearchResult[]; total: number } {
   const results: SearchResult[] = [];
   let total = 0;
@@ -80,7 +172,7 @@ function scan(
 
     for (const part of msg.parts) {
       if (results.length >= limit) break;
-      if (type !== "all" && part.type !== type) continue;
+      if (!partEligible(part, type, toolName)) continue;
 
       const texts = searchable(part);
       let matched = false;
@@ -128,6 +220,7 @@ function smartScan(
   before?: number,
   after?: number,
   width?: number,
+  toolName?: string,
 ): {
   results: SearchResult[];
   total: number;
@@ -154,6 +247,7 @@ function smartScan(
       role,
       before,
       after,
+      toolName,
     );
 
     allCandidates.push(...candidates);
@@ -299,6 +393,61 @@ function groupBySession(results: SearchResult[]): SearchResult[] {
   }));
 }
 
+function expandSearchResults(
+  results: SearchResult[],
+  loaded: Array<{ session: SessionMetaInternal; messages: MsgWithParts[] }>,
+  mode: ExpandMode,
+  expandResults: number,
+  window: number,
+): ExpandedResult[] | undefined {
+  if (mode === "none") return undefined;
+
+  const bySession = new Map(loaded.map((entry) => [entry.session.id, entry.messages]));
+  const expanded: ExpandedResult[] = [];
+  const budget: ExpansionBudget = { remaining: MAX_EXPANDED_TOTAL_TEXT_CHARS };
+  const count = Math.min(expandResults, results.length);
+
+  for (let resultIndex = 0; resultIndex < count; resultIndex++) {
+    const result = results[resultIndex]!;
+    const messages = bySession.get(result.sessionID);
+    if (!messages) continue;
+
+    const messageIndex = messages.findIndex((msg) => msg.info.id === result.messageID);
+    if (messageIndex === -1) continue;
+
+    if (mode === "message") {
+      expanded.push({
+        resultIndex,
+        sessionID: result.sessionID,
+        messageID: result.messageID,
+        mode,
+        message: formatExpandedMsg(messages[messageIndex]!, budget),
+      });
+      continue;
+    }
+
+    const start = Math.max(0, messageIndex - window);
+    const end = Math.min(messages.length, messageIndex + window + 1);
+    const slice = messages.slice(start, end);
+    const items: MessageItem[] = slice.map((msg) => {
+      const item = formatExpandedMsg(msg, budget);
+      return { ...item, center: msg.info.id === result.messageID };
+    });
+
+    expanded.push({
+      resultIndex,
+      sessionID: result.sessionID,
+      messageID: result.messageID,
+      mode,
+      messages: items,
+      hasMoreBefore: start > 0,
+      hasMoreAfter: end < messages.length,
+    });
+  }
+
+  return expanded;
+}
+
 // ── Main export ──────────────────────────────────────────────────────
 
 export function search(
@@ -314,7 +463,7 @@ Call when history could change the approach: debugging errors, investigating beh
 
 Skip trivial commands, simple local code/file lookup, simple edits with full context, ordinary code tasks where prior history would not change the approach, or anything not helped by past conversations.
 
-First call: for broad discovery use match:"smart", group:"session", scope:"global" (default), 5-10 results, and short terms from error text/feature/config/file/decision. Use role:"user" to filter out assistant/tool noise and surface original requirements or decisions. Try 2-3 query variants, then inspect promising hits with recall_get or recall_context.
+First call: for broad discovery use match:"smart", group:"session", scope:"global" (default), 5-10 results, and short terms from error text/feature/config/file/decision. Use role:"user" for requirements/decisions. Use expand:"context" or "message" when top-hit evidence will avoid a follow-up.
 
 If memory exists, store only durable findings: preferences, project decisions, reusable root causes, environment facts, behavior corrections, or repeatable success/failure. Do not store ephemeral details, one-off commands, transient errors, or implementation minutiae.
 
@@ -355,6 +504,28 @@ Modes: literal exact substring; smart ranked fuzzy; fuzzy looser. Smart/fuzzy in
       title: tool.schema.string().optional().describe("Pre-filter by session title"),
       before: tool.schema.number().optional().describe("Only messages before ms epoch"),
       after: tool.schema.number().optional().describe("Only messages after ms epoch"),
+      since: tool.schema.string().min(1).optional().describe("Newer-than filter: 2h, 7d, 3w"),
+      until: tool.schema.string().min(1).optional().describe("Older-than filter: 2h, 7d, 3w"),
+      directory: tool.schema.string().min(1).optional().describe("Exact or descendant session dir"),
+      toolName: tool.schema.string().min(1).optional().describe("Exact tool name; tool parts only"),
+      expand: tool.schema
+        .enum(["none", "context", "message"])
+        .default("none")
+        .describe("Inline none/context/message"),
+      expandResults: tool.schema
+        .number()
+        .int()
+        .min(1)
+        .max(MAX_EXPANDED_RESULTS)
+        .default(1)
+        .describe("Expanded result count"),
+      window: tool.schema
+        .number()
+        .int()
+        .min(0)
+        .max(limits.maxWindow)
+        .default(Math.min(3, limits.maxWindow))
+        .describe("Context messages each side"),
       width: tool.schema
         .number()
         .min(50)
@@ -366,8 +537,52 @@ Modes: literal exact substring; smart ranked fuzzy; fuzzy looser. Smart/fuzzy in
       const matchMode: MatchMode = args.match;
       const sessionID = optionalString(args.sessionID);
       const title = optionalString(args.title);
-      const before = positiveTimestampOrUndefined(args.before);
-      const after = positiveTimestampOrUndefined(args.after);
+      const directory = optionalString(args.directory);
+      const toolName = optionalString(args.toolName);
+      const expandMode: ExpandMode = args.expand;
+      const sessionListLimit = directory
+        ? listLimitForDirectoryFilter(args.sessions, limits.maxSessions)
+        : args.sessions;
+
+      const fail = (error: string): string =>
+        JSON.stringify({ ok: false, error } satisfies ErrorOutput);
+
+      if (toolName && args.type !== "all" && args.type !== "tool") {
+        return fail('toolName can only be used with type:"all" or type:"tool"');
+      }
+
+      let before = positiveTimestampOrUndefined(args.before);
+      let after = positiveTimestampOrUndefined(args.after);
+      try {
+        const now = Date.now();
+        const relativeAfter = parseRelativeTimestamp("since", args.since, now);
+        const relativeBefore = parseRelativeTimestamp("until", args.until, now);
+
+        if (after != null && relativeAfter != null) {
+          return fail("after and since cannot both be positive filters");
+        }
+        if (before != null && relativeBefore != null) {
+          return fail("before and until cannot both be positive filters");
+        }
+
+        after ??= relativeAfter;
+        before ??= relativeBefore;
+      } catch (e) {
+        return fail(errmsg(e));
+      }
+
+      if (after != null && before != null && after >= before) {
+        return fail("after/since must be older than before/until; check the time window");
+      }
+
+      if (
+        expandMode === "context" &&
+        args.expandResults * (2 * args.window + 1) > MAX_EXPANDED_CONTEXT_MESSAGES
+      ) {
+        return fail(
+          `expand context is capped at ${MAX_EXPANDED_CONTEXT_MESSAGES} messages; reduce expandResults or window`,
+        );
+      }
 
       ctx.metadata({
         title: `Searching ${args.scope} for "${args.query}"${matchMode !== "literal" ? ` (${matchMode})` : ""}`,
@@ -423,7 +638,7 @@ Modes: literal exact substring; smart ranked fuzzy; fuzzy looser. Smart/fuzzy in
         } else if (args.scope === "project") {
           const resp = await client.session.list({
             search: title,
-            limit: args.sessions,
+            limit: sessionListLimit,
           });
           if (resp.error) {
             const err: ErrorOutput = {
@@ -436,7 +651,7 @@ Modes: literal exact substring; smart ranked fuzzy; fuzzy looser. Smart/fuzzy in
         } else {
           const resp = await unscoped.experimental.session.list({
             search: title,
-            limit: args.sessions,
+            limit: sessionListLimit,
           });
           if (resp.error) {
             const err: ErrorOutput = {
@@ -446,6 +661,12 @@ Modes: literal exact substring; smart ranked fuzzy; fuzzy looser. Smart/fuzzy in
             return JSON.stringify(err);
           }
           if (resp.data) targets = resp.data.map(meta);
+        }
+
+        if (directory) {
+          targets = targets
+            .filter((target) => directoryMatches(target.directory, directory))
+            .slice(0, args.sessions);
         }
 
         // ── Load messages ─────────────────────────────────────────────
@@ -517,6 +738,17 @@ Modes: literal exact substring; smart ranked fuzzy; fuzzy looser. Smart/fuzzy in
           out.loadErrors = [...loadErrors];
           return out;
         };
+        const includeExpansion = <T extends SearchOutput>(out: T, final: SearchResult[]): T => {
+          const expanded = expandSearchResults(
+            final,
+            allLoaded,
+            expandMode,
+            args.expandResults,
+            args.window,
+          );
+          if (expanded) out.expanded = expanded;
+          return out;
+        };
 
         // ── Helper: run literal scan (full or limited) ───────────────
         const literalScan = (
@@ -542,6 +774,7 @@ Modes: literal exact substring; smart ranked fuzzy; fuzzy looser. Smart/fuzzy in
               before,
               after,
               args.width,
+              toolName,
             );
             collected.push(...result.results);
             total += result.total;
@@ -593,7 +826,7 @@ Modes: literal exact substring; smart ranked fuzzy; fuzzy looser. Smart/fuzzy in
             truncated,
             group: groupMode,
           };
-          return JSON.stringify(includeLoadErrors(out));
+          return JSON.stringify(includeLoadErrors(includeExpansion(out, final)));
         }
 
         // ── Smart/fuzzy path ────────────────────────────────────────
@@ -607,6 +840,7 @@ Modes: literal exact substring; smart ranked fuzzy; fuzzy looser. Smart/fuzzy in
           before,
           after,
           args.width,
+          toolName,
         );
 
         // ── Fallback to literal if smart returns nothing ────────────
@@ -631,7 +865,7 @@ Modes: literal exact substring; smart ranked fuzzy; fuzzy looser. Smart/fuzzy in
               degradeKind: "fallback",
               group: groupMode,
             };
-            return JSON.stringify(includeLoadErrors(out));
+            return JSON.stringify(includeLoadErrors(includeExpansion(out, final)));
           }
         }
 
@@ -657,7 +891,7 @@ Modes: literal exact substring; smart ranked fuzzy; fuzzy looser. Smart/fuzzy in
           degradeKind: smartResult.degradeKind,
           group: groupMode,
         };
-        return JSON.stringify(includeLoadErrors(out));
+        return JSON.stringify(includeLoadErrors(includeExpansion(out, final)));
       } catch (e) {
         const err: ErrorOutput = { ok: false, error: errmsg(e) };
         return JSON.stringify(err);

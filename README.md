@@ -160,9 +160,13 @@ recall({ query: "error", type: "tool", scope: "session" })
 recall({ query: "JWT", sessionID: "ses_from_another_project" })
 recall({ query: "rate limit", match: "smart", scope: "session", group: "session" })
 recall({ query: "prefiltr", match: "fuzzy", scope: "session", explain: true })
+recall({ query: "unauthorized", expand: "context", window: 1 })
+recall({ query: "migration", since: "7d", directory: "/workspace/project" })
+recall({ query: "legacy config", until: "3w" })
+recall({ query: "npm test", type: "tool", toolName: "bash" })
 ```
 
-First call guidance: use `match: "smart"` for topic discovery, naming variants, and likely typos. Use `group: "session"` for broad discovery, then call `recall_get` or `recall_context` on promising hits. Reserve literal matching for exact errors, commands, function names, or file paths.
+First call guidance: use `match: "smart"` for topic discovery, naming variants, and likely typos. Use `group: "session"` for broad discovery. Add `expand: "context"` or `expand: "message"` when you already know you need evidence from the top hit. Reserve literal matching for exact errors, commands, function names, or file paths.
 
 | Param            | Default                  | Description                                                                                                                                                                  |
 | ---------------- | ------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -174,11 +178,19 @@ First call guidance: use `match: "smart"` for topic discovery, naming variants, 
 | `type`           | `"all"`                  | `"text"`, `"tool"`, `"reasoning"`, or `"all"`                                                                                                                                |
 | `role`           | `"all"`                  | `"user"`, `"assistant"`, or `"all"`                                                                                                                                          |
 | `before`/`after` | —                        | Timestamp filters (ms epoch); nonpositive values are ignored                                                                                                                 |
+| `since`/`until`  | —                        | Relative time filters like `"2h"`, `"7d"`, or `"3w"`; `since` means newer than, `until` means older than                                                                     |
+| `directory`      | —                        | Filter sessions by exact directory or descendant path                                                                                                                        |
+| `toolName`       | —                        | Exact tool-name filter; only valid with `type: "all"` or `type: "tool"`                                                                                                      |
+| `expand`         | `"none"`                 | `"none"`, `"context"`, or `"message"`; inlines bounded evidence from top results                                                                                             |
+| `expandResults`  | `1`                      | Number of results to expand, max `3`                                                                                                                                         |
+| `window`         | `3`                      | Messages on each side for `expand: "context"`, capped by plugin `maxWindow`                                                                                                  |
 | `width`          | `200`                    | Snippet size (50–1000 chars)                                                                                                                                                 |
 | `sessions`       | `min(1000, maxSessions)` | Max sessions to scan, capped by plugin `maxSessions`                                                                                                                         |
 | `title`          | —                        | Filter by session title substring; blank values are ignored                                                                                                                  |
 | `group`          | `"part"`                 | `"part"` or `"session"` — when `"session"`, collapses results by session (one entry per session with the best-scoring or most-recent hit as representative, plus `hitCount`) |
 | `results`        | `10`                     | Max results to return                                                                                                                                                        |
+
+Blank optional filters are ignored. `toolName` is exact; if unsure, run a broad `type: "tool"` search first and inspect returned `toolName` values. Combining `since` and `until` is allowed only when the resulting time window is valid.
 
 Smart/fuzzy results include additional fields:
 
@@ -199,6 +211,9 @@ Response metadata:
 | `matchMode`      | `"smart"`, `"fuzzy"`, or `"literal"` (if fell back)                           |
 | `degradeKind`    | `"none"`, `"time"`, `"budget"`, or `"fallback"`                               |
 | `group`          | `"part"` or `"session"` — echoes back the grouping applied                    |
+| `expanded`       | Bounded `context` or `message` entries when `expand` is not `"none"`          |
+
+Expanded entries inline full message structure, but large text/output/error fields are truncated with a `[truncated by recall expansion]` marker to keep recall responses bounded. Once the shared expansion budget is exhausted, later large fields may be omitted.
 
 ### `recall_get` — Retrieve
 
@@ -252,15 +267,15 @@ Blank `search` values are treated as omitted.
 
 Advanced limits (all have sensible defaults):
 
-| Option           | Default   | Description                                                    |
-| ---------------- | --------- | -------------------------------------------------------------- |
-| `concurrency`    | `3`       | Parallel session loads                                         |
-| `maxSessions`    | unlimited | Max sessions per search; caps the `recall` `sessions` argument |
-| `maxResults`     | `50`      | Max results per search                                         |
-| `maxSessionList` | `100`     | Max sessions in listing                                        |
-| `maxMessages`    | `50`      | Max messages per browse                                        |
-| `maxWindow`      | `10`      | Max context window size                                        |
-| `defaultWidth`   | `200`     | Default snippet width                                          |
+| Option           | Default   | Description                                                                             |
+| ---------------- | --------- | --------------------------------------------------------------------------------------- |
+| `concurrency`    | `3`       | Parallel session loads                                                                  |
+| `maxSessions`    | unlimited | Hard max sessions per search; caps `recall.sessions` and directory-filter broad listing |
+| `maxResults`     | `50`      | Max results per search                                                                  |
+| `maxSessionList` | `100`     | Max sessions in listing                                                                 |
+| `maxMessages`    | `50`      | Max messages per browse                                                                 |
+| `maxWindow`      | `10`      | Max context window size                                                                 |
+| `defaultWidth`   | `200`     | Default snippet width                                                                   |
 
 ## How it works
 

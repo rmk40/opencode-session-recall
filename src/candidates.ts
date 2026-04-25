@@ -65,6 +65,7 @@ export function buildCandidates(
   role: string,
   before?: number,
   after?: number,
+  toolName?: string,
 ): {
   candidates: Candidate[];
   messagesProcessed: number;
@@ -101,8 +102,11 @@ export function buildCandidates(
         break;
       }
 
-      // Part type filter
-      if (type !== "all" && part.type !== type) {
+      // Part type/tool filters
+      if (toolName && (part.type !== "tool" || part.tool !== toolName)) {
+        continue;
+      }
+      if (!toolName && type !== "all" && part.type !== type) {
         continue;
       }
 

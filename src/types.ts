@@ -57,6 +57,7 @@ export type SearchResult = {
 export type SearchOutput = {
   ok: true;
   results: SearchResult[];
+  expanded?: ExpandedResult[];
   scanned: number;
   total: number;
   truncated: boolean;
@@ -70,6 +71,17 @@ export type SearchOutput = {
   degradeKind?: DegradeKind;
   /** Which grouping was applied */
   group?: GroupMode;
+};
+
+export type ExpandedResult = {
+  resultIndex: number;
+  sessionID: string;
+  messageID: string;
+  mode: "context" | "message";
+  messages?: MessageItem[];
+  message?: MessageItem;
+  hasMoreBefore?: boolean;
+  hasMoreAfter?: boolean;
 };
 
 export type MessageOutput = {

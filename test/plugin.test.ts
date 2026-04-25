@@ -14,6 +14,19 @@ function mustTool(definition: ToolDefinition | undefined): ToolDefinition {
   return definition;
 }
 
+function schemaDescription(value: unknown): string {
+  if (!value || typeof value !== "object" || !("description" in value)) return "";
+  const description = (value as { description?: unknown }).description;
+  return typeof description === "string" ? description : "";
+}
+
+function llmFacingChars(definition: ToolDefinition): number {
+  return (
+    definition.description.length +
+    Object.values(definition.args).reduce((total, arg) => total + schemaDescription(arg).length, 0)
+  );
+}
+
 function ctx(config: {
   baseUrl?: string;
   fetch?: unknown;
@@ -74,6 +87,18 @@ describe("plugin entry", () => {
     expect(withoutPrimary.config).toBeUndefined();
   });
 
+  it("keeps LLM-facing tool instructions compact", async () => {
+    const hooks = await plugin.default.server(ctx({ fetch: vi.fn() }), {});
+    const definitions = Object.values(hooks.tool ?? {});
+    const totalChars = definitions.reduce(
+      (total, definition) => total + llmFacingChars(definition),
+      0,
+    );
+
+    expect(totalChars).toBeLessThan(9_000);
+    expect(llmFacingChars(mustTool(hooks.tool?.recall))).toBeLessThan(5_000);
+  });
+
   it("clamps plugin limits into LLM-facing schemas", async () => {
     const hooks = await plugin.default.server(ctx({ fetch: vi.fn() }), {
       maxResults: 2.9,
@@ -89,6 +114,11 @@ describe("plugin entry", () => {
     expect(() => recallArgs.parse({ query: "rate", results: 3 })).toThrow();
     expect(() => recallArgs.parse({ query: "rate", sessions: 2 })).not.toThrow();
     expect(() => recallArgs.parse({ query: "rate", sessions: 3 })).toThrow();
+    expect(recallArgs.parse({ query: "rate" }).window).toBe(1);
+    expect(() => recallArgs.parse({ query: "rate", window: 1 })).not.toThrow();
+    expect(() => recallArgs.parse({ query: "rate", window: 2 })).toThrow();
+    expect(() => recallArgs.parse({ query: "rate", expandResults: 3 })).not.toThrow();
+    expect(() => recallArgs.parse({ query: "rate", expandResults: 4 })).toThrow();
 
     const messagesArgs = tool.schema.object(mustTool(hooks.tool?.recall_messages).args);
     expect(() => messagesArgs.parse({ limit: 3 })).not.toThrow();

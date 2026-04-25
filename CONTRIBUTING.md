@@ -69,23 +69,23 @@ The plugin registers five tools via the OpenCode plugin API. All data access goe
 
 ### Module map
 
-| Module                       | Lines | Purpose                                                                                  |
-| ---------------------------- | ----- | ---------------------------------------------------------------------------------------- |
-| `opencode-session-recall.ts` | 87    | Plugin entry point. Creates SDK clients, registers tools, injects `primary_tools` config |
-| `search.ts`                  | 726   | `recall` tool. Literal scan, smart/fuzzy pipeline, session grouping, load-error metadata |
-| `extract.ts`                 | 156   | Text extraction from message parts. `searchable()`, `matches()`, `snippet()`, `pruned()` |
-| `types.ts`                   | 179   | Shared types: `SearchResult`, `SearchOutput`, `MatchMode`, `DegradeKind`, `GroupMode`    |
-| `sessions.ts`                | 132   | `recall_sessions` tool                                                                   |
-| `get.ts`                     | 77    | `recall_get` tool                                                                        |
-| `context.ts`                 | 125   | `recall_context` tool                                                                    |
-| `messages.ts`                | 140   | `recall_messages` tool                                                                   |
-| `normalize.ts`               | 23    | Two-stage text normalization: `tokenize()` (stage 1) and `normalize()` (stage 2)         |
-| `query.ts`                   | 44    | Query parsing: `parseQuery()` → `ParsedQuery` with raw, lower, tokens, phrases           |
-| `candidates.ts`              | 186   | Candidate construction from messages/parts with budget enforcement                       |
-| `prefilter.ts`               | 95    | Cheap lexical prefiltering with edit-distance typo gate                                  |
-| `fuse.ts`                    | 67    | Fuse.js wrapper with weighted keys and threshold configuration                           |
-| `rank.ts`                    | ~275  | Structural re-ranking with boosts/penalties on top of Fuse scores                        |
-| `snippet.ts`                 | 150   | Token-density sliding window snippet selection                                           |
+| Module                       | Purpose                                                                                          |
+| ---------------------------- | ------------------------------------------------------------------------------------------------ |
+| `opencode-session-recall.ts` | Plugin entry point. Creates SDK clients, registers tools, injects `primary_tools` config         |
+| `search.ts`                  | `recall` tool. Literal scan, smart/fuzzy pipeline, filters, expansion, grouping, load-error data |
+| `extract.ts`                 | Text extraction from message parts. `searchable()`, `matches()`, `snippet()`, `pruned()`         |
+| `types.ts`                   | Shared types: search results, expanded entries, message outputs, sessions, and error outputs     |
+| `sessions.ts`                | `recall_sessions` tool                                                                           |
+| `get.ts`                     | `recall_get` tool                                                                                |
+| `context.ts`                 | `recall_context` tool                                                                            |
+| `messages.ts`                | `recall_messages` tool                                                                           |
+| `normalize.ts`               | Two-stage text normalization: `tokenize()` (stage 1) and `normalize()` (stage 2)                 |
+| `query.ts`                   | Query parsing: `parseQuery()` → `ParsedQuery` with raw, lower, tokens, phrases                   |
+| `candidates.ts`              | Candidate construction from messages/parts with budget enforcement                               |
+| `prefilter.ts`               | Cheap lexical prefiltering with edit-distance typo gate                                          |
+| `fuse.ts`                    | Fuse.js wrapper with weighted keys and threshold configuration                                   |
+| `rank.ts`                    | Structural re-ranking with boosts/penalties on top of Fuse scores                                |
+| `snippet.ts`                 | Token-density sliding window snippet selection                                                   |
 
 ### Search paths
 
@@ -127,6 +127,8 @@ flowchart TB
 **Smart/fuzzy path** (`match: "smart"` or `"fuzzy"`): Uses the multi-stage `smartScan()` pipeline. Returns all ranked results; the caller handles slicing and optional session grouping. Available for all scopes. Falls back to literal if zero results.
 
 **Session grouping** (`group: "session"`): After results are collected, `groupBySession()` collapses them — one entry per session with the best-scoring (smart/fuzzy) or most-recent (literal) hit as representative, plus `hitCount` showing how many part-level hits that session had.
+
+**Expansion** (`expand: "context"` or `"message"`): After filtering, grouping, and slicing, `expandSearchResults()` attaches an `expanded` array for the first `expandResults` final results. Context expansion marks the matched message with `center: true` and includes `hasMoreBefore` / `hasMoreAfter`.
 
 ### Smart/fuzzy pipeline
 
@@ -289,6 +291,8 @@ Key types across the codebase (`types.ts`, `candidates.ts`, `query.ts`):
 classDiagram
     class SearchResult {
         +string sessionID
+        +string sessionTitle
+        +string directory
         +string messageID
         +string role
         +number time
@@ -307,12 +311,26 @@ classDiagram
     class SearchOutput {
         +boolean ok
         +SearchResult[] results
+        +ExpandedResult[] expanded
         +number scanned
         +number total
         +boolean truncated
+        +number loadErrorCount
+        +string[] loadErrors
         +MatchMode matchMode
         +DegradeKind degradeKind
         +GroupMode group
+    }
+
+    class ExpandedResult {
+        +number resultIndex
+        +string sessionID
+        +string messageID
+        +string mode
+        +MessageItem[] messages
+        +MessageItem message
+        +boolean hasMoreBefore
+        +boolean hasMoreAfter
     }
 
     class Candidate {
@@ -335,6 +353,7 @@ classDiagram
     }
 
     SearchOutput --> SearchResult : contains
+    SearchOutput --> ExpandedResult : optional
     SearchResult ..> Candidate : derived from
     Candidate ..> ParsedQuery : matched against
 ```
