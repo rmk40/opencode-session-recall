@@ -28,16 +28,18 @@ import {
   populateNormalized,
   DEFAULT_BUDGETS,
 } from "./candidates.js";
-import { prefilter } from "./prefilter.js";
-import { fuseSearch, type FuseHit } from "./fuse.js";
-import { rank, rankDegraded, type RankedResult } from "./rank.js";
+import { bm25Search, type Bm25Hit } from "./bm25.js";
 import { smartSnippet } from "./snippet.js";
+import { compileRegex, regexFirstIndex, regexSnippet } from "./regex.js";
+import { classifyQuery } from "./route.js";
 
 /** Post-fetch time budget for the entire ranking pipeline (ms) */
 const TIME_BUDGET_MS = 2000;
 
-/** Pre-Fuse.js early-exit threshold (ms). Skip Fuse if prefilter alone takes this long. */
-const PREFUSE_BUDGET_MS = 1500;
+/** Wall-clock budget for the synchronous literal/regex scan loops (ms). Bounds
+ *  the worst case where a fired abort can't preempt synchronous scanning (e.g.
+ *  a hook timeout that lands mid-scan), keeping the event loop responsive. */
+const SCAN_TIME_BUDGET_MS = 2000;
 
 /** Max literal results to collect when grouping by session.
  *  Must be high enough to get representative hits from many sessions,
@@ -49,6 +51,14 @@ const MAX_EXPANDED_CONTEXT_MESSAGES = 30;
 const MAX_EXPANDED_TOTAL_TEXT_CHARS = 30_000;
 const MAX_EXPANDED_FIELD_CHARS = 4_000;
 const DIRECTORY_FILTER_LIST_LIMIT = 5000;
+/** In part-grouped results, cap hits per session in the initial fill so one
+ *  noisy session can't flood the result list; backfill if room remains. */
+const MAX_HITS_PER_SESSION_INITIAL = 2;
+/** Literal/regex part-mode scans collect this multiple of the requested result
+ *  count (bounded) before the diversity pass, so a single early session can't
+ *  fill every slot and starve cross-session diversity. Smart/fuzzy already
+ *  ranks the full candidate set, so it doesn't need this. */
+const DIVERSITY_SCAN_MULTIPLIER = 5;
 const MAX_WARNINGS = 5;
 const MAX_SUGGESTIONS = 3;
 const MAX_NEAR_MISSES = 3;
@@ -405,11 +415,12 @@ function findRepresentativeMessage(
   return undefined;
 }
 
+/** Build a title-sourced result. `titleSnippet` is precomputed by the caller so
+ *  literal and regex paths can share this single constructor. */
 function titleSearchResult(
   session: SessionMetaInternal,
   representative: MsgWithParts,
-  query: string,
-  width?: number,
+  titleSnippet: string,
 ): SearchResult {
   return annotateResult({
     sessionID: session.id,
@@ -421,7 +432,7 @@ function titleSearchResult(
     partID: `${session.id}:title`,
     partType: "title",
     pruned: false,
-    snippet: snippet(session.title, query, width),
+    snippet: titleSnippet,
     source: "title",
     directoryRelevance: session.directoryRelevance ?? "unknown",
     titleMatch: { title: session.title },
@@ -638,6 +649,76 @@ function scan(
   return { results, total };
 }
 
+// ── Regex scan ───────────────────────────────────────────────────────
+
+/** Bounded regex scan over candidate fields. Mirrors scan() but uses a RegExp. */
+function regexScan(
+  messages: MsgWithParts[],
+  session: SessionMetaInternal,
+  re: RegExp,
+  type: string,
+  role: string,
+  limit: number,
+  before?: number,
+  after?: number,
+  width?: number,
+  toolName?: string,
+): { results: SearchResult[]; total: number } {
+  const results: SearchResult[] = [];
+  let total = 0;
+
+  for (const msg of messages) {
+    if (results.length >= limit) break;
+    const ts = msg.info.time.created;
+    if (before != null && ts >= before) continue;
+    if (after != null && ts <= after) continue;
+    if (role !== "all" && msg.info.role !== role) continue;
+
+    for (const part of msg.parts) {
+      if (results.length >= limit) break;
+      if (!partEligible(part, type, toolName)) continue;
+
+      const fields = searchableFields(part);
+      let matched = false;
+
+      for (const field of fields) {
+        const matchIndex = regexFirstIndex(re, field.text);
+        if (matchIndex === -1) continue;
+        total++;
+        if (matched) continue;
+        matched = true;
+
+        if (results.length < limit) {
+          results.push(
+            annotateResult({
+              sessionID: session.id,
+              sessionTitle: session.title,
+              directory: session.directory,
+              messageID: msg.info.id,
+              role: msg.info.role,
+              time: msg.info.time.created,
+              partID: part.id,
+              partType: part.type,
+              pruned: pruned(part),
+              snippet: regexSnippet(re, field.text, width, matchIndex),
+              toolName: part.type === "tool" ? part.tool : undefined,
+              source: sourceForPartType(part.type),
+              directoryRelevance: session.directoryRelevance ?? "unknown",
+              why: {
+                matchedFields: [field.field],
+                directoryRelevance: session.directoryRelevance ?? "unknown",
+                recency: recencyLabel(msg.info.time.created),
+                confidence: "high",
+              },
+            }),
+          );
+        }
+      }
+    }
+  }
+  return { results, total };
+}
+
 // ── Smart/fuzzy scan ─────────────────────────────────────────────────
 
 /** smartScan returns ALL ranked results (caller handles slicing/grouping). */
@@ -655,6 +736,7 @@ function smartScan(
   after?: number,
   width?: number,
   toolName?: string,
+  abort?: AbortSignal,
 ): {
   results: SearchResult[];
   total: number;
@@ -668,8 +750,20 @@ function smartScan(
   const allCandidates: Array<ReturnType<typeof buildCandidates>["candidates"][number]> = [];
   let totalCharsUsed = 0;
   let anyBudgetHit = false;
+  let timedOut = false;
 
   for (const { session, messages } of allMessages) {
+    // Stop accumulating candidates if the caller aborted OR the wall-clock
+    // budget is already spent. The abort flag covers async cancellation, but it
+    // cannot flip during a synchronous run, so we also check the deadline
+    // directly here between sessions — this is the only thing that bounds the
+    // synchronous candidate-build/index phase for a hook whose timer fired while
+    // the event loop was blocked. A single in-flight BM25 exec still can't be
+    // preempted; the candidate/char budgets below bound that worst case.
+    if (abort?.aborted || performance.now() - startTime > TIME_BUDGET_MS) {
+      timedOut = true;
+      break;
+    }
     if (canSearchTitles(type, toolName)) {
       const representative = findRepresentativeMessage(messages, role, before, after);
       if (representative) {
@@ -706,49 +800,25 @@ function smartScan(
     }
   }
 
-  // ── 2. Prefilter ──────────────────────────────────────────────────
-  let filtered = prefilter(allCandidates, pq);
-
-  // Keep highest prefilter scores if over total cap
-  if (filtered.length > DEFAULT_BUDGETS.maxCandidatesTotal) {
-    filtered.sort((a, b) => b.prefilterScore - a.prefilterScore);
-    filtered = filtered.slice(0, DEFAULT_BUDGETS.maxCandidatesTotal);
-    anyBudgetHit = true;
-  }
-
-  const prefuseTime = performance.now() - startTime;
-
-  // ── 3. Check time budget (pre-Fuse early exit) ────────────────────
-  if (prefuseTime > PREFUSE_BUDGET_MS) {
-    // Time-budget degradation: skip Fuse.js, return prefilter-ranked
-    const ranked = rankDegraded(filtered, pq, explain);
-    const results = rankedToSearchResults(ranked, mode, explain, pq, width);
-    return {
-      results,
-      total: results.length,
-      degradeKind: "time",
-      matchMode: mode,
-    };
-  }
-
-  // ── 4. Populate stage-2 normalization for survivors ───────────────
-  for (const { candidate } of filtered) {
+  // ── 2. Populate stage-2 normalization for all candidates ──────────
+  // BM25 indexes the normalized fields directly; there is no separate
+  // prefilter survival gate (the index itself selects matching docs).
+  for (const candidate of allCandidates) {
     populateNormalized(candidate);
   }
 
-  const fuseCandidates = filtered.map((f) => f.candidate);
-
-  // ── 5. Run Fuse.js (no limit — we need accurate total count) ────
-  const hits: FuseHit[] = fuseSearch(fuseCandidates, pq, mode);
+  // ── 3. Run BM25 (MiniSearch) over all candidates ──────────────────
+  const hits = bm25Search(allCandidates, pq, mode, explain);
+  const allResults = rankedToSearchResults(hits, mode, explain, pq, width);
 
   const totalTime = performance.now() - startTime;
 
-  // ── 6. Rank ───────────────────────────────────────────────────────
-  const ranked = rank(hits, pq, explain);
-  const allResults = rankedToSearchResults(ranked, mode, explain, pq, width);
-
-  // Check if total pipeline exceeded budget
-  if (totalTime > TIME_BUDGET_MS) {
+  // ── 4. Time-budget safety valve ───────────────────────────────────
+  // BM25 does not swap algorithms under load; the budget only flags that
+  // elapsed time was high so coverage can report it. Results are unchanged.
+  // A wall-clock cutoff during candidate building (timedOut) is also a time
+  // degradation; candidate-count/char caps are reported as "budget".
+  if (timedOut || totalTime > TIME_BUDGET_MS) {
     return {
       results: allResults,
       total: allResults.length,
@@ -768,7 +838,7 @@ function smartScan(
 // ── Convert ranked results to SearchResult[] ─────────────────────────
 
 function rankedToSearchResults(
-  ranked: RankedResult[],
+  ranked: Bm25Hit[],
   mode: MatchMode,
   explain: boolean,
   query: ReturnType<typeof parseQuery>,
@@ -778,7 +848,7 @@ function rankedToSearchResults(
     const c = r.candidate;
 
     // Always use smartSnippet which operates on raw text positions.
-    // Fuse.js match ranges reference normalized fields and can't be
+    // BM25 match ranges reference normalized fields and can't be
     // used directly against rawText without position mapping.
     const snip = smartSnippet(c.rawText, query, width);
 
@@ -855,6 +925,35 @@ function groupBySession(results: SearchResult[]): SearchResult[] {
     hitCount: count,
     titleMatch: best.titleMatch ?? titleMatch,
   }));
+}
+
+/**
+ * Diversity pass for part-grouped results. Preserves the incoming ranking but
+ * caps how many hits each session contributes to the initial fill, so a single
+ * noisy session cannot dominate. If slots remain after the capped first pass
+ * (because there weren't enough distinct sessions), the held-back hits backfill
+ * in their original order. A non-positive cap or `perSession >= limit` is a
+ * no-op.
+ */
+function diversify(results: SearchResult[], limit: number, perSession: number): SearchResult[] {
+  if (perSession <= 0 || perSession >= limit || results.length <= limit) return results;
+
+  const counts = new Map<string, number>();
+  const firstPass: SearchResult[] = [];
+  const heldBack: SearchResult[] = [];
+
+  for (const r of results) {
+    const used = counts.get(r.sessionID) ?? 0;
+    if (used < perSession) {
+      counts.set(r.sessionID, used + 1);
+      firstPass.push(r);
+    } else {
+      heldBack.push(r);
+    }
+  }
+
+  if (firstPass.length >= limit) return firstPass;
+  return [...firstPass, ...heldBack];
 }
 
 function expandSearchResults(
@@ -995,11 +1094,22 @@ function buildSuggestions(input: {
   fallback: boolean;
   matchMode: MatchMode;
   type: string | undefined;
+  query: string;
 }): SearchSuggestion[] | undefined {
   const suggestions: SearchSuggestion[] = [];
   const onlyTitleHits =
     input.results.length > 0 && input.results.every((result) => result.source === "title");
   const typeFilter = input.type && input.type !== "all" ? input.type : undefined;
+
+  // Routing hint: never override the caller, only suggest a better-fitting mode.
+  const routed = classifyQuery(input.query, input.matchMode);
+  if (routed.suggested === "regex") {
+    suggestions.push({
+      reason: `${routed.reason} It may be intended as a pattern.`,
+      action: 'Use match:"regex" to match it as a regular expression.',
+      example: { match: "regex" },
+    });
+  }
 
   if (onlyTitleHits) {
     suggestions.push({
@@ -1075,6 +1185,7 @@ function attachCommonOutput<T extends SearchOutput>(
     fallback: boolean;
     matchMode: MatchMode;
     type: string | undefined;
+    query: string;
   },
 ): T {
   input.coverage.directoryBucketCounts = countDirectoryBuckets(input.final);
@@ -1088,6 +1199,7 @@ function attachCommonOutput<T extends SearchOutput>(
     fallback: input.fallback,
     matchMode: input.matchMode,
     type: input.type,
+    query: input.query,
   });
   if (suggestions) out.suggestions = suggestions;
   const nearMisses = buildNearMisses(input.final, input.allLoaded);
@@ -1114,7 +1226,7 @@ First call: for broad discovery use match:"smart", group:"session", scope:"globa
 
 If memory exists, store only durable findings: preferences, project decisions, reusable root causes, environment facts, behavior corrections, or repeatable success/failure. Do not store ephemeral details, one-off commands, transient errors, or implementation minutiae.
 
-Modes: literal exact substring; smart ranked fuzzy; fuzzy looser. Smart/fuzzy include score/matchedTerms and fall back to literal. Results are snippets; use recall_get/context for full content. loadErrorCount/loadErrors indicate partial session-load failures.`,
+Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (invalid pattern errors). Smart/fuzzy include score/matchedTerms and fall back to literal. Results are snippets; use recall_get/context for full content. loadErrorCount/loadErrors indicate partial session-load failures.`,
     args: {
       query: tool.schema.string().min(1).describe("Search text"),
       scope: tool.schema
@@ -1122,9 +1234,9 @@ Modes: literal exact substring; smart ranked fuzzy; fuzzy looser. Smart/fuzzy in
         .default("global")
         .describe("global=all projects, project=current project, session=current only"),
       match: tool.schema
-        .enum(["literal", "smart", "fuzzy"])
+        .enum(["literal", "smart", "fuzzy", "regex"])
         .default("literal")
-        .describe("literal=exact, smart=ranked fuzzy, fuzzy=looser"),
+        .describe("literal=exact, smart=ranked fuzzy, fuzzy=looser, regex=pattern"),
       explain: tool.schema.boolean().default(false).describe("Include matchReasons"),
       group: tool.schema
         .enum(["part", "session"])
@@ -1239,7 +1351,7 @@ Modes: literal exact substring; smart ranked fuzzy; fuzzy looser. Smart/fuzzy in
       const matchMode = pickEnum(
         "match",
         args.match,
-        ["literal", "smart", "fuzzy"] as const,
+        ["literal", "smart", "fuzzy", "regex"] as const,
         "literal",
       ) as MatchMode;
       const explain = typeof args.explain === "boolean" ? args.explain : false;
@@ -1333,6 +1445,14 @@ Modes: literal exact substring; smart ranked fuzzy; fuzzy looser. Smart/fuzzy in
 
       if (toolName && partType !== "all" && partType !== "tool") {
         return fail('toolName can only be used with type:"all" or type:"tool"');
+      }
+
+      // Compile the regex up front so an invalid pattern is a clean caller error.
+      let regex: RegExp | undefined;
+      if (matchMode === "regex") {
+        const compiled = compileRegex(args.query);
+        if (!compiled.ok) return fail(compiled.error);
+        regex = compiled.re;
       }
 
       const normalized = normalizeSearchOptions(
@@ -1665,6 +1785,7 @@ Modes: literal exact substring; smart ranked fuzzy; fuzzy looser. Smart/fuzzy in
               fallback,
               matchMode: effectiveMatchMode,
               type: partType,
+              query: args.query,
             }),
           );
         };
@@ -1676,9 +1797,17 @@ Modes: literal exact substring; smart ranked fuzzy; fuzzy looser. Smart/fuzzy in
           const collected: SearchResult[] = [];
           let total = 0;
           let early = false;
+          const scanStart = performance.now();
 
           for (const { session: sess, messages: msgs } of allLoaded) {
             if (collected.length >= scanLimit) {
+              early = true;
+              break;
+            }
+            // Bound synchronous scanning by wall-clock and honor a fired abort
+            // (a hook timeout may have landed mid-scan, where the abort flag
+            // couldn't be observed until now).
+            if (ctx.abort.aborted || performance.now() - scanStart > SCAN_TIME_BUDGET_MS) {
               early = true;
               break;
             }
@@ -1705,7 +1834,69 @@ Modes: literal exact substring; smart ranked fuzzy; fuzzy looser. Smart/fuzzy in
             ) {
               const representative = findRepresentativeMessage(msgs, role, before, after);
               if (representative) {
-                collected.push(titleSearchResult(sess, representative, args.query, widthArg));
+                collected.push(
+                  titleSearchResult(
+                    sess,
+                    representative,
+                    snippet(sess.title, args.query, widthArg),
+                  ),
+                );
+                total++;
+              }
+            }
+          }
+          return { collected, total, early };
+        };
+
+        // ── Helper: run regex scan (full or limited) ─────────────────
+        const regexScanAll = (
+          re: RegExp,
+          scanLimit: number,
+        ): { collected: SearchResult[]; total: number; early: boolean } => {
+          const collected: SearchResult[] = [];
+          let total = 0;
+          let early = false;
+          const scanStart = performance.now();
+
+          for (const { session: sess, messages: msgs } of allLoaded) {
+            if (collected.length >= scanLimit) {
+              early = true;
+              break;
+            }
+            // Bound synchronous scanning by wall-clock and honor a fired abort.
+            if (ctx.abort.aborted || performance.now() - scanStart > SCAN_TIME_BUDGET_MS) {
+              early = true;
+              break;
+            }
+            const remaining = scanLimit - collected.length;
+            const result = regexScan(
+              msgs,
+              sess,
+              re,
+              partType,
+              role,
+              remaining,
+              before,
+              after,
+              widthArg,
+              toolName,
+            );
+            collected.push(...result.results);
+            total += result.total;
+
+            const titleIndex = canSearchTitles(partType, toolName)
+              ? regexFirstIndex(re, sess.title)
+              : -1;
+            if (titleIndex !== -1 && collected.length < scanLimit) {
+              const representative = findRepresentativeMessage(msgs, role, before, after);
+              if (representative) {
+                collected.push(
+                  titleSearchResult(
+                    sess,
+                    representative,
+                    regexSnippet(re, sess.title, widthArg, titleIndex),
+                  ),
+                );
                 total++;
               }
             }
@@ -1731,7 +1922,12 @@ Modes: literal exact substring; smart ranked fuzzy; fuzzy looser. Smart/fuzzy in
               truncated: earlyExit || grouped.length > final.length,
             };
           }
-          const ordered = orderForDirectoryFallback(results, Boolean(directory && fallback));
+          // Diversify first (caps per-session hits), then restore directory
+          // relevance ordering — otherwise a held-back exact-directory hit can
+          // land behind a global-directory hit, inverting the fallback ordering
+          // the caller asked for.
+          const diversified = diversify(results, resultsArg, MAX_HITS_PER_SESSION_INITIAL);
+          const ordered = orderForDirectoryFallback(diversified, Boolean(directory && fallback));
           const final = ordered.slice(0, resultsArg);
           return {
             final,
@@ -1740,11 +1936,18 @@ Modes: literal exact substring; smart ranked fuzzy; fuzzy looser. Smart/fuzzy in
           };
         };
 
+        // Part-mode literal/regex over-collect so the diversity pass has
+        // cross-session material; grouped mode already scans broadly.
+        const partScanLimit = Math.min(
+          MAX_GROUPED_LITERAL_RESULTS,
+          resultsArg * DIVERSITY_SCAN_MULTIPLIER,
+        );
+
         // ── Route: literal or smart/fuzzy ─────────────────────────────
         if (matchMode === "literal") {
           // When grouping by session, scan all sessions (no early exit)
           // so we get representative hits from every matching session
-          const limit = isGrouped ? MAX_GROUPED_LITERAL_RESULTS : resultsArg;
+          const limit = isGrouped ? MAX_GROUPED_LITERAL_RESULTS : partScanLimit;
           const { collected, total, early } = literalScan(limit);
           const { final, total: outTotal, truncated } = applyGroupAndSlice(collected, total, early);
 
@@ -1764,25 +1967,60 @@ Modes: literal exact substring; smart ranked fuzzy; fuzzy looser. Smart/fuzzy in
           return JSON.stringify(finish(out, final, "literal"));
         }
 
+        // ── Route: regex ──────────────────────────────────────────────
+        if (matchMode === "regex" && regex) {
+          const limit = isGrouped ? MAX_GROUPED_LITERAL_RESULTS : partScanLimit;
+          const { collected, total, early } = regexScanAll(regex, limit);
+          const { final, total: outTotal, truncated } = applyGroupAndSlice(collected, total, early);
+
+          const unit = isGrouped ? "session" : "result";
+          ctx.metadata({
+            title: `Found ${final.length} ${unit}${final.length !== 1 ? "s" : ""} for /${args.query}/ (regex, ${scanned} session${scanned !== 1 ? "s" : ""}${loadErrorSuffix})`,
+          });
+
+          const out: SearchOutput = {
+            ok: true,
+            results: final,
+            scanned,
+            total: outTotal,
+            truncated,
+            matchMode: "regex",
+            group: groupMode,
+          };
+          return JSON.stringify(finish(out, final, "regex"));
+        }
+
         // ── Smart/fuzzy path ────────────────────────────────────────
+        // literal and regex modes returned above; only smart/fuzzy remain.
+        const smartMode: "smart" | "fuzzy" = matchMode === "fuzzy" ? "fuzzy" : "smart";
         const smartResult = smartScan(
           allLoaded,
           args.query,
           partType,
           role,
           explain,
-          matchMode,
+          smartMode,
           before,
           after,
           widthArg,
           toolName,
+          ctx.abort,
         );
         if (smartResult.degradeKind === "budget") pushUnique(normalized.limitedBy, "rankingBudget");
         if (smartResult.degradeKind === "time") pushUnique(normalized.limitedBy, "timeBudget");
 
         // ── Fallback to literal if smart returns nothing ────────────
-        if (smartResult.results.length === 0) {
-          const limit = isGrouped ? MAX_GROUPED_LITERAL_RESULTS : resultsArg;
+        // Skip the fallback when the smart pass was cut short rather than
+        // genuinely empty: if the caller aborted (a hook timeout fired
+        // mid-smartScan) or the wall-clock budget was hit, a synchronous literal
+        // re-scan would run past the budget the timeout just enforced, and would
+        // also mask the time-degradation signal.
+        if (
+          smartResult.results.length === 0 &&
+          smartResult.degradeKind !== "time" &&
+          !ctx.abort.aborted
+        ) {
+          const limit = isGrouped ? MAX_GROUPED_LITERAL_RESULTS : partScanLimit;
           const { collected, total, early } = literalScan(limit);
           const { final, total: outTotal, truncated } = applyGroupAndSlice(collected, total, early);
 

@@ -73,6 +73,25 @@ describe("plugin entry", () => {
     });
   });
 
+  it("registers the system nudge by default and omits opt-in hooks", async () => {
+    const hooks = await plugin.default.server(ctx({ fetch: vi.fn() }), {});
+    expect(hooks["experimental.chat.system.transform"]).toBeDefined();
+    expect(hooks["chat.message"]).toBeUndefined();
+    expect(hooks["experimental.session.compacting"]).toBeUndefined();
+  });
+
+  it("omits the nudge when nudge:false and enables opt-in hooks when requested", async () => {
+    const off = await plugin.default.server(ctx({ fetch: vi.fn() }), { nudge: false });
+    expect(off["experimental.chat.system.transform"]).toBeUndefined();
+
+    const on = await plugin.default.server(ctx({ fetch: vi.fn() }), {
+      autoRecall: true,
+      compactionRecall: true,
+    });
+    expect(on["chat.message"]).toBeDefined();
+    expect(on["experimental.session.compacting"]).toBeDefined();
+  });
+
   it("deduplicates primary tools and honors primary:false", async () => {
     const hooks = await plugin.default.server(ctx({ fetch: vi.fn() }), {});
     const config = {

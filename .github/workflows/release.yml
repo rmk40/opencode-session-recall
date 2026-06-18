@@ -28,8 +28,29 @@ jobs:
       - name: Publish to npm
         run: npm publish --access public
 
+      - name: Extract release notes from CHANGELOG
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          # Pull the section for this version (## <version> … up to the next ## heading).
+          awk -v ver="$VERSION" '
+            $0 ~ "^## " ver "([^0-9.]|$)" { capture = 1; next }
+            capture && /^## / { exit }
+            capture { print }
+          ' CHANGELOG.md > RELEASE_NOTES.md
+          if [ ! -s RELEASE_NOTES.md ]; then
+            echo "No CHANGELOG section found for $VERSION; falling back to generated notes." >&2
+            echo "FALLBACK=1" >> "$GITHUB_ENV"
+          fi
+        env:
+          GITHUB_REF_NAME: ${{ github.ref_name }}
+
       - name: Create GitHub Release
-        run: gh release create "$GITHUB_REF_NAME" --generate-notes --verify-tag --latest=true
+        run: |
+          if [ "${FALLBACK:-0}" = "1" ]; then
+            gh release create "$GITHUB_REF_NAME" --generate-notes --verify-tag --latest=true
+          else
+            gh release create "$GITHUB_REF_NAME" --notes-file RELEASE_NOTES.md --verify-tag --latest=true
+          fi
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITHUB_REF_NAME: ${{ github.ref_name }}

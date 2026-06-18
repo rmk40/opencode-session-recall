@@ -35,10 +35,10 @@ export type Candidate = {
   directoryRelevance?: DirectoryRelevance;
   titleMatch?: { title: string; matchedTerms?: string[] };
 
-  // Stage 1: lightweight tokens for prefiltering
+  // Deduplicated tokens for matched-term metadata checks
   tokens: string[];
 
-  // Stage 2: normalized weighted fields for Fuse.js (populated lazily)
+  // Normalized weighted fields indexed by the BM25 ranker (populated lazily)
   primaryText?: string;
   secondaryText?: string;
   titleText?: string;
@@ -221,7 +221,11 @@ export function buildTitleCandidate(
 
 /** Populate stage-2 normalized fields on a candidate (mutates in place). */
 export function populateNormalized(candidate: Candidate): void {
-  candidate.primaryText = normalize(candidate.rawText);
+  // For title candidates, rawText IS the session title, which is already indexed
+  // via titleText below. Indexing it in primaryText too would double-weight the
+  // same text (primary boost + title boost). Leave primaryText empty so a title
+  // candidate is scored only through its title field.
+  candidate.primaryText = candidate.partType === "title" ? "" : normalize(candidate.rawText);
   // secondaryText: directory path provides cross-project search context
   candidate.secondaryText = candidate.directory ? normalize(candidate.directory) : "";
   candidate.titleText = candidate.sessionTitle ? normalize(candidate.sessionTitle) : "";

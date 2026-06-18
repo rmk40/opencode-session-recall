@@ -5,16 +5,29 @@ export function splitCamelCase(text: string): string {
   return text.replace(/([a-z])([A-Z])/g, "$1 $2");
 }
 
-/** Stage 1: extract lightweight tokens from raw text for prefiltering */
-export function tokenize(text: string): string[] {
+/**
+ * Split text into normalized tokens, preserving duplicates and order.
+ * Splits on separators (`_-/.`), splits camelCase, lowercases.
+ *
+ * This is the canonical tokenizer used by the BM25 index/search so term
+ * frequency is preserved (a document that repeats a term is more relevant).
+ */
+export function tokenizeAll(text: string): string[] {
   const separated = text.replace(/[_\-/.]/g, " ");
   const camelSplit = splitCamelCase(separated);
   const lowered = camelSplit.toLowerCase();
-  const tokens = lowered.split(/\s+/).filter((t) => t.length > 0);
-  return [...new Set(tokens)];
+  return lowered.split(/\s+/).filter((t) => t.length > 0);
 }
 
-/** Stage 2: produce a fully normalized string for Fuse.js weighted fields */
+/**
+ * Deduplicated token set. Used for set-membership checks (matched-term
+ * detection, query token uniqueness) where repetition is irrelevant.
+ */
+export function tokenize(text: string): string[] {
+  return [...new Set(tokenizeAll(text))];
+}
+
+/** Produce a fully normalized whitespace-collapsed string for indexed fields. */
 export function normalize(text: string): string {
   const separated = text.replace(/[_\-/.]/g, " ");
   const camelSplit = splitCamelCase(separated);

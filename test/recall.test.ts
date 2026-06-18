@@ -948,10 +948,12 @@ describe("recall", () => {
   });
 
   it("reports time degradation deterministically", async () => {
+    // smartScan calls performance.now() at start and once after BM25. Make the
+    // elapsed time exceed the 2000ms total budget so it flags time degradation.
     let call = 0;
     const perf = vi.spyOn(performance, "now").mockImplementation(() => {
       call++;
-      return call === 1 ? 0 : 1_601;
+      return call === 1 ? 0 : 2_001;
     });
     try {
       const timed = await runTool<SearchOutput>(recallTool(makeFakeHarness()), {

@@ -4,121 +4,80 @@
 [![npm downloads](https://img.shields.io/npm/dm/opencode-session-recall)](https://www.npmjs.com/package/opencode-session-recall)
 [![license](https://img.shields.io/npm/l/opencode-session-recall)](https://github.com/rmk40/opencode-session-recall/blob/main/LICENSE)
 
-**Every conversation your agent has ever had — across every session, every project — is already in the database. It's just not looking.**
+**Search and retrieve everything your agent has ever done, across every session and every project, straight from OpenCode's own database.**
 
-[OpenCode](https://github.com/opencode-ai/opencode) stores the full conversation history from every session your agent has ever run — messages, tool calls, tool outputs, reasoning traces. All of it. Not just the current session. Not just the current project. Every project on the machine. Even after compaction shrinks what the model can see, the original content stays in the database — just no longer visible to the agent.
+[OpenCode](https://github.com/opencode-ai/opencode) already keeps the full history of every session you've run: messages, tool calls, tool outputs, and reasoning traces. That history covers every project on the machine, and it survives compaction. When compaction trims the context window, the original content stays in the database; the agent just stops being able to see it.
 
-This plugin gives the agent five tools to search and retrieve all of it on demand.
+This plugin adds five tools that read that history on demand. There is no second database, no embeddings, no summarization step, and nothing to sync. You install it, and the agent can search its own past.
 
-**No new database.**
-**No embeddings.**
-**No summarization.**
-**No duplication.**
-**No overhead.**
+## Why you want this
 
-Just install the plugin. The agent gains access to its entire history.
+The agent forgets things it already knows, and that costs you time on every project.
 
-## The problem is absurd when you think about it
+Say it works through a nasty build error and gets it fixed. Compaction runs, the conversation gets trimmed, and an hour later the same error comes back. The agent has no record of the fix in its context, so it debugs the whole thing again from scratch, even though the answer is sitting in the database it's connected to.
 
-Your agent solves a tricky build error. Twenty minutes later, compaction runs. An hour later, the same error shows up. The agent starts from zero — debugging something it already figured out, while the answer sits in the database it's connected to.
+Or you build rate-limiting middleware in one project this week and need the same thing in another project next week. To the agent the earlier work never happened. The implementation, the requirements you talked through, the edge cases you caught, are all still in the database in a session from the other project, and none of it gets reused.
 
-You built rate-limiting middleware in your API project last week. Now you need it in another project. The agent has no idea it ever existed — while the original implementation, the requirements discussion, the edge cases you worked through, all of it is sitting in the same database, in a session from a different project.
-
-You're 200 tool calls and 3 compactions deep. The agent has drifted from your original request. Your exact words are gone from context. But they're not gone — they're in the database. The agent just can't see them.
-
-The data already exists. This plugin removes the blindfold.
+Or you're a few hundred tool calls and several compactions into a long session, and the agent has quietly drifted from what you originally asked for. Your exact wording is gone from the context window, so there's nothing left to check the work against. It isn't actually gone, though. It's in the database, and this plugin lets the agent go read it.
 
 ## What it looks like
 
-**"We already fixed this."**
+**Recover a fix from earlier in the session.**
 
 ```
 recall({ query: "ECONNREFUSED retry", scope: "session" })
 ```
 
-Agent finds its own solution from 2 hours ago. Doesn't re-derive it.
+The agent pulls up the solution it landed on two hours ago instead of working it out a second time.
 
-**"It was in that other project."**
+**Reuse work from another project.**
 
 ```
 recall_sessions({ scope: "global", search: "rate limit" })
 recall_get({ sessionID: "...", messageID: "..." })
 ```
 
-Finds the implementation from your API project. Reuses it instead of reinventing it.
+It finds the rate-limiting implementation from the other project and reuses it.
 
-**"What did I originally ask for?"**
+**Check against the original request.**
 
 ```
 recall_messages({ limit: 5, role: "user" })
 ```
 
-Pulls up exact original requirements after 3 compactions. Checks its own work against what you actually said.
+After several compactions, the agent reads back your first few messages and compares its work to what you actually asked for.
 
-**"What was that error?"**
+**Get a tool output that was pruned.**
 
 ```
 recall({ query: "TypeError", type: "tool", scope: "session" })
 ```
 
-Gets the full stack trace from a tool output that got pruned. Doesn't re-run the failing command.
+The full stack trace is still in the database, so the agent reads it instead of re-running the command that failed.
 
-**"Why did we decide on that approach?"**
+**Recover the reasoning behind a decision.**
 
 ```
 recall({ query: "chose postgres over", scope: "project", type: "reasoning" })
 ```
 
-Recovers the reasoning behind an architectural decision from three sessions ago. Context that no summary captures.
+It retrieves why an architectural call was made several sessions ago, the kind of context a summary usually drops.
 
-**"Find it even with a typo."**
+**Search past a typo.**
 
 ```
 recall({ query: "prefiltr", match: "fuzzy", scope: "session" })
 ```
 
-Fuzzy search finds `prefilter` even when the agent misremembers the exact spelling. Results ranked by relevance, not just recency.
+Fuzzy matching finds `prefilter` even when the spelling is off, and ranks results by relevance rather than recency.
 
-**"Which sessions touched this topic?"**
+**See every session that touched a topic.**
 
 ```
 recall({ query: "rate limiting", scope: "global", match: "smart", group: "session" })
 ```
 
-4 sessions across 3 projects, each with `hitCount` and best representative snippet. One call to discover everywhere a topic came up.
-
-## Smart and fuzzy search
-
-Ranked fuzzy retrieval powered by [Fuse.js](https://www.fusejs.io/). Three matching strategies:
-
-| Mode                | Behavior                            | Best for                                        |
-| ------------------- | ----------------------------------- | ----------------------------------------------- |
-| `literal` (default) | Case-insensitive substring match    | Exact terms, all scopes                         |
-| `smart`             | Fuzzy ranked search (threshold 0.3) | Uncertain wording, typos, separator differences |
-| `fuzzy`             | Looser fuzzy search (threshold 0.5) | Very approximate queries, exploratory search    |
-
-```
-recall({ query: "rate limit middleware", match: "smart", scope: "project" })
-```
-
-Smart and fuzzy modes:
-
-- **Handle typos** — `prefiltr` finds `prefilter`, `ECONNREFUSD` finds `ECONNREFUSED`
-- **Normalize separators** — `rate-limit` matches `rateLimit` matches `rate_limit`
-- **Rank by relevance** — results scored 0–1 with structural boosts for exact phrases, full token coverage, reasoning traces, and recency
-- **Fall back gracefully** — if smart/fuzzy finds nothing, literal search runs automatically
-- **Time-budget degradation** — if ranking takes too long, returns prefilter-ranked results instead of timing out
-- **Explain mode** — add `explain: true` to see scoring breakdowns via `matchReasons`
-
-Available across all scopes — `"session"`, `"project"`, and `"global"`.
-
-## Recall is not memory
-
-This is not a memory system. Memory is selective and curated. Recall is raw history retrieval — verbatim, exhaustive, on demand.
-
-If you use a persistent memory system alongside this plugin, recall gives it source material. The agent searches history, follows promising hits with `recall_get` or `recall_context`, then stores only durable findings deliberately.
-
-Good memory candidates: user preferences, project decisions, reusable root causes, environment facts, corrections, and approaches that clearly succeeded or failed. Do not store ephemeral session details, one-off commands, transient errors, or implementation minutiae.
+One call returns the matching sessions across all your projects, each with a `hitCount` and a representative snippet.
 
 ## Install
 
@@ -134,7 +93,7 @@ Or add it to your `opencode.json`:
 }
 ```
 
-To disable cross-project search:
+That's the whole setup. The agent picks up the tools on the next session and uses them on its own; you don't have to teach it the syntax. To disable cross-project search:
 
 ```jsonc
 {
@@ -142,144 +101,33 @@ To disable cross-project search:
 }
 ```
 
-## Tools
+## Getting the agent to actually use it
 
-Five tools, designed around how agents actually navigate conversation history:
+A search tool only helps if the agent reaches for it. The plugin has three features aimed at that, at increasing levels of automation. The first is on by default; the other two you turn on yourself.
 
-### `recall` — Search
+**System-prompt nudge (`nudge`, on by default).** The plugin adds a short line to the system prompt reminding the agent to search its history when you reference past work. This is just text, so it costs a handful of tokens per request and nothing else. The agent still decides whether and when to call `recall`.
 
-The primary tool. Full-text search across session titles, messages, tool outputs, tool-input commands and `cwd` values, reasoning, and subtask descriptions. Searches globally by default, or narrow to the current project or session.
+**Automatic recall (`autoRecall`, off by default).** When one of your messages clearly points back at earlier work ("last time", "what did we decide", "same as before", "previously"), the plugin runs a recall for you and drops the top one to three hits, with citations, into the agent's context before it answers. The search is capped at 1.5 seconds and a bounded number of sessions, so it can't stall your turn, and if it finds nothing it stays quiet.
 
-Use before real work when prior history could change the approach: debugging, unexpected behavior, feature work, architecture or configuration changes, past commands, root causes, decisions, or "what did we do last time?" questions.
+**Compaction preservation (`compactionRecall`, off by default).** Right before a session is compacted, the plugin pulls the strongest durable findings from that session and appends them to the compaction prompt, so the summary the model writes keeps them instead of dropping them.
 
-Do not call it for every request. Skip it for trivial commands, local file/code inspection, simple edits with complete context, and questions that do not benefit from prior conversations. Use code search for the current codebase.
-
-```
-recall({ query: "authentication", scope: "project" })
-recall({ query: "error", type: "tool", scope: "session" })
-recall({ query: "JWT", sessionID: "ses_from_another_project" })
-recall({ query: "rate limit", match: "smart", scope: "session", group: "session" })
-recall({ query: "prefiltr", match: "fuzzy", scope: "session", explain: true })
-recall({ query: "unauthorized", expand: "context", window: 1 })
-recall({ query: "auth failure", expand: "context", window: "auto" })
-recall({ query: "migration", last: "7d", directory: "/workspace/project" })
-recall({ query: "release notes", from: "30d ago", to: "now" })
-recall({ query: "legacy config", before: "2026-01-01" })
-recall({ query: "deploy", directory: "/workspace/project", fallback: true })
-recall({ query: "npm test", type: "tool", toolName: "bash" })
+```jsonc
+{
+  "plugin": [["opencode-session-recall", { "autoRecall": true, "compactionRecall": true }]],
+}
 ```
 
-First call guidance: omit `sessions` unless you need a hard scan cap; the default scans all eligible sessions subject to configured and provider limits. Use `match: "smart"` for topic discovery, naming variants, and likely typos. Use `group: "session"` for broad discovery. Add `expand: "context"` or `expand: "message"` when you already know you need evidence from the top hit. Reserve literal matching for exact errors, commands, function names, or file paths.
-
-| Param                  | Default      | Description                                                                                                                                                                  |
-| ---------------------- | ------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `query`                | required     | Text to search for                                                                                                                                                           |
-| `scope`                | `"global"`   | `"session"`, `"project"`, or `"global"`                                                                                                                                      |
-| `match`                | `"literal"`  | `"literal"`, `"smart"`, or `"fuzzy"`                                                                                                                                         |
-| `explain`              | `false`      | Include scoring metadata in results                                                                                                                                          |
-| `sessionID`            | —            | Target a specific session (overrides scope); blank values are ignored                                                                                                        |
-| `type`                 | `"all"`      | `"text"`, `"tool"`, `"reasoning"`, or `"all"`                                                                                                                                |
-| `role`                 | `"all"`      | `"user"`, `"assistant"`, or `"all"`                                                                                                                                          |
-| `before`/`after`       | —            | Time bounds as ms epoch or dates like `"2026-01-01"`; nonpositive numbers are ignored                                                                                        |
-| `last`                 | —            | Recent-history lower bound like `"2h"`, `"7d"`, or `"3w"`                                                                                                                    |
-| `from`/`to`            | —            | Explicit time bounds like `"365d ago"` and `"now"`                                                                                                                           |
-| `since`/`until`        | —            | Compatibility relative filters; prefer `last`, `from`/`to`, or `before`/`after` in new calls                                                                                 |
-| `directory`            | —            | Filter sessions by exact directory or descendant path                                                                                                                        |
-| `fallback`             | `false`      | With `directory`, fill remaining results from same project/worktree and then global history                                                                                  |
-| `toolName`             | —            | Exact tool-name filter; only valid with `type: "all"` or `type: "tool"`                                                                                                      |
-| `expand`               | `"none"`     | `"none"`, `"context"`, or `"message"`; inlines bounded evidence from top results                                                                                             |
-| `expandResults`        | `1`          | Number of results to expand; oversized values are clamped to the safe maximum                                                                                                |
-| `window`               | `3`          | Messages on each side for `expand: "context"`, or `"auto"`; oversized values are clamped to plugin `maxWindow`                                                               |
-| `expandBudgetMessages` | `30`         | Total context messages to inline across expanded results                                                                                                                     |
-| `expandBudgetChars`    | `30000`      | Total expanded text budget                                                                                                                                                   |
-| `width`                | `200`        | Snippet size (50–1000 chars)                                                                                                                                                 |
-| `sessions`             | all eligible | Optional max sessions to scan, capped by plugin `maxSessions`                                                                                                                |
-| `title`                | —            | Filter by session title substring; blank values are ignored                                                                                                                  |
-| `group`                | `"part"`     | `"part"` or `"session"` — when `"session"`, collapses results by session (one entry per session with the best-scoring or most-recent hit as representative, plus `hitCount`) |
-| `results`              | `10`         | Max results to return                                                                                                                                                        |
-
-Blank optional filters are ignored. Malformed optional time filters are ignored or normalized with `warnings` when safe. `toolName` is exact; if unsure, run a broad `type: "tool"` search first and inspect returned `toolName` values. Combining time bounds is allowed only when the resulting time window is valid.
-
-Result entries can include these fields. Ranked-mode fields are present for smart/fuzzy matches; evidence fields explain why any result matched.
-
-| Field                | Description                                                              |
-| -------------------- | ------------------------------------------------------------------------ |
-| `score`              | Relevance score (0–1, higher is better)                                  |
-| `matchMode`          | Which strategy produced this result                                      |
-| `matchedTerms`       | Query tokens found in the candidate                                      |
-| `matchReasons`       | Scoring breakdown (only when `explain: true`)                            |
-| `hitCount`           | Number of part-level hits in this session (only when `group: "session"`) |
-| `source`             | `"message"`, `"title"`, `"tool"`, or `"reasoning"`                       |
-| `why`                | Compact match explanation: matched fields, terms, confidence, recency    |
-| `directoryRelevance` | `"exact"`, `"project"`, `"global"`, or `"unknown"`                       |
-| `titleMatch`         | Title evidence when a session title matched                              |
-
-Response metadata:
-
-| Field            | Description                                                                   |
-| ---------------- | ----------------------------------------------------------------------------- |
-| `loadErrorCount` | Number of scanned sessions that failed to load; omitted when zero             |
-| `loadErrors`     | Sample load failures; use this to distinguish load failures from zero matches |
-| `matchMode`      | `"smart"`, `"fuzzy"`, or `"literal"` (if fell back)                           |
-| `degradeKind`    | `"none"`, `"time"`, `"budget"`, or `"fallback"`                               |
-| `group`          | `"part"` or `"session"` — echoes back the grouping applied                    |
-| `expanded`       | Bounded `context` or `message` entries when `expand` is not `"none"`          |
-| `warnings`       | Safe downgrades, clamped options, expansion caps, fallback broadening         |
-| `suggestions`    | Actionable next steps for empty or weak searches                              |
-| `coverage`       | Sessions/messages/parts searched, skipped reasons, and limiting factors       |
-| `nearMisses`     | Closest searched sessions for empty results when cheap to report              |
-
-Expanded entries inline full message structure, but large text/output/error fields are truncated with a `[truncated by recall expansion]` marker to keep recall responses bounded. If context expansion exceeds message or text budgets, `recall` returns the base hits plus as much expansion as fits and reports the cap in `warnings`; it does not hard-fail a successful base search because expansion was too large.
-
-### `recall_get` — Retrieve
-
-Get the full content of a specific message, including all parts. Tool outputs are returned in their original form, even if they were pruned from context. Use after `recall` finds something interesting.
-
-```
-recall_get({ sessionID: "ses_abc", messageID: "msg_def" })
-```
-
-### `recall_context` — Expand
-
-Get a window of messages around a specific message. After `recall` finds a match, see what was asked before it and what happened after. Supports symmetric and asymmetric windows.
-
-```
-recall_context({ sessionID: "ses_abc", messageID: "msg_def", window: 3 })
-recall_context({ sessionID: "ses_abc", messageID: "msg_def", before: 1, after: 5 })
-```
-
-Returns `hasMoreBefore`/`hasMoreAfter` so the agent knows if it's at a boundary.
-
-### `recall_messages` — Browse
-
-Paginated message browsing. Walk through a session chronologically, read the beginning, check the most recent messages, or filter by role. Also supports content filtering to combine search and pagination.
-
-```
-recall_messages({ limit: 5, role: "user", reverse: true })
-recall_messages({ sessionID: "ses_abc", offset: 10, limit: 10 })
-recall_messages({ query: "npm", role: "user", reverse: true })
-```
-
-Defaults to the current session. Pagination metadata includes `total`, `hasMore`, and `offset`.
-Blank `sessionID` or `query` values are treated as omitted.
-
-### `recall_sessions` — Discover
-
-List sessions by title. Use this for lightweight recent-session browsing or recency checks. For topical discovery, prefer `recall`; it searches titles and content together and labels title-only hits.
-
-```
-recall_sessions({ scope: "project", search: "auth" })
-recall_sessions({ scope: "global", search: "deployment" })
-```
-
-Blank `search` values are treated as omitted.
+`autoRecall` and `compactionRecall` are off by default on purpose. Both do real work at a sensitive moment, an inline search before a reply or an edit to the persistent summary, so a bad trigger costs latency, tokens, or a polluted summary. The nudge has none of those downsides, which is why it ships on. If you want maximum automation, turn the other two on and see how they behave on your own history.
 
 ## Options
 
-| Option    | Type      | Default | Description                                         |
-| --------- | --------- | ------- | --------------------------------------------------- |
-| `primary` | `boolean` | `true`  | Register tools as primary (available to all agents) |
-| `global`  | `boolean` | `true`  | Allow cross-project search via `scope: "global"`    |
+| Option             | Type      | Default | Description                                                                                         |
+| ------------------ | --------- | ------- | --------------------------------------------------------------------------------------------------- |
+| `primary`          | `boolean` | `true`  | Register tools as primary (available to all agents)                                                 |
+| `global`           | `boolean` | `true`  | Allow cross-project search via `scope: "global"`                                                    |
+| `nudge`            | `boolean` | `true`  | Inject a short system-prompt reminder to use recall for past work                                   |
+| `autoRecall`       | `boolean` | `false` | On user messages that reference prior work, auto-run a bounded recall and inject the top cited hits |
+| `compactionRecall` | `boolean` | `false` | Before compaction, preserve durable findings into the summary                                       |
 
 Advanced limits (all have sensible defaults):
 
@@ -293,31 +141,119 @@ Advanced limits (all have sensible defaults):
 | `maxWindow`      | `10`      | Max context window size                                                                 |
 | `defaultWidth`   | `200`     | Default snippet width                                                                   |
 
+## Recall is not memory
+
+This is not a memory system, and it doesn't try to be one. A memory system is selective and curated; recall just returns raw history verbatim, on demand.
+
+The two work well together. If you run a persistent memory system alongside this plugin, recall is where its source material comes from: the agent searches its history, follows the promising hits with `recall_get` or `recall_context`, and then decides what is worth committing to memory.
+
+Good things to keep are user preferences, project decisions, reusable root causes, environment facts, corrections, and approaches that clearly worked or clearly failed. Skip the ephemeral stuff: one-off commands, transient errors, and routine implementation detail.
+
+---
+
+The rest of this document is reference material. The agent gets the full parameter and response schema from each tool's own description at runtime, so you don't need to read it to use the plugin.
+
+## Tools
+
+Five tools, designed around how agents navigate conversation history.
+
+### `recall` — Search
+
+The primary tool. Full-text search across session titles, messages, tool outputs, tool-input commands and `cwd` values, reasoning, and subtask descriptions. Searches globally by default, or narrowed to the current project or session.
+
+It supports four [match modes](#match-modes), session vs. part grouping, time and directory filters, and optional inline expansion of the top hits. Ranked results (`smart` and `fuzzy`) carry a relevance `score` and the matched terms; every result carries a short explanation of why it matched, and the response includes coverage metadata describing what was searched. The agent receives the complete parameter list and response shape in the tool description; the short version:
+
+```
+recall({ query: "authentication", scope: "project" })
+recall({ query: "rate limit", match: "smart", group: "session" })
+recall({ query: "prefiltr", match: "fuzzy", explain: true })
+recall({ query: "unauthorized", expand: "context", window: 1 })
+recall({ query: "migration", last: "7d", directory: "/workspace/project" })
+recall({ query: "npm test", type: "tool", toolName: "bash" })
+recall({ query: "ECONNREFUSED|ETIMEDOUT", match: "regex", scope: "global" })
+```
+
+Optional filters are forgiving: blank values are ignored, and malformed time filters are dropped or normalized with a warning rather than failing the search. Expansion is bounded; if it would exceed the message or character budget, `recall` returns the base hits plus as much expansion as fits and notes the cap in `warnings` instead of erroring out.
+
+### `recall_get` — Retrieve
+
+Get the full content of a specific message, including all parts. Tool outputs are returned in their original form, even if they were pruned from context. Use after `recall` finds something interesting.
+
+```
+recall_get({ sessionID: "ses_abc", messageID: "msg_def" })
+```
+
+### `recall_context` — Expand
+
+Get a window of messages around a specific message. After `recall` finds a match, see what was asked before it and what happened after. Supports symmetric and asymmetric windows, and reports `hasMoreBefore`/`hasMoreAfter` at boundaries.
+
+```
+recall_context({ sessionID: "ses_abc", messageID: "msg_def", window: 3 })
+recall_context({ sessionID: "ses_abc", messageID: "msg_def", before: 1, after: 5 })
+```
+
+### `recall_messages` — Browse
+
+Paginated message browsing. Walk through a session chronologically, read the beginning, check the most recent messages, or filter by role. Also supports content filtering to combine search and pagination. Defaults to the current session.
+
+```
+recall_messages({ limit: 5, role: "user", reverse: true })
+recall_messages({ sessionID: "ses_abc", offset: 10, limit: 10 })
+recall_messages({ query: "npm", role: "user", reverse: true })
+```
+
+### `recall_sessions` — Discover
+
+List sessions by title, for lightweight recent-session browsing or recency checks. For topical discovery, prefer `recall`; it searches titles and content together and labels title-only hits.
+
+```
+recall_sessions({ scope: "project", search: "auth" })
+recall_sessions({ scope: "global", search: "deployment" })
+```
+
+## Match modes
+
+`recall` supports four ways to match a query. `literal` is the default; the ranked modes use [BM25](https://en.wikipedia.org/wiki/Okapi_BM25) via [MiniSearch](https://github.com/lucaong/minisearch).
+
+| Mode                | Behavior                                   | Best for                                        |
+| ------------------- | ------------------------------------------ | ----------------------------------------------- |
+| `literal` (default) | Case-insensitive substring match           | Exact terms, all scopes                         |
+| `smart`             | BM25 ranked search, tight fuzzy tolerance  | Uncertain wording, typos, separator differences |
+| `fuzzy`             | BM25 ranked search, looser fuzzy tolerance | Very approximate queries, exploratory search    |
+| `regex`             | Bounded regex scan over content            | Error codes, stack traces, paths, IDs, URLs     |
+
+In `smart` and `fuzzy` mode, BM25 ranks rarer, more specific terms above common boilerplate and adjusts for document length, so a short message that is actually about your query beats a long log that happens to mention the words once. Each result gets a 0–1 score, with boosts for exact phrases, full token coverage, reasoning traces, error output, user messages, and recency.
+
+These modes also tolerate typos (`prefiltr` finds `prefilter`, `ECONNREFUSD` finds `ECONNREFUSED`) and treat separators as interchangeable (`rate-limit`, `rateLimit`, and `rate_limit` all match each other). If a ranked search finds nothing, `recall` automatically retries as a literal search. Pass `explain: true` to see the per-result scoring breakdown in `matchReasons`.
+
+`regex` mode scans content with a regular expression you supply. It is the right tool for exact shapes like error codes, stack traces, file paths, IDs, and URLs. An invalid pattern returns an error rather than silently matching nothing.
+
+All four modes work in every scope: `"session"`, `"project"`, and `"global"`.
+
 ## How it works
 
-When OpenCode compacts a session, it doesn't delete anything. Tool outputs get a `compacted` timestamp and are replaced with placeholder text in the LLM's context — but the original data stays in the database. Messages before a compaction boundary are skipped when building the LLM context — but they're still there.
+Compaction in OpenCode doesn't delete anything. Tool outputs get a `compacted` timestamp and are swapped for placeholder text in the model's context, and messages before a compaction boundary are skipped when the context is rebuilt, but in both cases the original rows stay in the database.
 
-This plugin reads all of it through the OpenCode SDK:
+This plugin reads them back through the OpenCode SDK:
 
-- No direct database queries, no separate storage
-- Zero setup — no embeddings to generate, no indexes to build, no data to sync
-- Eligible sessions scanned newest-first with bounded concurrency; `maxSessions` is the hard safety cap
-- Respects abort signals for long-running searches
-- Cross-project search enabled by default (disable with `global: false`)
-- Smart and fuzzy ranking works across all scopes — session, project, and global
+- No direct database queries and no separate storage.
+- No setup. There are no embeddings to generate, no index to build, and no data to keep in sync.
+- Eligible sessions are scanned newest-first with bounded concurrency, and `maxSessions` is the hard safety cap.
+- Long-running searches respect abort signals.
+- Cross-project search is on by default; disable it with `global: false`.
+- Ranked search works in every scope: session, project, and global.
 
 ### Smart/fuzzy pipeline
 
-When `match` is `"smart"` or `"fuzzy"`, the search goes through a multi-stage ranking pipeline:
+When `match` is `"smart"` or `"fuzzy"`, the search goes through a BM25 ranking pipeline:
 
 1. **Candidate construction** — Messages are scanned newest-first. Session titles and each part's searchable text are extracted and tokenized. Per-session and global budgets cap the candidate pool.
-2. **Prefiltering** — Cheap lexical gate using exact substring, quoted phrase, token overlap, and bounded edit-distance (Levenshtein ≤ 1 for tokens ≥ 4 chars). Only candidates with at least one match survive.
-3. **Normalization** — Surviving candidates get full stage-2 normalization (camelCase splitting, separator normalization, whitespace collapse) for Fuse.js field matching.
-4. **Fuse.js ranking** — Weighted search across primary text (0.65), project directory (0.20), session title (0.10), and tool name (0.05). Returns all matches above the mode threshold.
-5. **Structural re-ranking** — Fuse scores are adjusted with deterministic boosts (exact phrase, full token coverage, reasoning traces, error text, user role, recency) and penalties (weak single-token fuzzy, poor coverage).
-6. **Snippet selection** — Token-density sliding window finds the most relevant excerpt from the raw text.
+2. **Normalization** — All candidates get their indexed fields normalized (camelCase splitting, separator normalization, whitespace collapse). There is no separate prefilter survival gate; the BM25 index selects matching documents itself.
+3. **BM25 ranking** — A per-query in-memory [MiniSearch](https://github.com/lucaong/minisearch) BM25 index is built across primary text (boost 2), project directory (0.6), session title (0.3), and tool name (0.15). BM25 weights rare terms (IDF) and normalizes for document length. Prefix matching applies to terms over 3 chars and fuzzy tolerance to terms of 4 chars or more (tighter for smart, looser for fuzzy).
+4. **Structural re-ranking** — BM25 scores (normalized 0–1) are adjusted with multiplicative boosts (exact phrase, full token coverage, reasoning traces, error text, user role, recency) and penalties (weak single-token fuzzy, poor coverage). A relative score floor drops weak noise without dropping the best hit.
+5. **Snippet selection** — A token-density sliding window picks the most relevant excerpt from the raw text.
 
-The entire pipeline runs within a 2-second post-fetch time budget. If the pre-Fuse stage alone exceeds 1.5 seconds, Fuse.js is skipped and prefilter-ranked results are returned with `degradeKind: "time"`. If the full pipeline completes but exceeds the total budget, Fuse-ranked results are still returned but marked as time-degraded.
+The pipeline runs within a 2-second post-fetch time budget. If a search exceeds it, the BM25-ranked results are still returned, marked with `degradeKind: "time"` (a latency flag; the ranking is unchanged). If smart or fuzzy finds nothing, literal search runs automatically as a fallback.
 
 ## Contributing
 

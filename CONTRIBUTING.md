@@ -65,70 +65,82 @@ flowchart TB
     SDK --> DB
 ```
 
-The plugin registers five tools via the OpenCode plugin API. All data access goes through the OpenCode SDK — no direct database queries.
+The plugin registers five tools via the OpenCode plugin API, plus optional event hooks for proactive recall (see [Invocation hooks](#invocation-hooks)). All data access goes through the OpenCode SDK — no direct database queries.
 
 ### Module map
 
-| Module                       | Purpose                                                                                          |
-| ---------------------------- | ------------------------------------------------------------------------------------------------ |
-| `opencode-session-recall.ts` | Plugin entry point. Creates SDK clients, registers tools, injects `primary_tools` config         |
-| `search.ts`                  | `recall` tool. Literal scan, smart/fuzzy pipeline, filters, expansion, grouping, load-error data |
-| `extract.ts`                 | Text extraction from message parts. `searchable()`, `matches()`, `snippet()`, `pruned()`         |
-| `types.ts`                   | Shared types: search results, expanded entries, message outputs, sessions, and error outputs     |
-| `sessions.ts`                | `recall_sessions` tool                                                                           |
-| `get.ts`                     | `recall_get` tool                                                                                |
-| `context.ts`                 | `recall_context` tool                                                                            |
-| `messages.ts`                | `recall_messages` tool                                                                           |
-| `normalize.ts`               | Two-stage text normalization: `tokenize()` (stage 1) and `normalize()` (stage 2)                 |
-| `query.ts`                   | Query parsing: `parseQuery()` → `ParsedQuery` with raw, lower, tokens, phrases                   |
-| `candidates.ts`              | Candidate construction from messages/parts with budget enforcement                               |
-| `prefilter.ts`               | Cheap lexical prefiltering with edit-distance typo gate                                          |
-| `fuse.ts`                    | Fuse.js wrapper with weighted keys and threshold configuration                                   |
-| `rank.ts`                    | Structural re-ranking with boosts/penalties on top of Fuse scores                                |
-| `snippet.ts`                 | Token-density sliding window snippet selection                                                   |
+| Module                       | Purpose                                                                                            |
+| ---------------------------- | -------------------------------------------------------------------------------------------------- |
+| `opencode-session-recall.ts` | Plugin entry point. Creates SDK clients, registers tools and hooks, injects `primary_tools`        |
+| `search.ts`                  | `recall` tool. Literal, regex, and smart/fuzzy paths, filters, expansion, grouping, diversity      |
+| `extract.ts`                 | Text extraction from message parts. `searchableFields()` plus `matches()`, `snippet()`, `pruned()` |
+| `types.ts`                   | Shared types: search results, expanded entries, message outputs, sessions, and error outputs       |
+| `sessions.ts`                | `recall_sessions` tool                                                                             |
+| `get.ts`                     | `recall_get` tool                                                                                  |
+| `context.ts`                 | `recall_context` tool                                                                              |
+| `messages.ts`                | `recall_messages` tool                                                                             |
+| `normalize.ts`               | Tokenizers/normalizer: `tokenizeAll()` (dup-preserving, for BM25) and `tokenize()` (deduped)       |
+| `query.ts`                   | Query parsing: `parseQuery()` → `ParsedQuery` with raw, lower, tokens, phrases                     |
+| `candidates.ts`              | Candidate construction from messages/parts with budget enforcement                                 |
+| `bm25.ts`                    | BM25 relevance ranking (MiniSearch) with structural boosts/penalties                               |
+| `regex.ts`                   | `regex` match mode: pattern compile, bounded scan, match snippet                                   |
+| `route.ts`                   | Query-shape classification (`looksLikeRegex`, `classifyQuery`) that drives mode suggestions        |
+| `snippet.ts`                 | Token-density sliding window snippet selection                                                     |
+| `hooks/system-nudge.ts`      | `nudge` option: system-prompt reminder to use recall                                               |
+| `hooks/auto-recall.ts`       | `autoRecall` option: bounded auto-search on `chat.message`, injects cited hits                     |
+| `hooks/compaction-recall.ts` | `compactionRecall` option: preserves durable findings into the compaction summary                  |
+| `hooks/part-id.ts`           | Generates opencode-compatible ascending `prt_` part IDs for injected synthetic parts               |
 
 ### Search paths
 
-The `recall` tool has two distinct execution paths:
+The `recall` tool has three distinct execution paths, selected by `match`:
 
 ```mermaid
 flowchart TB
-    Start["recall(query, match, ...)"] --> Guard{"match = literal?"}
+    Start["recall(query, match, ...)"] --> Guard{"match?"}
 
-    Guard -->|Yes| Literal["Literal scan path"]
-    Guard -->|No| Smart["Smart/fuzzy pipeline"]
+    Guard -->|literal| Literal["scan()"]
+    Guard -->|regex| Regex["regexScan() — compileRegex first"]
+    Guard -->|smart/fuzzy| Smart["smartScan() — BM25"]
 
-    Literal --> LitScan["scan() in search.ts"]
-    LitScan --> LitMatch["matches() in extract.ts"]
-    LitMatch --> LitSnip["snippet() in extract.ts"]
-    LitSnip --> GroupCheck1{"group = session?"}
-
-    Smart --> Pipeline["smartScan()"]
-    Pipeline --> SmartOut["Ranked results"]
-
-    SmartOut --> FallbackCheck{"Zero results?"}
+    Smart --> FallbackCheck{"Zero results?"}
     FallbackCheck -->|Yes| Fallback["Literal fallback"]
-    FallbackCheck -->|No| GroupCheck2{"group = session?"}
-    Fallback --> LitScan
+    FallbackCheck -->|No| Ranked["Ranked results"]
+    Fallback --> Literal
 
-    GroupCheck1 -->|Yes| Group1["groupBySession()"]
-    GroupCheck1 -->|No| Slice1["Slice to limit"]
-    GroupCheck2 -->|Yes| Group2["groupBySession()"]
-    GroupCheck2 -->|No| Slice2["Slice to limit"]
+    Literal --> GroupSlice["applyGroupAndSlice()"]
+    Regex --> GroupSlice
+    Ranked --> GroupSlice
 
-    Group1 --> Out1["SearchOutput"]
-    Slice1 --> Out1
-    Group2 --> Out2["SearchOutput + metadata"]
-    Slice2 --> Out2
+    GroupSlice --> GroupCheck{"group = session?"}
+    GroupCheck -->|Yes| Group["groupBySession()"]
+    GroupCheck -->|No| Diversify["diversify() + slice"]
+
+    Group --> Out["SearchOutput + metadata"]
+    Diversify --> Out
 ```
 
-**Literal path** (`match: "literal"`, the default): Uses the original `scan()` function. Iterates messages → parts → `searchable()` → `matches()` (case-insensitive `includes`). Stops early when the result limit is reached (or collects up to 1000 when grouping by session). Available for all scopes.
+**Literal path** (`match: "literal"`, the default): `scan()` iterates messages → parts → `searchableFields()` → `matches()` (case-insensitive `includes`). Stops once enough results are collected (the part path over-collects for diversity; grouped mode scans broadly). Available for all scopes.
 
-**Smart/fuzzy path** (`match: "smart"` or `"fuzzy"`): Uses the multi-stage `smartScan()` pipeline. Returns all ranked results; the caller handles slicing and optional session grouping. Available for all scopes. Falls back to literal if zero results.
+**Regex path** (`match: "regex"`): The pattern is compiled once with `compileRegex()` up front — an invalid pattern is a hard error before any scanning. `regexScan()`/`regexScanAll()` mirror the literal scanners but match with the compiled `RegExp` and build snippets via `regexSnippet()`. Bypasses BM25. Field text is length-capped per match; there is no per-match timeout (see `regex.ts` header).
 
-**Session grouping** (`group: "session"`): After results are collected, `groupBySession()` collapses them — one entry per session with the best-scoring (smart/fuzzy) or most-recent (literal) hit as representative, plus `hitCount` showing how many part-level hits that session had.
+**Smart/fuzzy path** (`match: "smart"` or `"fuzzy"`): The multi-stage `smartScan()` BM25 pipeline. Returns all ranked results; the caller slices and optionally groups. Falls back to the literal path if it finds nothing, so smart/fuzzy results that came from the fallback carry literal semantics (no `score`/`matchedTerms`).
+
+**Session grouping** (`group: "session"`): `groupBySession()` collapses results to one entry per session with the best-scoring (smart/fuzzy) or most-recent (literal/regex) hit as representative, plus `hitCount`. In part mode, `diversify()` instead caps how many hits a single session contributes to the initial fill so one noisy session can't flood the list.
 
 **Expansion** (`expand: "context"` or `"message"`): After filtering, grouping, and slicing, `expandSearchResults()` attaches an `expanded` array for the first `expandResults` final results. Context expansion marks the matched message with `center: true` and includes `hasMoreBefore` / `hasMoreAfter`.
+
+### Invocation hooks
+
+Besides the five tools, the plugin optionally registers OpenCode event hooks so the agent uses recall proactively. They are wired in `opencode-session-recall.ts` and gated by plugin options. Each hook is fully wrapped in `try/catch`: OpenCode runs hooks through `Effect.promise`, where a thrown hook becomes a fatal defect, so the hooks must never throw.
+
+| Hook                                 | Option (default)         | Module                       | Behavior                                                                                                |
+| ------------------------------------ | ------------------------ | ---------------------------- | ------------------------------------------------------------------------------------------------------- |
+| `experimental.chat.system.transform` | `nudge` (on)             | `hooks/system-nudge.ts`      | Pushes one reminder string onto `output.system`; idempotent via a sentinel; guards entry types          |
+| `chat.message`                       | `autoRecall` (off)       | `hooks/auto-recall.ts`       | Cue-gated bounded recall; injects a cited synthetic text part into `output.parts`                       |
+| `experimental.session.compacting`    | `compactionRecall` (off) | `hooks/compaction-recall.ts` | Session-scoped durable-signal recall; appends one cited block to `output.context` (never sets `prompt`) |
+
+The two search-running hooks (`autoRecall`, `compactionRecall`) each build their own `search()` tool instance and call its `execute` with a synthetic `ToolContext`. The search is bounded by a 1.5-second wall-clock timeout (`AbortController` + `Promise.race`, single timer cleared in `finally`); `autoRecall` also caps the scan at `sessions: 200`. `autoRecall` injects a `synthetic: true` text part carrying a real `prt_` id from `hooks/part-id.ts`, because the hook fires after OpenCode has already assigned ids to the message's other parts.
 
 ### Smart/fuzzy pipeline
 
@@ -141,50 +153,33 @@ flowchart TB
         BudgetCheck -->|No| Continue["Continue scanning"]
     end
 
-    subgraph "Stage 2: Prefilter"
-        Prefilter["prefilter()"]
-        Prefilter --> Score["prefilterScore()"]
-        Score --> S1["Exact substring +100"]
-        Score --> S2["Phrase match +30"]
-        Score --> S3["Token overlap +10 each"]
-        Score --> S4["Typo match +3 each"]
-        Score --> S5["Full coverage +20"]
+    subgraph "Stage 2: Normalize"
+        Normalize["populateNormalized()<br/>(all candidates)"]
     end
 
-    subgraph "Stage 3: Time Check"
-        TimeCheck{"Pre-Fuse > 1500ms?"}
-        TimeCheck -->|Yes| Degrade["rankDegraded()"]
-        TimeCheck -->|No| Normalize["populateNormalized()"]
+    subgraph "Stage 3: BM25 (bm25.ts)"
+        Index["new MiniSearch() + addAll()"]
+        Index --> Search["search() — BM25+, fuzzy, prefix"]
+        Search --> Boosts["× boosts: phrase, coverage,<br/>reasoning, error, user, recency"]
+        Boosts --> Penalties["× penalties: weak fuzzy,<br/>poor coverage"]
+        Penalties --> Floor["Relative score floor"]
     end
 
-    subgraph "Stage 4: Fuse.js"
-        FuseSearch["fuseSearch()"]
-    end
-
-    subgraph "Stage 5: Rank"
-        Rank["rank()"]
-        Rank --> Boosts["Boosts: phrase, coverage,<br/>reasoning, error, user, recency"]
-        Rank --> Penalties["Penalties: weak fuzzy,<br/>poor coverage"]
-    end
-
-    subgraph "Stage 6: Output"
+    subgraph "Stage 4: Output"
         Snippet["smartSnippet()"]
         Snippet --> Results["SearchResult[]"]
     end
 
-    Build --> Prefilter
-    Continue --> Prefilter
-    MarkBudget --> Prefilter
-    Prefilter --> TimeCheck
-    Normalize --> FuseSearch
-    FuseSearch --> Rank
-    Rank --> Snippet
-    Degrade --> Snippet
+    Build --> Normalize
+    Continue --> Normalize
+    MarkBudget --> Normalize
+    Normalize --> Index
+    Floor --> Snippet
 ```
 
 #### Stage 1: Candidate construction (`candidates.ts`)
 
-Messages are scanned newest-first. For each message part, `searchable()` extracts text arrays and all texts are joined as `rawText`. Stage-1 tokenization (`tokenize()`) produces lightweight tokens for prefiltering. Budgets enforced during construction:
+Messages are scanned newest-first. For each message part, `searchableFields()` extracts the searchable field texts and they are joined as `rawText`. `tokenize()` produces a deduplicated token set used for matched-term metadata. Budgets enforced during construction:
 
 | Budget                    | Default   | Purpose                         |
 | ------------------------- | --------- | ------------------------------- |
@@ -195,91 +190,80 @@ Messages are scanned newest-first. For each message part, `searchable()` extract
 | `maxMessagesPerSession`   | 1000      | Message scan limit              |
 | `maxPartsPerSession`      | 5000      | Part scan limit                 |
 
-#### Stage 2: Prefiltering (`prefilter.ts`)
+Note: when the candidate cap is hit the array is truncated in scan order (newest sessions/parts first), not by query relevance — BM25 then ranks whatever is in the index.
 
-Cheap lexical gate. Each candidate gets a `prefilterScore`:
+#### Stage 2: Normalization (`normalize.ts`)
 
-- **Exact raw substring** of the full query → +100
-- **Quoted phrase** present → +30 each
-- **Token overlap** (substring match) → +10 each
-- **Typo match** (edit distance ≤ 1, tokens ≥ 4 chars) → +3 each
-- **Full coverage** (all tokens matched) → +20
-
-Only candidates with score > 0 survive. If survivors exceed the candidate cap, the highest-scoring are kept.
-
-#### Stage 3: Time budget check
-
-If pre-Fuse processing exceeds 1500ms (provisional, calibrated from benchmarks), the pipeline skips Fuse.js and returns `rankDegraded()` results with `degradeKind: "time"`.
-
-#### Stage 4: Normalization + Fuse.js (`normalize.ts`, `fuse.ts`)
-
-Surviving candidates get stage-2 normalization:
+All candidates get their indexed fields populated by `populateNormalized()`:
 
 - `primaryText`: `normalize(rawText)` — camelCase splitting, separator → space, lowercase, whitespace collapse
 - `secondaryText`: `normalize(directory)` — project directory for cross-project context
 - `titleText`: `normalize(sessionTitle)` — session title
 - `hintText`: `normalize(toolName)` — tool name identifiers
 
-Fuse.js searches with weighted keys:
+There is no separate prefilter survival gate — the BM25 index itself selects matching documents.
 
-| Key             | Weight | Source                       |
-| --------------- | ------ | ---------------------------- |
-| `primaryText`   | 0.65   | Normalized message/tool text |
-| `secondaryText` | 0.20   | Normalized project directory |
-| `titleText`     | 0.10   | Normalized session title     |
-| `hintText`      | 0.05   | Normalized tool name         |
+#### Stage 3: BM25 ranking (`bm25.ts`)
 
-Thresholds: 0.3 for smart, 0.5 for fuzzy. `ignoreLocation` and `ignoreFieldNorm` are enabled so long texts aren't penalized.
+A fresh in-memory MiniSearch index is built per query over all candidates and discarded after. This is intentional and cheap (histories load fast; there is no persistent cache by design). MiniSearch provides BM25+ scoring, which weights rare terms (IDF) and normalizes for document length.
 
-#### Stage 5: Structural re-ranking (`rank.ts`)
+The index tokenizes with `tokenizeAll()` (the duplicate-preserving tokenizer, so term frequency stays meaningful). Field boosts:
 
-Fuse scores (inverted: 1 = best) are adjusted with deterministic boosts and penalties:
+| Field           | Boost | Source                       |
+| --------------- | ----- | ---------------------------- |
+| `primaryText`   | 2     | Normalized message/tool text |
+| `secondaryText` | 0.6   | Normalized project directory |
+| `titleText`     | 0.3   | Normalized session title     |
+| `hintText`      | 0.15  | Normalized tool name         |
 
-| Signal             | Value      | Condition                                  |
+Search options: `combineWith: "OR"`, `prefix` for terms > 3 chars, and `fuzzy` for terms ≥ 4 chars (edit-distance fraction 0.2 for smart, 0.3 for fuzzy, capped by `maxFuzzy: 6`).
+
+BM25 scores are normalized to 0..1 relative to the top hit, then adjusted by **multiplicative** structural boosts/penalties (converted from the prior additive model):
+
+| Signal             | Multiplier | Condition                                  |
 | ------------------ | ---------- | ------------------------------------------ |
-| Exact phrase       | +0.15      | Quoted phrase found verbatim in raw text   |
-| All tokens matched | +0.10      | Every query token present (exact or typo)  |
-| Reasoning part     | +0.05      | Part type is `reasoning`                   |
-| Error text         | +0.05      | Tool output contains error-like patterns   |
-| User role          | +0.03      | Message authored by user                   |
-| Recency            | +0.00–0.05 | Decays linearly over 1 week                |
-| Weak single fuzzy  | -0.10      | Single fuzzy match, normalized score < 0.7 |
-| Poor coverage      | -0.08      | < 50% of query tokens matched              |
+| Exact phrase       | ×1.15      | Quoted phrase found verbatim in raw text   |
+| All tokens matched | ×1.10      | Every query token present (exact or fuzzy) |
+| Reasoning part     | ×1.05      | Part type is `reasoning`                   |
+| Error text         | ×1.05      | Tool output contains error-like patterns   |
+| User role          | ×1.03      | Message authored by user                   |
+| Recency            | ×1.00–1.05 | Decays linearly over 1 week                |
+| Weak single fuzzy  | ×0.90      | Single match, relative score < 0.7         |
+| Poor coverage      | ×0.92      | < 50% of query tokens matched              |
 
-When `explain: true`, each boost/penalty is recorded in `matchReasons`.
+A relative score floor (`MIN_RELATIVE_SCORE`) drops trailing noise from OR-combined weak single-term matches, but never drops the only/best hit. Results sort by score, then recency, then `partID` for deterministic ties. When `explain: true`, each adjustment is recorded in `matchReasons`.
 
-#### Stage 6: Snippet selection (`snippet.ts`)
+Quoted phrases are soft signals, not hard constraints: `parseQuery()` turns them into ordinary tokens for BM25, and the exact-phrase multiplier rewards documents whose raw text contains the verbatim phrase.
+
+#### Stage 4: Snippet selection (`snippet.ts`)
 
 `smartSnippet()` finds all positions of query tokens and phrases in the raw text, then uses a sliding window to select the span with the most distinct token matches. The window is centered on the densest cluster.
 
-### Two-stage normalization
-
-The pipeline uses two levels of text processing to balance speed and match quality:
+### Text normalization
 
 ```mermaid
 flowchart LR
-    Raw["Raw text"] --> T["tokenize() — Stage 1"]
-    T --> Tokens["Lowercase tokens<br/>camelCase split<br/>separator split<br/>deduplicated"]
+    Raw["Raw text"] --> TA["tokenizeAll()"]
+    TA --> Tokens["Lowercase tokens<br/>camelCase split<br/>separator split<br/>duplicates preserved"]
+    Tokens --> BM25["Indexed/searched by BM25"]
 
-    Raw --> N["normalize() — Stage 2"]
+    Raw --> N["normalize()"]
     N --> Norm["Separator → space<br/>camelCase split<br/>lowercase<br/>whitespace collapse"]
-
-    Tokens --> Prefilter["Used by prefilter"]
-    Norm --> Fuse["Used by Fuse.js"]
+    Norm --> Fields["Candidate field text"]
 ```
 
-**Stage 1** (`tokenize`): Applied during candidate construction. Cheap — lowercase, split on separators and camelCase boundaries, deduplicate. Produces tokens for prefilter matching.
-
-**Stage 2** (`normalize`): Applied only to prefilter survivors. More expensive — full normalization for Fuse.js field matching. Applied to both candidate fields and the Fuse query string.
+- `tokenizeAll()`: duplicate-preserving tokenizer used by the BM25 index and search so term frequency is meaningful.
+- `tokenize()`: deduplicated variant used for set-membership checks (matched-term/field detection, query token uniqueness).
+- `normalize()`: whitespace-collapsed normalized string used to populate the candidate fields the index reads.
 
 ### Dependencies
 
-| Package               | Version | Purpose                                                            |
-| --------------------- | ------- | ------------------------------------------------------------------ |
-| `@opencode-ai/sdk`    | ^1.3.2  | OpenCode API client                                                |
-| `fuse.js`             | ^7.3.0  | Fuzzy search and ranking                                           |
-| `fastest-levenshtein` | ^1.0.16 | Edit-distance for typo detection in prefilter                      |
-| `zod`                 | ^4.3.6  | Schema validation (used by `@opencode-ai/plugin` tool definitions) |
+| Package               | Version | Purpose                                                           |
+| --------------------- | ------- | ----------------------------------------------------------------- |
+| `@opencode-ai/sdk`    | ^1.3.2  | OpenCode API client                                               |
+| `minisearch`          | ^7.2.0  | BM25 relevance ranking for smart/fuzzy search                     |
+| `fastest-levenshtein` | ^1.0.16 | Edit-distance for matched-term detection                          |
+| `zod`                 | ^4.3.6  | Schema validation backing the `tool.schema` builder for tool args |
 
 Peer dependency: `@opencode-ai/plugin` >= 1.2.0
 
@@ -338,12 +322,14 @@ classDiagram
         +string messageID
         +string partID
         +string rawText
+        +SearchableField[] fieldTexts
         +string[] tokens
         +string primaryText
         +string secondaryText
         +string titleText
         +string hintText
     }
+    note for Candidate "Abbreviated. The full type also carries\nsessionTitle, directory, role, time, partType,\ntoolName, source, directoryRelevance, titleMatch.\nbm25.ts reads fieldTexts/directory/sessionTitle/toolName."
 
     class ParsedQuery {
         +string raw
@@ -365,17 +351,19 @@ classDiagram
 Smart/fuzzy search works across all scopes. When optimizing for larger scopes (more sessions), benchmark:
 
 1. Candidate construction time and memory at scale
-2. Prefilter survival rates for broad queries
-3. Fuse.js indexing cost at high candidate counts
-4. End-to-end latency within the 2-second time budget
+2. BM25 index build + search cost at high candidate counts
+3. Post-fetch ranking latency against the 2-second budget in `smartScan()` (which starts after session discovery/loading, not at request entry). For the `autoRecall`/`compactionRecall` hooks, the relevant cap is their own 1.5-second wall-clock timeout.
+
+When changing ranking, re-run the relevance eval (`test/eval/`) — it gates MRR and recall@5 against `baseline.json` over a labeled corpus, so regressions fail the build.
 
 #### Tuning ranking
 
-All ranking constants are at the top of `rank.ts`:
+All ranking constants are at the top of `bm25.ts`:
 
-- `EXACT_PHRASE_BOOST`, `ALL_TOKENS_BOOST`, `REASONING_BOOST`, etc.
+- `EXACT_PHRASE_MULT`, `ALL_TOKENS_MULT`, `REASONING_MULT`, etc. (multiplicative structural boosts)
 - `RECENCY_WINDOW_MS` controls how fast the recency boost decays
-- `SMART_THRESHOLD` and `FUZZY_THRESHOLD` in `fuse.ts` control match strictness
+- `MIN_RELATIVE_SCORE` controls how aggressively weak OR-combined matches are dropped
+- `fuzzyFor()` controls smart vs. fuzzy edit-distance tolerance
 
 #### Adding a new tool
 
@@ -396,7 +384,7 @@ This project follows [Conventional Commits](https://www.conventionalcommits.org/
 
 Types: `feat`, `fix`, `docs`, `refactor`, `perf`, `test`, `chore`
 
-Common scopes: `recall`, `search`, `rank`, `fuse`, `prefilter`, `snippet`, `types`
+Common scopes: `recall`, `search`, `bm25`, `snippet`, `types`
 
 ## License
 

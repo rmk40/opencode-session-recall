@@ -26,7 +26,7 @@ export const DEFAULTS: Limits = {
   defaultWidth: 200,
 };
 
-export type MatchMode = "literal" | "smart" | "fuzzy";
+export type MatchMode = "literal" | "smart" | "fuzzy" | "regex";
 export type DegradeKind = "none" | "time" | "budget" | "fallback";
 export type GroupMode = "part" | "session";
 export type ResultSource = "message" | "title" | "tool" | "reasoning";
@@ -134,7 +134,9 @@ export type SearchOutput = {
   loadErrors?: string[];
   /** Which strategy produced the returned results */
   matchMode?: MatchMode;
-  /** What happened during ranking */
+  /** Ranking/coverage flag: "fallback" (smart→literal), "budget" (candidate cap
+   *  hit), "time" (search exceeded the time budget — a latency flag, results are
+   *  still BM25-ranked), or "none". */
   degradeKind?: DegradeKind;
   /** Which grouping was applied */
   group?: GroupMode;

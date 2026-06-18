@@ -1,9 +1,8 @@
 import { describe, expect, it } from "vitest";
-import { buildCandidates, type Candidate } from "../src/candidates.js";
+import { buildCandidates, populateNormalized, type Candidate } from "../src/candidates.js";
 import { format, formatMsg, pruned, searchable, snippet } from "../src/extract.js";
-import { prefilter } from "../src/prefilter.js";
 import { parseQuery } from "../src/query.js";
-import { rank, rankDegraded } from "../src/rank.js";
+import { bm25Search } from "../src/bm25.js";
 import { smartSnippet } from "../src/snippet.js";
 import { errmsg, optionalString } from "../src/types.js";
 import { normalize, splitCamelCase, tokenize } from "../src/normalize.js";
@@ -229,109 +228,92 @@ describe("extract helpers", () => {
   });
 });
 
+function indexed(overrides: Partial<Candidate> & { rawText: string }): Candidate {
+  const c = candidate(overrides);
+  populateNormalized(c);
+  return c;
+}
+
 describe("search ranking helpers", () => {
-  it("prefilters exact, phrase, and typo matches", () => {
-    const candidates = [
-      candidate({ rawText: "rate limit cache" }),
-      candidate({ rawText: "walkthrough guide" }),
-      candidate({ rawText: "unrelated" }),
-    ];
-
-    expect(
-      prefilter(candidates, parseQuery('"rate limit"')).map((r) => r.candidate.rawText),
-    ).toEqual(["rate limit cache"]);
-    expect(prefilter(candidates, parseQuery("walthrough")).map((r) => r.candidate.rawText)).toEqual(
-      ["walkthrough guide"],
-    );
-  });
-
-  it("ranks with explainable boosts, penalties, and time tie-breaks", () => {
+  it("ranks BM25 matches with explainable structural boosts", () => {
     const query = parseQuery('"rate limit" cache missing');
-    const hits = [
-      {
-        candidate: candidate({
-          rawText: "rate limit cache error",
-          role: "user",
-          partType: "tool",
-          toolName: "bash",
-          time: 1_000,
-        }),
-        fuseScore: 0.1,
-        normalizedScore: 0.9,
-      },
-      {
-        candidate: candidate({ rawText: "rate", time: 2_000 }),
-        fuseScore: 0.1,
-        normalizedScore: 0.9,
-      },
-      {
-        candidate: candidate({ rawText: "rat", time: 3_000 }),
-        fuseScore: 0.4,
-        normalizedScore: 0.6,
-      },
-      {
-        candidate: candidate({
-          rawText: "rate limit cache",
-          partType: "reasoning",
-          time: 4_000,
-        }),
-        fuseScore: 0.2,
-        normalizedScore: 0.8,
-      },
+    const candidates = [
+      indexed({
+        rawText: "rate limit cache error",
+        role: "user",
+        partType: "tool",
+        toolName: "bash",
+        time: 1_000,
+      }),
+      indexed({ rawText: "rate", time: 2_000 }),
+      indexed({ rawText: "rate limit cache", partType: "reasoning", time: 4_000 }),
     ];
 
-    const ranked = rank(hits, query, true);
+    const ranked = bm25Search(candidates, query, "smart", true);
     const errorResult = ranked.find((r) => r.candidate.rawText === "rate limit cache error");
-    expect(errorResult?.matchReasons.join(" ")).toContain("Exact phrase match");
-    expect(errorResult?.matchReasons.join(" ")).toContain("Error text boost");
-    expect(errorResult?.matchReasons.join(" ")).toContain("User text boost");
+    expect(errorResult?.matchReasons.join(" ")).toContain("Exact phrase");
+    expect(errorResult?.matchReasons.join(" ")).toContain("Error text");
+    expect(errorResult?.matchReasons.join(" ")).toContain("User text");
     expect(
       ranked.find((r) => r.candidate.partType === "reasoning")?.matchReasons.join(" "),
-    ).toContain("Reasoning part boost");
-    expect(ranked.find((r) => r.candidate.rawText === "rate")?.matchReasons.join(" ")).toContain(
-      "Poor query coverage",
-    );
-
-    const weak = rank(
-      [
-        {
-          candidate: candidate({ rawText: "rat" }),
-          fuseScore: 0.4,
-          normalizedScore: 0.6,
-        },
-      ],
-      parseQuery("rate"),
-      true,
-    );
-    expect(weak[0]?.matchReasons.join(" ")).toContain("Weak single-token fuzzy");
-
-    const tied = rank(
-      [
-        {
-          candidate: candidate({ rawText: "same", time: 10 }),
-          fuseScore: 0.1,
-          normalizedScore: 0.9,
-        },
-        {
-          candidate: candidate({ rawText: "same", time: 20 }),
-          fuseScore: 0.1,
-          normalizedScore: 0.9,
-        },
-      ],
-      parseQuery("same"),
-      false,
-    );
-    expect(tied.map((r) => r.candidate.time)).toEqual([20, 10]);
+    ).toContain("Reasoning part");
+    // Every returned score stays within 0..1.
+    for (const r of ranked) {
+      expect(r.score).toBeGreaterThanOrEqual(0);
+      expect(r.score).toBeLessThanOrEqual(1);
+    }
   });
 
-  it("ranks degraded results and builds smart snippets at boundaries", () => {
-    const degraded = rankDegraded(
-      [{ candidate: candidate({ rawText: "rate limit" }), prefilterScore: 30 }],
-      parseQuery("rate"),
-      true,
-    );
-    expect(degraded[0]?.matchReasons[0]).toContain("Degraded mode");
+  it("rewards term rarity (IDF) over boilerplate", () => {
+    const boilerplate = "error failed config session result tool output update value data";
+    const candidates = [
+      indexed({ rawText: `discriminative ${boilerplate}` }),
+      indexed({ rawText: `${boilerplate} ${boilerplate}` }),
+    ];
+    const ranked = bm25Search(candidates, parseQuery("discriminative config"), "smart", false);
+    expect(ranked[0]?.candidate.rawText).toContain("discriminative");
+  });
 
+  it("matches typos within edit distance via BM25 fuzzy", () => {
+    const candidates = [
+      indexed({ rawText: "prefilter pipeline" }),
+      indexed({ rawText: "unrelated content" }),
+    ];
+    const ranked = bm25Search(candidates, parseQuery("prefiltr"), "fuzzy", false);
+    expect(ranked[0]?.candidate.rawText).toContain("prefilter");
+  });
+
+  it("breaks score ties by recency (newest first)", () => {
+    const candidates = [
+      indexed({ rawText: "same token", time: 10 }),
+      indexed({ rawText: "same token", time: 20 }),
+    ];
+    const ranked = bm25Search(candidates, parseQuery("same"), "smart", false);
+    expect(ranked.map((r) => r.candidate.time)).toEqual([20, 10]);
+  });
+
+  it("returns nothing for a non-matching query", () => {
+    const candidates = [indexed({ rawText: "rate limit cache" })];
+    expect(bm25Search(candidates, parseQuery("zzzznomatch"), "smart", false)).toEqual([]);
+  });
+
+  it("does not over-report matchedTerms for a non-prefix substring", () => {
+    // "cate" is a substring of "domicate" but not a prefix; BM25 prefix search
+    // would not match it, so matchedTerms must not claim it did.
+    const candidates = [indexed({ rawText: "domicate widget" })];
+    const ranked = bm25Search(candidates, parseQuery("cate"), "smart", false);
+    for (const r of ranked) {
+      expect(r.matchedTerms).not.toContain("cate");
+    }
+  });
+
+  it("does not index a title candidate's text into primaryText (no double-weight)", () => {
+    const titleCand = indexed({ rawText: "rate limit", partType: "title" });
+    expect(titleCand.primaryText).toBe("");
+    expect(titleCand.titleText).toBeTruthy();
+  });
+
+  it("builds smart snippets at boundaries", () => {
     expect(smartSnippet("", parseQuery("rate"), 10)).toBe("");
     expect(smartSnippet("abcdef", parseQuery("zzz"), 3)).toBe("abc...");
     expect(smartSnippet("aaa rate bbb limit ccc", parseQuery("rate limit"), 12)).toContain("rate");

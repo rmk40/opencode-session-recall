@@ -1,0 +1,5 @@
+{
+  "mrr": 1.0,
+  "recallAt5": 1.0,
+  "_note": "Recorded from the BM25 (MiniSearch) ranker. The prior Fuse.js ranker scored MRR 0.5 / recall@5 0.5 on these cases. New ranking engines must meet or beat these numbers. Update only intentionally, explaining why in the change-set."
+}

@@ -5,17 +5,29 @@ import { search } from "./search.js";
 import { get } from "./get.js";
 import { context } from "./context.js";
 import { messages } from "./messages.js";
+import { systemNudge } from "./hooks/system-nudge.js";
+import { autoRecall } from "./hooks/auto-recall.js";
+import { compactionRecall } from "./hooks/compaction-recall.js";
 import { TOOLS, DEFAULTS, type Limits } from "./types.js";
 
 type Options = {
   primary?: boolean;
   global?: boolean;
+  /** Inject a system-prompt reminder to use recall (R1a). Default: true. */
+  nudge?: boolean;
+  /** Run gated automatic recall on each user message (R1b). Default: false. */
+  autoRecall?: boolean;
+  /** Preserve durable findings into the compaction summary (R1c). Default: false. */
+  compactionRecall?: boolean;
 } & Partial<Limits>;
 
 const server: Plugin = async (ctx, options) => {
   const opts = (options ?? {}) as Options;
   const primary = opts.primary !== false;
   const global = opts.global !== false;
+  const nudge = opts.nudge !== false;
+  const autoRecallEnabled = opts.autoRecall === true;
+  const compactionRecallEnabled = opts.compactionRecall === true;
 
   const clamp = (val: number | undefined, fallback: number, min = 1) =>
     Math.max(min, Math.floor(val ?? fallback));
@@ -64,6 +76,15 @@ const server: Plugin = async (ctx, options) => {
       recall_context: context(client, limits),
       recall_messages: messages(client, limits),
     },
+    ...(nudge && {
+      "experimental.chat.system.transform": systemNudge(),
+    }),
+    ...(autoRecallEnabled && {
+      "chat.message": autoRecall(client, unscoped, global, limits),
+    }),
+    ...(compactionRecallEnabled && {
+      "experimental.session.compacting": compactionRecall(client, unscoped, global, limits),
+    }),
     ...(primary && {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any -- opencode config type not exported
       config: async (c: any) => {
