@@ -2,3 +2,4 @@ node_modules/
 dist/
 *.tsbuildinfo
 RELEASE_NOTES.md
+session-ses_*.md

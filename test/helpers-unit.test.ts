@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { buildCandidates, populateNormalized, type Candidate } from "../src/candidates.js";
-import { format, formatMsg, pruned, searchable, snippet } from "../src/extract.js";
+import { format, formatMsg, isSelfTool, pruned, searchable, snippet } from "../src/extract.js";
 import { parseQuery } from "../src/query.js";
 import { bm25Search } from "../src/bm25.js";
 import { smartSnippet } from "../src/snippet.js";
@@ -91,6 +91,22 @@ describe("extract helpers", () => {
     const self = completedToolPart("p2", "s", "m", "recall", {}, "self output");
     expect(searchable(self)).toEqual([]);
 
+    // Host-namespaced variants of our own tools are also excluded so recall
+    // can never find prior recall output regardless of how the tool was named.
+    for (const name of [
+      "recall_messages",
+      "mcp__opencode-session-recall__recall",
+      "opencode-session-recall_recall",
+      "mcp__srv__recall_context",
+    ]) {
+      const namespaced = completedToolPart("p2x", "s", "m", name, {}, "self output");
+      expect(searchable(namespaced), name).toEqual([]);
+    }
+
+    // An unrelated tool that merely ends in "recall" is NOT excluded.
+    const notSelf = completedToolPart("p2y", "s", "m", "myrecall", {}, "real output");
+    expect(searchable(notSelf)).toContain("real output");
+
     const errored = errorToolPart("p3", "s", "m", "bash", { path: "src" }, "failed");
     expect(searchable(errored)).toEqual(["failed", '{"path":"src"}']);
 
@@ -107,6 +123,28 @@ describe("extract helpers", () => {
     const long = "x".repeat(10_100);
     const truncated = completedToolPart("p7", "s", "m", "bash", { long }, "out");
     expect(searchable(truncated)[2]?.length).toBe(10_000);
+  });
+
+  it("identifies our own recall tools, including host-namespaced names", () => {
+    // Bare registered names.
+    for (const name of [
+      "recall",
+      "recall_get",
+      "recall_sessions",
+      "recall_context",
+      "recall_messages",
+    ]) {
+      expect(isSelfTool(name), name).toBe(true);
+    }
+    // Namespaced by an MCP host or provider prefix.
+    expect(isSelfTool("mcp__opencode-session-recall__recall")).toBe(true);
+    expect(isSelfTool("opencode-session-recall_recall")).toBe(true);
+    expect(isSelfTool("provider.recall_get")).toBe(true);
+    expect(isSelfTool("mcp__srv__recall_context")).toBe(true);
+    // Unrelated tools that merely contain or end in a recall-like substring.
+    for (const name of ["myrecall", "recallx", "precall", "recall_other", "bash", "read"]) {
+      expect(isSelfTool(name), name).toBe(false);
+    }
   });
 
   it("builds snippets and pruned flags at important boundaries", () => {

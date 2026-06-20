@@ -20,7 +20,7 @@ import {
   type ResultSource,
   type ResultWhy,
 } from "./types.js";
-import { searchableFields, snippet, pruned, matches, formatMsg } from "./extract.js";
+import { searchableFields, snippet, pruned, matches, formatMsg, isSelfTool } from "./extract.js";
 import { parseQuery } from "./query.js";
 import {
   buildCandidates,
@@ -561,7 +561,18 @@ function truncateExpandedText(
   return `${value.slice(0, sliceLength)}${EXPANSION_TRUNCATED}`;
 }
 
+const SELF_TOOL_REDACTED = "[recall output omitted]";
+
 function truncateExpandedPart(part: PartOutput, budget: ExpansionBudget): PartOutput {
+  // Never surface our own recall tool output inside expansion. Search matching
+  // already excludes self-tool parts (searchableFields), but expansion formats
+  // every surrounding part, so a hit adjacent to a prior recall call would leak
+  // that recall's output. Redact the body but keep the part marker so message
+  // structure/positioning is preserved. Explicit recall_get/recall_context are
+  // unaffected — this only applies to recall's inline expansion.
+  if (part.type === "tool" && part.toolName && isSelfTool(part.toolName)) {
+    return { ...part, content: SELF_TOOL_REDACTED, output: undefined, error: undefined };
+  }
   return {
     ...part,
     content: truncateExpandedText(part.content, budget),

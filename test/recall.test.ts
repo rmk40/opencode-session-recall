@@ -645,6 +645,36 @@ describe("recall", () => {
     });
   });
 
+  it("redacts self-recall tool output inside expansion context", async () => {
+    const h = makeFakeHarness();
+    const tool = recallTool(h);
+
+    // s-current contains a `recall` tool part (m-current-4). Expand a wide
+    // context window around a hit so that part is included, and confirm its
+    // output is redacted rather than leaked back through recall.
+    const out = await runTool<SearchOutput>(tool, {
+      query: "rate-limit middleware",
+      scope: "session",
+      sessionID: "s-current",
+      expand: "context",
+      window: 10,
+    });
+
+    const expandedMessages = out.expanded?.flatMap((e) => e.messages ?? []) ?? [];
+    const selfParts = expandedMessages
+      .flatMap((m) => m.parts)
+      .filter((p) => p.type === "tool" && p.toolName === "recall");
+    // The recall part is present (structure preserved) but its body is redacted.
+    expect(selfParts.length).toBeGreaterThan(0);
+    for (const p of selfParts) {
+      expect(p.output).toBeUndefined();
+      expect(p.content).toBe("[recall output omitted]");
+    }
+    // The known self-output string must not appear anywhere in the expansion.
+    const serialized = JSON.stringify(out.expanded);
+    expect(serialized).not.toContain("unique-self-recall-result");
+  });
+
   it("truncates large expanded text fields with an explicit marker", async () => {
     const h = makeFakeHarness();
     const current = h.sessions.find((s) => s.id === "s-current");

@@ -9,7 +9,27 @@ import { TOOLS, type PartOutput, type MessageItem, type ResultWhy } from "./type
 
 const INPUT_SEARCH_LIMIT = 10_000;
 const SELF = new Set<string>(TOOLS);
+/** Separators a host may use when namespacing a tool (e.g. `mcp__server__recall`,
+ *  `opencode-session-recall_recall`, `provider.recall`). */
+const SELF_BOUNDARY = /[._/-]$/;
 export type SearchableField = { field: ResultWhy["matchedFields"][number]; text: string };
+
+/**
+ * Whether a tool-part's tool name is one of OUR recall tools, so its output is
+ * never searchable by recall (prevents recall from finding prior recall
+ * results). Matches the bare registered name and host-namespaced variants like
+ * `mcp__opencode-session-recall__recall` — but requires a separator before the
+ * suffix so an unrelated tool such as `myrecall` is not excluded.
+ */
+export function isSelfTool(toolName: string): boolean {
+  if (SELF.has(toolName)) return true;
+  for (const self of TOOLS) {
+    if (!toolName.endsWith(self)) continue;
+    const prefix = toolName.slice(0, toolName.length - self.length);
+    if (prefix.length > 0 && SELF_BOUNDARY.test(prefix)) return true;
+  }
+  return false;
+}
 
 function input(val: unknown): string {
   const raw = JSON.stringify(val);
@@ -41,7 +61,7 @@ export function searchable(part: Part): string[] {
 }
 
 export function searchableFields(part: Part): SearchableField[] {
-  if (part.type === "tool" && SELF.has(part.tool)) return [];
+  if (part.type === "tool" && isSelfTool(part.tool)) return [];
   switch (part.type) {
     case "text":
       return part.text ? [{ field: "text", text: part.text }] : [];
