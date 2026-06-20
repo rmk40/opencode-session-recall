@@ -1,6 +1,13 @@
 import { tool, type ToolDefinition, type ToolContext } from "@opencode-ai/plugin";
 import type { OpencodeClient } from "@opencode-ai/sdk/v2";
-import { errmsg, type ContextOutput, type ErrorOutput, type Limits } from "./types.js";
+import {
+  errmsg,
+  coerceInt,
+  optionalString,
+  type ContextOutput,
+  type ErrorOutput,
+  type Limits,
+} from "./types.js";
 import { formatMsg } from "./extract.js";
 
 export function context(client: OpencodeClient, limits: Limits): ToolDefinition {
@@ -33,12 +40,21 @@ If memory exists, store only durable findings surfaced here; skip ephemeral deta
     async execute(args, ctx: ToolContext): Promise<string> {
       ctx.metadata({ title: "Getting context around message..." });
 
-      const nb = args.before ?? args.window;
-      const na = args.after ?? args.window;
+      // Defensive: the live MCP host can bypass Zod defaults, leaving window /
+      // before / after undefined (which would make the slice bounds NaN).
+      const sessionID = optionalString(args.sessionID);
+      const messageID = optionalString(args.messageID);
+      if (!sessionID || !messageID) {
+        const err: ErrorOutput = { ok: false, error: "sessionID and messageID are required" };
+        return JSON.stringify(err);
+      }
+      const window = coerceInt(args.window, Math.min(3, limits.maxWindow), 0, limits.maxWindow);
+      const nb = args.before == null ? window : coerceInt(args.before, window, 0, limits.maxWindow);
+      const na = args.after == null ? window : coerceInt(args.after, window, 0, limits.maxWindow);
 
       try {
         const resp = await client.session.messages({
-          sessionID: args.sessionID,
+          sessionID: sessionID,
         });
         if (resp.error) {
           const err: ErrorOutput = { ok: false, error: errmsg(resp.error) };
@@ -50,11 +66,11 @@ If memory exists, store only durable findings surfaced here; skip ephemeral deta
         }
 
         const msgs = resp.data;
-        const idx = msgs.findIndex((m) => m.info.id === args.messageID);
+        const idx = msgs.findIndex((m) => m.info.id === messageID);
         if (idx === -1) {
           const err: ErrorOutput = {
             ok: false,
-            error: `Message not found: ${args.messageID}`,
+            error: `Message not found: ${messageID}`,
           };
           return JSON.stringify(err);
         }
@@ -65,13 +81,13 @@ If memory exists, store only durable findings surfaced here; skip ephemeral deta
 
         const items = slice.map((m) => {
           const item = formatMsg(m);
-          return { ...item, center: m.info.id === args.messageID };
+          return { ...item, center: m.info.id === messageID };
         });
 
         let title: string | undefined;
         let directory: string | undefined;
         try {
-          const sess = await client.session.get({ sessionID: args.sessionID });
+          const sess = await client.session.get({ sessionID: sessionID });
           if (sess.data) {
             title = sess.data.title;
             directory = sess.data.directory;

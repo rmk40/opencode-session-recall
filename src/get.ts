@@ -1,7 +1,7 @@
 import { tool, type ToolDefinition, type ToolContext } from "@opencode-ai/plugin";
 import type { OpencodeClient } from "@opencode-ai/sdk/v2";
 import type { MessageOutput, ErrorOutput } from "./types.js";
-import { errmsg } from "./types.js";
+import { errmsg, optionalString } from "./types.js";
 import { formatMsg } from "./extract.js";
 
 export function get(client: OpencodeClient): ToolDefinition {
@@ -14,17 +14,25 @@ If memory exists, store only durable findings surfaced here; skip ephemeral deta
       messageID: tool.schema.string().describe("Message to retrieve"),
     },
     async execute(args, ctx: ToolContext): Promise<string> {
+      // Defensive: the live MCP host can bypass Zod, so required args may be
+      // missing rather than schema-validated.
+      const sessionID = optionalString(args.sessionID);
+      const messageID = optionalString(args.messageID);
+      if (!sessionID || !messageID) {
+        const err: ErrorOutput = { ok: false, error: "sessionID and messageID are required" };
+        return JSON.stringify(err);
+      }
       ctx.metadata({
-        title: `Retrieving message ${args.messageID.slice(0, 20)}...`,
+        title: `Retrieving message ${messageID.slice(0, 20)}...`,
       });
 
       try {
         const result = await client.session.message({
-          sessionID: args.sessionID,
-          messageID: args.messageID,
+          sessionID,
+          messageID,
         });
         if (!result.data) {
-          const msg = result.error ? errmsg(result.error) : `Message not found: ${args.messageID}`;
+          const msg = result.error ? errmsg(result.error) : `Message not found: ${messageID}`;
           const err: ErrorOutput = { ok: false, error: msg };
           return JSON.stringify(err);
         }
@@ -34,7 +42,7 @@ If memory exists, store only durable findings surfaced here; skip ephemeral deta
         let title: string | undefined;
         let directory: string | undefined;
         try {
-          const sess = await client.session.get({ sessionID: args.sessionID });
+          const sess = await client.session.get({ sessionID: sessionID });
           if (sess.data) {
             title = sess.data.title;
             directory = sess.data.directory;

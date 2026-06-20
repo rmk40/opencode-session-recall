@@ -12,7 +12,7 @@ import type {
   SearchOutput,
   SessionsOutput,
 } from "../src/types.js";
-import { TEST_LIMITS, makeContext, makeFakeHarness, runTool } from "./helpers.js";
+import { TEST_LIMITS, makeContext, makeFakeHarness, runTool, runToolRaw } from "./helpers.js";
 
 describe("recall_sessions", () => {
   it("lists project sessions with schema defaults", async () => {
@@ -126,6 +126,21 @@ describe("recall_messages", () => {
     const noData = makeFakeHarness({ noMessageData: new Set(["s-current"]) });
     const noDataOut = await runTool<ErrorOutput>(messagesTool(noData.client, TEST_LIMITS), {});
     expect(noDataOut.error).toBe("No messages returned");
+  });
+
+  it("survives raw MCP-bypass args (undefined role/limit/offset/reverse must not filter everything)", async () => {
+    // The live MCP host can forward args that skip Zod defaults. With role
+    // undefined, the old code did `role !== "all"` → true → filtered everything
+    // out, returning total:0 on a non-empty session. Coercion must restore the
+    // defaults. runToolRaw bypasses Zod exactly like the MCP host.
+    const h = makeFakeHarness();
+    const out = await runToolRaw<MessagesOutput>(messagesTool(h.client, TEST_LIMITS), {
+      sessionID: "s-current",
+    });
+    expect(out.ok).toBe(true);
+    expect(out.pagination.total).toBe(6);
+    expect(out.pagination.returned).toBeGreaterThan(0);
+    expect(out.pagination.offset).toBe(0);
   });
 });
 
@@ -293,6 +308,30 @@ describe("recall_context", () => {
       messageID: "m-current-1",
     });
     expect(noDataOut.error).toBe("No messages returned");
+  });
+
+  it("survives raw MCP-bypass args (undefined window must not break slice bounds)", async () => {
+    const h = makeFakeHarness();
+    const out = await runToolRaw<ContextOutput>(contextTool(h.client, TEST_LIMITS), {
+      sessionID: "s-current",
+      messageID: "m-current-3",
+    });
+    expect(out.ok).toBe(true);
+    expect(out.messages.length).toBeGreaterThan(0);
+    expect(out.messages.some((m) => m.center)).toBe(true);
+  });
+});
+
+describe("recall_sessions defensive args", () => {
+  it("survives raw MCP-bypass args (undefined scope/limit default to project)", async () => {
+    const h = makeFakeHarness();
+    const out = await runToolRaw<SessionsOutput>(
+      sessionsTool(h.client, h.unscoped, true, TEST_LIMITS),
+      {},
+    );
+    expect(out.ok).toBe(true);
+    expect(out.scope).toBe("project");
+    expect(Array.isArray(out.sessions)).toBe(true);
   });
 });
 

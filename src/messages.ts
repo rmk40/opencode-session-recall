@@ -3,6 +3,9 @@ import type { OpencodeClient, Part } from "@opencode-ai/sdk/v2";
 import {
   errmsg,
   optionalString,
+  coerceEnum,
+  coerceBool,
+  coerceInt,
   type MessagesOutput,
   type ErrorOutput,
   type Limits,
@@ -37,6 +40,13 @@ export function messages(client: OpencodeClient, limits: Limits): ToolDefinition
     async execute(args, ctx: ToolContext): Promise<string> {
       const sid = optionalString(args.sessionID) ?? ctx.sessionID;
       const query = optionalString(args.query);
+      // The live MCP host can bypass Zod defaults, so coerce every optional arg
+      // defensively. An undefined `role` previously made `role !== "all"` true
+      // and filtered out every message (total: 0 on a non-empty session).
+      const role = coerceEnum(args.role, ["user", "assistant", "all"] as const, "all");
+      const reverse = coerceBool(args.reverse, false);
+      const offset = coerceInt(args.offset, 0, 0, Number.MAX_SAFE_INTEGER);
+      const limit = coerceInt(args.limit, Math.min(10, limits.maxMessages), 1, limits.maxMessages);
       if (!sid) {
         const err: ErrorOutput = {
           ok: false,
@@ -59,11 +69,11 @@ export function messages(client: OpencodeClient, limits: Limits): ToolDefinition
         }
 
         let filtered = resp.data;
-        if (args.role !== "all") filtered = filtered.filter((m) => m.info.role === args.role);
+        if (role !== "all") filtered = filtered.filter((m) => m.info.role === role);
         if (query) filtered = filtered.filter((m) => msgMatches(m, query));
 
-        const ordered = args.reverse ? [...filtered].reverse() : filtered;
-        const slice = ordered.slice(args.offset, args.offset + args.limit);
+        const ordered = reverse ? [...filtered].reverse() : filtered;
+        const slice = ordered.slice(offset, offset + limit);
         const items = slice.map(formatMsg);
 
         let title: string | undefined;
@@ -79,7 +89,7 @@ export function messages(client: OpencodeClient, limits: Limits): ToolDefinition
         }
 
         ctx.metadata({
-          title: `Showing ${items.length} of ${filtered.length} messages (offset ${args.offset})${title ? ` from "${title}"` : ""}`,
+          title: `Showing ${items.length} of ${filtered.length} messages (offset ${offset})${title ? ` from "${title}"` : ""}`,
         });
 
         const out: MessagesOutput = {
@@ -87,10 +97,10 @@ export function messages(client: OpencodeClient, limits: Limits): ToolDefinition
           messages: items,
           context: { sessionTitle: title, directory },
           pagination: {
-            offset: args.offset,
+            offset,
             returned: items.length,
             total: filtered.length,
-            hasMore: args.offset + args.limit < filtered.length,
+            hasMore: offset + limit < filtered.length,
           },
         };
         return JSON.stringify(out);

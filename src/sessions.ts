@@ -3,6 +3,8 @@ import type { OpencodeClient } from "@opencode-ai/sdk/v2";
 import {
   errmsg,
   optionalString,
+  coerceEnum,
+  coerceInt,
   type SessionItem,
   type SessionsOutput,
   type ErrorOutput,
@@ -32,14 +34,22 @@ export function sessions(
     },
     async execute(args, ctx: ToolContext): Promise<string> {
       const search = optionalString(args.search);
+      // Defensive: live MCP host can bypass Zod defaults.
+      const scope = coerceEnum(args.scope, ["project", "global"] as const, "project");
+      const limit = coerceInt(
+        args.limit,
+        Math.min(20, limits.maxSessionList),
+        1,
+        limits.maxSessionList,
+      );
 
       ctx.metadata({
         title: search
-          ? `Listing ${args.scope} sessions matching "${search}"`
-          : `Listing ${args.scope} sessions`,
+          ? `Listing ${scope} sessions matching "${search}"`
+          : `Listing ${scope} sessions`,
       });
 
-      if (args.scope === "global" && !global) {
+      if (scope === "global" && !global) {
         const err: ErrorOutput = {
           ok: false,
           error: "Global scope disabled via plugin option: global: false",
@@ -50,10 +60,10 @@ export function sessions(
       try {
         const items: SessionItem[] = [];
 
-        if (args.scope === "global") {
+        if (scope === "global") {
           const result = await unscoped.experimental.session.list({
             search,
-            limit: args.limit,
+            limit: limit,
           });
           if (result.error) {
             const err: ErrorOutput = {
@@ -79,7 +89,7 @@ export function sessions(
         } else {
           const result = await client.session.list({
             search,
-            limit: args.limit,
+            limit: limit,
           });
           if (result.error) {
             const err: ErrorOutput = {
@@ -102,14 +112,14 @@ export function sessions(
         }
 
         ctx.metadata({
-          title: `Found ${items.length} ${args.scope} sessions${search ? ` matching "${search}"` : ""}`,
+          title: `Found ${items.length} ${scope} sessions${search ? ` matching "${search}"` : ""}`,
         });
 
         const out: SessionsOutput = {
           ok: true,
           sessions: items,
           returned: items.length,
-          scope: args.scope,
+          scope: scope,
         };
         return JSON.stringify(out);
       } catch (e) {

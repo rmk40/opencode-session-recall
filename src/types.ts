@@ -262,3 +262,30 @@ export function optionalString(value: string | undefined): string | undefined {
   const trimmed = value?.trim();
   return trimmed ? trimmed : undefined;
 }
+
+/**
+ * Defensive arg coercers for tools other than `recall`.
+ *
+ * The live MCP host can forward raw caller args that bypass the Zod schema, so
+ * enum/number/boolean defaults are NOT guaranteed to be applied. Without this,
+ * e.g. an undefined `role` makes `role !== "all"` true and silently filters out
+ * every message. These mirror the defensive coercion `recall` already does.
+ */
+export function coerceEnum<T extends string>(
+  value: unknown,
+  allowed: readonly T[],
+  fallback: T,
+): T {
+  return typeof value === "string" && (allowed as readonly string[]).includes(value)
+    ? (value as T)
+    : fallback;
+}
+
+export function coerceBool(value: unknown, fallback: boolean): boolean {
+  return typeof value === "boolean" ? value : fallback;
+}
+
+export function coerceInt(value: unknown, fallback: number, min: number, max: number): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) return fallback;
+  return Math.min(max, Math.max(min, Math.trunc(value)));
+}
