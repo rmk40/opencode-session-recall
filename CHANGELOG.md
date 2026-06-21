@@ -4,6 +4,39 @@ All notable changes to this project are documented here. This project follows
 [Conventional Commits](https://www.conventionalcommits.org/) and
 [Semantic Versioning](https://semver.org/).
 
+## 0.12.1
+
+A bug-fix release. Search worked, but **retrieving and browsing the results was
+broken** — so after `recall` found a hit, reading or paginating it could come
+back empty. Searching for things you can't then retrieve is no use; this fixes
+the retrieval half of the flow.
+
+### Fixed
+
+- **Tool-argument defaults were not applied, breaking the browse/retrieve
+  tools.** opencode passes the model's raw argument object to a plugin tool's
+  `execute`; it validates against the Zod schema but does not feed back the
+  parsed value, so schema `.default()`s are never materialized. When the model
+  omitted `role`, `recall_messages` saw `role: undefined`, its role filter
+  matched nothing, and a fully-loaded session reported `total: 0` with no
+  messages (verified live: 590 messages fetched, 0 after the filter). The same
+  missing-default behavior left `recall_context` with `NaN` slice bounds and
+  could make `recall_get` throw on an undefined `messageID`. `recall` (search)
+  already coerced its own args defensively; the four browse/retrieve tools now
+  do too, via shared `coerceEnum` / `coerceBool` / `coerceInt` helpers plus
+  required-argument guards. Impact: retrieving or browsing a session —
+  including cross-project results that `recall` surfaces — now works regardless
+  of which optional args the caller sends.
+- **`recall` could surface its own prior output under renamed tool calls.** When
+  tool names are namespaced upstream (e.g. `mcp__…__recall`), they slipped past
+  the self-exclusion guard, so recall could match earlier recall results; and
+  inline `expand` could include a nearby recall call's output. Both are now
+  excluded from search and redacted from expansion, matching by suffix so
+  namespaced variants are caught. Explicit `recall_get` / `recall_context`
+  remain full-fidelity.
+
+Verified end-to-end by driving a fresh opencode session against real history.
+
 ## 0.12.0
 
 This release rebuilds how `recall` ranks results and adds the ability for the
