@@ -1329,6 +1329,126 @@ describe("recall", () => {
       );
       expect(out.suggestions?.some((s) => s.example && "match" in s.example)).toBe(true);
     });
+
+    it("keeps zero-result guidance ahead of the code-token hint under the suggestion cap", async () => {
+      // Four priority-0 zero-result hints fire (directory, excluded session,
+      // type filter, few sessions searched); the priority-1 code-token hint
+      // must be the one displaced by the 3-suggestion cap.
+      const out = await runTool<SearchOutput>(recallTool(makeFakeHarness()), {
+        query: "zanzibar_qux warp",
+        match: "smart",
+        type: "reasoning",
+        directory: "/nonexistent/path",
+      });
+
+      expect(out.results).toEqual([]);
+      expect(out.suggestions).toHaveLength(3);
+      expect(out.suggestions!.some((s) => s.reason.includes("code-like tokens"))).toBe(false);
+    });
+
+    it("suggests a title filter when shortlisted sessions do not rank", async () => {
+      const h = makeFakeHarness();
+      const planned = session("s-planned", "Zanzibar migration planning", PROJECT_DIR, Date.now());
+      const worker = session("s-worker", "Other work", PROJECT_DIR, Date.now());
+      h.sessions.push(planned, worker);
+      h.globalSessions.push(globalSessionFrom(planned), globalSessionFrom(worker));
+      h.messagesBySession[planned.id] = [
+        bundle(userMessage("m-planned", planned.id, Date.now()), [
+          textPart("p-planned", planned.id, "m-planned", "notes about unrelated prose entirely"),
+        ]),
+      ];
+      h.messagesBySession[worker.id] = [
+        bundle(assistantMessage("m-worker", worker.id, Date.now()), [
+          completedToolPart(
+            "p-worker",
+            worker.id,
+            "m-worker",
+            "bash",
+            { command: "run" },
+            "zanzibar deployment output log",
+          ),
+        ]),
+      ];
+
+      // type:"tool" leaves the shortlisted session with zero eligible
+      // candidates, so its metadata overlap cannot rank — the hint must
+      // point at the title filter instead.
+      const out = await runTool<SearchOutput>(recallTool(h), {
+        query: "zanzibar",
+        match: "smart",
+        type: "tool",
+      });
+
+      expect(out.results.length).toBeGreaterThan(0);
+      expect(out.results.every((r) => r.sessionID !== planned.id)).toBe(true);
+      const hint = out.suggestions?.find((s) => s.reason.includes("title/directory match"));
+      expect(hint?.example).toEqual({ title: "zanzibar" });
+    });
+
+    it("suggests inspecting a dense grouped session with group:part", async () => {
+      const h = makeFakeHarness();
+      const dense = session("s-dense", "Widget session", PROJECT_DIR, Date.now());
+      h.sessions.push(dense);
+      h.globalSessions.push(globalSessionFrom(dense));
+      h.messagesBySession[dense.id] = Array.from({ length: 10 }, (_, i) =>
+        bundle(assistantMessage(`m-dense-${i}`, dense.id, Date.now() - i), [
+          textPart(`p-dense-${i}`, dense.id, `m-dense-${i}`, `flurbwidget occurrence ${i}`),
+        ]),
+      );
+
+      const out = await runTool<SearchOutput>(recallTool(h), {
+        query: "flurbwidget",
+        group: "session",
+      });
+
+      expect(out.results[0]?.hitCount).toBeGreaterThanOrEqual(10);
+      const hint = out.suggestions?.find((s) => s.action.includes('group:"part"'));
+      expect(hint?.example).toEqual({ group: "part", sessionID: dense.id });
+    });
+  });
+
+  describe("literal candidate scans", () => {
+    it("counts one result per part for multi-field matches and classes literal hits", async () => {
+      const h = makeFakeHarness();
+      const fields = session("s-fields", "Field session", PROJECT_DIR, Date.now());
+      h.sessions.push(fields);
+      h.globalSessions.push(globalSessionFrom(fields));
+      h.messagesBySession[fields.id] = [
+        bundle(assistantMessage("m-fields", fields.id, Date.now()), [
+          completedToolPart(
+            "p-multi",
+            fields.id,
+            "m-fields",
+            "bash",
+            { command: "grishnak --verify" },
+            "grishnak verified ok",
+          ),
+          completedToolPart(
+            "p-input",
+            fields.id,
+            "m-fields",
+            "bash",
+            { command: "flumox run" },
+            "done",
+          ),
+        ]),
+      ];
+      const tool = recallTool(h);
+
+      // The query matches output, command, AND the JSON input of one part:
+      // total counts matched parts, not matched fields.
+      const multi = await runTool<SearchOutput>(tool, { query: "grishnak", scope: "project" });
+      expect(multi.results).toHaveLength(1);
+      expect(multi.total).toBe(1);
+      expect(multi.truncated).toBe(false);
+      expect(multi.results[0]?.why?.evidenceClass).toBe("tool-output");
+
+      // A hit found only in what was asked of the tool classes as tool-input.
+      const inputOnly = await runTool<SearchOutput>(tool, { query: "flumox", scope: "project" });
+      expect(inputOnly.total).toBe(1);
+      expect(inputOnly.results[0]?.why?.evidenceClass).toBe("tool-input");
+      expect(inputOnly.results[0]?.why?.matchedFields).toEqual(["command"]);
+    });
   });
 
   describe("query plan", () => {
@@ -1470,6 +1590,48 @@ describe("recall", () => {
         excludeCurrentSession: true,
       });
       expect(currentTarget.ok).toBe(false);
+    });
+
+    it("does not apply the implicit default to an explicit current-session target", async () => {
+      const out = await runTool<SearchOutput>(recallTool(makeFakeHarness()), {
+        query: "rate-limit",
+        sessionID: "s-current",
+      });
+
+      // Targeting the current session by ID with no exclusion args must
+      // search it: the scope-aware default never contradicts an explicit target.
+      expect(out.ok).toBe(true);
+      expect(out.results.length).toBeGreaterThan(0);
+      expect(out.results.every((r) => r.sessionID === "s-current")).toBe(true);
+      expect(out.coverage?.skippedByReason?.excludedSession).toBeUndefined();
+    });
+
+    it("combines excludeSessionID with the default current-session exclusion", async () => {
+      const out = await runTool<SearchOutput>(recallTool(makeFakeHarness()), {
+        query: "rate",
+        excludeSessionID: "s-other",
+      });
+
+      expect(out.coverage?.skippedByReason?.excludedSession).toBe(2);
+      expect(out.results.length).toBeGreaterThan(0);
+      expect(out.results.every((r) => r.sessionID === "s-project-2")).toBe(true);
+    });
+
+    it("omits the exclusion suggestion when the current session was not discovered", async () => {
+      const { ctx } = makeContext({ sessionID: "s-elsewhere" });
+      const out = await runTool<SearchOutput>(
+        recallTool(makeFakeHarness()),
+        { query: "no-such-term-anywhere" },
+        ctx,
+      );
+
+      // The exclusion removed nothing, so the zero-result guidance must not
+      // blame it and coverage must not count a skip.
+      expect(out.results).toEqual([]);
+      expect(out.coverage?.skippedByReason?.excludedSession).toBeUndefined();
+      expect(
+        out.suggestions?.some((s) => s.reason.includes("excluded the current session")),
+      ).toBeFalsy();
     });
 
     it("suggests dropping excludeCurrentSession:false when the current session dominates", async () => {

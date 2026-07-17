@@ -24,7 +24,12 @@ import {
   type ExpansionBudget,
 } from "../src/search.js";
 import type { PartOutput } from "../src/types.js";
-import { metadataShortlist, mergeShortlistHits, SHORTLIST_MULT } from "../src/plan.js";
+import {
+  metadataShortlist,
+  mergeShortlistHits,
+  SHORTLIST_MAX,
+  SHORTLIST_MULT,
+} from "../src/plan.js";
 import type { EvidenceClass, SearchResult } from "../src/types.js";
 import { smartSnippet, truncatePreservingMatch } from "../src/snippet.js";
 import { errmsg, optionalString } from "../src/types.js";
@@ -417,6 +422,25 @@ describe("query plan (codeTokens, shortlist, merge)", () => {
     expect(ranked[0]?.matchReasons.join(" ")).toContain("Exact code token");
   });
 
+  it("treats bare acronyms as code tokens and dedupes repeats", () => {
+    expect(parseQuery("parse the JSON body").codeTokens).toEqual(["JSON"]);
+    expect(parseQuery("deploy.yaml then deploy.yaml again").codeTokens).toEqual(["deploy.yaml"]);
+  });
+
+  it("caps the shortlist at SHORTLIST_MAX keeping the highest-overlap session", () => {
+    const query = parseQuery("warp drive");
+    const sessions = Array.from({ length: 30 }, (_, i) => ({
+      id: `s-${String(i).padStart(2, "0")}`,
+      title: `warp session number${i}`,
+      directory: "/w",
+    }));
+    // Two overlapping tokens: must survive the cap ahead of the one-token crowd.
+    sessions.push({ id: "s-top", title: "warp drive assembly", directory: "/w" });
+    const shortlist = metadataShortlist(sessions, query);
+    expect(shortlist.size).toBe(SHORTLIST_MAX);
+    expect(shortlist.has("s-top")).toBe(true);
+  });
+
   it("shortlists sessions by metadata token overlap, capped and length-gated", () => {
     const query = parseQuery("ghostauth live test");
     const shortlist = metadataShortlist(
@@ -553,6 +577,69 @@ describe("query plan (codeTokens, shortlist, merge)", () => {
     const weak = merged.find((h) => h.candidate.partID === "weak-1")!;
     // The weak session borrows nothing from the strong one: 1.0 × 0.2 × 1.1.
     expect(weak.score).toBeCloseTo(0.2 * SHORTLIST_MULT, 5);
+  });
+
+  it("normalizes deep scores per session, not against the global deep top", () => {
+    const mk = (partID: string, sessionID: string, score: number) =>
+      ({
+        candidate: candidate({ rawText: partID, partID, sessionID }),
+        score,
+        matchedTerms: [],
+        matchedFields: [],
+        evidenceClass: "human-text",
+        matchReasons: [],
+      }) as never;
+    // s-b's boosted deep top (0.5) is below s-a's (2.0). Each session's best
+    // must still land at exactly its OWN ceiling × 1.1 — global normalization
+    // would leave s-b at (0.5/2.0) × 0.4 × 1.1 and deny it the lift.
+    const broad = [mk("a1", "s-a", 1.0), mk("b1", "s-b", 0.4)];
+    const deep = [mk("a1", "s-a", 2.0), mk("b1", "s-b", 0.5)];
+    const merged = mergeShortlistHits(broad as never, deep as never, false);
+    expect(merged.find((h) => h.candidate.partID === "a1")!.score).toBeCloseTo(
+      1.0 * SHORTLIST_MULT,
+      5,
+    );
+    expect(merged.find((h) => h.candidate.partID === "b1")!.score).toBeCloseTo(
+      0.4 * SHORTLIST_MULT,
+      5,
+    );
+  });
+
+  it("returns deep hits sorted and unscaled when the broad pass is empty", () => {
+    const mk = (partID: string, score: number) =>
+      ({
+        candidate: candidate({ rawText: partID, partID, sessionID: "s1" }),
+        score,
+        matchedTerms: [],
+        matchedFields: [],
+        evidenceClass: "human-text",
+        matchReasons: [],
+      }) as never;
+    const merged = mergeShortlistHits([], [mk("pa", 0.4), mk("pb", 0.9)] as never, false);
+    // No broad ceiling exists: no shortlist multiplier, standard hit ordering.
+    expect(merged.map((h) => h.candidate.partID)).toEqual(["pb", "pa"]);
+    expect(merged.map((h) => h.score)).toEqual([0.9, 0.4]);
+  });
+
+  it("keeps the broad hit when it outscores its scaled deep counterpart", () => {
+    const mk = (partID: string, score: number) =>
+      ({
+        candidate: candidate({ rawText: partID, partID, sessionID: "s1" }),
+        score,
+        matchedTerms: [],
+        matchedFields: [],
+        evidenceClass: "human-text",
+        matchReasons: [],
+      }) as never;
+    const broad = [mk("p-top", 1.0), mk("p-low", 0.9)];
+    const deep = [mk("p-top", 1.0), mk("p-low", 0.3)];
+    const merged = mergeShortlistHits(broad as never, deep as never, true);
+    const low = merged.find((h) => h.candidate.partID === "p-low")!;
+    // p-low's deep rank scales to (0.3 / 1.0) × ceiling 1.0 × 1.1 = 0.33,
+    // below its broad score of 0.9: the broad hit stays, with no shortlist
+    // reason attached.
+    expect(low.score).toBe(0.9);
+    expect(low.matchReasons.some((r) => r.includes("Title-shortlist"))).toBe(false);
   });
 });
 
@@ -849,6 +936,26 @@ describe("search ranking helpers", () => {
     expect(ranked[1]?.evidenceClass).toBe("skill-definition");
     expect(ranked[0]?.matchReasons.join(" ")).toContain("Tool input");
     expect(ranked[1]?.matchReasons.join(" ")).toContain("Skill definition");
+  });
+
+  it("boosts hits whose session digest covers at least half the query tokens", () => {
+    const query = parseQuery("checkout throttle keeper widget"); // 4 tokens
+    const covered = indexed({
+      rawText: "checkout throttle notes",
+      partID: "p-covered",
+      digestText: normalize("checkout throttle"), // 2 of 4: exactly the boundary
+    });
+    const uncovered = indexed({
+      rawText: "checkout throttle notes",
+      partID: "p-uncovered",
+      digestText: normalize("checkout"), // 1 of 4: below half
+    });
+    const ranked = bm25Search([uncovered, covered], query, "smart", true);
+    const coveredHit = ranked.find((h) => h.candidate.partID === "p-covered")!;
+    const uncoveredHit = ranked.find((h) => h.candidate.partID === "p-uncovered")!;
+    expect(coveredHit.matchReasons.join(" ")).toContain("Session digest match");
+    expect(uncoveredHit.matchReasons.join(" ")).not.toContain("Session digest match");
+    expect(ranked[0]!.candidate.partID).toBe("p-covered");
   });
 
   it("rewards term rarity (IDF) over boilerplate", () => {

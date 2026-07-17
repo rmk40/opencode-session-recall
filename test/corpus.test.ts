@@ -12,6 +12,7 @@ import {
   bundle,
   completedToolPart,
   makeFakeHarness,
+  reasoningPart,
   runTool,
   session,
   textPart,
@@ -144,6 +145,56 @@ describe("CorpusCache", () => {
     expect(again.sessions[0]!.candidates.length).toBe(1);
   });
 
+  it("keeps a session pinned until every overlapping sync releases it", async () => {
+    const h = makeFakeHarness();
+    const big = "x".repeat(500);
+    for (const id of ["s-big-1", "s-big-2"]) {
+      h.messagesBySession[id] = [
+        bundle(userMessage(`m-${id}`, id, 1_000), [textPart(`p-${id}`, id, `m-${id}`, big)]),
+      ];
+    }
+    const cache = new CorpusCache(h.client, { ...TEST_LIMITS, cacheMaxChars: 600 });
+    const fetchesOf = (id: string) => h.calls.messages.filter((c) => c.sessionID === id).length;
+
+    // Two overlapping queries pin s-big-1; only one of them releases.
+    const a = await cache.sync([target("s-big-1", 1_000)]);
+    const b = await cache.sync([target("s-big-1", 1_000)]);
+    a.release();
+
+    // Eviction pressure from another session must evict the unpinned one, not
+    // the session still pinned by the in-flight query.
+    const other = await cache.sync([target("s-big-2", 1_000)]);
+    other.release();
+    const stillCached = await cache.sync([target("s-big-1", 1_000)]);
+    stillCached.release();
+    expect(fetchesOf("s-big-1")).toBe(1);
+
+    // Once the last overlapping sync releases, the session becomes evictable.
+    b.release();
+    const evictor = await cache.sync([target("s-big-2", 1_000)]);
+    evictor.release();
+    const refetched = await cache.sync([target("s-big-1", 1_000)]);
+    refetched.release();
+    expect(fetchesOf("s-big-1")).toBe(2);
+  });
+
+  it("returns placeholder entries without load errors when aborted before fetching", async () => {
+    const h = makeFakeHarness();
+    const cache = new CorpusCache(h.client, TEST_LIMITS);
+    const controller = new AbortController();
+    controller.abort();
+
+    const result = await cache.sync([target("s-current", 1_000)], controller.signal);
+    result.release();
+    // An abort is not a load failure: no fetch happened and no error is
+    // fabricated for the sessions the abort skipped.
+    expect(h.calls.messages).toHaveLength(0);
+    expect(result.loadErrorCount).toBe(0);
+    expect(result.sessions).toHaveLength(1);
+    expect(result.sessions[0]!.candidates).toEqual([]);
+    expect(result.sessions[0]!.loadError).toBeUndefined();
+  });
+
   it("release() is idempotent and unpin survives double release", async () => {
     const h = makeFakeHarness();
     const cache = new CorpusCache(h.client, TEST_LIMITS);
@@ -233,6 +284,57 @@ describe("buildSessionDigest", () => {
     ] as never);
     expect(digest).not.toContain("zeppelin");
     expect(digest).toBe("");
+  });
+
+  it("uses the earliest user message as the head and ignores reasoning vocabulary", () => {
+    const digest = digestOf([
+      {
+        info: { id: "m1", role: "user", time: { created: 100 } },
+        parts: [textPart("p1", "s", "m1", "Fix the broken telemetry exporter")],
+      },
+      {
+        info: { id: "m2", role: "user", time: { created: 200 } },
+        parts: [textPart("p2", "s", "m2", "Also polish dashboard rendering")],
+      },
+      {
+        info: { id: "m3", role: "assistant", time: { created: 300 } },
+        parts: [reasoningPart("p3", "s", "m3", "quixotic quixotic quixotic pondering")],
+      },
+    ] as never);
+    // Candidates arrive newest-first; the head must still be the EARLIEST
+    // user message, not the most recent one.
+    expect(digest.startsWith("Fix the broken telemetry exporter")).toBe(true);
+    // Reasoning is neither a statement nor an action: no digest credit.
+    expect(digest).not.toContain("quixotic");
+  });
+
+  it("filters stopwords, short and letterless tokens, and caps the vocabulary at eight", () => {
+    const words = [
+      "ambera",
+      "brindle",
+      "cascade",
+      "dorval",
+      "estuary",
+      "fjordic",
+      "gantry",
+      "harbinger",
+      "icicle",
+      "jamboree",
+      "kestrel",
+      "lantern",
+    ];
+    const digest = digestOf([
+      {
+        info: { id: "m1", role: "user", time: { created: 100 } },
+        parts: [textPart("p1", "s", "m1", "go do")],
+      },
+      {
+        info: { id: "m2", role: "assistant", time: { created: 200 } },
+        parts: [textPart("p2", "s", "m2", `should with this 1234 ab ${words.join(" ")}`)],
+      },
+    ] as never);
+    // Equal counts tie-break alphabetically; only the first eight survive.
+    expect(digest).toBe("go do ambera brindle cascade dorval estuary fjordic gantry harbinger");
   });
 
   it("keeps sessions with no statements or commands digest-free", () => {

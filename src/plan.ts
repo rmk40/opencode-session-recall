@@ -90,16 +90,22 @@ export function mergeShortlistHits(broad: Bm25Hit[], deep: Bm25Hit[], explain: b
   const fallbackCeiling = broadTop * MIN_RELATIVE_SCORE;
   // Deep scores are unclamped (base × structural multipliers), so anchoring
   // on them directly would compound the multiplier stack with SHORTLIST_MULT
-  // (an effective ~mult × 1.1 instead of the documented × 1.1). Normalize to
-  // the deep pass's top first: the anchor is the hit's RELATIVE rank within
-  // the neighborhood, and the neighborhood's best lands at exactly
-  // ceiling × SHORTLIST_MULT.
-  const deepTop = deep.reduce((max, hit) => Math.max(max, hit.score), 0);
-  if (deepTop <= 0) return [...byPart.values()].sort(compareHits);
+  // (an effective ~mult × 1.1 instead of the documented × 1.1). Normalize
+  // each deep hit to ITS OWN SESSION's deep top: the anchor is the hit's
+  // relative rank within its neighborhood, and every neighborhood's best
+  // lands at exactly its own ceiling × SHORTLIST_MULT.
+  const deepTopBySession = new Map<string, number>();
+  for (const hit of deep) {
+    const sessionID = hit.candidate.sessionID;
+    const known = deepTopBySession.get(sessionID) ?? 0;
+    if (hit.score > known) deepTopBySession.set(sessionID, hit.score);
+  }
 
   for (const hit of deep) {
     const ceiling = ceilingBySession.get(hit.candidate.sessionID) ?? fallbackCeiling;
     if (ceiling <= 0) continue;
+    const deepTop = deepTopBySession.get(hit.candidate.sessionID) ?? 0;
+    if (deepTop <= 0) continue;
     const scaled = (hit.score / deepTop) * ceiling * SHORTLIST_MULT;
     const existing = byPart.get(hit.candidate.partID);
     if (existing && existing.score >= scaled) continue;

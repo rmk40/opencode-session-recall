@@ -118,6 +118,45 @@ describe("parseSafetensors", () => {
       /unsupported dtype/,
     );
   });
+
+  it("throws when the file is shorter than its header-length prefix", () => {
+    expect(() => parseSafetensors(new Uint8Array(4))).toThrow(/shorter than its header-length/);
+  });
+
+  it("throws when the declared header length exceeds the file", () => {
+    const bytes = Buffer.alloc(16);
+    bytes.writeBigUInt64LE(BigInt(1_000), 0);
+    expect(() => parseSafetensors(new Uint8Array(bytes))).toThrow(/header length exceeds/);
+  });
+
+  it("throws when the embeddings tensor is ambiguous (two unnamed 2-D tensors)", () => {
+    const data = Buffer.alloc(16);
+    const header = Buffer.from(
+      JSON.stringify({
+        a: { dtype: "F32", shape: [1, 2], data_offsets: [0, 8] },
+        b: { dtype: "F32", shape: [1, 2], data_offsets: [8, 16] },
+      }),
+      "utf8",
+    );
+    const length = Buffer.alloc(8);
+    length.writeBigUInt64LE(BigInt(header.length));
+    expect(() => parseSafetensors(new Uint8Array(Buffer.concat([length, header, data])))).toThrow(
+      /could not locate/,
+    );
+  });
+
+  it("throws when tensor data is shorter than the declared shape", () => {
+    const data = Buffer.alloc(8); // 2 floats, but shape declares 2×4 = 8 floats
+    const header = Buffer.from(
+      JSON.stringify({ embeddings: { dtype: "F32", shape: [2, 4], data_offsets: [0, 8] } }),
+      "utf8",
+    );
+    const length = Buffer.alloc(8);
+    length.writeBigUInt64LE(BigInt(header.length));
+    expect(() => parseSafetensors(new Uint8Array(Buffer.concat([length, header, data])))).toThrow(
+      /shorter than its declared shape/,
+    );
+  });
 });
 
 // ── SemanticEmbedder ─────────────────────────────────────────────────────
@@ -196,6 +235,16 @@ describe("SemanticEmbedder", () => {
     await embedder.init();
     expect(embedder.ready).toBe(false);
     expect(embedder.initError).toMatch(/unsupported tokenizer/);
+  });
+
+  it("caps embedding input at 2,000 chars", async () => {
+    const embedder = new SemanticEmbedder("fixture/tiny", fixtureModel());
+    await embedder.init();
+    const padded = "auth ".repeat(400); // exactly 2,000 chars
+    // Tokens beyond the cap are dropped: 400×"auth" pools to the "auth" row.
+    expect(embedder.embed(`${padded}login`)).toEqual(embedder.embed("auth"));
+    // Control: the same suffix inside the cap does change the vector.
+    expect(embedder.embed("auth login")).not.toEqual(embedder.embed("auth"));
   });
 
   it("runs init only once (idempotent)", async () => {
