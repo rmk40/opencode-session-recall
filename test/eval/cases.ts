@@ -124,7 +124,22 @@ export const EVAL_CASES: EvalCase[] = [
       directory: GHOST_DIR,
     },
     relevantSessionIDs: ["e-flow"],
-    expect: { classInTop3: ["tool-input"] },
+    expect: { classInTop3: ["tool-input"], maxClassInTop5: { "skill-definition": 1 } },
+  },
+  {
+    // Field report: a literal scan floods with skill payloads by scan order
+    // alone (three skill parts across e-flow/e-docs); the class-cap pass must
+    // keep the top five diverse regardless of ranking.
+    name: "field-report: literal tuistory flood capped to one skill hit",
+    args: {
+      query: "tuistory",
+      match: "literal",
+      group: "part",
+      scope: "global",
+      directory: GHOST_DIR,
+    },
+    relevantSessionIDs: ["e-flow"],
+    expect: { maxClassInTop5: { "skill-definition": 1 } },
   },
   {
     // Field report: authored usage of an API outranks the generic skill body

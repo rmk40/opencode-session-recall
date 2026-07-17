@@ -1293,6 +1293,42 @@ describe("recall", () => {
     expect(h.calls.messages).toHaveLength(1);
   });
 
+  describe("composition-aware suggestions", () => {
+    it("flags generated-material dominance and exact code tokens", async () => {
+      const h = makeFakeHarness();
+      const docsHeavy = session("s-docsheavy", "Docs Heavy", PROJECT_DIR, Date.now());
+      h.sessions.push(docsHeavy);
+      h.globalSessions.push(globalSessionFrom(docsHeavy));
+      h.messagesBySession[docsHeavy.id] = [0, 1, 2].map((i) =>
+        bundle(assistantMessage(`m-dh-${i}`, docsHeavy.id, Date.now() - i), [
+          completedToolPart(
+            `p-dh-${i}`,
+            docsHeavy.id,
+            `m-dh-${i}`,
+            "read",
+            { filePath: `/doc-${i}.md` },
+            `ZANTHOR_TOKEN reference documentation copy ${i}`,
+            { title: "Read doc" },
+          ),
+        ]),
+      );
+
+      const out = await runTool<SearchOutput>(recallTool(h), {
+        query: "ZANTHOR_TOKEN",
+        match: "smart",
+        scope: "project",
+        excludeCurrentSession: false,
+      });
+      // file-read caps still allow two; with only reads matching, the top-5
+      // composition triggers the generated-material hint. codeTokens trigger
+      // the literal hint.
+      expect(out.suggestions?.some((s) => s.reason.includes("generated reference material"))).toBe(
+        true,
+      );
+      expect(out.suggestions?.some((s) => s.example && "match" in s.example)).toBe(true);
+    });
+  });
+
   describe("query plan", () => {
     it("reports selected variants only under explain", async () => {
       const h = makeFakeHarness();

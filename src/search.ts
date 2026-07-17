@@ -699,6 +699,7 @@ function smartScan(
   degradeKind: DegradeKind;
   matchMode: MatchMode;
   planSelected: string[];
+  shortlistIDs: string[];
 } {
   const pq = parseQuery(query);
   const startTime = performance.now();
@@ -752,6 +753,7 @@ function smartScan(
     degradeKind: timedOut || totalTime > TIME_BUDGET_MS ? "time" : "none",
     matchMode: mode,
     planSelected,
+    shortlistIDs: [...shortlist],
   };
 }
 
@@ -940,6 +942,72 @@ export function groupBySession(results: SearchResult[]): SearchResult[] {
       ...(topEvidence.length > 0 && { topEvidence }),
     };
   });
+}
+
+/** Per-class caps for the final part-mode slice: generated reference material
+ *  must not crowd out other evidence. Plain tool output is uncapped. */
+const CLASS_CAPS: Partial<Record<EvidenceClass, number>> = {
+  "skill-definition": 1,
+  "file-read": 2,
+};
+
+/** Queries that describe actions: exact code anchors or command verbs. */
+const COMMAND_VERB_RE = /\b(run|launch|type|press|test|reproduce|install|start)\b/i;
+
+/**
+ * Final part-mode pass: apply per-class caps within the slice, backfill from
+ * held-back hits when the caps starve the fill, and for command-like queries
+ * guarantee one tool-input hit when any exists. Runs AFTER
+ * orderForDirectoryFallback — that re-sort is class-blind, so a cap applied
+ * inside diversify() would be silently defeated whenever directory fallback
+ * reorders the list.
+ */
+export function capAndSlice(
+  ordered: SearchResult[],
+  limit: number,
+  commandLike: boolean,
+): SearchResult[] {
+  const classCounts = new Map<string, number>();
+  const final: SearchResult[] = [];
+  const heldBack: SearchResult[] = [];
+
+  for (const hit of ordered) {
+    if (final.length >= limit) {
+      heldBack.push(hit);
+      continue;
+    }
+    const cls = hit.why?.evidenceClass;
+    const cap = cls != null ? CLASS_CAPS[cls] : undefined;
+    if (cls != null && cap != null) {
+      const used = classCounts.get(cls) ?? 0;
+      if (used >= cap) {
+        heldBack.push(hit);
+        continue;
+      }
+      classCounts.set(cls, used + 1);
+    }
+    final.push(hit);
+  }
+
+  // Backfill in original order when the caps starved the fill (mirrors the
+  // per-session diversity semantics: caps yield rather than return less).
+  for (const hit of heldBack) {
+    if (final.length >= limit) break;
+    final.push(hit);
+  }
+
+  if (
+    commandLike &&
+    final.length > 0 &&
+    !final.some((hit) => hit.why?.evidenceClass === "tool-input")
+  ) {
+    const promoted = heldBack.find(
+      (hit) => hit.why?.evidenceClass === "tool-input" && !final.includes(hit),
+    );
+    if (promoted) final[final.length - 1] = promoted;
+  }
+
+  return final;
 }
 
 /**
@@ -1145,6 +1213,9 @@ function buildSuggestions(input: {
   currentSessionExcluded: boolean;
   /** Caller explicitly passed excludeCurrentSession:false. */
   excludeExplicitOff: boolean;
+  codeTokens: string[];
+  /** Session IDs the metadata shortlist selected (smart/fuzzy only). */
+  shortlistIDs: string[];
 }): SearchSuggestion[] | undefined {
   const suggestions: SearchSuggestion[] = [];
   const onlyTitleHits =
@@ -1226,6 +1297,54 @@ function buildSuggestions(input: {
     }
   }
 
+  // Composition-aware guidance over non-empty results.
+  const topFive = input.results.slice(0, 5);
+  const generatedCount = topFive.filter(
+    (result) =>
+      result.why?.evidenceClass === "skill-definition" || result.why?.evidenceClass === "file-read",
+  ).length;
+  if (generatedCount >= 3) {
+    suggestions.push({
+      reason: "Most top hits are generated reference material (skill payloads, file reads).",
+      action: 'Re-run oriented to actions: type:"tool" surfaces commands and their output.',
+      example: { type: "tool" },
+    });
+  }
+
+  const topResult = input.results[0];
+  if (topResult?.hitCount != null && topResult.hitCount >= 10) {
+    suggestions.push({
+      reason: `Session ${topResult.sessionID} holds ${topResult.hitCount} matching parts.`,
+      action: 'Inspect it directly with group:"part" and sessionID.',
+      example: { group: "part", sessionID: topResult.sessionID },
+    });
+  }
+
+  if (input.codeTokens.length > 0 && (input.matchMode === "smart" || input.matchMode === "fuzzy")) {
+    suggestions.push({
+      reason: "The query contains exact code-like tokens.",
+      action: 'match:"literal" pins them exactly.',
+      example: { match: "literal", query: input.codeTokens[0] },
+    });
+  }
+
+  if (input.shortlistIDs.length > 0 && input.results.length > 0) {
+    const returned = new Set(input.results.map((result) => result.sessionID));
+    if (!input.shortlistIDs.some((id) => returned.has(id))) {
+      const titleTerm =
+        input.codeTokens[0] ??
+        input.query
+          .toLowerCase()
+          .split(/\s+/)
+          .find((token) => token.length >= 4);
+      suggestions.push({
+        reason: "Sessions whose title/directory match the query exist but none ranked.",
+        action: "Narrow to them with a title filter or browse via recall_sessions.",
+        ...(titleTerm && { example: { title: titleTerm } }),
+      });
+    }
+  }
+
   return suggestions.length > 0 ? suggestions.slice(0, MAX_SUGGESTIONS) : undefined;
 }
 
@@ -1261,6 +1380,8 @@ function attachCommonOutput<T extends SearchOutput>(
     currentSessionID?: string;
     currentSessionExcluded: boolean;
     excludeExplicitOff: boolean;
+    codeTokens: string[];
+    shortlistIDs: string[];
   },
 ): T {
   input.coverage.directoryBucketCounts = countDirectoryBuckets(input.final);
@@ -1278,6 +1399,8 @@ function attachCommonOutput<T extends SearchOutput>(
     currentSessionID: input.currentSessionID,
     currentSessionExcluded: input.currentSessionExcluded,
     excludeExplicitOff: input.excludeExplicitOff,
+    codeTokens: input.codeTokens,
+    shortlistIDs: input.shortlistIDs,
   });
   if (suggestions) out.suggestions = suggestions;
   const nearMisses = buildNearMisses(input.final, input.searchedSessions);
@@ -1300,6 +1423,8 @@ export function search(
 Call when history could change the approach: debugging errors, investigating behavior, non-trivial feature work in areas with likely prior history, changing architecture/config, answering "last time/before", recovering commands/root causes/decisions, or checking if an approach worked or failed. Also call before substantive work in an unfamiliar area of this project.
 
 Skip trivial commands, simple local code/file lookup, simple edits with full context, ordinary code tasks where prior history would not change the approach, or anything not helped by past conversations.
+
+For "how did we do X before": match:"smart", group:"session" (current session is already excluded by default); if results are weak, search the project directory literally for the tool/command name and inspect tool-input hits with expand:"context" or recall_context.
 
 First call: for broad discovery use match:"smart", group:"session", scope:"global" (default), 5-10 results, and short terms from error text/feature/config/file/decision. The current session is excluded by default; pass excludeCurrentSession:false to search it (or use scope:"session"). Use role:"user" for requirements/decisions. Use expand:"context" or "message" when top-hit evidence will avoid a follow-up.
 
@@ -1927,6 +2052,8 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
                 currentSessionID,
                 currentSessionExcluded,
                 excludeExplicitOff: excludeExplicit === false,
+                codeTokens: queryMeta.codeTokens,
+                shortlistIDs,
               }),
             );
           };
@@ -2021,10 +2148,11 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
             // Diversify first (caps per-session hits), then restore directory
             // relevance ordering — otherwise a held-back exact-directory hit can
             // land behind a global-directory hit, inverting the fallback ordering
-            // the caller asked for.
+            // the caller asked for. Class caps and the tool-input guarantee run
+            // last, over the directory-ordered list (capAndSlice).
             const diversified = diversify(results, resultsArg, MAX_HITS_PER_SESSION_INITIAL);
             const ordered = orderForDirectoryFallback(diversified, Boolean(directory && fallback));
-            const final = ordered.slice(0, resultsArg);
+            const final = capAndSlice(ordered, resultsArg, commandLikeQuery);
             return {
               final,
               total: partTotal,
@@ -2038,6 +2166,11 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
             MAX_GROUPED_LITERAL_RESULTS,
             resultsArg * DIVERSITY_SCAN_MULTIPLIER,
           );
+          const queryMeta = parseQuery(args.query);
+          const commandLikeQuery =
+            queryMeta.codeTokens.length > 0 || COMMAND_VERB_RE.test(args.query);
+          // Populated by the smart path before finish() runs; empty otherwise.
+          let shortlistIDs: string[] = [];
 
           // ── Route: literal or smart/fuzzy ─────────────────────────────
           if (matchMode === "literal") {
@@ -2106,6 +2239,7 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
             ctx.abort,
           );
           if (smartResult.degradeKind === "time") pushUnique(normalized.limitedBy, "timeBudget");
+          shortlistIDs = smartResult.shortlistIDs;
 
           const QUERY_PLAN_VARIANTS = [
             "bm25-broad",

@@ -17,7 +17,12 @@ import {
 } from "../src/extract.js";
 import { parseQuery } from "../src/query.js";
 import { bm25Search } from "../src/bm25.js";
-import { groupBySession, truncateExpandedPart, type ExpansionBudget } from "../src/search.js";
+import {
+  capAndSlice,
+  groupBySession,
+  truncateExpandedPart,
+  type ExpansionBudget,
+} from "../src/search.js";
 import type { PartOutput } from "../src/types.js";
 import { metadataShortlist, mergeShortlistHits, SHORTLIST_MULT } from "../src/plan.js";
 import type { EvidenceClass, SearchResult } from "../src/types.js";
@@ -576,6 +581,61 @@ describe("truncatePreservingMatch", () => {
   it("degrades to a head slice when the cap leaves no useful window", () => {
     const out = truncatePreservingMatch(text, text.indexOf("NEEDLE"), 80);
     expect(out).toBe(text.slice(0, 80));
+  });
+});
+
+describe("capAndSlice class caps", () => {
+  function hit(partID: string, evidenceClass: EvidenceClass): SearchResult {
+    return {
+      sessionID: "s1",
+      sessionTitle: "S",
+      directory: PROJECT_DIR,
+      messageID: `m-${partID}`,
+      role: "assistant",
+      time: 1_000,
+      partID,
+      partType: "tool",
+      pruned: false,
+      snippet: "snip",
+      why: { matchedFields: [], evidenceClass },
+    };
+  }
+
+  it("caps skill-definition to one and file-read to two within the slice", () => {
+    const ordered = [
+      hit("p1", "skill-definition"),
+      hit("p2", "skill-definition"),
+      hit("p3", "file-read"),
+      hit("p4", "file-read"),
+      hit("p5", "file-read"),
+      hit("p6", "tool-output"),
+      hit("p7", "human-text"),
+    ];
+    const final = capAndSlice(ordered, 5, false);
+    expect(final.map((h) => h.partID)).toEqual(["p1", "p3", "p4", "p6", "p7"]);
+  });
+
+  it("backfills held-back hits when caps starve the fill", () => {
+    const ordered = [
+      hit("p1", "skill-definition"),
+      hit("p2", "skill-definition"),
+      hit("p3", "skill-definition"),
+    ];
+    const final = capAndSlice(ordered, 3, false);
+    expect(final.map((h) => h.partID)).toEqual(["p1", "p2", "p3"]);
+  });
+
+  it("promotes a held-back tool-input hit for command-like queries only", () => {
+    const ordered = [hit("p1", "human-text"), hit("p2", "tool-output"), hit("p3", "tool-input")];
+    const commandLike = capAndSlice(ordered, 2, true);
+    expect(commandLike.map((h) => h.partID)).toEqual(["p1", "p3"]);
+
+    const plain = capAndSlice(ordered, 2, false);
+    expect(plain.map((h) => h.partID)).toEqual(["p1", "p2"]);
+
+    // No swap when a tool-input hit is already present.
+    const present = capAndSlice([hit("p0", "tool-input"), ...ordered], 2, true);
+    expect(present.map((h) => h.partID)).toEqual(["p0", "p1"]);
   });
 });
 

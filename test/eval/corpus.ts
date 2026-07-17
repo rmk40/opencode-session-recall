@@ -248,6 +248,28 @@ export function makeEvalCorpus(now = Date.now()): EvalCorpus {
           { title: "tuistory skill" },
         ),
       ]),
+      bundle(assistantMessage("ef-2c", sFlow.id, now - 98_600), [
+        completedToolPart(
+          "ef-2cp",
+          sFlow.id,
+          "ef-2c",
+          "skill",
+          { skill: "tuistory" },
+          "tuistory skill quick reference. " + tuistorySkillPayload(),
+          { title: "tuistory skill reference" },
+        ),
+      ]),
+      bundle(assistantMessage("ef-2b", sFlow.id, now - 98_500), [
+        completedToolPart(
+          "ef-2bp",
+          sFlow.id,
+          "ef-2b",
+          "skill",
+          { skill: "tuistory" },
+          "tuistory skill addendum: opencode-specific notes. " + tuistorySkillPayload(),
+          { title: "tuistory skill addendum" },
+        ),
+      ]),
       bundle(assistantMessage("ef-3", sFlow.id, now - 98_000), [
         completedToolPart(
           "ef-3p",
