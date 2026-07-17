@@ -1144,6 +1144,17 @@ function buildSuggestions(input: {
     });
   }
 
+  // Placed ahead of the generic zero-result hints so the MAX_SUGGESTIONS cap
+  // cannot drop it: when the exclusion removed the caller's session, that is
+  // the likeliest explanation for an empty result.
+  if (input.results.length === 0 && input.currentSessionExcluded) {
+    suggestions.push({
+      reason: "This search excluded the current session.",
+      action: "Pass excludeCurrentSession:false if you meant to search this conversation.",
+      example: { excludeCurrentSession: false },
+    });
+  }
+
   if (input.results.length === 0 && input.matchMode === "literal") {
     suggestions.push({
       reason: "Literal search found no hits.",
@@ -1167,14 +1178,6 @@ function buildSuggestions(input: {
     suggestions.push({
       reason: `Only ${count} ${noun} ${verb} searched.`,
       action: "Remove narrowing filters or increase the sessions limit.",
-    });
-  }
-
-  if (input.results.length === 0 && input.currentSessionExcluded) {
-    suggestions.push({
-      reason: "The current session is excluded from this search by default.",
-      action: "Pass excludeCurrentSession:false if you meant to search this conversation.",
-      example: { excludeCurrentSession: false },
     });
   }
 

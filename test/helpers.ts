@@ -23,6 +23,7 @@ export const TEST_LIMITS: Limits = {
   maxMessages: 50,
   maxWindow: 10,
   defaultWidth: 120,
+  cacheMaxChars: 2_000_000,
 };
 
 type ApiFailure = { data: { message: string } };

@@ -40,6 +40,7 @@ const server: Plugin = async (ctx, options) => {
     maxMessages: clamp(opts.maxMessages, DEFAULTS.maxMessages),
     maxWindow: clamp(opts.maxWindow, DEFAULTS.maxWindow),
     defaultWidth: clamp(opts.defaultWidth, DEFAULTS.defaultWidth, 50),
+    cacheMaxChars: clamp(opts.cacheMaxChars, DEFAULTS.cacheMaxChars),
   };
 
   // Extract the in-process fetch from the v1 client's internals.

@@ -1319,6 +1319,15 @@ describe("recall", () => {
       expect(garbage.ok).toBe(true);
       expect(garbage.results).toEqual([]);
       expect(garbage.coverage?.skippedByReason?.excludedSession).toBe(1);
+
+      // A non-string excludeSessionID must coerce to "unset", not throw.
+      const numericID = await runToolRaw<SearchOutput>(tool, {
+        query: "rate-limit middleware",
+        excludeCurrentSession: false,
+        excludeSessionID: 123,
+      });
+      expect(numericID.ok).toBe(true);
+      expect(numericID.results.some((r) => r.sessionID === "s-current")).toBe(true);
     });
 
     it("excludes an arbitrary session via excludeSessionID", async () => {

@@ -14,6 +14,8 @@ export type Limits = {
   maxMessages: number;
   maxWindow: number;
   defaultWidth: number;
+  /** Total raw-text budget for the in-memory corpus cache (LRU-evicted). */
+  cacheMaxChars: number;
 };
 
 export const DEFAULTS: Limits = {
@@ -24,6 +26,7 @@ export const DEFAULTS: Limits = {
   maxMessages: 50,
   maxWindow: 10,
   defaultWidth: 200,
+  cacheMaxChars: 50_000_000,
 };
 
 export type MatchMode = "literal" | "smart" | "fuzzy" | "regex";
@@ -276,8 +279,11 @@ export function errmsg(e: unknown): string {
   }
 }
 
-export function optionalString(value: string | undefined): string | undefined {
-  const trimmed = value?.trim();
+export function optionalString(value: unknown): string | undefined {
+  // Defensive against the host-bypass path: a raw non-string (number, object)
+  // must coerce to "unset", not throw on .trim().
+  if (typeof value !== "string") return undefined;
+  const trimmed = value.trim();
   return trimmed ? trimmed : undefined;
 }
 
