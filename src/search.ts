@@ -66,7 +66,14 @@ const MAX_NEAR_MISSES = 3;
 const EXPANSION_TRUNCATED = "\n[truncated by recall expansion]";
 
 type ExpandMode = "none" | "context" | "message";
-type ExpansionBudget = { remaining: number; truncated: boolean; partCapped?: boolean };
+export type ExpansionBudget = {
+  remaining: number;
+  truncated: boolean;
+  /** A field was cut because the BUDGET bound it (not the per-field cap). */
+  limitedByBudget?: boolean;
+  /** The per-part cap was the binding constraint for some part. */
+  partCapped?: boolean;
+};
 /** Locate the query's match position in a text, per match mode (-1 if none). */
 type MatchFinder = (text: string) => number;
 type TimeValue = number | string | undefined;
@@ -464,6 +471,7 @@ function truncateExpandedText(
   if (value == null) return undefined;
   if (budget.remaining <= 0) {
     budget.truncated = true;
+    budget.limitedByBudget = true;
     return undefined;
   }
 
@@ -472,6 +480,9 @@ function truncateExpandedText(
     budget.remaining -= value.length;
     return value;
   }
+  // Truncating: record whether the budget (rather than the per-field cap)
+  // was the binding constraint, so the caller can attribute the cut.
+  if (budget.remaining < MAX_EXPANDED_FIELD_CHARS) budget.limitedByBudget = true;
 
   if (allowed <= EXPANSION_TRUNCATED.length) {
     budget.truncated = true;
@@ -494,7 +505,8 @@ function truncateExpandedText(
 
 const SELF_TOOL_REDACTED = "[recall output omitted]";
 
-function truncateExpandedPart(
+/** Exported for direct unit tests of the per-part budget mechanics. */
+export function truncateExpandedPart(
   part: PartOutput,
   budget: ExpansionBudget,
   findMatch?: MatchFinder,
@@ -521,8 +533,11 @@ function truncateExpandedPart(
   budget.remaining -= initialAllowance - partBudget.remaining;
   if (partBudget.truncated) {
     budget.truncated = true;
-    // The part cap (not the global budget) was the binding constraint.
-    if (initialAllowance === MAX_EXPANDED_PART_CHARS && partBudget.remaining === 0) {
+    // The part cap was binding only when a field was cut by the sub-budget
+    // itself (limitedByBudget) AND the sub-budget was the 6k part cap rather
+    // than the global remainder. A lone field cut by the 4k field cap is not
+    // a part-cap event.
+    if (partBudget.limitedByBudget && initialAllowance === MAX_EXPANDED_PART_CHARS) {
       budget.partCapped = true;
     }
   }
@@ -1848,25 +1863,30 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
             return out;
           };
           // Locate the query's match position inside an expanded field so
-          // truncation can preserve the matched region, per the active mode.
-          const smartTokens =
-            matchMode === "smart" || matchMode === "fuzzy" ? parseQuery(args.query).tokens : [];
+          // truncation can preserve the matched region. Built per EFFECTIVE
+          // mode: the smart-to-literal fallback path must locate literally,
+          // not with the smart token list it never matched with.
           const queryLower = args.query.toLowerCase();
-          const findMatch: MatchFinder = (text) => {
-            if (matchMode === "regex" && regex) return regexFirstIndex(regex, text);
-            const lower = text.toLowerCase();
-            if (matchMode === "literal") return lower.indexOf(queryLower);
-            for (const token of smartTokens) {
-              const index = lower.indexOf(token);
-              if (index !== -1) return index;
-            }
-            return -1;
+          let smartTokensMemo: string[] | undefined;
+          const makeFindMatch = (effectiveMode: MatchMode): MatchFinder => {
+            return (text) => {
+              if (effectiveMode === "regex" && regex) return regexFirstIndex(regex, text);
+              const lower = text.toLowerCase();
+              if (effectiveMode === "literal") return lower.indexOf(queryLower);
+              smartTokensMemo ??= parseQuery(args.query).tokens;
+              for (const token of smartTokensMemo) {
+                const index = lower.indexOf(token);
+                if (index !== -1) return index;
+              }
+              return -1;
+            };
           };
 
           const includeExpansion = async <T extends SearchOutput>(
             out: T,
             final: SearchResult[],
             warnings: string[],
+            effectiveMatchMode: MatchMode,
           ): Promise<T> => {
             const expansion = await expandSearchResults(
               final,
@@ -1876,7 +1896,7 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
               normalized.window,
               normalized.expandBudgetMessages,
               normalized.expandBudgetChars,
-              findMatch,
+              makeFindMatch(effectiveMatchMode),
             );
             if (expansion.expanded) out.expanded = expansion.expanded;
             warnings.push(...expansion.warnings);
@@ -1894,7 +1914,7 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
               );
             }
             return includeLoadErrors(
-              attachCommonOutput(await includeExpansion(out, final, warnings), {
+              attachCommonOutput(await includeExpansion(out, final, warnings, effectiveMatchMode), {
                 final,
                 searchedSessions,
                 coverage,

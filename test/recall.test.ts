@@ -1319,7 +1319,7 @@ describe("recall", () => {
   });
 
   describe("expansion match preservation", () => {
-    it("keeps the matched region of an oversized part and warns about the part cap", async () => {
+    it("keeps the matched region of an oversized part during expansion", async () => {
       const h = makeFakeHarness();
       const big = session("s-bigpart", "Big Part", PROJECT_DIR, Date.now());
       h.sessions.push(big);

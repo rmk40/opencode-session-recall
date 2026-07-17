@@ -17,7 +17,8 @@ import {
 } from "../src/extract.js";
 import { parseQuery } from "../src/query.js";
 import { bm25Search } from "../src/bm25.js";
-import { groupBySession } from "../src/search.js";
+import { groupBySession, truncateExpandedPart, type ExpansionBudget } from "../src/search.js";
+import type { PartOutput } from "../src/types.js";
 import { metadataShortlist, mergeShortlistHits, SHORTLIST_MULT } from "../src/plan.js";
 import type { EvidenceClass, SearchResult } from "../src/types.js";
 import { smartSnippet, truncatePreservingMatch } from "../src/snippet.js";
@@ -499,6 +500,48 @@ describe("query plan (codeTokens, shortlist, merge)", () => {
     expect(pa.score).toBeCloseTo(0.4 * SHORTLIST_MULT, 5);
     const pb = merged.find((h) => h.candidate.partID === "pb")!;
     expect(pb.score).toBe(1.0);
+  });
+});
+
+describe("truncateExpandedPart budgets", () => {
+  function toolPart(fields: Partial<PartOutput>): PartOutput {
+    return { id: "p1", type: "tool", pruned: false, toolName: "bash", ...fields };
+  }
+
+  it("caps a multi-field part at the part budget and leaves the rest for siblings", () => {
+    const budget: ExpansionBudget = { remaining: 30_000, truncated: false };
+    const out = truncateExpandedPart(
+      toolPart({
+        content: "c".repeat(5_000),
+        output: "o".repeat(5_000),
+        error: "e".repeat(5_000),
+      }),
+      budget,
+    );
+    // Part consumed exactly the 6k part cap, not 12k+.
+    expect(30_000 - budget.remaining).toBe(6_000);
+    expect(budget.partCapped).toBe(true);
+    expect(budget.truncated).toBe(true);
+    // Fields degrade in order: content gets the field cap, output the rest.
+    expect(out.content?.length).toBeLessThanOrEqual(4_000);
+    expect(out.output?.length).toBeLessThanOrEqual(2_000);
+    expect(out.error).toBeUndefined();
+  });
+
+  it("does not report the part cap for a single field cut by the field cap", () => {
+    const budget: ExpansionBudget = { remaining: 30_000, truncated: false };
+    truncateExpandedPart(toolPart({ output: "o".repeat(10_000) }), budget);
+    expect(30_000 - budget.remaining).toBe(4_000);
+    expect(budget.partCapped).toBeUndefined();
+    expect(budget.truncated).toBe(true);
+  });
+
+  it("attributes cuts to the global budget when it is smaller than the part cap", () => {
+    const budget: ExpansionBudget = { remaining: 1_000, truncated: false };
+    truncateExpandedPart(toolPart({ output: "o".repeat(5_000) }), budget);
+    expect(budget.remaining).toBe(0);
+    expect(budget.partCapped).toBeUndefined();
+    expect(budget.truncated).toBe(true);
   });
 });
 
