@@ -166,11 +166,10 @@ function annotateResult(result: SearchResult): SearchResult {
   return {
     ...result,
     source,
-    directoryRelevance: result.directoryRelevance ?? "unknown",
     why: {
       matchedFields: defaultMatchedFields(result.partType),
       matchedTerms: result.matchedTerms,
-      directoryRelevance: result.directoryRelevance ?? "unknown",
+      directoryRelevance: "unknown",
       recency: recencyLabel(result.time),
       confidence,
       ...result.why,
@@ -593,7 +592,6 @@ function candidateResult(
     snippet: snip,
     toolName: candidate.toolName,
     source: candidate.source ?? sourceForPartType(candidate.partType),
-    directoryRelevance: relevance,
     titleMatch: candidate.titleMatch,
     why: {
       matchedFields: [matchedField],
@@ -806,7 +804,6 @@ function rankedToSearchResults(
             ? r.matchedFields
             : (c.why?.matchedFields ?? defaultMatchedFields(c.partType)),
       },
-      directoryRelevance: relevance,
       titleMatch: c.titleMatch,
     });
 
@@ -1171,7 +1168,8 @@ function directoryRank(relevance: DirectoryRelevance | undefined): number {
 function orderForDirectoryFallback(results: SearchResult[], enabled: boolean): SearchResult[] {
   if (!enabled) return results;
   return [...results].sort((a, b) => {
-    const rankDiff = directoryRank(a.directoryRelevance) - directoryRank(b.directoryRelevance);
+    const rankDiff =
+      directoryRank(a.why?.directoryRelevance) - directoryRank(b.why?.directoryRelevance);
     if (rankDiff !== 0) return rankDiff;
     const scoreDiff = (b.score ?? 0) - (a.score ?? 0);
     if (scoreDiff !== 0) return scoreDiff;
@@ -1184,12 +1182,9 @@ function countDirectoryBuckets(
 ): SearchCoverage["directoryBucketCounts"] | undefined {
   const counts: NonNullable<SearchCoverage["directoryBucketCounts"]> = {};
   for (const result of results) {
-    if (
-      result.directoryRelevance === "exact" ||
-      result.directoryRelevance === "project" ||
-      result.directoryRelevance === "global"
-    ) {
-      counts[result.directoryRelevance] = (counts[result.directoryRelevance] ?? 0) + 1;
+    const relevance = result.why?.directoryRelevance;
+    if (relevance === "exact" || relevance === "project" || relevance === "global") {
+      counts[relevance] = (counts[relevance] ?? 0) + 1;
     }
   }
   return Object.keys(counts).length > 0 ? counts : undefined;
@@ -1430,7 +1425,7 @@ First call: for broad discovery use match:"smart", group:"session", scope:"globa
 
 If memory exists, store only durable findings: preferences, project decisions, reusable root causes, environment facts, behavior corrections, or repeatable success/failure. Do not store ephemeral details, one-off commands, transient errors, or implementation minutiae.
 
-Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (invalid pattern errors). Smart/fuzzy include score/matchedTerms and fall back to literal. Results are snippets; use recall_get/context for full content. loadErrorCount/loadErrors indicate partial session-load failures.`,
+Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (invalid pattern errors). Smart/fuzzy include score/matchedTerms and fall back to literal. Results are snippets; use recall_get/context for full content. coverage reports what was searched; coverage.loadErrors reports partial session-load failures.`,
     args: {
       query: tool.schema.string().min(1).describe("Search text"),
       scope: tool.schema
@@ -1962,6 +1957,7 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
               skippedByReason.filtered = sessionsSkipped - accounted;
             }
           }
+          const incomplete = loadErrorCount > 0;
           const coverage: SearchCoverage = {
             totalSessionsKnown: false,
             sessionsDiscovered,
@@ -1973,20 +1969,16 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
             skippedByReason: Object.keys(skippedByReason).length > 0 ? skippedByReason : undefined,
             directoryBucketsSearched,
             limitedBy: normalized.limitedBy.length > 0 ? normalized.limitedBy : undefined,
+            loadErrors: incomplete
+              ? { count: loadErrorCount, samples: [...loadErrors] }
+              : undefined,
           };
 
           const groupMode: GroupMode = groupArg;
           const isGrouped = groupMode === "session";
-          const incomplete = loadErrorCount > 0;
           const loadErrorSuffix = incomplete
             ? `, ${loadErrorCount} load error${loadErrorCount !== 1 ? "s" : ""}`
             : "";
-          const includeLoadErrors = <T extends SearchOutput>(out: T): T => {
-            if (!incomplete) return out;
-            out.loadErrorCount = loadErrorCount;
-            out.loadErrors = [...loadErrors];
-            return out;
-          };
           // Locate the query's match position inside an expanded field so
           // truncation can preserve the matched region. Built per EFFECTIVE
           // mode: the smart-to-literal fallback path must locate literally,
@@ -2038,8 +2030,9 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
                 `${loadErrorCount} session${loadErrorCount === 1 ? "" : "s"} failed to load; results may be partial.`,
               );
             }
-            return includeLoadErrors(
-              attachCommonOutput(await includeExpansion(out, final, warnings, effectiveMatchMode), {
+            return attachCommonOutput(
+              await includeExpansion(out, final, warnings, effectiveMatchMode),
+              {
                 final,
                 searchedSessions,
                 coverage,
@@ -2054,7 +2047,7 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
                 excludeExplicitOff: excludeExplicit === false,
                 codeTokens: queryMeta.codeTokens,
                 shortlistIDs,
-              }),
+              },
             );
           };
 
@@ -2192,7 +2185,6 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
             const out: SearchOutput = {
               ok: true,
               results: final,
-              scanned,
               total: outTotal,
               truncated,
               group: groupMode,
@@ -2218,7 +2210,6 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
             const out: SearchOutput = {
               ok: true,
               results: final,
-              scanned,
               total: outTotal,
               truncated,
               matchMode: "regex",
@@ -2279,7 +2270,6 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
               const out: SearchOutput = {
                 ok: true,
                 results: final,
-                scanned,
                 total: outTotal,
                 truncated,
                 matchMode: "literal",
@@ -2306,7 +2296,6 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
           const out: SearchOutput = {
             ok: true,
             results: final,
-            scanned,
             total: outTotal,
             truncated,
             matchMode: smartResult.matchMode,

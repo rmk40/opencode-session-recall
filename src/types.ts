@@ -30,7 +30,7 @@ export const DEFAULTS: Limits = {
 };
 
 export type MatchMode = "literal" | "smart" | "fuzzy" | "regex";
-export type DegradeKind = "none" | "time" | "budget" | "fallback";
+export type DegradeKind = "none" | "time" | "fallback";
 export type GroupMode = "part" | "session";
 export type ResultSource = "message" | "title" | "tool" | "reasoning";
 export type DirectoryRelevance = "exact" | "project" | "global" | "unknown";
@@ -90,6 +90,8 @@ export type SearchCoverage = {
     | "timeBudget"
     | "abortSignal"
   >;
+  /** Present when some sessions failed to load; samples are capped. */
+  loadErrors?: { count: number; samples: string[] };
 };
 
 export type ResultWhy = {
@@ -147,7 +149,6 @@ export type SearchResult = {
   topEvidence?: TopEvidence[];
   source?: ResultSource;
   why?: ResultWhy;
-  directoryRelevance?: DirectoryRelevance;
   titleMatch?: {
     title: string;
     matchedTerms?: string[];
@@ -158,18 +159,13 @@ export type SearchOutput = {
   ok: true;
   results: SearchResult[];
   expanded?: ExpandedResult[];
-  scanned: number;
   total: number;
   truncated: boolean;
-  /** Number of sessions whose messages could not be loaded */
-  loadErrorCount?: number;
-  /** Sample message-load failures; omitted when all scanned sessions loaded */
-  loadErrors?: string[];
   /** Which strategy produced the returned results */
   matchMode?: MatchMode;
-  /** Ranking/coverage flag: "fallback" (smart→literal), "budget" (candidate cap
-   *  hit), "time" (search exceeded the time budget — a latency flag, results are
-   *  still BM25-ranked), or "none". */
+  /** Ranking/coverage flag: "fallback" (smart→literal), "time" (search
+   *  exceeded the time budget — a latency flag, results are still
+   *  BM25-ranked), or "none". */
   degradeKind?: DegradeKind;
   /** Which grouping was applied */
   group?: GroupMode;

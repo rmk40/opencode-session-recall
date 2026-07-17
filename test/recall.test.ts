@@ -46,7 +46,6 @@ describe("recall", () => {
     expect(out.group).toBe("part");
     expect(out.results.map((r) => r.sessionID)).toEqual(["s-other", "s-other", "s-other"]);
     expect(out.results.some((r) => r.source === "title")).toBe(true);
-    expect(out.scanned).toBe(2);
     expect(out.truncated).toBe(false);
     expect(out.coverage).toMatchObject({
       sessionsDiscovered: 3,
@@ -124,7 +123,7 @@ describe("recall", () => {
       query: "walkthrough",
       title: "Actualyze",
     });
-    expect(titled.scanned).toBe(1);
+    expect(titled.coverage?.sessionsSearched).toBe(1);
     expect(h.calls.globalList.at(-1)).toEqual({
       search: "Actualyze",
       limit: undefined,
@@ -399,7 +398,7 @@ describe("recall", () => {
       directory: PROJECT_DIR,
       fallback: true,
     });
-    expect(smart.results.find((result) => result.source === "title")?.directoryRelevance).toBe(
+    expect(smart.results.find((result) => result.source === "title")?.why?.directoryRelevance).toBe(
       "exact",
     );
   });
@@ -450,7 +449,7 @@ describe("recall", () => {
       fallback: true,
     });
     expect(fallback.results.some((r) => r.sessionID === "s-other")).toBe(true);
-    expect(fallback.results.find((r) => r.sessionID === "s-other")?.directoryRelevance).toBe(
+    expect(fallback.results.find((r) => r.sessionID === "s-other")?.why?.directoryRelevance).toBe(
       "global",
     );
     expect(fallback.warnings).toContain(
@@ -467,7 +466,6 @@ describe("recall", () => {
       sessions: 1,
       excludeCurrentSession: false,
     });
-    expect(capped.scanned).toBe(1);
     expect(capped.coverage).toMatchObject({
       sessionsEligible: 3,
       sessionsSearched: 1,
@@ -1010,7 +1008,6 @@ describe("recall", () => {
       excludeCurrentSession: false,
     });
     expect(out.results.some((r) => r.sessionID === "s-rare")).toBe(true);
-    expect(out.degradeKind).not.toBe("budget");
   });
 
   it("reports time degradation deterministically", async () => {
@@ -1202,8 +1199,8 @@ describe("recall", () => {
       excludeCurrentSession: false,
     });
     expect(partialOut.results).toHaveLength(3);
-    expect(partialOut.loadErrorCount).toBe(2);
-    expect(partialOut.loadErrors).toEqual(
+    expect(partialOut.coverage?.loadErrors?.count).toBe(2);
+    expect(partialOut.coverage?.loadErrors?.samples).toEqual(
       expect.arrayContaining([
         expect.stringContaining("s-project-2: Unauthorized"),
         expect.stringContaining("s-current: thrown messages: s-current"),
@@ -1222,8 +1219,8 @@ describe("recall", () => {
       excludeCurrentSession: false,
     });
     expect(totalOut.results).toEqual([]);
-    expect(totalOut.loadErrorCount).toBe(3);
-    expect(totalOut.loadErrors).toHaveLength(3);
+    expect(totalOut.coverage?.loadErrors?.count).toBe(3);
+    expect(totalOut.coverage?.loadErrors?.samples).toHaveLength(3);
   });
 
   it("continues explicit session searches when metadata lookup fails", async () => {
@@ -1250,9 +1247,9 @@ describe("recall", () => {
 
     expect(out.ok).toBe(true);
     expect(out.results).toEqual([]);
-    expect(out.scanned).toBe(1);
-    expect(out.loadErrorCount).toBe(1);
-    expect(out.loadErrors?.[0]).toContain("s-missing: Unauthorized");
+    expect(out.coverage?.sessionsSearched).toBe(1);
+    expect(out.coverage?.loadErrors?.count).toBe(1);
+    expect(out.coverage?.loadErrors?.samples[0]).toContain("s-missing: Unauthorized");
   });
 
   it("returns errors for disabled global search, missing current session, and aborts", async () => {
