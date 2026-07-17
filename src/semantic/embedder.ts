@@ -162,22 +162,27 @@ export function parseSafetensors(bytes: Uint8Array): EmbeddingMatrix {
     tensorBytes.byteOffset,
     tensorBytes.byteLength,
   );
+  // Validate byte lengths BEFORE allocating: a malformed header claiming a
+  // huge shape must fail on the guard, not on (or after) the allocation.
   const count = vocabSize * dims;
-  const data = new Float32Array(count);
-
   if (tensor.dtype === "F32") {
     if (tensorBytes.byteLength < count * F32_BYTES) {
       throw new Error("safetensors: F32 tensor data shorter than its declared shape");
     }
-    for (let i = 0; i < count; i++) data[i] = tensorView.getFloat32(i * F32_BYTES, true);
   } else if (tensor.dtype === "F16") {
     if (tensorBytes.byteLength < count * F16_BYTES) {
       throw new Error("safetensors: F16 tensor data shorter than its declared shape");
     }
-    for (let i = 0; i < count; i++)
-      data[i] = halfToFloat(tensorView.getUint16(i * F16_BYTES, true));
   } else {
     throw new Error(`safetensors: unsupported dtype ${tensor.dtype} (only F32 and F16)`);
+  }
+
+  const data = new Float32Array(count);
+  if (tensor.dtype === "F32") {
+    for (let i = 0; i < count; i++) data[i] = tensorView.getFloat32(i * F32_BYTES, true);
+  } else {
+    for (let i = 0; i < count; i++)
+      data[i] = halfToFloat(tensorView.getUint16(i * F16_BYTES, true));
   }
 
   return { data, vocabSize, dims };

@@ -88,11 +88,19 @@ export function mergeShortlistHits(broad: Bm25Hit[], deep: Bm25Hit[], explain: b
   }
   const broadTop = broad[0]?.score ?? 0;
   const fallbackCeiling = broadTop * MIN_RELATIVE_SCORE;
+  // Deep scores are unclamped (base × structural multipliers), so anchoring
+  // on them directly would compound the multiplier stack with SHORTLIST_MULT
+  // (an effective ~mult × 1.1 instead of the documented × 1.1). Normalize to
+  // the deep pass's top first: the anchor is the hit's RELATIVE rank within
+  // the neighborhood, and the neighborhood's best lands at exactly
+  // ceiling × SHORTLIST_MULT.
+  const deepTop = deep.reduce((max, hit) => Math.max(max, hit.score), 0);
+  if (deepTop <= 0) return [...byPart.values()].sort(compareHits);
 
   for (const hit of deep) {
     const ceiling = ceilingBySession.get(hit.candidate.sessionID) ?? fallbackCeiling;
     if (ceiling <= 0) continue;
-    const scaled = hit.score * ceiling * SHORTLIST_MULT;
+    const scaled = (hit.score / deepTop) * ceiling * SHORTLIST_MULT;
     const existing = byPart.get(hit.candidate.partID);
     if (existing && existing.score >= scaled) continue;
     byPart.set(hit.candidate.partID, {
