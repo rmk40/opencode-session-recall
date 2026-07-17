@@ -79,6 +79,9 @@ const server: Plugin = async (ctx, options) => {
   if (opts.prewarm === true) {
     // Fire-and-forget: sync whatever history is visible so the first search
     // (including a hook's, which has a tight wall-clock budget) starts warm.
+    // Peak memory during the warm is bounded by full history, not
+    // cacheMaxChars: everything is pinned by the single sync() until its
+    // release(), after which LRU eviction settles under the cap.
     void (async () => {
       try {
         const resp = global

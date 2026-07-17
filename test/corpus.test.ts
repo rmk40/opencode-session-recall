@@ -118,6 +118,34 @@ describe("CorpusCache", () => {
     again.release();
     expect(again.sessions[0]!.candidates.length).toBe(1);
   });
+
+  it("release() is idempotent and unpin survives double release", async () => {
+    const h = makeFakeHarness();
+    const cache = new CorpusCache(h.client, TEST_LIMITS);
+    const result = await cache.sync([target("s-current", 1_000)]);
+    result.release();
+    result.release();
+    // A later sync still works and still deduplicates correctly.
+    const again = await cache.sync([target("s-current", 1_000)]);
+    again.release();
+    expect(again.sessions[0]!.candidates.length).toBeGreaterThan(0);
+  });
+
+  it("concurrent callers deduping onto one failed fetch each see the failure", async () => {
+    const h = makeFakeHarness({ messageThrows: new Set(["s-current"]) });
+    const cache = new CorpusCache(h.client, TEST_LIMITS);
+    const [a, b] = await Promise.all([
+      cache.sync([target("s-current", 1_000)]),
+      cache.sync([target("s-current", 1_000)]),
+    ]);
+    a.release();
+    b.release();
+    expect(h.calls.messages).toHaveLength(1);
+    expect(a.loadErrorCount).toBe(1);
+    expect(b.loadErrorCount).toBe(1);
+    expect(a.sessions[0]!.loadError).toBeDefined();
+    expect(b.sessions[0]!.loadError).toBeDefined();
+  });
 });
 
 describe("assembleSession", () => {

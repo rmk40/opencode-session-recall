@@ -559,9 +559,12 @@ function scan(
     let matched = false;
     for (const field of candidate.fieldTexts) {
       if (!matches(field.text, query)) continue;
-      total++;
       if (matched) continue;
       matched = true;
+      // Count per matched PART (one result unit), not per matched field:
+      // total must be comparable with results.length and with smart mode's
+      // part-granular total, or truncated can misreport.
+      total++;
       if (results.length < limit) {
         results.push(
           candidateResult(candidate, relevance, field.field, snippet(field.text, query, width)),
@@ -589,9 +592,10 @@ function regexScanCandidates(
     for (const field of candidate.fieldTexts) {
       const matchIndex = regexFirstIndex(re, field.text);
       if (matchIndex === -1) continue;
-      total++;
       if (matched) continue;
       matched = true;
+      // Per matched part, matching scan(); see the note there.
+      total++;
       if (results.length < limit) {
         results.push(
           candidateResult(
