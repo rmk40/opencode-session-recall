@@ -13,6 +13,7 @@ import type { Limits } from "../src/types.js";
 
 export const PROJECT_DIR = "/workspace/project";
 export const OTHER_DIR = "/workspace/other";
+export const GHOST_DIR = "/workspace/ghostauth";
 
 export const TEST_LIMITS: Limits = {
   concurrency: 2,
@@ -89,7 +90,7 @@ export function globalSessionFrom(s: Session): GlobalSession {
     project:
       s.directory === PROJECT_DIR
         ? { id: "project-main", name: "main", worktree: PROJECT_DIR }
-        : { id: "project-other", name: "other", worktree: OTHER_DIR },
+        : { id: "project-other", name: "other", worktree: s.directory },
   } as GlobalSession;
 }
 

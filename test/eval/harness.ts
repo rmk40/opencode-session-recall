@@ -8,7 +8,7 @@
  */
 import type { OpencodeClient } from "@opencode-ai/sdk/v2";
 import type { ToolContext, ToolDefinition } from "@opencode-ai/plugin";
-import type { SearchOutput } from "../../src/types.js";
+import type { EvidenceClass, SearchOutput } from "../../src/types.js";
 import { PROJECT_DIR } from "../helpers.js";
 import { makeEvalCorpus, type EvalCorpus } from "./corpus.js";
 
@@ -58,10 +58,18 @@ export function makeEvalClients(corpus: EvalCorpus = makeEvalCorpus()): {
   };
 }
 
-export function evalContext(): ToolContext {
+/**
+ * Build an eval ToolContext. The default sessionID is deliberately NOT a
+ * corpus session: `recall` excludes the caller's current session by default,
+ * so a corpus default would silently remove that session from every case and
+ * weaken ranking cases that depend on it (e.g. old-strong vs recent-weak
+ * needs e-noise as a live competitor). Cases that test the exclusion set
+ * `ctxSessionID` explicitly.
+ */
+export function evalContext(sessionID = "e-external"): ToolContext {
   return {
-    sessionID: "e-noise",
-    messageID: "en-2",
+    sessionID,
+    messageID: "eval-msg",
     agent: "build",
     directory: PROJECT_DIR,
     worktree: PROJECT_DIR,
@@ -77,6 +85,17 @@ export type EvalCase = {
   args: Record<string, unknown>;
   /** Session ID(s) considered relevant, in no particular order. */
   relevantSessionIDs: string[];
+  /** Current-session id for this case's ToolContext (default: non-corpus id). */
+  ctxSessionID?: string;
+  /** Extra per-case assertions beyond rank metrics. */
+  expect?: {
+    /** Session IDs that must NOT appear anywhere in the results. */
+    notInResults?: string[];
+    /** At least one of these evidence classes must appear in the top 3. */
+    classInTop3?: EvidenceClass[];
+    /** Per-class maximum count within the top 5 results. */
+    maxClassInTop5?: Partial<Record<EvidenceClass, number>>;
+  };
 };
 
 export type CaseResult = {
@@ -88,6 +107,8 @@ export type CaseResult = {
   /** whether any relevant session appeared in the top 5. */
   hitAt5: boolean;
   returnedSessionIDs: string[];
+  /** Evidence class per result, in rank order (undefined until populated). */
+  topClasses: (string | undefined)[];
 };
 
 export type EvalSummary = {
@@ -96,18 +117,24 @@ export type EvalSummary = {
   cases: CaseResult[];
 };
 
-/** Run one case through the search tool and score it by session rank. */
+/** Run one case through the search tool and score it by session rank. A case
+ *  with `ctxSessionID` gets its own context; otherwise the shared default. */
 export async function runCase(
   searchTool: ToolDefinition,
   c: EvalCase,
-  ctx: ToolContext,
+  ctx?: ToolContext,
 ): Promise<CaseResult> {
-  const raw = await searchTool.execute(c.args as Parameters<typeof searchTool.execute>[0], ctx);
+  const caseCtx = c.ctxSessionID ? evalContext(c.ctxSessionID) : (ctx ?? evalContext());
+  const raw = await searchTool.execute(c.args as Parameters<typeof searchTool.execute>[0], caseCtx);
   const parsed = JSON.parse(raw) as SearchOutput | { ok: false; error: string };
 
   const returnedSessionIDs: string[] = [];
+  const topClasses: (string | undefined)[] = [];
   if ("ok" in parsed && parsed.ok) {
-    for (const r of parsed.results) returnedSessionIDs.push(r.sessionID);
+    for (const r of parsed.results) {
+      returnedSessionIDs.push(r.sessionID);
+      topClasses.push(r.why?.evidenceClass);
+    }
   }
 
   const relevant = new Set(c.relevantSessionIDs);
@@ -127,13 +154,14 @@ export async function runCase(
     rr: firstRelevantRank > 0 ? 1 / firstRelevantRank : 0,
     hitAt5,
     returnedSessionIDs,
+    topClasses,
   };
 }
 
 export async function runEval(
   searchTool: ToolDefinition,
   cases: EvalCase[],
-  ctx: ToolContext,
+  ctx?: ToolContext,
 ): Promise<EvalSummary> {
   const results: CaseResult[] = [];
   for (const c of cases) {

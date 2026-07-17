@@ -89,4 +89,20 @@ export const EVAL_CASES: EvalCase[] = [
     },
     relevantSessionIDs: ["e-auth"],
   },
+  {
+    // Field report: historical-workflow discovery. The current conversation
+    // (e-cur) parrots the whole query; default current-session exclusion must
+    // keep it out so the real workflow session (e-flow, misleading title in
+    // the ghostauth directory) can surface.
+    name: "field-report: prior ghostauth/tuistory workflow excludes current session",
+    args: {
+      query: "ghostauth tuistory test opencode plugin auth login debug workflow",
+      match: "smart",
+      group: "session",
+      scope: "global",
+    },
+    ctxSessionID: "e-cur",
+    relevantSessionIDs: ["e-flow"],
+    expect: { notInResults: ["e-cur"] },
+  },
 ];

@@ -32,6 +32,22 @@ export type GroupMode = "part" | "session";
 export type ResultSource = "message" | "title" | "tool" | "reasoning";
 export type DirectoryRelevance = "exact" | "project" | "global" | "unknown";
 
+/**
+ * What kind of evidence a hit is, derived deterministically from part type,
+ * tool name, and which fields matched. Generated reference material
+ * (skill-definition, file-read) is distinguished from concrete actions
+ * (tool-input) and conversational statements (human-text) so ranking and
+ * grouping can prefer the latter for "what did we do before" queries.
+ */
+export type EvidenceClass =
+  | "human-text" // text part, user or assistant
+  | "reasoning"
+  | "tool-input" // hit matched in command/cwd/toolName fields (incl. JSON input)
+  | "tool-output"
+  | "file-read" // tool name suffix-matches "read"
+  | "skill-definition" // tool name suffix-matches "skill"
+  | "session-title";
+
 export type SearchSuggestion = {
   reason: string;
   action: string;
@@ -65,6 +81,7 @@ export type SearchCoverage = {
     | "sessionsLimit"
     | "maxSessions"
     | "providerLimit"
+    | "excludedSession"
     | "loadError"
     | "rankingBudget"
     | "timeBudget"
@@ -80,6 +97,7 @@ export type ResultWhy = {
   directoryRelevance?: DirectoryRelevance;
   recency?: "recent" | "older" | "unknown";
   confidence?: "high" | "medium" | "low";
+  evidenceClass?: EvidenceClass;
 };
 
 export type NearMiss = {

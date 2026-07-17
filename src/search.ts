@@ -1106,6 +1106,11 @@ function buildSuggestions(input: {
   matchMode: MatchMode;
   type: string | undefined;
   query: string;
+  currentSessionID?: string;
+  /** The current session was actually removed from this search's targets. */
+  currentSessionExcluded: boolean;
+  /** Caller explicitly passed excludeCurrentSession:false. */
+  excludeExplicitOff: boolean;
 }): SearchSuggestion[] | undefined {
   const suggestions: SearchSuggestion[] = [];
   const onlyTitleHits =
@@ -1165,6 +1170,25 @@ function buildSuggestions(input: {
     });
   }
 
+  if (input.results.length === 0 && input.currentSessionExcluded) {
+    suggestions.push({
+      reason: "The current session is excluded from this search by default.",
+      action: "Pass excludeCurrentSession:false if you meant to search this conversation.",
+      example: { excludeCurrentSession: false },
+    });
+  }
+
+  if (input.excludeExplicitOff && input.currentSessionID && input.results.length > 0) {
+    const top = input.results.slice(0, Math.min(5, input.results.length));
+    const fromCurrent = top.filter((result) => result.sessionID === input.currentSessionID).length;
+    if (fromCurrent * 2 >= top.length) {
+      suggestions.push({
+        reason: "Most top hits are from this conversation, not prior history.",
+        action: "Drop excludeCurrentSession:false so prior sessions rank instead.",
+      });
+    }
+  }
+
   return suggestions.length > 0 ? suggestions.slice(0, MAX_SUGGESTIONS) : undefined;
 }
 
@@ -1197,6 +1221,9 @@ function attachCommonOutput<T extends SearchOutput>(
     matchMode: MatchMode;
     type: string | undefined;
     query: string;
+    currentSessionID?: string;
+    currentSessionExcluded: boolean;
+    excludeExplicitOff: boolean;
   },
 ): T {
   input.coverage.directoryBucketCounts = countDirectoryBuckets(input.final);
@@ -1211,6 +1238,9 @@ function attachCommonOutput<T extends SearchOutput>(
     matchMode: input.matchMode,
     type: input.type,
     query: input.query,
+    currentSessionID: input.currentSessionID,
+    currentSessionExcluded: input.currentSessionExcluded,
+    excludeExplicitOff: input.excludeExplicitOff,
   });
   if (suggestions) out.suggestions = suggestions;
   const nearMisses = buildNearMisses(input.final, input.allLoaded);
@@ -1233,7 +1263,7 @@ Call when history could change the approach: debugging errors, investigating beh
 
 Skip trivial commands, simple local code/file lookup, simple edits with full context, ordinary code tasks where prior history would not change the approach, or anything not helped by past conversations.
 
-First call: for broad discovery use match:"smart", group:"session", scope:"global" (default), 5-10 results, and short terms from error text/feature/config/file/decision. Use role:"user" for requirements/decisions. Use expand:"context" or "message" when top-hit evidence will avoid a follow-up.
+First call: for broad discovery use match:"smart", group:"session", scope:"global" (default), 5-10 results, and short terms from error text/feature/config/file/decision. The current session is excluded by default; pass excludeCurrentSession:false to search it (or use scope:"session"). Use role:"user" for requirements/decisions. Use expand:"context" or "message" when top-hit evidence will avoid a follow-up.
 
 If memory exists, store only durable findings: preferences, project decisions, reusable root causes, environment facts, behavior corrections, or repeatable success/failure. Do not store ephemeral details, one-off commands, transient errors, or implementation minutiae.
 
@@ -1254,6 +1284,11 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
         .default("part")
         .describe("part=per hit, session=one per session with hitCount"),
       sessionID: tool.schema.string().optional().describe("Specific session; overrides scope"),
+      excludeCurrentSession: tool.schema
+        .boolean()
+        .optional()
+        .describe("Default true for project/global scopes; false includes this session"),
+      excludeSessionID: tool.schema.string().optional().describe("Exclude one session by ID"),
       type: tool.schema
         .enum(["text", "tool", "reasoning", "all"])
         .default("all")
@@ -1442,6 +1477,16 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
       const title = optionalString(args.title);
       const directory = optionalString(args.directory);
       const toolName = optionalString(args.toolName);
+      const excludeSessionID = optionalString(args.excludeSessionID);
+      // Scope-aware default: exclude the caller's own session for broad
+      // history discovery, but never when the caller targeted a specific
+      // session. The schema deliberately has no Zod default so an explicit
+      // `true` stays distinguishable from the implicit default (a Zod-
+      // materialized `true` would hard-error every scope:"session" call).
+      const excludeExplicit =
+        typeof args.excludeCurrentSession === "boolean" ? args.excludeCurrentSession : undefined;
+      const currentSessionID = optionalString(ctx.sessionID);
+      const excludeCurrent = excludeExplicit ?? (scope !== "session" && !sessionID);
       const requestedSessions =
         args.sessions == null
           ? undefined
@@ -1456,6 +1501,23 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
 
       if (toolName && partType !== "all" && partType !== "tool") {
         return fail('toolName can only be used with type:"all" or type:"tool"');
+      }
+
+      // Contradictory exclusion filters are caller errors, but only when the
+      // exclusion was explicit — the implicit default never conflicts because
+      // it does not apply to session scope or explicit sessionID targets.
+      if (excludeExplicit === true && scope === "session") {
+        return fail(
+          'excludeCurrentSession cannot be combined with scope:"session"; the search would exclude its only target',
+        );
+      }
+      if (sessionID && excludeSessionID && sessionID === excludeSessionID) {
+        return fail("sessionID and excludeSessionID refer to the same session");
+      }
+      if (excludeExplicit === true && sessionID && currentSessionID === sessionID) {
+        return fail(
+          "sessionID targets the current session but excludeCurrentSession is true; drop one of them",
+        );
       }
 
       // Compile the regex up front so an invalid pattern is a clean caller error.
@@ -1595,8 +1657,33 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
 
         const discoveredTargets = dedupeSessions(targets);
         const skippedByReason: Record<string, number> = {};
+
+        // Session exclusion is a metadata filter on the eligible set.
+        // discoveredTargets stays untouched so sessionsDiscovered keeps
+        // counting everything found and the sessionsSkipped reconciliation
+        // below stays consistent.
+        const excludedIDs = new Set(
+          [excludeSessionID, excludeCurrent ? currentSessionID : undefined].filter(
+            (id): id is string => Boolean(id),
+          ),
+        );
+        const consideredTargets =
+          excludedIDs.size > 0
+            ? discoveredTargets.filter((target) => !excludedIDs.has(target.id))
+            : discoveredTargets;
+        const excludedCount = discoveredTargets.length - consideredTargets.length;
+        const currentSessionExcluded = Boolean(
+          excludeCurrent &&
+          currentSessionID &&
+          discoveredTargets.some((target) => target.id === currentSessionID),
+        );
+        if (excludedCount > 0) {
+          skippedByReason.excludedSession = excludedCount;
+          pushUnique(normalized.limitedBy, "excludedSession");
+        }
+
         let directoryBucketsSearched: SearchCoverage["directoryBucketsSearched"];
-        let sessionsEligible = discoveredTargets.length;
+        let sessionsEligible = consideredTargets.length;
         if (directory) {
           pushUnique(normalized.limitedBy, "directory");
           const fallbackWorktree = optionalString(ctx.worktree) ?? optionalString(ctx.directory);
@@ -1605,7 +1692,7 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
               "Directory fallback could not identify a project/worktree bucket; using exact and global buckets only.",
             );
           }
-          const bucketed = discoveredTargets.map((target) =>
+          const bucketed = consideredTargets.map((target) =>
             withDirectoryRelevance(
               target,
               classifyDirectoryRelevance(target, directory, fallbackWorktree),
@@ -1633,7 +1720,7 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
           } else {
             targets = exact;
             sessionsEligible = targets.length;
-            const skipped = discoveredTargets.length - targets.length;
+            const skipped = consideredTargets.length - targets.length;
             if (skipped > 0) skippedByReason.directory = skipped;
             directoryBucketsSearched = exact.length > 0 ? ["exact"] : [];
           }
@@ -1644,7 +1731,7 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
             targets = targets.slice(0, requestedSessions);
           }
         } else {
-          targets = discoveredTargets.map((target) => withDirectoryRelevance(target, "unknown"));
+          targets = consideredTargets.map((target) => withDirectoryRelevance(target, "unknown"));
           sessionsEligible = targets.length;
         }
 
@@ -1797,6 +1884,9 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
               matchMode: effectiveMatchMode,
               type: partType,
               query: args.query,
+              currentSessionID,
+              currentSessionExcluded,
+              excludeExplicitOff: excludeExplicit === false,
             }),
           );
         };

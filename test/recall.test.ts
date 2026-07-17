@@ -46,14 +46,16 @@ describe("recall", () => {
     expect(out.group).toBe("part");
     expect(out.results.map((r) => r.sessionID)).toEqual(["s-other", "s-other", "s-other"]);
     expect(out.results.some((r) => r.source === "title")).toBe(true);
-    expect(out.scanned).toBe(3);
+    expect(out.scanned).toBe(2);
     expect(out.truncated).toBe(false);
     expect(out.coverage).toMatchObject({
       sessionsDiscovered: 3,
-      sessionsSearched: 3,
-      sessionsSkipped: 0,
+      sessionsSearched: 2,
+      sessionsSkipped: 1,
       totalSessionsKnown: false,
+      skippedByReason: { excludedSession: 1 },
     });
+    expect(out.coverage?.limitedBy).toContain("excludedSession");
   });
 
   it("routes project, current-session, and explicit-session searches correctly", async () => {
@@ -92,6 +94,7 @@ describe("recall", () => {
       scope: "project",
       type: "tool",
       role: "assistant",
+      excludeCurrentSession: false,
     });
     expect(toolOnly.results).toHaveLength(1);
     expect(toolOnly.results[0]).toMatchObject({
@@ -105,6 +108,7 @@ describe("recall", () => {
       query: "unauthorized",
       scope: "project",
       before: unauthorizedAt,
+      excludeCurrentSession: false,
     });
     expect(before.results).toEqual([]);
 
@@ -112,6 +116,7 @@ describe("recall", () => {
       query: "unauthorized",
       scope: "project",
       after: unauthorizedAt - 1,
+      excludeCurrentSession: false,
     });
     expect(after.results).toHaveLength(1);
 
@@ -425,6 +430,7 @@ describe("recall", () => {
       query: "rate",
       directory: PROJECT_DIR,
       results: 10,
+      excludeCurrentSession: false,
     });
 
     expect(out.results.some((r) => r.sessionID === "s-current")).toBe(true);
@@ -459,6 +465,7 @@ describe("recall", () => {
       query: "rate",
       directory: PROJECT_DIR,
       sessions: 1,
+      excludeCurrentSession: false,
     });
     expect(capped.scanned).toBe(1);
     expect(capped.coverage).toMatchObject({
@@ -490,6 +497,7 @@ describe("recall", () => {
       query: "unauthorized",
       scope: "project",
       toolName: "bash",
+      excludeCurrentSession: false,
     });
     expect(bash.results).toHaveLength(1);
     expect(bash.results[0]).toMatchObject({ partType: "tool", toolName: "bash" });
@@ -579,10 +587,12 @@ describe("recall", () => {
       query: "CHECKOUT",
       scope: "project",
       results: 10,
+      excludeCurrentSession: false,
     });
     const punctuation = await runTool<SearchOutput>(tool, {
       query: "C++",
       scope: "project",
+      excludeCurrentSession: false,
     });
 
     expect(mixedCase.results.length).toBeGreaterThan(1);
@@ -598,6 +608,7 @@ describe("recall", () => {
       query: "rate",
       scope: "project",
       results: 1,
+      excludeCurrentSession: false,
     });
     expect(ungrouped.results).toHaveLength(1);
     expect(ungrouped.truncated).toBe(true);
@@ -607,6 +618,7 @@ describe("recall", () => {
       scope: "project",
       group: "session",
       results: 1,
+      excludeCurrentSession: false,
     });
     expect(grouped.results).toHaveLength(1);
     expect(grouped.total).toBe(2);
@@ -624,6 +636,7 @@ describe("recall", () => {
     const baseline = await runTool<SearchOutput>(tool, {
       query: "unauthorized",
       scope: "project",
+      excludeCurrentSession: false,
     });
     expect(baseline.expanded).toBeUndefined();
 
@@ -631,6 +644,7 @@ describe("recall", () => {
       query: "unauthorized",
       scope: "project",
       expand: "message",
+      excludeCurrentSession: false,
     });
     expect(expanded.expanded).toHaveLength(1);
     expect(expanded.expanded?.[0]).toMatchObject({
@@ -697,6 +711,7 @@ describe("recall", () => {
       query: "large-expand-token",
       scope: "project",
       expand: "message",
+      excludeCurrentSession: false,
     });
 
     const output = out.expanded?.[0]?.message?.parts[0]?.output;
@@ -750,6 +765,7 @@ describe("recall", () => {
       scope: "project",
       expand: "context",
       window: 1,
+      excludeCurrentSession: false,
     });
 
     expect(out.expanded).toHaveLength(1);
@@ -776,6 +792,7 @@ describe("recall", () => {
       scope: "project",
       expand: "context",
       window: 0,
+      excludeCurrentSession: false,
     });
 
     expect(out.expanded?.[0]?.messages?.map((m) => [m.message.id, m.center])).toEqual([
@@ -791,6 +808,7 @@ describe("recall", () => {
       expand: "context",
       window: "auto",
       expandBudgetMessages: 1,
+      excludeCurrentSession: false,
     });
 
     expect(out.expanded?.[0]?.messages?.map((m) => [m.message.id, m.center])).toEqual([
@@ -890,6 +908,7 @@ describe("recall", () => {
       results: 10,
       expand: "message",
       expandResults: 2,
+      excludeCurrentSession: false,
     });
     expect(expanded.results.length).toBeGreaterThan(2);
     expect(expanded.expanded).toHaveLength(2);
@@ -902,6 +921,7 @@ describe("recall", () => {
       expandResults: 3,
       window: 5,
       expandBudgetMessages: 2,
+      excludeCurrentSession: false,
     });
     expect(tooLarge.results.length).toBeGreaterThan(0);
     expect(tooLarge.expanded?.length).toBeGreaterThan(0);
@@ -919,6 +939,7 @@ describe("recall", () => {
       results: 2,
       expand: "message",
       expandResults: 2,
+      excludeCurrentSession: false,
     });
 
     expect(out.results).toHaveLength(2);
@@ -1005,11 +1026,13 @@ describe("recall", () => {
     const self = await runTool<SearchOutput>(tool, {
       query: "unique-self-recall-result",
       scope: "project",
+      excludeCurrentSession: false,
     });
     const unrelated = await runTool<SearchOutput>(tool, {
       query: "unauthorized",
       scope: "project",
       type: "tool",
+      excludeCurrentSession: false,
     });
 
     expect(self.results).toEqual([]);
@@ -1036,9 +1059,11 @@ describe("recall", () => {
     const projectOut = await runTool<SearchOutput>(recallTool(h), {
       query: "walkthrough",
       scope: "project",
+      excludeCurrentSession: false,
     });
     const globalOut = await runTool<SearchOutput>(recallTool(h), {
       query: "walkthrough",
+      excludeCurrentSession: false,
     });
 
     const projectSessionIDs = new Set(h.sessions.map((s) => s.id));
@@ -1128,6 +1153,7 @@ describe("recall", () => {
       {
         query: "totally-absent-token",
         scope: "project",
+        excludeCurrentSession: false,
       },
     );
     expect(multi.coverage?.sessionsSearched).toBe(2);
@@ -1160,6 +1186,7 @@ describe("recall", () => {
     });
     const partialOut = await runTool<SearchOutput>(recallTool(partial), {
       query: "walkthrough",
+      excludeCurrentSession: false,
     });
     expect(partialOut.results).toHaveLength(3);
     expect(partialOut.loadErrorCount).toBe(2);
@@ -1179,6 +1206,7 @@ describe("recall", () => {
     });
     const totalOut = await runTool<SearchOutput>(recallTool(total), {
       query: "walkthrough",
+      excludeCurrentSession: false,
     });
     expect(totalOut.results).toEqual([]);
     expect(totalOut.loadErrorCount).toBe(3);
@@ -1250,5 +1278,101 @@ describe("recall", () => {
 
     expect(out).toEqual({ ok: false, error: "aborted" });
     expect(h.calls.messages).toHaveLength(1);
+  });
+
+  describe("current-session exclusion", () => {
+    it("excludes the current session by default", async () => {
+      const out = await runTool<SearchOutput>(recallTool(makeFakeHarness()), {
+        query: "rate-limit middleware",
+      });
+
+      expect(out.results).toEqual([]);
+      expect(out.coverage?.skippedByReason?.excludedSession).toBe(1);
+      expect(out.coverage?.limitedBy).toContain("excludedSession");
+      const excluded = out.suggestions?.find((s) => s.reason.includes("current session"));
+      expect(excluded?.example).toEqual({ excludeCurrentSession: false });
+    });
+
+    it("includes the current session when excludeCurrentSession is false", async () => {
+      const out = await runTool<SearchOutput>(recallTool(makeFakeHarness()), {
+        query: "rate-limit middleware",
+        excludeCurrentSession: false,
+      });
+
+      expect(out.results.some((r) => r.sessionID === "s-current")).toBe(true);
+    });
+
+    it("applies the default when hosts bypass Zod parsing", async () => {
+      const tool = recallTool(makeFakeHarness());
+
+      const missing = await runToolRaw<SearchOutput>(tool, {
+        query: "rate-limit middleware",
+      });
+      expect(missing.ok).toBe(true);
+      expect(missing.results).toEqual([]);
+      expect(missing.coverage?.skippedByReason?.excludedSession).toBe(1);
+
+      const garbage = await runToolRaw<SearchOutput>(tool, {
+        query: "rate-limit middleware",
+        excludeCurrentSession: "yes",
+      });
+      expect(garbage.ok).toBe(true);
+      expect(garbage.results).toEqual([]);
+      expect(garbage.coverage?.skippedByReason?.excludedSession).toBe(1);
+    });
+
+    it("excludes an arbitrary session via excludeSessionID", async () => {
+      const out = await runTool<SearchOutput>(recallTool(makeFakeHarness()), {
+        query: "walkthrough",
+        excludeSessionID: "s-other",
+        excludeCurrentSession: false,
+      });
+
+      expect(out.results.every((r) => r.sessionID !== "s-other")).toBe(true);
+      expect(out.results).toEqual([]);
+      expect(out.coverage?.skippedByReason?.excludedSession).toBe(1);
+    });
+
+    it("rejects contradictory exclusion arguments", async () => {
+      const tool = recallTool(makeFakeHarness());
+
+      const sessionScope = await runTool<ErrorOutput>(tool, {
+        query: "x",
+        scope: "session",
+        excludeCurrentSession: true,
+      });
+      expect(sessionScope.ok).toBe(false);
+      expect(sessionScope.error).toContain('scope:"session"');
+
+      const sameSession = await runTool<ErrorOutput>(tool, {
+        query: "x",
+        sessionID: "s-other",
+        excludeSessionID: "s-other",
+      });
+      expect(sameSession.ok).toBe(false);
+
+      const currentTarget = await runTool<ErrorOutput>(tool, {
+        query: "x",
+        sessionID: "s-current",
+        excludeCurrentSession: true,
+      });
+      expect(currentTarget.ok).toBe(false);
+    });
+
+    it("suggests dropping excludeCurrentSession:false when the current session dominates", async () => {
+      const out = await runTool<SearchOutput>(recallTool(makeFakeHarness()), {
+        query: "rate",
+        scope: "project",
+        excludeCurrentSession: false,
+      });
+
+      const top = out.results.slice(0, 5);
+      const fromCurrent = top.filter((r) => r.sessionID === "s-current").length;
+      expect(fromCurrent * 2).toBeGreaterThanOrEqual(top.length);
+      const dominance = out.suggestions?.find((s) =>
+        s.reason.startsWith("Most top hits are from this conversation"),
+      );
+      expect(dominance).toBeDefined();
+    });
   });
 });

@@ -50,4 +50,35 @@ describe("recall relevance eval", () => {
       expect(c.relevantSessionIDs.length).toBeGreaterThan(0);
     }
   });
+
+  it("meets per-case expectations (exclusions, evidence classes)", async () => {
+    const summary = await runEval(searchTool, EVAL_CASES, ctx);
+    for (const [index, c] of EVAL_CASES.entries()) {
+      const result = summary.cases[index]!;
+      if (!c.expect) continue;
+
+      for (const banned of c.expect.notInResults ?? []) {
+        expect(
+          result.returnedSessionIDs,
+          `${c.name}: session ${banned} must not appear in results`,
+        ).not.toContain(banned);
+      }
+
+      if (c.expect.classInTop3) {
+        const top3 = result.topClasses.slice(0, 3);
+        expect(
+          c.expect.classInTop3.some((cls) => top3.includes(cls)),
+          `${c.name}: expected one of [${c.expect.classInTop3.join(", ")}] in top-3 classes, got [${top3.join(", ")}]`,
+        ).toBe(true);
+      }
+
+      for (const [cls, max] of Object.entries(c.expect.maxClassInTop5 ?? {})) {
+        const count = result.topClasses.slice(0, 5).filter((got) => got === cls).length;
+        expect(
+          count,
+          `${c.name}: class ${cls} appears ${count} times in top 5 (max ${max})`,
+        ).toBeLessThanOrEqual(max as number);
+      }
+    }
+  });
 });

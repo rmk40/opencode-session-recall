@@ -171,6 +171,25 @@ describe("autoRecall hook", () => {
     expect(synthetic?.type).toBe("text");
   });
 
+  it("excludes the session it fires in from injected citations", async () => {
+    const h = makeFakeHarness();
+    const hook = autoRecall(h.client, h.unscoped, true, TEST_LIMITS);
+    const output = {
+      message: { id: "m-x" } as never,
+      // "rate limit" matches both s-current (rate-limit middleware) and
+      // s-project-2 (rateLimit cache); only the latter may be cited.
+      parts: [
+        { type: "text", text: "what did we decide about rate limit last time?" },
+      ] as unknown[],
+    };
+    await hook({ sessionID: "s-current" } as never, output as never);
+    const synthetic = (output.parts as Array<{ synthetic?: boolean; text?: string }>).find(
+      (p) => p.synthetic,
+    );
+    expect(synthetic?.text).toContain(`session ${"s-project-2".slice(0, 8)}`);
+    expect(synthetic?.text).not.toContain(`session ${"s-current".slice(0, 8)}`);
+  });
+
   it("does nothing when the gate does not fire", async () => {
     const h = makeFakeHarness();
     const hook = autoRecall(h.client, h.unscoped, true, TEST_LIMITS);
