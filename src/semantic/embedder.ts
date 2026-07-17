@@ -58,6 +58,8 @@ const MAX_EMBED_INPUT_CHARS = 2_000;
 const DEFAULT_CONTINUING_PREFIX = "##";
 const SAFETENSORS_HEADER_LENGTH_BYTES = 8;
 const F16_BYTES = 2;
+/** Allocation guard for untrusted shapes (~500M floats = 2GB). */
+const MAX_TENSOR_ELEMENTS = 500_000_000;
 const F32_BYTES = 4;
 
 // ── safetensors parsing ────────────────────────────────────────────────────
@@ -104,7 +106,7 @@ export function parseSafetensors(bytes: Uint8Array): EmbeddingMatrix {
   const headerLength = Number(view.getBigUint64(0, true));
   const headerStart = SAFETENSORS_HEADER_LENGTH_BYTES;
   const dataStart = headerStart + headerLength;
-  if (dataStart > bytes.byteLength) {
+  if (!Number.isSafeInteger(headerLength) || headerLength <= 0 || dataStart > bytes.byteLength) {
     throw new Error("safetensors: header length exceeds file size");
   }
 
@@ -126,11 +128,34 @@ export function parseSafetensors(bytes: Uint8Array): EmbeddingMatrix {
     throw new Error("safetensors: could not locate the embeddings tensor");
   }
 
+  // Untrusted bytes: validate shape and offsets before any allocation or
+  // subarray arithmetic (negative offsets, non-integers, and oversized
+  // shapes must fail cleanly, not allocate or read out of bounds).
   const [vocabSize, dims] = tensor.shape;
-  if (!vocabSize || !dims) {
+  if (
+    !Number.isSafeInteger(vocabSize) ||
+    !Number.isSafeInteger(dims) ||
+    !vocabSize ||
+    !dims ||
+    vocabSize <= 0 ||
+    dims <= 0 ||
+    vocabSize * dims > MAX_TENSOR_ELEMENTS
+  ) {
     throw new Error(`safetensors: unexpected embeddings shape ${JSON.stringify(tensor.shape)}`);
   }
   const [offsetStart, offsetEnd] = tensor.data_offsets;
+  const dataLength = bytes.byteLength - dataStart;
+  if (
+    !Number.isSafeInteger(offsetStart) ||
+    !Number.isSafeInteger(offsetEnd) ||
+    offsetStart < 0 ||
+    offsetEnd < offsetStart ||
+    offsetEnd > dataLength
+  ) {
+    throw new Error(
+      `safetensors: tensor offsets ${JSON.stringify(tensor.data_offsets)} out of bounds`,
+    );
+  }
   const tensorBytes = bytes.subarray(dataStart + offsetStart, dataStart + offsetEnd);
   const tensorView = new DataView(
     tensorBytes.buffer,
@@ -313,8 +338,24 @@ export class SemanticEmbedder {
    *                      downloaded on first use.
    */
   constructor(model: string, artifactsDir?: string) {
+    // The model id becomes both a URL path segment and a cache directory
+    // path; an unvalidated value could traverse out of the cache dir or
+    // alter the remote request. Enforce the strict HuggingFace `org/name`
+    // shape (single slash, word/dot/dash segments, no leading dots).
+    if (!SemanticEmbedder.isValidModelID(model)) {
+      throw new Error(
+        `invalid semantic model id ${JSON.stringify(model)}; expected "org/name" (letters, digits, ., _, -)`,
+      );
+    }
     this.model = model;
     this.artifactsDirOverride = artifactsDir;
+  }
+
+  static isValidModelID(model: string): boolean {
+    return (
+      /^[A-Za-z0-9][A-Za-z0-9._-]*\/[A-Za-z0-9][A-Za-z0-9._-]*$/.test(model) &&
+      !model.includes("..")
+    );
   }
 
   get ready(): boolean {

@@ -149,11 +149,12 @@ export function formatAutoRecallBlock(results: SearchResult[]): string | undefin
  * `Promise.race` against the timeout means the hook resolves promptly once
  * control returns to the event loop after ~SEARCH_TIMEOUT_MS — it cannot
  * preempt synchronous work that is currently blocking the loop. The aborted
- * controller stops the search's own work at the next checkpoint: between async
- * session-load batches, and between sessions during synchronous candidate
- * building (smartScan also checks the wall-clock deadline there). A single
- * in-flight synchronous BM25 exec can't be interrupted, but the candidate/char
- * budgets bound it. We also cap the session scan (history default is unbounded).
+ * controller stops the search's own work at the next checkpoint: between
+ * cache-sync batches, and between sessions during synchronous pool assembly
+ * (smartScan also checks the wall-clock deadline there). A single in-flight
+ * synchronous BM25 exec can't be interrupted; a warm corpus cache keeps it
+ * well under the timeout, and a cold cache simply times out (injecting
+ * nothing) until warm.
  */
 async function runAutoSearch(
   searchTool: ToolDefinition,

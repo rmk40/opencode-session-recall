@@ -57,6 +57,8 @@ export type CachedSession = {
   candidates: Candidate[];
   /** Content-derived session digest (may be empty); see buildSessionDigest. */
   digestText: string;
+  /** Candidate embeddings were computed (or no embedder is configured). */
+  embedded: boolean;
   messageCount: number;
   charCount: number;
   lastAccess: number;
@@ -385,6 +387,7 @@ export class CorpusCache {
       const existing = this.sessions.get(target.id);
       if (existing && existing.meta.updated === target.updated) {
         existing.lastAccess = ++this.clock;
+        this.ensureEmbeddings(existing);
         return {
           meta: existing.meta,
           candidates: existing.candidates,
@@ -444,26 +447,21 @@ export class CorpusCache {
       const normalizedDigest = digestText ? normalize(digestText) : "";
       for (const candidate of candidates) candidate.digestText = normalizedDigest;
 
-      // Opt-in semantic layer: embed each candidate once per session version,
-      // amortized exactly like tokenization. Only when the model is already
-      // ready — init() is never awaited here, so a cold embedder leaves
-      // candidates unembedded and searches stay lexical until it warms.
-      // Embeddings are deliberately NOT counted toward charCount (eviction is
-      // sized by raw text, not vector memory).
-      if (this.embedder?.ready) {
-        for (const candidate of candidates) {
-          candidate.embedding = this.embedder.embed(candidate.rawText);
-        }
-      }
-
       const entry: CachedSession = {
         meta: { ...target },
         candidates,
         digestText,
+        embedded: false,
         messageCount: messages.length,
         charCount: charsUsed,
         lastAccess: ++this.clock,
       };
+      // Opt-in semantic layer: embed once per session version, amortized like
+      // tokenization. A cold embedder leaves the entry unembedded; the
+      // cache-hit path retries once the model warms (see ensureEmbeddings),
+      // so a corpus filled during warmup is not permanently lexical.
+      // Embeddings are deliberately NOT counted toward charCount.
+      this.ensureEmbeddings(entry);
 
       // Unknown version: usable for this query, never stored — a stale key of
       // 0 must not shadow future syncs or survive as unevictable state.
@@ -488,6 +486,23 @@ export class CorpusCache {
     if (count == null) return;
     if (count <= 1) this.pins.delete(id);
     else this.pins.set(id, count - 1);
+  }
+
+  /** Embed a cached entry's candidates once the embedder is ready. Runs at
+   *  most once per entry (the embedded flag), so sessions cached while the
+   *  model was still loading pick up embeddings on their next cache hit
+   *  instead of staying lexical until eviction or a version bump. */
+  private ensureEmbeddings(entry: CachedSession): void {
+    if (entry.embedded) return;
+    if (!this.embedder) {
+      entry.embedded = true;
+      return;
+    }
+    if (!this.embedder.ready) return;
+    for (const candidate of entry.candidates) {
+      candidate.embedding = this.embedder.embed(candidate.rawText);
+    }
+    entry.embedded = true;
   }
 
   private evict(): void {

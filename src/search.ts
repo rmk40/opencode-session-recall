@@ -54,10 +54,10 @@ const TIME_BUDGET_MS = 2000;
  *  a hook timeout that lands mid-scan), keeping the event loop responsive. */
 const SCAN_TIME_BUDGET_MS = 2000;
 
-/** Max literal results to collect when grouping by session.
- *  Must be high enough to get representative hits from many sessions,
- *  but bounded to prevent unbounded memory growth on broad queries. */
-const MAX_GROUPED_LITERAL_RESULTS = 1000;
+/** Part-mode literal/regex over-collection bound (grouped mode scans the
+ *  whole eligible corpus — the completeness contract — with the wall-clock
+ *  scan budget as the safety valve, reported via truncated). */
+const MAX_PART_SCAN_RESULTS = 1000;
 
 const MAX_EXPANDED_RESULTS = 3;
 const MAX_EXPANDED_CONTEXT_MESSAGES = 30;
@@ -2283,7 +2283,7 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
           // Part-mode literal/regex over-collect so the diversity pass has
           // cross-session material; grouped mode already scans broadly.
           const partScanLimit = Math.min(
-            MAX_GROUPED_LITERAL_RESULTS,
+            MAX_PART_SCAN_RESULTS,
             resultsArg * DIVERSITY_SCAN_MULTIPLIER,
           );
 
@@ -2291,7 +2291,7 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
           if (matchMode === "literal") {
             // When grouping by session, scan all sessions (no early exit)
             // so we get representative hits from every matching session
-            const limit = isGrouped ? MAX_GROUPED_LITERAL_RESULTS : partScanLimit;
+            const limit = isGrouped ? Number.MAX_SAFE_INTEGER : partScanLimit;
             const { collected, total, early } = literalScan(limit);
             const {
               final,
@@ -2316,7 +2316,7 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
 
           // ── Route: regex ──────────────────────────────────────────────
           if (matchMode === "regex" && regex) {
-            const limit = isGrouped ? MAX_GROUPED_LITERAL_RESULTS : partScanLimit;
+            const limit = isGrouped ? Number.MAX_SAFE_INTEGER : partScanLimit;
             const { collected, total, early } = regexScanAll(regex, limit);
             const {
               final,
@@ -2382,7 +2382,7 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
             smartResult.degradeKind !== "time" &&
             !ctx.abort.aborted
           ) {
-            const limit = isGrouped ? MAX_GROUPED_LITERAL_RESULTS : partScanLimit;
+            const limit = isGrouped ? Number.MAX_SAFE_INTEGER : partScanLimit;
             const { collected, total, early } = literalScan(limit);
             const {
               final,

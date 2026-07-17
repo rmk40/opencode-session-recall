@@ -16,8 +16,10 @@ import type { EvidenceClass, ResultWhy } from "./types.js";
  * phrase, coverage) are layered on as multiplicative document boosts so they
  * ride on a calibrated relevance score rather than an uncalibrated fuzzy distance.
  *
- * The index is rebuilt every call. This is intentional and cheap: histories load
- * fast and there is no persistent cache (by design).
+ * The index is rebuilt per query over candidates served from the shared
+ * corpus cache (src/corpus.ts), which already amortizes fetching, extraction,
+ * tokenization, and normalization per session version — rebuilding the
+ * MiniSearch index itself is the cheap part.
  */
 
 export type Bm25Mode = "smart" | "fuzzy";
@@ -366,7 +368,10 @@ export function bm25Search(
   hits.sort(compareHits);
 
   // Drop trailing noise from OR-combined weak single-term matches, but never
-  // drop the only/best hit (the floor is relative to the top score).
+  // drop the only/best hit. The floor is relative to the BOOSTED top score:
+  // internal scores are unclamped, so a fixed threshold would stop being
+  // relative whenever multipliers push the top above 1.
   if (hits.length <= 1) return hits;
-  return hits.filter((h) => h.score >= MIN_RELATIVE_SCORE);
+  const floor = hits[0]!.score * MIN_RELATIVE_SCORE;
+  return hits.filter((h) => h.score >= floor);
 }
