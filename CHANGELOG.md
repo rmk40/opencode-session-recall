@@ -4,6 +4,113 @@ All notable changes to this project are documented here. This project follows
 [Conventional Commits](https://www.conventionalcommits.org/) and
 [Semantic Versioning](https://semver.org/).
 
+## Unreleased
+
+This release is about retrieval efficiency: making one or two `recall` calls
+sufficient for "how did we do X before" queries instead of seven progressively
+narrower ones. Search is now complete over the eligible scope (an in-memory
+corpus cache replaces the per-query candidate budgets that silently dropped
+old sessions), the asker's own conversation and generated reference material
+stop crowding out real history, and grouped results expose the evidence that
+made a session useful. One release note is breaking: the search output shape
+was consolidated.
+
+### Breaking
+
+- **Global- and project-scope searches exclude the current session by
+  default.** Broad "how did we do this before" queries used to be won by the
+  conversation that asked them — it repeats the query terms verbatim and gets
+  the recency boost. Callers who want in-session hits pass
+  `excludeCurrentSession: false` (or `scope: "session"`, which always searches
+  it); the default never applies when a specific `sessionID` is targeted, and
+  a new `excludeSessionID` parameter excludes any one session by ID. Zero-result
+  responses name the exclusion in their suggestions so the lever is
+  discoverable.
+- **Search output shape consolidated.** The consumer is a model reading JSON;
+  redundant fields cost tokens on every response. Top-level `scanned` is
+  removed (use `coverage.sessionsSearched`); top-level `loadErrorCount` /
+  `loadErrors` are folded into `coverage.loadErrors: { count, samples }`;
+  result-level `directoryRelevance` now lives only under `why`; and
+  `degradeKind: "budget"` is gone (unreachable now that candidate budgets no
+  longer exist). Nothing else about `results` entries changed.
+- **Coverage counts are content-honest.** `messagesSearched` / `partsSearched`
+  now count messages/parts with searchable content that passed the filters,
+  instead of everything scanned before text extraction (which inflated
+  `partsSearched` with unsearchable parts).
+
+### Added
+
+- **Incremental in-memory corpus cache.** Each session's searchable text is
+  built once per session version (keyed by update time) instead of re-fetched
+  and re-tokenized on every query. OpenCode's database stays the sole source
+  of truth; the cache is LRU-bounded by the new `cacheMaxChars` option
+  (default 50 million chars), and eviction only ever costs latency, never
+  results. This removes the per-query candidate budgets and their scan-order
+  truncation — a rare term in the oldest session is now found regardless of
+  history size. A new `prewarm` option (default off) syncs the cache at plugin
+  startup so the first search starts warm.
+- **Evidence classes.** Every hit is classified deterministically
+  (`human-text`, `tool-input`, `tool-output`, `reasoning`, `file-read`,
+  `skill-definition`, `session-title`) and the class is reported in
+  `why.evidenceClass`. Ranking boosts concrete actions (tool inputs) and
+  penalizes generated reference material (skill payloads, file reads), so a
+  60-char command line beats a 20,000-char skill body that mentions the same
+  terms. Final part-mode slices cap reference material (one skill-definition,
+  two file-read) and guarantee a tool-input hit for command-like queries.
+- **Grouped results carry their evidence.** Session-grouped results include
+  `evidenceKinds` (the classes seen in that session) and up to two
+  `topEvidence` snippets of other classes, and the representative hit is
+  chosen by class priority among near-best scores — a workflow session is
+  represented by its commands, not by the skill payload that happened to
+  score highest.
+- **Two-stage session-first search.** Smart/fuzzy queries shortlist sessions
+  whose title, directory, or digest overlaps the query, then re-rank the
+  shortlist's content with its own BM25 index (shortlist-local IDF), merged
+  with the broad pass. Code-like tokens (`deploy.yaml`, `launchTerminal`,
+  `GHOSTAUTH_LIVE_TUI`) are extracted from the query and boosted on verbatim
+  match. With `explain: true`, a new `queryPlan` field records which
+  strategies ran.
+- **Session digests.** At cache fill, each session gets a content-derived
+  digest: the head of its first user message plus its most characteristic
+  action vocabulary, built only from statements and commands — file reads and
+  skill payloads earn no credit. The digest is indexed alongside title and
+  directory, so ranking can find the right session even when its title is
+  misleading.
+- **Opt-in local semantic layer.** With `semantic: true`, smart/fuzzy ranking
+  blends in cosine similarity from local static embeddings
+  (`minishlab/potion-base-8M` by default, ~30 MB, downloaded once to
+  `~/.cache/opencode-session-recall/models/` on first use). Searches stay
+  lexical-only until the model warms, and any failure degrades to
+  lexical-only. Off by default; nothing is downloaded unless enabled. New
+  options: `semantic`, `semanticWeight`, `semanticModel`.
+- **Composition-aware suggestions.** Guidance now reacts to what came back:
+  top hits dominated by the current session, or by generated reference
+  material, shortlisted-but-unranked sessions, exact code tokens under a
+  ranked search, and high-`hitCount` grouped results each get a concrete
+  next call.
+
+### Changed
+
+- **Expansion budgets are allocated per part.** One oversized tool dump can no
+  longer eat the whole expansion budget: each part is capped at 6,000 chars
+  within the total, and when the matched part itself is truncated, the region
+  around the match is preserved instead of head-slicing it away.
+- **Expansion fetches on demand.** Expanded sessions' messages are fetched
+  only when expansion runs, instead of riding on a bulk load of everything
+  searched.
+- Auto-recall's own injected `<recall-auto>` blocks are no longer searchable,
+  so a prior injection can't be found by later searches.
+
+### Removed
+
+- The auto-recall 200-session scan cap. The hook now searches the full scope
+  through the shared corpus cache; its 1.5-second wall-clock timeout remains
+  the safety valve.
+- The per-query candidate budgets (`maxCandidatesTotal`,
+  `maxCandidatesPerSession`, `maxCharsTotal`, `maxMessagesPerSession`,
+  `maxPartsPerSession`) and their scan-order truncation. `cacheMaxChars` and
+  the per-candidate 20,000-char cap are the remaining size controls.
+
 ## 0.12.1
 
 A bug-fix release. Search worked, but **retrieving and browsing the results was
