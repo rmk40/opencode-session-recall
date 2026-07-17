@@ -1,7 +1,7 @@
 import type { Plugin } from "@opencode-ai/plugin";
 import { createOpencodeClient, type Session, type GlobalSession } from "@opencode-ai/sdk/v2";
 import { sessions } from "./sessions.js";
-import { search, type SemanticSearchConfig } from "./search.js";
+import { search, DISCOVERY_LIMIT, type SemanticSearchConfig } from "./search.js";
 import { get } from "./get.js";
 import { context } from "./context.js";
 import { messages } from "./messages.js";
@@ -119,9 +119,11 @@ const server: Plugin = async (ctx, options) => {
     // release(), after which LRU eviction settles under the cap.
     void (async () => {
       try {
+        // Explicit limit: the server defaults to 100 rows otherwise, which
+        // would warm only a fraction of the history.
         const resp = global
-          ? await unscoped.experimental.session.list({})
-          : await client.session.list({});
+          ? await unscoped.experimental.session.list({ limit: DISCOVERY_LIMIT })
+          : await client.session.list({ limit: DISCOVERY_LIMIT });
         const data = (resp.data ?? []) as Array<Session | GlobalSession>;
         const warmed = await cache.sync(
           data.map((s) => ({

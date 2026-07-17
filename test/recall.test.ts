@@ -40,7 +40,7 @@ describe("recall", () => {
       query: "walkthrough",
     });
 
-    expect(h.calls.globalList).toEqual([{ search: undefined, limit: undefined }]);
+    expect(h.calls.globalList).toEqual([{ search: undefined, limit: 10_000 }]);
     expect(h.calls.projectList).toEqual([]);
     expect(out.ok).toBe(true);
     expect(out.group).toBe("part");
@@ -126,7 +126,7 @@ describe("recall", () => {
     expect(titled.coverage?.sessionsSearched).toBe(1);
     expect(h.calls.globalList.at(-1)).toEqual({
       search: "Actualyze",
-      limit: undefined,
+      limit: 10_000,
     });
   });
 
@@ -578,7 +578,7 @@ describe("recall", () => {
     );
     expect(h.calls.projectList).toContainEqual({
       search: undefined,
-      limit: undefined,
+      limit: 10_000,
     });
   });
 
@@ -1501,6 +1501,185 @@ describe("recall", () => {
       expect(expandedPart?.output).toContain("zebrafinch-token");
       expect(expandedPart?.output).toContain("chars omitted");
       expect(out.warnings?.some((w) => w.includes("truncated or omitted"))).toBe(true);
+    });
+  });
+
+  describe("discovery completeness", () => {
+    it("finds matches beyond the server's 100-session default window", async () => {
+      const h = makeFakeHarness();
+      const now = Date.now();
+      // 120 filler sessions newer than the needle so the needle sits past
+      // where an omitted limit (server default 100) would truncate.
+      for (let index = 0; index < 120; index++) {
+        const filler = session(`s-page-${index}`, `Page Filler ${index}`, OTHER_DIR, now - index);
+        h.globalSessions.push(globalSessionFrom(filler));
+        h.messagesBySession[filler.id] = [
+          bundle(userMessage(`m-page-${index}`, filler.id, now - index), [
+            textPart(`p-page-${index}`, filler.id, `m-page-${index}`, "routine filler note"),
+          ]),
+        ];
+      }
+      const needle = session("s-deep", "Deep History", OTHER_DIR, now - 1_000_000);
+      h.globalSessions.push(globalSessionFrom(needle));
+      h.messagesBySession[needle.id] = [
+        bundle(userMessage("m-deep", needle.id, now - 1_000_000), [
+          textPart("p-deep", needle.id, "m-deep", "quixotic-artifact provenance decision"),
+        ]),
+      ];
+
+      const out = await runTool<SearchOutput>(recallTool(h), {
+        query: "quixotic-artifact",
+      });
+      expect(out.results.some((r) => r.sessionID === "s-deep")).toBe(true);
+      expect(h.calls.globalList[0]?.limit).toBe(10_000);
+      // Well under the discovery limit: no provider-cap warning.
+      expect(out.coverage?.limitedBy ?? []).not.toContain("providerLimit");
+    });
+
+    it("reports providerLimit when discovery fills the completeness window", async () => {
+      const h = makeFakeHarness();
+      // Force a tiny completeness window via maxSessions... instead, emulate
+      // the cap by returning exactly DISCOVERY_LIMIT rows is impractical in a
+      // fixture; assert the accounting path directly through a patched list.
+      const original = h.unscoped.experimental.session.list.bind(h.unscoped.experimental.session);
+      (h.unscoped.experimental.session as unknown as Record<string, unknown>).list =
+        async (params: { search?: string; limit?: number }) => {
+          const resp = (await original(params)) as { data?: unknown[] };
+          if (resp.data && params.limit === 10_000) {
+            // Simulate a full window: pad metadata rows up to the limit.
+            const template = h.globalSessions[0]!;
+            const padded = [...resp.data];
+            for (let index = padded.length; index < 10_000; index++) {
+              padded.push({
+                ...template,
+                id: `s-pad-${index}`,
+                title: `Pad ${index}`,
+              });
+            }
+            return { data: padded };
+          }
+          return resp;
+        };
+
+      const out = await runTool<SearchOutput>(recallTool(h), {
+        query: "walkthrough",
+        excludeCurrentSession: false,
+      });
+      expect(out.ok).toBe(true);
+      expect(out.coverage?.limitedBy).toContain("providerLimit");
+      expect(
+        out.warnings?.some((w) => w.includes("older history may exist beyond this window")),
+      ).toBe(true);
+    }, 30_000);
+  });
+
+  describe("exclusion family", () => {
+    function familyHarness() {
+      const h = makeFakeHarness();
+      const now = Date.now();
+      const root = session("s-root", "Family Root", PROJECT_DIR, now - 5_000);
+      const child = session(
+        "s-child",
+        "Family Child",
+        PROJECT_DIR,
+        now - 4_000,
+        undefined,
+        "s-root",
+      );
+      const grandchild = session(
+        "s-grandchild",
+        "Family Grandchild",
+        PROJECT_DIR,
+        now - 3_000,
+        undefined,
+        "s-child",
+      );
+      const sibling = session(
+        "s-sibling",
+        "Family Sibling",
+        PROJECT_DIR,
+        now - 2_000,
+        undefined,
+        "s-root",
+      );
+      for (const sess of [root, child, grandchild, sibling]) {
+        h.globalSessions.push(globalSessionFrom(sess));
+        h.messagesBySession[sess.id] = [
+          bundle(userMessage(`m-${sess.id}`, sess.id, sess.time.updated), [
+            textPart(`p-${sess.id}`, sess.id, `m-${sess.id}`, "family lineage evidence marker"),
+          ]),
+        ];
+      }
+      return h;
+    }
+
+    it("excludes the whole delegation tree when searching from the root", async () => {
+      const h = familyHarness();
+      const out = await runTool<SearchOutput>(
+        recallTool(h),
+        { query: "family lineage evidence" },
+        makeContext({ sessionID: "s-root" }).ctx,
+      );
+      expect(out.results).toEqual([]);
+      expect(out.coverage?.skippedByReason?.excludedSession).toBe(4);
+    });
+
+    it("excludes ancestors and siblings when searching from a subagent child", async () => {
+      const h = familyHarness();
+      const out = await runTool<SearchOutput>(
+        recallTool(h),
+        { query: "family lineage evidence" },
+        makeContext({ sessionID: "s-grandchild" }).ctx,
+      );
+      expect(out.results).toEqual([]);
+      expect(out.coverage?.skippedByReason?.excludedSession).toBe(4);
+    });
+
+    it("keeps unrelated sessions and restores the family on explicit opt-in", async () => {
+      const h = familyHarness();
+      const outsider = session("s-outsider", "Unrelated", PROJECT_DIR, Date.now() - 1_000);
+      h.globalSessions.push(globalSessionFrom(outsider));
+      h.messagesBySession[outsider.id] = [
+        bundle(userMessage("m-outsider", outsider.id, Date.now() - 1_000), [
+          textPart("p-outsider", outsider.id, "m-outsider", "family lineage evidence marker too"),
+        ]),
+      ];
+
+      const excluded = await runTool<SearchOutput>(
+        recallTool(h),
+        { query: "family lineage evidence" },
+        makeContext({ sessionID: "s-root" }).ctx,
+      );
+      expect(excluded.results.map((r) => r.sessionID)).toEqual(["s-outsider"]);
+
+      const optIn = await runTool<SearchOutput>(
+        recallTool(h),
+        { query: "family lineage evidence", excludeCurrentSession: false },
+        makeContext({ sessionID: "s-root" }).ctx,
+      );
+      expect(new Set(optIn.results.map((r) => r.sessionID)).size).toBe(5);
+    });
+
+    it("survives a parentID cycle without hanging", async () => {
+      const h = makeFakeHarness();
+      const now = Date.now();
+      const a = session("s-cyc-a", "Cycle A", PROJECT_DIR, now - 2_000, undefined, "s-cyc-b");
+      const b = session("s-cyc-b", "Cycle B", PROJECT_DIR, now - 1_000, undefined, "s-cyc-a");
+      for (const sess of [a, b]) {
+        h.globalSessions.push(globalSessionFrom(sess));
+        h.messagesBySession[sess.id] = [
+          bundle(userMessage(`m-${sess.id}`, sess.id, now), [
+            textPart(`p-${sess.id}`, sess.id, `m-${sess.id}`, "cycle marker text"),
+          ]),
+        ];
+      }
+      const out = await runTool<SearchOutput>(
+        recallTool(h),
+        { query: "cycle marker" },
+        makeContext({ sessionID: "s-cyc-a" }).ctx,
+      );
+      expect(out.ok).toBe(true);
+      expect(out.results).toEqual([]);
     });
   });
 

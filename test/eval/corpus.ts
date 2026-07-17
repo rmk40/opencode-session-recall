@@ -79,6 +79,16 @@ export function makeEvalCorpus(now = Date.now()): EvalCorpus {
   // e-cur: the CURRENT conversation — repeats the historical query's vocabulary
   // because the user just asked for it, but contains no workflow evidence.
   const sCur = session("e-cur", "Multikey auth login debugging", PROJECT_DIR, now - 2_000);
+  // e-cur-sub: a subagent spawned FROM e-cur that restates the query and
+  // "findings" — the delegation-tree leak from round-2 dogfooding.
+  const sCurSub = session(
+    "e-cur-sub",
+    "Evaluate recall search results",
+    PROJECT_DIR,
+    now - 1_500,
+    undefined,
+    "e-cur",
+  );
   // e-flow: the useful workflow session. Misleading title on purpose; lives in
   // the ghostauth project; holds the real tuistory command sequence plus a
   // large generated skill payload that must not become the representative.
@@ -222,6 +232,20 @@ export function makeEvalCorpus(now = Date.now()): EvalCorpus {
           sCur.id,
           "ec-2",
           "Searching prior history for the ghostauth tuistory test workflow now.",
+        ),
+      ]),
+    ],
+
+    // ── e-cur-sub: delegation-tree echo of the current conversation ─────
+    [sCurSub.id]: [
+      bundle(assistantMessage("ecs-1", sCurSub.id, now - 1_400), [
+        textPart(
+          "ecs-1p",
+          sCurSub.id,
+          "ecs-1",
+          "Findings: the ghostauth tuistory test workflow for the opencode plugin " +
+            "auth login debug involved launching the TUI. Query terms repeated: " +
+            "ghostauth tuistory test opencode plugin auth login debug workflow.",
         ),
       ]),
     ],
@@ -375,8 +399,8 @@ export function makeEvalCorpus(now = Date.now()): EvalCorpus {
     ],
   };
 
-  const sessions = [sAuth, sRate, sDb, sNoise, sCur];
-  const globalSessions = [sAuth, sRate, sDb, sNoise, sOther, sCur, sFlow, sDocs, sTui].map(
+  const sessions = [sAuth, sRate, sDb, sNoise, sCur, sCurSub];
+  const globalSessions = [sAuth, sRate, sDb, sNoise, sOther, sCur, sCurSub, sFlow, sDocs, sTui].map(
     globalSessionFrom,
   );
 

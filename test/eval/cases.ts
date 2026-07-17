@@ -105,7 +105,7 @@ export const EVAL_CASES: EvalCase[] = [
     ctxSessionID: "e-cur",
     relevantSessionIDs: ["e-flow"],
     expect: {
-      notInResults: ["e-cur"],
+      notInResults: ["e-cur", "e-cur-sub"],
       // The grouped representative must be conversational or action evidence,
       // never the skill payload that happens to score well lexically.
       classInTop3: ["human-text", "tool-input"],

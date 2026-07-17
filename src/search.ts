@@ -67,6 +67,10 @@ const MAX_EXPANDED_FIELD_CHARS = 4_000;
  *  oversized tool dump cannot consume the whole expansion budget. */
 const MAX_EXPANDED_PART_CHARS = 6_000;
 const DIRECTORY_FILTER_LIST_LIMIT = 5000;
+/** Explicit discovery limit for "all history" requests: the opencode server
+ *  defaults to 100 rows when no limit is sent (silently hiding older
+ *  sessions), and it applies caller limits unclamped. Exported for prewarm. */
+export const DISCOVERY_LIMIT = 10_000;
 /** In part-grouped results, cap hits per session in the initial fill so one
  *  noisy session can't flood the result list; backfill if room remains. */
 const MAX_HITS_PER_SESSION_INITIAL = 2;
@@ -105,6 +109,7 @@ type SessionMetaInternal = {
   title: string;
   directory: string;
   updated: number;
+  parentID?: string;
   projectID?: string;
   projectWorktree?: string;
   directoryRelevance?: DirectoryRelevance;
@@ -117,9 +122,62 @@ function meta(s: Session | GlobalSession): SessionMetaInternal {
     title: s.title,
     directory: s.directory,
     updated: s.time.updated,
+    parentID: s.parentID,
     projectID: s.projectID,
     projectWorktree: project?.worktree,
   };
+}
+
+/** Bounded ancestor walk + descendant BFS depth for the exclusion family. */
+const MAX_FAMILY_DEPTH = 16;
+
+/**
+ * The current session's delegation tree within the discovered set: walk
+ * parentID up to the highest discovered ancestor (bounded, cycle-guarded),
+ * then collect that root's transitive descendants. Searching for prior
+ * history from a parent must not answer with its own subagents' restated
+ * findings — and vice versa from inside a subagent. Exported for tests.
+ */
+export function exclusionFamily(
+  discovered: SessionMetaInternal[],
+  currentSessionID: string,
+): Set<string> {
+  const byID = new Map<string, SessionMetaInternal>();
+  const childrenByParent = new Map<string, string[]>();
+  for (const session of discovered) {
+    byID.set(session.id, session);
+    if (session.parentID) {
+      const siblings = childrenByParent.get(session.parentID);
+      if (siblings) siblings.push(session.id);
+      else childrenByParent.set(session.parentID, [session.id]);
+    }
+  }
+
+  // Ascend to the top-most discovered ancestor.
+  let root = currentSessionID;
+  const seen = new Set([currentSessionID]);
+  for (let depth = 0; depth < MAX_FAMILY_DEPTH; depth++) {
+    const parentID = byID.get(root)?.parentID;
+    if (!parentID || seen.has(parentID)) break;
+    seen.add(parentID);
+    root = parentID;
+  }
+
+  // Collect the root's subtree (bounded, cycle-guarded).
+  const family = new Set([currentSessionID, root]);
+  let frontier = [root];
+  for (let depth = 0; depth < MAX_FAMILY_DEPTH && frontier.length > 0; depth++) {
+    const next: string[] = [];
+    for (const id of frontier) {
+      for (const childID of childrenByParent.get(id) ?? []) {
+        if (family.has(childID)) continue;
+        family.add(childID);
+        next.push(childID);
+      }
+    }
+    frontier = next;
+  }
+  return family;
 }
 
 function positiveTimestampOrUndefined(value: TimeValue): number | undefined {
@@ -470,10 +528,11 @@ function dedupeSessions(sessions: SessionMetaInternal[]): SessionMetaInternal[] 
 function listLimitForDirectoryFilter(
   argsLimit: number | undefined,
   configuredLimit: number,
-): number | undefined {
+): number {
   // A finite maxSessions is a hard plugin safety cap; broaden only within it.
   if (Number.isFinite(configuredLimit)) return configuredLimit;
-  if (argsLimit == null) return undefined;
+  // No cap: never send undefined — the server would default to 100 rows.
+  if (argsLimit == null) return DISCOVERY_LIMIT;
   return Math.max(argsLimit, DIRECTORY_FILTER_LIST_LIMIT);
 }
 
@@ -1540,7 +1599,7 @@ Skip trivial commands, simple local code/file lookup, simple edits with full con
 
 For "how did we do X before": match:"smart", group:"session" (current session is already excluded by default); if results are weak, search the project directory literally for the tool/command name and inspect tool-input hits with expand:"context" or recall_context.
 
-First call: for broad discovery use match:"smart", group:"session", scope:"global" (default), 5-10 results, and short terms from error text/feature/config/file/decision. The current session is excluded by default; pass excludeCurrentSession:false to search it (or use scope:"session"). Use role:"user" for requirements/decisions. Use expand:"context" or "message" when top-hit evidence will avoid a follow-up.
+First call: for broad discovery use match:"smart", group:"session", scope:"global" (default), 5-10 results, and short terms from error text/feature/config/file/decision. The current session and its subagent sessions are excluded by default; pass excludeCurrentSession:false to search them (or use scope:"session"). Use role:"user" for requirements/decisions. Use expand:"context" or "message" when top-hit evidence will avoid a follow-up.
 
 If memory exists, store only durable findings: preferences, project decisions, reusable root causes, environment facts, behavior corrections, or repeatable success/failure. Do not store ephemeral details, one-off commands, transient errors, or implementation minutiae.
 
@@ -1768,10 +1827,12 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
         args.sessions == null
           ? undefined
           : pickNumber("sessions", args.sessions, 1, limits.maxSessions, limits.maxSessions);
+      // Never send an undefined limit: the server defaults to 100 rows,
+      // which would silently hide older history from an "all history" sweep.
       const sessionListLimit = directory
         ? listLimitForDirectoryFilter(requestedSessions, limits.maxSessions)
         : (requestedSessions ??
-          (Number.isFinite(limits.maxSessions) ? limits.maxSessions : undefined));
+          (Number.isFinite(limits.maxSessions) ? limits.maxSessions : DISCOVERY_LIMIT));
 
       const fail = (error: string): string =>
         JSON.stringify({ ok: false, error } satisfies ErrorOutput);
@@ -1840,11 +1901,20 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
 
       try {
         let targets: SessionMetaInternal[] = [];
+        // A raw list response that fills our completeness-mode limit means
+        // even older history may exist beyond the window we asked for.
+        let providerCapHit = false;
+        const noteDiscoveryCap = (count: number): void => {
+          if (sessionListLimit === DISCOVERY_LIMIT && count >= DISCOVERY_LIMIT) {
+            providerCapHit = true;
+          }
+        };
 
         if (sessionID) {
           let title = "";
           let directory = "";
           let updated = 0;
+          let parentID: string | undefined;
           let projectID: string | undefined;
           let projectWorktree: string | undefined;
           try {
@@ -1856,13 +1926,16 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
               title = data.title;
               directory = data.directory;
               updated = data.time.updated;
+              parentID = data.parentID;
               projectID = data.projectID;
               projectWorktree = "project" in data ? data.project?.worktree : undefined;
             }
           } catch {
             // Can't get metadata, proceed anyway
           }
-          targets = [{ id: sessionID, title, directory, updated, projectID, projectWorktree }];
+          targets = [
+            { id: sessionID, title, directory, updated, parentID, projectID, projectWorktree },
+          ];
         } else if (scope === "session") {
           if (!ctx.sessionID) {
             const err: ErrorOutput = {
@@ -1875,6 +1948,7 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
           let title = "";
           let directory = "";
           let updated = 0;
+          let parentID: string | undefined;
           let projectID: string | undefined;
           let projectWorktree: string | undefined;
           try {
@@ -1884,13 +1958,16 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
               title = data.title;
               directory = data.directory;
               updated = data.time.updated;
+              parentID = data.parentID;
               projectID = data.projectID;
               projectWorktree = "project" in data ? data.project?.worktree : undefined;
             }
           } catch {
             // proceed without metadata
           }
-          targets = [{ id: ctx.sessionID, title, directory, updated, projectID, projectWorktree }];
+          targets = [
+            { id: ctx.sessionID, title, directory, updated, parentID, projectID, projectWorktree },
+          ];
         } else if (scope === "project") {
           const resp = await client.session.list({
             search: title,
@@ -1903,7 +1980,10 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
             };
             return JSON.stringify(err);
           }
-          if (resp.data) targets = resp.data.map(meta);
+          if (resp.data) {
+            noteDiscoveryCap(resp.data.length);
+            targets = resp.data.map(meta);
+          }
         } else {
           const resp = await unscoped.experimental.session.list({
             search: title,
@@ -1916,7 +1996,10 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
             };
             return JSON.stringify(err);
           }
-          if (resp.data) targets = resp.data.map(meta);
+          if (resp.data) {
+            noteDiscoveryCap(resp.data.length);
+            targets = resp.data.map(meta);
+          }
         }
 
         if (directory && fallback && !sessionID && scope === "project" && global) {
@@ -1924,7 +2007,10 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
             search: title,
             limit: sessionListLimit,
           });
-          if (resp.data) targets = dedupeSessions([...targets, ...resp.data.map(meta)]);
+          if (resp.data) {
+            noteDiscoveryCap(resp.data.length);
+            targets = dedupeSessions([...targets, ...resp.data.map(meta)]);
+          }
           if (resp.error) {
             normalized.warnings.push(
               `Directory fallback could not list global sessions: ${errmsg(resp.error)}.`,
@@ -1939,11 +2025,16 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
         // discoveredTargets stays untouched so sessionsDiscovered keeps
         // counting everything found and the sessionsSkipped reconciliation
         // below stays consistent.
-        const excludedIDs = new Set(
-          [excludeSessionID, excludeCurrent ? currentSessionID : undefined].filter(
-            (id): id is string => Boolean(id),
-          ),
-        );
+        const excludedIDs = new Set<string>();
+        if (excludeSessionID) excludedIDs.add(excludeSessionID);
+        if (excludeCurrent && currentSessionID) {
+          // Exclude the whole delegation tree, not just the one session:
+          // subagents spawned from this conversation restate its query and
+          // findings, and are the same self-reflection problem one level down.
+          for (const id of exclusionFamily(discoveredTargets, currentSessionID)) {
+            excludedIDs.add(id);
+          }
+        }
         const consideredTargets =
           excludedIDs.size > 0
             ? discoveredTargets.filter((target) => !excludedIDs.has(target.id))
@@ -1957,6 +2048,13 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
         if (excludedCount > 0) {
           skippedByReason.excludedSession = excludedCount;
           pushUnique(normalized.limitedBy, "excludedSession");
+        }
+
+        if (providerCapHit) {
+          pushUnique(normalized.limitedBy, "providerLimit");
+          normalized.warnings.push(
+            "Discovery returned the maximum requested sessions; older history may exist beyond this window. Narrow with directory/title or time filters.",
+          );
         }
 
         let directoryBucketsSearched: SearchCoverage["directoryBucketsSearched"];

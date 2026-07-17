@@ -69,6 +69,7 @@ export function session(
   directory: string,
   updated: number,
   archived?: number,
+  parentID?: string,
 ): Session {
   return {
     id,
@@ -76,6 +77,7 @@ export function session(
     projectID: directory === PROJECT_DIR ? "project-main" : "project-other",
     directory,
     title,
+    parentID,
     version: "0.0.0-test",
     time: {
       created: updated - 1000,
@@ -383,7 +385,8 @@ function filtered<T extends Session | GlobalSession>(
   const matching = search
     ? sessions.filter((s) => s.title.toLowerCase().includes(search.toLowerCase()))
     : sessions;
-  return matching.slice(0, limit);
+  // Mimic the opencode server: an omitted limit defaults to 100 rows.
+  return matching.slice(0, limit ?? 100);
 }
 
 export function makeFakeHarness(options: FakeOptions = {}): FakeHarness {

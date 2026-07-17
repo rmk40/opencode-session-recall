@@ -25,7 +25,8 @@ export function makeEvalClients(corpus: EvalCorpus = makeEvalCorpus()): {
   const client = {
     session: {
       list: async (params?: ListParams) => ({
-        data: matchTitle(corpus.sessions, params?.search).slice(0, params?.limit),
+        // Mimic the opencode server: an omitted limit defaults to 100 rows.
+        data: matchTitle(corpus.sessions, params?.search).slice(0, params?.limit ?? 100),
       }),
       get: async ({ sessionID }: { sessionID: string }) => {
         const found = corpus.globalSessions.find((s) => s.id === sessionID);
@@ -46,7 +47,7 @@ export function makeEvalClients(corpus: EvalCorpus = makeEvalCorpus()): {
     experimental: {
       session: {
         list: async (params?: ListParams) => ({
-          data: matchTitle(corpus.globalSessions, params?.search).slice(0, params?.limit),
+          data: matchTitle(corpus.globalSessions, params?.search).slice(0, params?.limit ?? 100),
         }),
       },
     },
