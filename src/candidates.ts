@@ -45,95 +45,64 @@ export type Candidate = {
   hintText?: string;
 };
 
-export type CandidateBudgets = {
-  maxMessagesPerSession: number;
-  maxPartsPerSession: number;
-  maxCharsPerCandidate: number;
-  maxCharsTotal: number;
-  maxCandidatesPerSession: number;
-  maxCandidatesTotal: number;
+/** Truncate very long tool outputs per candidate. */
+export const MAX_CHARS_PER_CANDIDATE = 20_000;
+
+/**
+ * Query-time filters applied to cached candidates. Semantics match the old
+ * per-query message/part filters exactly: `before` excludes messages at or
+ * after the timestamp, `after` excludes messages at or before it, `toolName`
+ * implies tool parts only, and `type` applies only without `toolName`.
+ */
+export type CandidateFilters = {
+  type: string;
+  role: string;
+  before?: number;
+  after?: number;
+  toolName?: string;
 };
 
-export const DEFAULT_BUDGETS: CandidateBudgets = {
-  maxMessagesPerSession: 1000,
-  maxPartsPerSession: 5000,
-  maxCharsPerCandidate: 20000,
-  maxCharsTotal: 2000000,
-  maxCandidatesPerSession: 500,
-  maxCandidatesTotal: 3000,
-};
+export function candidateEligible(candidate: Candidate, filters: CandidateFilters): boolean {
+  if (filters.role !== "all" && candidate.role !== filters.role) return false;
+  if (filters.before != null && candidate.time >= filters.before) return false;
+  if (filters.after != null && candidate.time <= filters.after) return false;
+  if (filters.toolName) {
+    return candidate.partType === "tool" && candidate.toolName === filters.toolName;
+  }
+  if (filters.type !== "all" && candidate.partType !== filters.type) return false;
+  return true;
+}
 
-/** Build candidates from a single session's messages. Returns candidates and budget tracking info. */
+/**
+ * Build the complete, unfiltered candidate list for one session version.
+ * Runs once per session change at cache-fill time (see corpus.ts), so there
+ * are no per-query filters and no scan budgets here; the only size control is
+ * the per-candidate character cap. Iterates newest message first so eligible
+ * candidates come out newest-first for representative selection.
+ */
 export function buildCandidates(
   messages: Array<{ info: MsgInfo; parts: Part[] }>,
   session: SessionMeta,
-  budgets: CandidateBudgets,
-  type: string,
-  role: string,
-  before?: number,
-  after?: number,
-  toolName?: string,
 ): {
   candidates: Candidate[];
-  messagesProcessed: number;
-  partsProcessed: number;
   charsUsed: number;
-  budgetHit: boolean;
 } {
   const candidates: Candidate[] = [];
-  let messagesProcessed = 0;
-  let partsProcessed = 0;
   let charsUsed = 0;
-  let budgetHit = false;
 
   // Iterate newest-first (messages arrive chronological, so reverse)
   for (let mi = messages.length - 1; mi >= 0; mi--) {
-    if (messagesProcessed >= budgets.maxMessagesPerSession) {
-      budgetHit = true;
-      break;
-    }
-
     const msg = messages[mi]!;
     const info = msg.info;
 
-    // Message-level filters
-    if (role !== "all" && info.role !== role) continue;
-    if (before != null && info.time.created >= before) continue;
-    if (after != null && info.time.created <= after) continue;
-
-    messagesProcessed++;
-
     for (const part of msg.parts) {
-      if (partsProcessed >= budgets.maxPartsPerSession) {
-        budgetHit = true;
-        break;
-      }
-
-      // Part type/tool filters
-      if (toolName && (part.type !== "tool" || part.tool !== toolName)) {
-        continue;
-      }
-      if (!toolName && type !== "all" && part.type !== type) {
-        continue;
-      }
-
-      partsProcessed++;
-
       const fields = searchableFields(part);
       if (fields.length === 0) continue;
 
       // Join all searchable texts so smart mode searches the same content as literal
       let rawText = fields.map((field) => field.text).join("\n\n");
-
-      // Truncate at per-candidate char budget
-      if (rawText.length > budgets.maxCharsPerCandidate) {
-        rawText = rawText.slice(0, budgets.maxCharsPerCandidate);
-      }
-
-      // Check total char budget
-      if (charsUsed + rawText.length > budgets.maxCharsTotal) {
-        budgetHit = true;
-        break;
+      if (rawText.length > MAX_CHARS_PER_CANDIDATE) {
+        rawText = rawText.slice(0, MAX_CHARS_PER_CANDIDATE);
       }
       charsUsed += rawText.length;
 
@@ -151,7 +120,6 @@ export function buildCandidates(
         fieldTexts: fields,
         tokens: tokenize(rawText),
         source: part.type === "tool" ? "tool" : part.type === "reasoning" ? "reasoning" : "message",
-        directoryRelevance: session.directoryRelevance,
         why: {
           matchedFields: [],
         },
@@ -162,30 +130,10 @@ export function buildCandidates(
       }
 
       candidates.push(candidate);
-
-      if (candidates.length >= budgets.maxCandidatesPerSession) {
-        budgetHit = true;
-        break;
-      }
-    }
-
-    // If inner loop hit a budget, stop outer loop too
-    if (
-      partsProcessed >= budgets.maxPartsPerSession ||
-      charsUsed >= budgets.maxCharsTotal ||
-      candidates.length >= budgets.maxCandidatesPerSession
-    ) {
-      break;
     }
   }
 
-  return {
-    candidates,
-    messagesProcessed,
-    partsProcessed,
-    charsUsed,
-    budgetHit,
-  };
+  return { candidates, charsUsed };
 }
 
 export function buildTitleCandidate(

@@ -1,5 +1,5 @@
 import type { Plugin } from "@opencode-ai/plugin";
-import { createOpencodeClient } from "@opencode-ai/sdk/v2";
+import { createOpencodeClient, type Session, type GlobalSession } from "@opencode-ai/sdk/v2";
 import { sessions } from "./sessions.js";
 import { search } from "./search.js";
 import { get } from "./get.js";
@@ -8,6 +8,7 @@ import { messages } from "./messages.js";
 import { systemNudge } from "./hooks/system-nudge.js";
 import { autoRecall } from "./hooks/auto-recall.js";
 import { compactionRecall } from "./hooks/compaction-recall.js";
+import { CorpusCache } from "./corpus.js";
 import { TOOLS, DEFAULTS, type Limits } from "./types.js";
 
 type Options = {
@@ -19,6 +20,8 @@ type Options = {
   autoRecall?: boolean;
   /** Preserve durable findings into the compaction summary (R1c). Default: false. */
   compactionRecall?: boolean;
+  /** Warm the corpus cache at plugin init (fire-and-forget). Default: false. */
+  prewarm?: boolean;
 } & Partial<Limits>;
 
 const server: Plugin = async (ctx, options) => {
@@ -69,10 +72,38 @@ const server: Plugin = async (ctx, options) => {
     headers: rest,
   });
 
+  // One shared corpus cache behind every search path (the recall tool and
+  // both search-running hooks), so any of them warms the cache for all.
+  const cache = new CorpusCache(client, limits);
+
+  if (opts.prewarm === true) {
+    // Fire-and-forget: sync whatever history is visible so the first search
+    // (including a hook's, which has a tight wall-clock budget) starts warm.
+    void (async () => {
+      try {
+        const resp = global
+          ? await unscoped.experimental.session.list({})
+          : await client.session.list({});
+        const data = (resp.data ?? []) as Array<Session | GlobalSession>;
+        const warmed = await cache.sync(
+          data.map((s) => ({
+            id: s.id,
+            title: s.title,
+            directory: s.directory,
+            updated: s.time.updated,
+          })),
+        );
+        warmed.release();
+      } catch {
+        // Best-effort; a failed prewarm just means a cold first search.
+      }
+    })();
+  }
+
   return {
     tool: {
       recall_sessions: sessions(client, unscoped, global, limits),
-      recall: search(client, unscoped, global, limits),
+      recall: search(client, unscoped, global, limits, cache),
       recall_get: get(client),
       recall_context: context(client, limits),
       recall_messages: messages(client, limits),
@@ -81,10 +112,10 @@ const server: Plugin = async (ctx, options) => {
       "experimental.chat.system.transform": systemNudge(),
     }),
     ...(autoRecallEnabled && {
-      "chat.message": autoRecall(client, unscoped, global, limits),
+      "chat.message": autoRecall(client, unscoped, global, limits, cache),
     }),
     ...(compactionRecallEnabled && {
-      "experimental.session.compacting": compactionRecall(client, unscoped, global, limits),
+      "experimental.session.compacting": compactionRecall(client, unscoped, global, limits, cache),
     }),
     ...(primary && {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any -- opencode config type not exported

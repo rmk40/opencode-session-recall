@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
-import { DEFAULT_BUDGETS } from "../src/candidates.js";
 import { search } from "../src/search.js";
+import { CorpusCache } from "../src/corpus.js";
 import type { SearchOutput, ErrorOutput } from "../src/types.js";
 import {
   PROJECT_DIR,
@@ -20,7 +20,7 @@ import {
 } from "./helpers.js";
 
 function recallTool(h = makeFakeHarness(), global = true, limits = TEST_LIMITS) {
-  return search(h.client, h.unscoped, global, limits);
+  return search(h.client, h.unscoped, global, limits, new CorpusCache(h.client, limits));
 }
 
 function messageTime(
@@ -975,27 +975,42 @@ describe("recall", () => {
     expect(fuzzy.results.some((r) => r.sessionID === "s-other")).toBe(true);
   });
 
-  it("reports budget degradation deterministically", async () => {
+  it("ranks the whole eligible corpus with no scan-order candidate truncation", async () => {
+    // Regression for the old maxCandidatesTotal=3000 cap: a rare term planted
+    // in the LAST session of provider list order, beyond where the old cap
+    // truncated, must still be found. Impossible under the old architecture.
     const h = makeFakeHarness();
-    const big = session("s-budget", "Budget Stress", PROJECT_DIR, Date.now());
-    h.sessions.push(big);
-    h.globalSessions.push(globalSessionFrom(big));
-    h.messagesBySession[big.id] = Array.from(
-      { length: DEFAULT_BUDGETS.maxCandidatesPerSession + 1 },
-      (_, index) => {
-        const messageID = `m-budget-${index}`;
-        return bundle(assistantMessage(messageID, big.id, Date.now() - index), [
-          textPart(`p-budget-${index}`, big.id, messageID, "budget token"),
+    const now = Date.now();
+    for (let sIndex = 0; sIndex < 4; sIndex++) {
+      const filler = session(`s-fill-${sIndex}`, `Filler ${sIndex}`, PROJECT_DIR, now - sIndex);
+      h.sessions.push(filler);
+      h.globalSessions.push(globalSessionFrom(filler));
+      h.messagesBySession[filler.id] = Array.from({ length: 40 }, (_, mIndex) => {
+        const messageID = `m-fill-${sIndex}-${mIndex}`;
+        return bundle(assistantMessage(messageID, filler.id, now - mIndex), [
+          ...Array.from({ length: 20 }, (_, pIndex) =>
+            textPart(`p-fill-${sIndex}-${mIndex}-${pIndex}`, filler.id, messageID, "filler noise"),
+          ),
         ]);
-      },
-    );
+      });
+    }
+    const rare = session("s-rare", "Rare Needle", PROJECT_DIR, now - 100);
+    h.sessions.push(rare);
+    h.globalSessions.push(globalSessionFrom(rare));
+    h.messagesBySession[rare.id] = [
+      bundle(userMessage("m-rare", rare.id, now - 100), [
+        textPart("p-rare", rare.id, "m-rare", "xylozene reactor calibration decision"),
+      ]),
+    ];
 
-    const budget = await runTool<SearchOutput>(recallTool(h), {
-      query: "budget",
+    const out = await runTool<SearchOutput>(recallTool(h), {
+      query: "xylozene calibration",
       scope: "project",
       match: "smart",
+      excludeCurrentSession: false,
     });
-    expect(budget.degradeKind).toBe("budget");
+    expect(out.results.some((r) => r.sessionID === "s-rare")).toBe(true);
+    expect(out.degradeKind).not.toBe("budget");
   });
 
   it("reports time degradation deterministically", async () => {
@@ -1066,14 +1081,12 @@ describe("recall", () => {
       excludeCurrentSession: false,
     });
 
-    const projectSessionIDs = new Set(h.sessions.map((s) => s.id));
-    const projectExpected = Object.entries(h.messagesBySession)
-      .filter(([sessionID]) => projectSessionIDs.has(sessionID))
-      .reduce((sum, [, msgs]) => sum + (msgs?.length ?? 0), 0);
-    const totalExpected = Object.values(h.messagesBySession).reduce(
-      (sum, msgs) => sum + (msgs?.length ?? 0),
-      0,
-    );
+    // Candidate-derived coverage: messages/parts WITH searchable content.
+    // s-current has 6 messages but m-current-4 holds only recall's own tool
+    // output (self-excluded), so 5 messages / 5 parts count; s-project-2 adds
+    // 3/3 and s-other (global only) adds 2/2.
+    const projectExpected = 8;
+    const totalExpected = 10;
 
     expect(projectOut.coverage?.messagesSearched).toBe(projectExpected);
     expect(projectOut.coverage?.partsSearched).toBeGreaterThan(0);

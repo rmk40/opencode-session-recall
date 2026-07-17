@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { buildCandidates, populateNormalized, type Candidate } from "../src/candidates.js";
+import {
+  buildCandidates,
+  candidateEligible,
+  populateNormalized,
+  type Candidate,
+} from "../src/candidates.js";
 import { format, formatMsg, isSelfTool, pruned, searchable, snippet } from "../src/extract.js";
 import { parseQuery } from "../src/query.js";
 import { bm25Search } from "../src/bm25.js";
@@ -357,7 +362,7 @@ describe("search ranking helpers", () => {
     expect(smartSnippet("aaa rate bbb limit ccc", parseQuery("rate limit"), 12)).toContain("rate");
   });
 
-  it("builds candidates with role/type/time filters", () => {
+  it("builds unfiltered candidates; query filters apply via candidateEligible", () => {
     const messages = [
       {
         info: userMessage("u", "s", 100),
@@ -369,28 +374,37 @@ describe("search ranking helpers", () => {
       },
     ];
 
-    const built = buildCandidates(
-      messages,
-      { id: "s", title: "Session", directory: PROJECT_DIR },
-      {
-        maxMessagesPerSession: 10,
-        maxPartsPerSession: 10,
-        maxCharsPerCandidate: 100,
-        maxCharsTotal: 1000,
-        maxCandidatesPerSession: 10,
-        maxCandidatesTotal: 10,
-      },
-      "tool",
-      "assistant",
-      300,
-      100,
-    );
-
-    expect(built.candidates).toHaveLength(1);
+    // Cache-fill build: everything searchable, newest message first.
+    const built = buildCandidates(messages, { id: "s", title: "Session", directory: PROJECT_DIR });
+    expect(built.candidates).toHaveLength(2);
+    expect(built.candidates.map((c) => c.partType)).toEqual(["tool", "text"]);
     expect(built.candidates[0]).toMatchObject({
       partType: "tool",
       role: "assistant",
       rawText: "tool text\n\nbash\n\n{}",
     });
+
+    // Query-time filters reproduce the old build-time filtering exactly.
+    const filters = { type: "tool", role: "assistant", before: 300, after: 100 };
+    const eligible = built.candidates.filter((c) => candidateEligible(c, filters));
+    expect(eligible).toHaveLength(1);
+    expect(eligible[0]).toMatchObject({ partType: "tool", role: "assistant" });
+
+    // Boundary semantics: before excludes >= boundary, after excludes <= boundary.
+    expect(
+      built.candidates.filter((c) =>
+        candidateEligible(c, { type: "all", role: "all", before: 200 }),
+      ),
+    ).toHaveLength(1);
+    expect(
+      built.candidates.filter((c) =>
+        candidateEligible(c, { type: "all", role: "all", after: 200 }),
+      ),
+    ).toHaveLength(0);
+    expect(
+      built.candidates.filter((c) =>
+        candidateEligible(c, { type: "text", role: "all", toolName: "bash" }),
+      ),
+    ).toHaveLength(1);
   });
 });

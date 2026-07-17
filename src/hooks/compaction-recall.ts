@@ -1,6 +1,7 @@
 import type { Hooks, ToolContext, ToolDefinition } from "@opencode-ai/plugin";
 import type { OpencodeClient } from "@opencode-ai/sdk/v2";
 import type { Limits, SearchOutput, SearchResult } from "../types.js";
+import type { CorpusCache } from "../corpus.js";
 import { search } from "../search.js";
 
 /**
@@ -109,8 +110,9 @@ export function compactionRecall(
   unscoped: OpencodeClient,
   global: boolean,
   limits: Limits,
+  cache: CorpusCache,
 ): NonNullable<Hooks["experimental.session.compacting"]> {
-  const searchTool = search(client, unscoped, global, limits);
+  const searchTool = search(client, unscoped, global, limits, cache);
 
   return async (input, output) => {
     try {

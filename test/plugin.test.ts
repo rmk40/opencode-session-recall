@@ -92,6 +92,26 @@ describe("plugin entry", () => {
     expect(on["experimental.session.compacting"]).toBeDefined();
   });
 
+  it("prewarm syncs visible history at init when enabled", async () => {
+    const listGlobal = vi.fn(async () => ({
+      data: [{ id: "s1", title: "T", directory: PROJECT_DIR, time: { created: 1, updated: 2 } }],
+    }));
+    const messages = vi.fn(async () => ({ data: [] }));
+    createOpencodeClient
+      .mockImplementationOnce((options: unknown) => ({
+        ...(options as object),
+        session: { messages },
+      }))
+      .mockImplementationOnce((options: unknown) => ({
+        ...(options as object),
+        experimental: { session: { list: listGlobal } },
+      }));
+
+    await plugin.default.server(ctx({ fetch: vi.fn() }), { prewarm: true });
+    await vi.waitFor(() => expect(listGlobal).toHaveBeenCalled());
+    await vi.waitFor(() => expect(messages).toHaveBeenCalledWith({ sessionID: "s1" }));
+  });
+
   it("deduplicates primary tools and honors primary:false", async () => {
     const hooks = await plugin.default.server(ctx({ fetch: vi.fn() }), {});
     const config = {

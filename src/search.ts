@@ -20,14 +20,10 @@ import {
   type ResultSource,
   type ResultWhy,
 } from "./types.js";
-import { searchableFields, snippet, pruned, matches, formatMsg, isSelfTool } from "./extract.js";
+import { snippet, matches, formatMsg, isSelfTool } from "./extract.js";
 import { parseQuery } from "./query.js";
-import {
-  buildCandidates,
-  buildTitleCandidate,
-  populateNormalized,
-  DEFAULT_BUDGETS,
-} from "./candidates.js";
+import type { Candidate, CandidateFilters } from "./candidates.js";
+import { assembleSession, type AssembledSession, type CorpusCache } from "./corpus.js";
 import { bm25Search, type Bm25Hit } from "./bm25.js";
 import { smartSnippet } from "./snippet.js";
 import { compileRegex, regexFirstIndex, regexSnippet } from "./regex.js";
@@ -393,89 +389,8 @@ function normalizeSearchOptions(
   };
 }
 
-function partEligible(part: Part, type: string, toolName: string | undefined): boolean {
-  if (toolName) return part.type === "tool" && part.tool === toolName;
-  return type === "all" || part.type === type;
-}
-
-function findRepresentativeMessage(
-  messages: MsgWithParts[],
-  role: string,
-  before?: number,
-  after?: number,
-): MsgWithParts | undefined {
-  for (let index = messages.length - 1; index >= 0; index--) {
-    const msg = messages[index]!;
-    const ts = msg.info.time.created;
-    if (before != null && ts >= before) continue;
-    if (after != null && ts <= after) continue;
-    if (role !== "all" && msg.info.role !== role) continue;
-    return msg;
-  }
-  return undefined;
-}
-
-/** Build a title-sourced result. `titleSnippet` is precomputed by the caller so
- *  literal and regex paths can share this single constructor. */
-function titleSearchResult(
-  session: SessionMetaInternal,
-  representative: MsgWithParts,
-  titleSnippet: string,
-): SearchResult {
-  return annotateResult({
-    sessionID: session.id,
-    sessionTitle: session.title,
-    directory: session.directory,
-    messageID: representative.info.id,
-    role: representative.info.role,
-    time: representative.info.time.created,
-    partID: `${session.id}:title`,
-    partType: "title",
-    pruned: false,
-    snippet: titleSnippet,
-    source: "title",
-    directoryRelevance: session.directoryRelevance ?? "unknown",
-    titleMatch: { title: session.title },
-    why: {
-      matchedFields: ["title"],
-      directoryRelevance: session.directoryRelevance ?? "unknown",
-      recency: recencyLabel(representative.info.time.created),
-      confidence: "medium",
-    },
-  });
-}
-
 function canSearchTitles(type: string, toolName: string | undefined): boolean {
   return type === "all" && !toolName;
-}
-
-function countSearchCoverage(
-  loaded: Array<{ messages: MsgWithParts[] }>,
-  type: string,
-  role: string,
-  toolName: string | undefined,
-  before?: number,
-  after?: number,
-): { messagesSearched: number; partsSearched: number } {
-  let messagesSearched = 0;
-  let partsSearched = 0;
-
-  for (const { messages } of loaded) {
-    for (const msg of messages) {
-      const ts = msg.info.time.created;
-      if (before != null && ts >= before) continue;
-      if (after != null && ts <= after) continue;
-      if (role !== "all" && msg.info.role !== role) continue;
-      messagesSearched++;
-
-      for (const part of msg.parts) {
-        if (!partEligible(part, type, toolName)) continue;
-        partsSearched++;
-      }
-    }
-  }
-
-  return { messagesSearched, partsSearched };
 }
 
 function sameProjectOrWorktree(
@@ -589,164 +504,127 @@ function formatExpandedMsg(msg: MsgWithParts, budget: ExpansionBudget): MessageI
   };
 }
 
-/** Cap sample size only; loadErrorCount still reports all failures. */
-const MAX_LOAD_ERROR_SAMPLES = 5;
+// ── Candidate scans (cached corpus) ──────────────────────────────────
+// Literal and regex matching run over cached candidates' fieldTexts, which
+// searchableFields() built at cache-fill time, so matching semantics are
+// identical to the old per-message scans. Query filters were applied during
+// assembly; the session's bound title candidate rides at the end of the pool
+// so content hits precede the title hit, as before.
 
-// ── Literal scan (preserved from original) ──────────────────────────
+/** Build a SearchResult from a cached candidate hit (literal/regex paths). */
+function candidateResult(
+  candidate: Candidate,
+  relevance: DirectoryRelevance,
+  matchedField: ResultWhy["matchedFields"][number],
+  snip: string,
+): SearchResult {
+  return annotateResult({
+    sessionID: candidate.sessionID,
+    sessionTitle: candidate.sessionTitle,
+    directory: candidate.directory,
+    messageID: candidate.messageID,
+    role: candidate.role,
+    time: candidate.time,
+    partID: candidate.partID,
+    partType: candidate.partType,
+    pruned: candidate.isPruned,
+    snippet: snip,
+    toolName: candidate.toolName,
+    source: candidate.source ?? sourceForPartType(candidate.partType),
+    directoryRelevance: relevance,
+    titleMatch: candidate.titleMatch,
+    why: {
+      matchedFields: [matchedField],
+      directoryRelevance: relevance,
+      recency: recencyLabel(candidate.time),
+      confidence: candidate.partType === "title" ? "medium" : "high",
+    },
+  });
+}
 
 function scan(
-  messages: MsgWithParts[],
-  session: SessionMetaInternal,
+  candidates: Candidate[],
+  relevance: DirectoryRelevance,
   query: string,
-  type: string,
-  role: string,
   limit: number,
-  before?: number,
-  after?: number,
   width?: number,
-  toolName?: string,
 ): { results: SearchResult[]; total: number } {
   const results: SearchResult[] = [];
   let total = 0;
 
-  for (const msg of messages) {
+  for (const candidate of candidates) {
     if (results.length >= limit) break;
-    const ts = msg.info.time.created;
-    if (before != null && ts >= before) continue;
-    if (after != null && ts <= after) continue;
-    if (role !== "all" && msg.info.role !== role) continue;
-
-    for (const part of msg.parts) {
-      if (results.length >= limit) break;
-      if (!partEligible(part, type, toolName)) continue;
-
-      const fields = searchableFields(part);
-      let matched = false;
-
-      for (const field of fields) {
-        if (!matches(field.text, query)) continue;
-        total++;
-        if (matched) continue;
-        matched = true;
-
-        if (results.length < limit) {
-          results.push(
-            annotateResult({
-              sessionID: session.id,
-              sessionTitle: session.title,
-              directory: session.directory,
-              messageID: msg.info.id,
-              role: msg.info.role,
-              time: msg.info.time.created,
-              partID: part.id,
-              partType: part.type,
-              pruned: pruned(part),
-              snippet: snippet(field.text, query, width),
-              toolName: part.type === "tool" ? part.tool : undefined,
-              source: sourceForPartType(part.type),
-              directoryRelevance: session.directoryRelevance ?? "unknown",
-              why: {
-                matchedFields: [field.field],
-                directoryRelevance: session.directoryRelevance ?? "unknown",
-                recency: recencyLabel(msg.info.time.created),
-                confidence: "high",
-              },
-            }),
-          );
-        }
+    let matched = false;
+    for (const field of candidate.fieldTexts) {
+      if (!matches(field.text, query)) continue;
+      total++;
+      if (matched) continue;
+      matched = true;
+      if (results.length < limit) {
+        results.push(
+          candidateResult(candidate, relevance, field.field, snippet(field.text, query, width)),
+        );
       }
     }
   }
   return { results, total };
 }
 
-// ── Regex scan ───────────────────────────────────────────────────────
-
-/** Bounded regex scan over candidate fields. Mirrors scan() but uses a RegExp. */
-function regexScan(
-  messages: MsgWithParts[],
-  session: SessionMetaInternal,
+/** Regex scan over cached candidate fields. Mirrors scan() but uses a RegExp. */
+function regexScanCandidates(
+  candidates: Candidate[],
+  relevance: DirectoryRelevance,
   re: RegExp,
-  type: string,
-  role: string,
   limit: number,
-  before?: number,
-  after?: number,
   width?: number,
-  toolName?: string,
 ): { results: SearchResult[]; total: number } {
   const results: SearchResult[] = [];
   let total = 0;
 
-  for (const msg of messages) {
+  for (const candidate of candidates) {
     if (results.length >= limit) break;
-    const ts = msg.info.time.created;
-    if (before != null && ts >= before) continue;
-    if (after != null && ts <= after) continue;
-    if (role !== "all" && msg.info.role !== role) continue;
-
-    for (const part of msg.parts) {
-      if (results.length >= limit) break;
-      if (!partEligible(part, type, toolName)) continue;
-
-      const fields = searchableFields(part);
-      let matched = false;
-
-      for (const field of fields) {
-        const matchIndex = regexFirstIndex(re, field.text);
-        if (matchIndex === -1) continue;
-        total++;
-        if (matched) continue;
-        matched = true;
-
-        if (results.length < limit) {
-          results.push(
-            annotateResult({
-              sessionID: session.id,
-              sessionTitle: session.title,
-              directory: session.directory,
-              messageID: msg.info.id,
-              role: msg.info.role,
-              time: msg.info.time.created,
-              partID: part.id,
-              partType: part.type,
-              pruned: pruned(part),
-              snippet: regexSnippet(re, field.text, width, matchIndex),
-              toolName: part.type === "tool" ? part.tool : undefined,
-              source: sourceForPartType(part.type),
-              directoryRelevance: session.directoryRelevance ?? "unknown",
-              why: {
-                matchedFields: [field.field],
-                directoryRelevance: session.directoryRelevance ?? "unknown",
-                recency: recencyLabel(msg.info.time.created),
-                confidence: "high",
-              },
-            }),
-          );
-        }
+    let matched = false;
+    for (const field of candidate.fieldTexts) {
+      const matchIndex = regexFirstIndex(re, field.text);
+      if (matchIndex === -1) continue;
+      total++;
+      if (matched) continue;
+      matched = true;
+      if (results.length < limit) {
+        results.push(
+          candidateResult(
+            candidate,
+            relevance,
+            field.field,
+            regexSnippet(re, field.text, width, matchIndex),
+          ),
+        );
       }
     }
   }
   return { results, total };
+}
+
+/** A session's per-query scan pool: eligible candidates, then the title hit. */
+function scanPool(session: AssembledSession): Candidate[] {
+  return session.titleCandidate
+    ? [...session.candidates, session.titleCandidate]
+    : session.candidates;
 }
 
 // ── Smart/fuzzy scan ─────────────────────────────────────────────────
 
-/** smartScan returns ALL ranked results (caller handles slicing/grouping). */
+/** smartScan returns ALL ranked results (caller handles slicing/grouping).
+ *  Candidates come pre-built and pre-normalized from the corpus cache; there
+ *  are no per-query candidate budgets, so the whole eligible corpus is ranked.
+ *  The time budget remains as a safety valve (flags latency, never swaps
+ *  ranking algorithms or truncates by relevance-blind scan order). */
 function smartScan(
-  allMessages: Array<{
-    session: SessionMetaInternal;
-    messages: MsgWithParts[];
-  }>,
+  assembled: Array<{ session: AssembledSession; relevance: DirectoryRelevance }>,
   query: string,
-  type: string,
-  role: string,
   explain: boolean,
   mode: "smart" | "fuzzy",
-  before?: number,
-  after?: number,
   width?: number,
-  toolName?: string,
   abort?: AbortSignal,
 ): {
   results: SearchResult[];
@@ -757,91 +635,30 @@ function smartScan(
   const pq = parseQuery(query);
   const startTime = performance.now();
 
-  // ── 1. Build candidates across all sessions ───────────────────────
-  const allCandidates: Array<ReturnType<typeof buildCandidates>["candidates"][number]> = [];
-  let totalCharsUsed = 0;
-  let anyBudgetHit = false;
+  const pool: Candidate[] = [];
+  const relevanceBySession = new Map<string, DirectoryRelevance>();
   let timedOut = false;
 
-  for (const { session, messages } of allMessages) {
-    // Stop accumulating candidates if the caller aborted OR the wall-clock
-    // budget is already spent. The abort flag covers async cancellation, but it
-    // cannot flip during a synchronous run, so we also check the deadline
-    // directly here between sessions — this is the only thing that bounds the
-    // synchronous candidate-build/index phase for a hook whose timer fired while
-    // the event loop was blocked. A single in-flight BM25 exec still can't be
-    // preempted; the candidate/char budgets below bound that worst case.
+  for (const entry of assembled) {
+    // Honor a fired abort (hook timeout) between sessions; the deadline check
+    // bounds the synchronous pool-assembly phase the abort flag can't preempt.
     if (abort?.aborted || performance.now() - startTime > TIME_BUDGET_MS) {
       timedOut = true;
       break;
     }
-    if (canSearchTitles(type, toolName)) {
-      const representative = findRepresentativeMessage(messages, role, before, after);
-      if (representative) {
-        const titleCandidate = buildTitleCandidate(session, representative.info);
-        if (titleCandidate) {
-          allCandidates.push(titleCandidate);
-        }
-      }
-    }
-
-    const { candidates, charsUsed, budgetHit } = buildCandidates(
-      messages,
-      session,
-      {
-        ...DEFAULT_BUDGETS,
-        maxCharsTotal: DEFAULT_BUDGETS.maxCharsTotal - totalCharsUsed,
-      },
-      type,
-      role,
-      before,
-      after,
-      toolName,
-    );
-
-    allCandidates.push(...candidates);
-    totalCharsUsed += charsUsed;
-    if (budgetHit) anyBudgetHit = true;
-
-    // Enforce global candidate cap
-    if (allCandidates.length >= DEFAULT_BUDGETS.maxCandidatesTotal) {
-      allCandidates.length = DEFAULT_BUDGETS.maxCandidatesTotal;
-      anyBudgetHit = true;
-      break;
-    }
+    relevanceBySession.set(entry.session.meta.id, entry.relevance);
+    if (entry.session.titleCandidate) pool.push(entry.session.titleCandidate);
+    pool.push(...entry.session.candidates);
   }
 
-  // ── 2. Populate stage-2 normalization for all candidates ──────────
-  // BM25 indexes the normalized fields directly; there is no separate
-  // prefilter survival gate (the index itself selects matching docs).
-  for (const candidate of allCandidates) {
-    populateNormalized(candidate);
-  }
-
-  // ── 3. Run BM25 (MiniSearch) over all candidates ──────────────────
-  const hits = bm25Search(allCandidates, pq, mode, explain);
-  const allResults = rankedToSearchResults(hits, mode, explain, pq, width);
+  const hits = bm25Search(pool, pq, mode, explain);
+  const allResults = rankedToSearchResults(hits, mode, explain, pq, width, relevanceBySession);
 
   const totalTime = performance.now() - startTime;
-
-  // ── 4. Time-budget safety valve ───────────────────────────────────
-  // BM25 does not swap algorithms under load; the budget only flags that
-  // elapsed time was high so coverage can report it. Results are unchanged.
-  // A wall-clock cutoff during candidate building (timedOut) is also a time
-  // degradation; candidate-count/char caps are reported as "budget".
-  if (timedOut || totalTime > TIME_BUDGET_MS) {
-    return {
-      results: allResults,
-      total: allResults.length,
-      degradeKind: "time",
-      matchMode: mode,
-    };
-  }
-
   return {
     results: allResults,
     total: allResults.length,
-    degradeKind: anyBudgetHit ? "budget" : "none",
+    degradeKind: timedOut || totalTime > TIME_BUDGET_MS ? "time" : "none",
     matchMode: mode,
   };
 }
@@ -854,9 +671,14 @@ function rankedToSearchResults(
   explain: boolean,
   query: ReturnType<typeof parseQuery>,
   width: number | undefined,
+  relevanceBySession: Map<string, DirectoryRelevance>,
 ): SearchResult[] {
   return ranked.map((r) => {
     const c = r.candidate;
+    // Directory relevance is per-query (it depends on the caller's directory
+    // filter), so it comes from the query's session map, never from the
+    // cached candidate.
+    const relevance = relevanceBySession.get(c.sessionID) ?? "unknown";
 
     // Always use smartSnippet which operates on raw text positions.
     // BM25 match ranges reference normalized fields and can't be
@@ -881,12 +703,13 @@ function rankedToSearchResults(
       source: c.source,
       why: {
         ...c.why,
+        directoryRelevance: relevance,
         matchedFields:
           r.matchedFields.length > 0
             ? r.matchedFields
             : (c.why?.matchedFields ?? defaultMatchedFields(c.partType)),
       },
-      directoryRelevance: c.directoryRelevance ?? "unknown",
+      directoryRelevance: relevance,
       titleMatch: c.titleMatch,
     });
 
@@ -967,18 +790,17 @@ function diversify(results: SearchResult[], limit: number, perSession: number): 
   return [...firstPass, ...heldBack];
 }
 
-function expandSearchResults(
+async function expandSearchResults(
   results: SearchResult[],
-  loaded: Array<{ session: SessionMetaInternal; messages: MsgWithParts[] }>,
+  client: OpencodeClient,
   mode: ExpandMode,
   expandResults: number,
   window: number,
   expandBudgetMessages: number,
   expandBudgetChars: number,
-): { expanded?: ExpandedResult[]; warnings: string[] } {
+): Promise<{ expanded?: ExpandedResult[]; warnings: string[] }> {
   if (mode === "none") return { warnings: [] };
 
-  const bySession = new Map(loaded.map((entry) => [entry.session.id, entry.messages]));
   const expanded: ExpandedResult[] = [];
   const budget: ExpansionBudget = { remaining: expandBudgetChars, truncated: false };
   const expandable = results
@@ -992,6 +814,26 @@ function expandSearchResults(
 
   if (count === 0 && results.some((result) => result.source === "title")) {
     warnings.push("Expansion skipped title-only hits; title results do not have matched parts.");
+  }
+
+  // On-demand fetch: search runs over cached candidates, so full messages are
+  // loaded here only for the (≤ expandResults) sessions actually expanded.
+  const bySession = new Map<string, MsgWithParts[]>();
+  for (const sessionID of new Set(expandable.map((entry) => entry.result.sessionID))) {
+    try {
+      const resp = await client.session.messages({ sessionID });
+      if (resp.data) {
+        bySession.set(sessionID, resp.data as MsgWithParts[]);
+      } else {
+        warnings.push(
+          `Expansion could not load session ${sessionID}: ${
+            resp.error ? errmsg(resp.error) : "no messages returned"
+          }.`,
+        );
+      }
+    } catch (error) {
+      warnings.push(`Expansion could not load session ${sessionID}: ${errmsg(error)}.`);
+    }
   }
 
   for (const { result, resultIndex } of expandable) {
@@ -1197,16 +1039,16 @@ function buildSuggestions(input: {
 
 function buildNearMisses(
   results: SearchResult[],
-  loaded: Array<{ session: SessionMetaInternal; messages: MsgWithParts[] }>,
+  searched: Array<{ id: string; title: string; directory: string }>,
 ): NearMiss[] | undefined {
   if (results.length > 0) return undefined;
-  const misses = loaded
-    .filter((entry) => entry.session.title || entry.session.directory)
+  const misses = searched
+    .filter((session) => session.title || session.directory)
     .slice(0, MAX_NEAR_MISSES)
-    .map((entry) => ({
-      sessionID: entry.session.id,
-      title: entry.session.title || undefined,
-      directory: entry.session.directory || undefined,
+    .map((session) => ({
+      sessionID: session.id,
+      title: session.title || undefined,
+      directory: session.directory || undefined,
       reason: "Session was searched but no searchable part matched the query.",
     }));
   return misses.length > 0 ? misses : undefined;
@@ -1216,7 +1058,7 @@ function attachCommonOutput<T extends SearchOutput>(
   out: T,
   input: {
     final: SearchResult[];
-    allLoaded: Array<{ session: SessionMetaInternal; messages: MsgWithParts[] }>;
+    searchedSessions: Array<{ id: string; title: string; directory: string }>;
     coverage: SearchCoverage;
     warnings: string[];
     directory?: string;
@@ -1246,7 +1088,7 @@ function attachCommonOutput<T extends SearchOutput>(
     excludeExplicitOff: input.excludeExplicitOff,
   });
   if (suggestions) out.suggestions = suggestions;
-  const nearMisses = buildNearMisses(input.final, input.allLoaded);
+  const nearMisses = buildNearMisses(input.final, input.searchedSessions);
   if (nearMisses) out.nearMisses = nearMisses;
   return out;
 }
@@ -1258,6 +1100,7 @@ export function search(
   unscoped: OpencodeClient,
   global: boolean,
   limits: Limits,
+  cache: CorpusCache,
 ): ToolDefinition {
   return tool({
     description: `Search prior opencode conversations by message/tool-output content. Primary history-discovery tool; prefer over recall_sessions for topical discovery (titles only).
@@ -1748,390 +1591,255 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
         if (sessionID) pushUnique(normalized.limitedBy, "sessionID");
         else if (scope !== "global") pushUnique(normalized.limitedBy, "scope");
 
-        // ── Load messages ─────────────────────────────────────────────
-        const allLoaded: Array<{
-          session: SessionMetaInternal;
-          messages: MsgWithParts[];
-        }> = [];
-        const loadErrors: string[] = [];
-        let loadErrorCount = 0;
-        let scanned = 0;
-
-        for (let i = 0; i < targets.length; i += limits.concurrency) {
-          if (ctx.abort.aborted) break;
-
-          const batch = targets.slice(i, i + limits.concurrency);
-
-          const loaded = await Promise.all(
-            batch.map(async (t) => {
-              try {
-                const resp = await client.session.messages({
-                  sessionID: t.id,
-                });
-                if (resp.error) {
-                  loadErrorCount++;
-                  if (loadErrors.length < MAX_LOAD_ERROR_SAMPLES) {
-                    loadErrors.push(`${t.id}: ${errmsg(resp.error)}`);
-                  }
-                  return { session: t, messages: [] as MsgWithParts[] };
-                }
-                if (!resp.data) {
-                  loadErrorCount++;
-                  if (loadErrors.length < MAX_LOAD_ERROR_SAMPLES) {
-                    loadErrors.push(`${t.id}: no messages returned`);
-                  }
-                  return { session: t, messages: [] as MsgWithParts[] };
-                }
-                return {
-                  session: t,
-                  messages: resp.data as MsgWithParts[],
-                };
-              } catch (e) {
-                loadErrorCount++;
-                if (loadErrors.length < MAX_LOAD_ERROR_SAMPLES) {
-                  loadErrors.push(`${t.id}: ${errmsg(e)}`);
-                }
-                return { session: t, messages: [] as MsgWithParts[] };
-              }
-            }),
-          );
-
-          allLoaded.push(...loaded);
-          scanned += batch.length;
-        }
-
-        if (ctx.abort.aborted) {
-          const err: ErrorOutput = { ok: false, error: "aborted" };
-          return JSON.stringify(err);
-        }
-
-        if (loadErrorCount > 0) pushUnique(normalized.limitedBy, "loadError");
-        const { messagesSearched, partsSearched } = countSearchCoverage(
-          allLoaded,
-          partType,
-          role,
-          toolName,
-          before,
-          after,
-        );
-        const sessionsDiscovered = discoveredTargets.length;
-        const sessionsSkipped = sessionsDiscovered - scanned;
-        if (sessionsSkipped > 0) {
-          const accounted = Object.values(skippedByReason).reduce((sum, value) => sum + value, 0);
-          if (accounted < sessionsSkipped) {
-            skippedByReason.filtered = sessionsSkipped - accounted;
-          }
-        }
-        const coverage: SearchCoverage = {
-          totalSessionsKnown: false,
-          sessionsDiscovered,
-          sessionsEligible,
-          sessionsSearched: scanned,
-          messagesSearched,
-          partsSearched,
-          sessionsSkipped,
-          skippedByReason: Object.keys(skippedByReason).length > 0 ? skippedByReason : undefined,
-          directoryBucketsSearched,
-          limitedBy: normalized.limitedBy.length > 0 ? normalized.limitedBy : undefined,
-        };
-
-        const groupMode: GroupMode = groupArg;
-        const isGrouped = groupMode === "session";
-        const incomplete = loadErrorCount > 0;
-        const loadErrorSuffix = incomplete
-          ? `, ${loadErrorCount} load error${loadErrorCount !== 1 ? "s" : ""}`
-          : "";
-        const includeLoadErrors = <T extends SearchOutput>(out: T): T => {
-          if (!incomplete) return out;
-          out.loadErrorCount = loadErrorCount;
-          out.loadErrors = [...loadErrors];
-          return out;
-        };
-        const includeExpansion = <T extends SearchOutput>(
-          out: T,
-          final: SearchResult[],
-          warnings: string[],
-        ): T => {
-          const expansion = expandSearchResults(
-            final,
-            allLoaded,
-            expandMode,
-            normalized.expandResults,
-            normalized.window,
-            normalized.expandBudgetMessages,
-            normalized.expandBudgetChars,
-          );
-          if (expansion.expanded) out.expanded = expansion.expanded;
-          warnings.push(...expansion.warnings);
-          return out;
-        };
-        const finish = <T extends SearchOutput>(
-          out: T,
-          final: SearchResult[],
-          effectiveMatchMode: MatchMode,
-        ): T => {
-          const warnings = [...normalized.warnings];
-          if (incomplete) {
-            warnings.push(
-              `${loadErrorCount} session${loadErrorCount === 1 ? "" : "s"} failed to load; results may be partial.`,
-            );
-          }
-          return includeLoadErrors(
-            attachCommonOutput(includeExpansion(out, final, warnings), {
-              final,
-              allLoaded,
-              coverage,
-              warnings,
-              directory,
-              fallback,
-              matchMode: effectiveMatchMode,
-              type: partType,
-              query: args.query,
-              currentSessionID,
-              currentSessionExcluded,
-              excludeExplicitOff: excludeExplicit === false,
-            }),
-          );
-        };
-
-        // ── Helper: run literal scan (full or limited) ───────────────
-        const literalScan = (
-          scanLimit: number,
-        ): { collected: SearchResult[]; total: number; early: boolean } => {
-          const collected: SearchResult[] = [];
-          let total = 0;
-          let early = false;
-          const scanStart = performance.now();
-
-          for (const { session: sess, messages: msgs } of allLoaded) {
-            if (collected.length >= scanLimit) {
-              early = true;
-              break;
-            }
-            // Bound synchronous scanning by wall-clock and honor a fired abort
-            // (a hook timeout may have landed mid-scan, where the abort flag
-            // couldn't be observed until now).
-            if (ctx.abort.aborted || performance.now() - scanStart > SCAN_TIME_BUDGET_MS) {
-              early = true;
-              break;
-            }
-            const remaining = scanLimit - collected.length;
-            const result = scan(
-              msgs,
-              sess,
-              args.query,
-              partType,
-              role,
-              remaining,
-              before,
-              after,
-              widthArg,
-              toolName,
-            );
-            collected.push(...result.results);
-            total += result.total;
-
-            if (
-              canSearchTitles(partType, toolName) &&
-              matches(sess.title, args.query) &&
-              collected.length < scanLimit
-            ) {
-              const representative = findRepresentativeMessage(msgs, role, before, after);
-              if (representative) {
-                collected.push(
-                  titleSearchResult(
-                    sess,
-                    representative,
-                    snippet(sess.title, args.query, widthArg),
-                  ),
-                );
-                total++;
-              }
-            }
-          }
-          return { collected, total, early };
-        };
-
-        // ── Helper: run regex scan (full or limited) ─────────────────
-        const regexScanAll = (
-          re: RegExp,
-          scanLimit: number,
-        ): { collected: SearchResult[]; total: number; early: boolean } => {
-          const collected: SearchResult[] = [];
-          let total = 0;
-          let early = false;
-          const scanStart = performance.now();
-
-          for (const { session: sess, messages: msgs } of allLoaded) {
-            if (collected.length >= scanLimit) {
-              early = true;
-              break;
-            }
-            // Bound synchronous scanning by wall-clock and honor a fired abort.
-            if (ctx.abort.aborted || performance.now() - scanStart > SCAN_TIME_BUDGET_MS) {
-              early = true;
-              break;
-            }
-            const remaining = scanLimit - collected.length;
-            const result = regexScan(
-              msgs,
-              sess,
-              re,
-              partType,
-              role,
-              remaining,
-              before,
-              after,
-              widthArg,
-              toolName,
-            );
-            collected.push(...result.results);
-            total += result.total;
-
-            const titleIndex = canSearchTitles(partType, toolName)
-              ? regexFirstIndex(re, sess.title)
-              : -1;
-            if (titleIndex !== -1 && collected.length < scanLimit) {
-              const representative = findRepresentativeMessage(msgs, role, before, after);
-              if (representative) {
-                collected.push(
-                  titleSearchResult(
-                    sess,
-                    representative,
-                    regexSnippet(re, sess.title, widthArg, titleIndex),
-                  ),
-                );
-                total++;
-              }
-            }
-          }
-          return { collected, total, early };
-        };
-
-        // ── Helper: apply grouping and slicing ───────────────────────
-        const applyGroupAndSlice = (
-          results: SearchResult[],
-          partTotal: number,
-          earlyExit: boolean,
-        ): { final: SearchResult[]; total: number; truncated: boolean } => {
-          if (isGrouped) {
-            const grouped = orderForDirectoryFallback(
-              groupBySession(results),
-              Boolean(directory && fallback),
-            );
-            const final = grouped.slice(0, resultsArg);
-            return {
-              final,
-              total: grouped.length,
-              truncated: earlyExit || grouped.length > final.length,
-            };
-          }
-          // Diversify first (caps per-session hits), then restore directory
-          // relevance ordering — otherwise a held-back exact-directory hit can
-          // land behind a global-directory hit, inverting the fallback ordering
-          // the caller asked for.
-          const diversified = diversify(results, resultsArg, MAX_HITS_PER_SESSION_INITIAL);
-          const ordered = orderForDirectoryFallback(diversified, Boolean(directory && fallback));
-          const final = ordered.slice(0, resultsArg);
-          return {
-            final,
-            total: partTotal,
-            truncated: earlyExit || partTotal > final.length,
-          };
-        };
-
-        // Part-mode literal/regex over-collect so the diversity pass has
-        // cross-session material; grouped mode already scans broadly.
-        const partScanLimit = Math.min(
-          MAX_GROUPED_LITERAL_RESULTS,
-          resultsArg * DIVERSITY_SCAN_MULTIPLIER,
-        );
-
-        // ── Route: literal or smart/fuzzy ─────────────────────────────
-        if (matchMode === "literal") {
-          // When grouping by session, scan all sessions (no early exit)
-          // so we get representative hits from every matching session
-          const limit = isGrouped ? MAX_GROUPED_LITERAL_RESULTS : partScanLimit;
-          const { collected, total, early } = literalScan(limit);
-          const { final, total: outTotal, truncated } = applyGroupAndSlice(collected, total, early);
-
-          const unit = isGrouped ? "session" : "result";
-          ctx.metadata({
-            title: `Found ${final.length} ${unit}${final.length !== 1 ? "s" : ""} for "${args.query}" (${scanned} session${scanned !== 1 ? "s" : ""} searched${loadErrorSuffix})`,
-          });
-
-          const out: SearchOutput = {
-            ok: true,
-            results: final,
-            scanned,
-            total: outTotal,
-            truncated,
-            group: groupMode,
-          };
-          return JSON.stringify(finish(out, final, "literal"));
-        }
-
-        // ── Route: regex ──────────────────────────────────────────────
-        if (matchMode === "regex" && regex) {
-          const limit = isGrouped ? MAX_GROUPED_LITERAL_RESULTS : partScanLimit;
-          const { collected, total, early } = regexScanAll(regex, limit);
-          const { final, total: outTotal, truncated } = applyGroupAndSlice(collected, total, early);
-
-          const unit = isGrouped ? "session" : "result";
-          ctx.metadata({
-            title: `Found ${final.length} ${unit}${final.length !== 1 ? "s" : ""} for /${args.query}/ (regex, ${scanned} session${scanned !== 1 ? "s" : ""}${loadErrorSuffix})`,
-          });
-
-          const out: SearchOutput = {
-            ok: true,
-            results: final,
-            scanned,
-            total: outTotal,
-            truncated,
-            matchMode: "regex",
-            group: groupMode,
-          };
-          return JSON.stringify(finish(out, final, "regex"));
-        }
-
-        // ── Smart/fuzzy path ────────────────────────────────────────
-        // literal and regex modes returned above; only smart/fuzzy remain.
-        const smartMode: "smart" | "fuzzy" = matchMode === "fuzzy" ? "fuzzy" : "smart";
-        const smartResult = smartScan(
-          allLoaded,
-          args.query,
-          partType,
-          role,
-          explain,
-          smartMode,
-          before,
-          after,
-          widthArg,
-          toolName,
+        // ── Sync sessions through the corpus cache ────────────────────
+        // Only changed/missing sessions are fetched; everything else is
+        // served from the in-memory corpus. release() (in the finally below)
+        // unpins the synced sessions so they become evictable again.
+        const sync = await cache.sync(
+          targets.map((t) => ({
+            id: t.id,
+            title: t.title,
+            directory: t.directory,
+            updated: t.updated,
+          })),
           ctx.abort,
         );
-        if (smartResult.degradeKind === "budget") pushUnique(normalized.limitedBy, "rankingBudget");
-        if (smartResult.degradeKind === "time") pushUnique(normalized.limitedBy, "timeBudget");
+        try {
+          if (ctx.abort.aborted) {
+            const err: ErrorOutput = { ok: false, error: "aborted" };
+            return JSON.stringify(err);
+          }
 
-        // ── Fallback to literal if smart returns nothing ────────────
-        // Skip the fallback when the smart pass was cut short rather than
-        // genuinely empty: if the caller aborted (a hook timeout fired
-        // mid-smartScan) or the wall-clock budget was hit, a synchronous literal
-        // re-scan would run past the budget the timeout just enforced, and would
-        // also mask the time-degradation signal.
-        if (
-          smartResult.results.length === 0 &&
-          smartResult.degradeKind !== "time" &&
-          !ctx.abort.aborted
-        ) {
-          const limit = isGrouped ? MAX_GROUPED_LITERAL_RESULTS : partScanLimit;
-          const { collected, total, early } = literalScan(limit);
-          const { final, total: outTotal, truncated } = applyGroupAndSlice(collected, total, early);
+          const { loadErrors, loadErrorCount } = sync;
+          const scanned = sync.sessions.length;
+          if (loadErrorCount > 0) pushUnique(normalized.limitedBy, "loadError");
 
-          if (final.length > 0) {
+          // Apply this query's filters to the cached corpus. Coverage counts
+          // are derived from the eligible candidates: messages/parts WITH
+          // searchable content that passed the filters (a deliberate change
+          // from the old pre-extraction counting; see the plan's Phase 2).
+          const searchTitles = canSearchTitles(partType, toolName);
+          const filters: CandidateFilters = { type: partType, role, before, after, toolName };
+          const assembled = sync.sessions.map((entry, index) => ({
+            session: assembleSession(entry, filters, searchTitles),
+            relevance: targets[index]?.directoryRelevance ?? ("unknown" as DirectoryRelevance),
+          }));
+
+          let messagesSearched = 0;
+          let partsSearched = 0;
+          for (const entry of assembled) {
+            messagesSearched += entry.session.messagesSearched;
+            partsSearched += entry.session.partsSearched;
+          }
+          const searchedSessions = assembled.map((entry) => ({
+            id: entry.session.meta.id,
+            title: entry.session.meta.title,
+            directory: entry.session.meta.directory,
+          }));
+
+          const sessionsDiscovered = discoveredTargets.length;
+          const sessionsSkipped = sessionsDiscovered - scanned;
+          if (sessionsSkipped > 0) {
+            const accounted = Object.values(skippedByReason).reduce((sum, value) => sum + value, 0);
+            if (accounted < sessionsSkipped) {
+              skippedByReason.filtered = sessionsSkipped - accounted;
+            }
+          }
+          const coverage: SearchCoverage = {
+            totalSessionsKnown: false,
+            sessionsDiscovered,
+            sessionsEligible,
+            sessionsSearched: scanned,
+            messagesSearched,
+            partsSearched,
+            sessionsSkipped,
+            skippedByReason: Object.keys(skippedByReason).length > 0 ? skippedByReason : undefined,
+            directoryBucketsSearched,
+            limitedBy: normalized.limitedBy.length > 0 ? normalized.limitedBy : undefined,
+          };
+
+          const groupMode: GroupMode = groupArg;
+          const isGrouped = groupMode === "session";
+          const incomplete = loadErrorCount > 0;
+          const loadErrorSuffix = incomplete
+            ? `, ${loadErrorCount} load error${loadErrorCount !== 1 ? "s" : ""}`
+            : "";
+          const includeLoadErrors = <T extends SearchOutput>(out: T): T => {
+            if (!incomplete) return out;
+            out.loadErrorCount = loadErrorCount;
+            out.loadErrors = [...loadErrors];
+            return out;
+          };
+          const includeExpansion = async <T extends SearchOutput>(
+            out: T,
+            final: SearchResult[],
+            warnings: string[],
+          ): Promise<T> => {
+            const expansion = await expandSearchResults(
+              final,
+              client,
+              expandMode,
+              normalized.expandResults,
+              normalized.window,
+              normalized.expandBudgetMessages,
+              normalized.expandBudgetChars,
+            );
+            if (expansion.expanded) out.expanded = expansion.expanded;
+            warnings.push(...expansion.warnings);
+            return out;
+          };
+          const finish = async <T extends SearchOutput>(
+            out: T,
+            final: SearchResult[],
+            effectiveMatchMode: MatchMode,
+          ): Promise<T> => {
+            const warnings = [...normalized.warnings];
+            if (incomplete) {
+              warnings.push(
+                `${loadErrorCount} session${loadErrorCount === 1 ? "" : "s"} failed to load; results may be partial.`,
+              );
+            }
+            return includeLoadErrors(
+              attachCommonOutput(await includeExpansion(out, final, warnings), {
+                final,
+                searchedSessions,
+                coverage,
+                warnings,
+                directory,
+                fallback,
+                matchMode: effectiveMatchMode,
+                type: partType,
+                query: args.query,
+                currentSessionID,
+                currentSessionExcluded,
+                excludeExplicitOff: excludeExplicit === false,
+              }),
+            );
+          };
+
+          // ── Helper: run literal scan (full or limited) ───────────────
+          const literalScan = (
+            scanLimit: number,
+          ): { collected: SearchResult[]; total: number; early: boolean } => {
+            const collected: SearchResult[] = [];
+            let total = 0;
+            let early = false;
+            const scanStart = performance.now();
+
+            for (const entry of assembled) {
+              if (collected.length >= scanLimit) {
+                early = true;
+                break;
+              }
+              // Bound synchronous scanning by wall-clock and honor a fired abort
+              // (a hook timeout may have landed mid-scan, where the abort flag
+              // couldn't be observed until now).
+              if (ctx.abort.aborted || performance.now() - scanStart > SCAN_TIME_BUDGET_MS) {
+                early = true;
+                break;
+              }
+              const remaining = scanLimit - collected.length;
+              const result = scan(
+                scanPool(entry.session),
+                entry.relevance,
+                args.query,
+                remaining,
+                widthArg,
+              );
+              collected.push(...result.results);
+              total += result.total;
+            }
+            return { collected, total, early };
+          };
+
+          // ── Helper: run regex scan (full or limited) ─────────────────
+          const regexScanAll = (
+            re: RegExp,
+            scanLimit: number,
+          ): { collected: SearchResult[]; total: number; early: boolean } => {
+            const collected: SearchResult[] = [];
+            let total = 0;
+            let early = false;
+            const scanStart = performance.now();
+
+            for (const entry of assembled) {
+              if (collected.length >= scanLimit) {
+                early = true;
+                break;
+              }
+              // Bound synchronous scanning by wall-clock and honor a fired abort.
+              if (ctx.abort.aborted || performance.now() - scanStart > SCAN_TIME_BUDGET_MS) {
+                early = true;
+                break;
+              }
+              const remaining = scanLimit - collected.length;
+              const result = regexScanCandidates(
+                scanPool(entry.session),
+                entry.relevance,
+                re,
+                remaining,
+                widthArg,
+              );
+              collected.push(...result.results);
+              total += result.total;
+            }
+            return { collected, total, early };
+          };
+
+          // ── Helper: apply grouping and slicing ───────────────────────
+          const applyGroupAndSlice = (
+            results: SearchResult[],
+            partTotal: number,
+            earlyExit: boolean,
+          ): { final: SearchResult[]; total: number; truncated: boolean } => {
+            if (isGrouped) {
+              const grouped = orderForDirectoryFallback(
+                groupBySession(results),
+                Boolean(directory && fallback),
+              );
+              const final = grouped.slice(0, resultsArg);
+              return {
+                final,
+                total: grouped.length,
+                truncated: earlyExit || grouped.length > final.length,
+              };
+            }
+            // Diversify first (caps per-session hits), then restore directory
+            // relevance ordering — otherwise a held-back exact-directory hit can
+            // land behind a global-directory hit, inverting the fallback ordering
+            // the caller asked for.
+            const diversified = diversify(results, resultsArg, MAX_HITS_PER_SESSION_INITIAL);
+            const ordered = orderForDirectoryFallback(diversified, Boolean(directory && fallback));
+            const final = ordered.slice(0, resultsArg);
+            return {
+              final,
+              total: partTotal,
+              truncated: earlyExit || partTotal > final.length,
+            };
+          };
+
+          // Part-mode literal/regex over-collect so the diversity pass has
+          // cross-session material; grouped mode already scans broadly.
+          const partScanLimit = Math.min(
+            MAX_GROUPED_LITERAL_RESULTS,
+            resultsArg * DIVERSITY_SCAN_MULTIPLIER,
+          );
+
+          // ── Route: literal or smart/fuzzy ─────────────────────────────
+          if (matchMode === "literal") {
+            // When grouping by session, scan all sessions (no early exit)
+            // so we get representative hits from every matching session
+            const limit = isGrouped ? MAX_GROUPED_LITERAL_RESULTS : partScanLimit;
+            const { collected, total, early } = literalScan(limit);
+            const {
+              final,
+              total: outTotal,
+              truncated,
+            } = applyGroupAndSlice(collected, total, early);
+
             const unit = isGrouped ? "session" : "result";
             ctx.metadata({
-              title: `Found ${final.length} ${unit}${final.length !== 1 ? "s" : ""} for "${args.query}" (literal fallback, ${scanned} session${scanned !== 1 ? "s" : ""}${loadErrorSuffix})`,
+              title: `Found ${final.length} ${unit}${final.length !== 1 ? "s" : ""} for "${args.query}" (${scanned} session${scanned !== 1 ? "s" : ""} searched${loadErrorSuffix})`,
             });
 
             const out: SearchOutput = {
@@ -2140,37 +1848,116 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
               scanned,
               total: outTotal,
               truncated,
-              matchMode: "literal",
-              degradeKind: "fallback",
               group: groupMode,
             };
-            return JSON.stringify(finish(out, final, "literal"));
+            return JSON.stringify(await finish(out, final, "literal"));
           }
+
+          // ── Route: regex ──────────────────────────────────────────────
+          if (matchMode === "regex" && regex) {
+            const limit = isGrouped ? MAX_GROUPED_LITERAL_RESULTS : partScanLimit;
+            const { collected, total, early } = regexScanAll(regex, limit);
+            const {
+              final,
+              total: outTotal,
+              truncated,
+            } = applyGroupAndSlice(collected, total, early);
+
+            const unit = isGrouped ? "session" : "result";
+            ctx.metadata({
+              title: `Found ${final.length} ${unit}${final.length !== 1 ? "s" : ""} for /${args.query}/ (regex, ${scanned} session${scanned !== 1 ? "s" : ""}${loadErrorSuffix})`,
+            });
+
+            const out: SearchOutput = {
+              ok: true,
+              results: final,
+              scanned,
+              total: outTotal,
+              truncated,
+              matchMode: "regex",
+              group: groupMode,
+            };
+            return JSON.stringify(await finish(out, final, "regex"));
+          }
+
+          // ── Smart/fuzzy path ────────────────────────────────────────
+          // literal and regex modes returned above; only smart/fuzzy remain.
+          const smartMode: "smart" | "fuzzy" = matchMode === "fuzzy" ? "fuzzy" : "smart";
+          const smartResult = smartScan(
+            assembled,
+            args.query,
+            explain,
+            smartMode,
+            widthArg,
+            ctx.abort,
+          );
+          if (smartResult.degradeKind === "time") pushUnique(normalized.limitedBy, "timeBudget");
+
+          // ── Fallback to literal if smart returns nothing ────────────
+          // Skip the fallback when the smart pass was cut short rather than
+          // genuinely empty: if the caller aborted (a hook timeout fired
+          // mid-smartScan) or the wall-clock budget was hit, a synchronous literal
+          // re-scan would run past the budget the timeout just enforced, and would
+          // also mask the time-degradation signal.
+          if (
+            smartResult.results.length === 0 &&
+            smartResult.degradeKind !== "time" &&
+            !ctx.abort.aborted
+          ) {
+            const limit = isGrouped ? MAX_GROUPED_LITERAL_RESULTS : partScanLimit;
+            const { collected, total, early } = literalScan(limit);
+            const {
+              final,
+              total: outTotal,
+              truncated,
+            } = applyGroupAndSlice(collected, total, early);
+
+            if (final.length > 0) {
+              const unit = isGrouped ? "session" : "result";
+              ctx.metadata({
+                title: `Found ${final.length} ${unit}${final.length !== 1 ? "s" : ""} for "${args.query}" (literal fallback, ${scanned} session${scanned !== 1 ? "s" : ""}${loadErrorSuffix})`,
+              });
+
+              const out: SearchOutput = {
+                ok: true,
+                results: final,
+                scanned,
+                total: outTotal,
+                truncated,
+                matchMode: "literal",
+                degradeKind: "fallback",
+                group: groupMode,
+              };
+              return JSON.stringify(await finish(out, final, "literal"));
+            }
+          }
+
+          // ── Return smart/fuzzy results ──────────────────────────────
+          const {
+            final,
+            total: outTotal,
+            truncated,
+          } = applyGroupAndSlice(smartResult.results, smartResult.total, false);
+
+          const unit = isGrouped ? "session" : "result";
+          ctx.metadata({
+            title: `Found ${final.length} ${unit}${final.length !== 1 ? "s" : ""} for "${args.query}" (${matchMode}, ${scanned} session${scanned !== 1 ? "s" : ""}${loadErrorSuffix})`,
+          });
+
+          const out: SearchOutput = {
+            ok: true,
+            results: final,
+            scanned,
+            total: outTotal,
+            truncated,
+            matchMode: smartResult.matchMode,
+            degradeKind: smartResult.degradeKind,
+            group: groupMode,
+          };
+          return JSON.stringify(await finish(out, final, smartResult.matchMode));
+        } finally {
+          sync.release();
         }
-
-        // ── Return smart/fuzzy results ──────────────────────────────
-        const {
-          final,
-          total: outTotal,
-          truncated,
-        } = applyGroupAndSlice(smartResult.results, smartResult.total, false);
-
-        const unit = isGrouped ? "session" : "result";
-        ctx.metadata({
-          title: `Found ${final.length} ${unit}${final.length !== 1 ? "s" : ""} for "${args.query}" (${matchMode}, ${scanned} session${scanned !== 1 ? "s" : ""}${loadErrorSuffix})`,
-        });
-
-        const out: SearchOutput = {
-          ok: true,
-          results: final,
-          scanned,
-          total: outTotal,
-          truncated,
-          matchMode: smartResult.matchMode,
-          degradeKind: smartResult.degradeKind,
-          group: groupMode,
-        };
-        return JSON.stringify(finish(out, final, smartResult.matchMode));
       } catch (e) {
         const err: ErrorOutput = { ok: false, error: errmsg(e) };
         return JSON.stringify(err);

@@ -3,6 +3,7 @@ import { context as contextTool } from "../src/context.js";
 import { get as getTool } from "../src/get.js";
 import { messages as messagesTool } from "../src/messages.js";
 import { search } from "../src/search.js";
+import { CorpusCache } from "../src/corpus.js";
 import { sessions as sessionsTool } from "../src/sessions.js";
 import type {
   ContextOutput,
@@ -338,10 +339,8 @@ describe("recall_sessions defensive args", () => {
 describe("LLM-facing schemas", () => {
   it("reject invalid enum and capped numeric args before execute", async () => {
     const h = makeFakeHarness();
-    const recall = search(h.client, h.unscoped, true, {
-      ...TEST_LIMITS,
-      maxResults: 2,
-    });
+    const limits = { ...TEST_LIMITS, maxResults: 2 };
+    const recall = search(h.client, h.unscoped, true, limits, new CorpusCache(h.client, limits));
 
     await expect(
       runTool<SearchOutput>(recall, { query: "rate", scope: "everywhere" }),

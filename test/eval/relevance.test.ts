@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { search } from "../../src/search.js";
+import { CorpusCache } from "../../src/corpus.js";
 import { TEST_LIMITS } from "../helpers.js";
 import { EVAL_CASES } from "./cases.js";
 import { makeEvalClients, evalContext, runEval } from "./harness.js";
@@ -16,7 +17,13 @@ import BASELINE from "./baseline.json" with { type: "json" };
  */
 describe("recall relevance eval", () => {
   const { client, unscoped } = makeEvalClients();
-  const searchTool = search(client, unscoped, true, TEST_LIMITS);
+  const searchTool = search(
+    client,
+    unscoped,
+    true,
+    TEST_LIMITS,
+    new CorpusCache(client, TEST_LIMITS),
+  );
   const ctx = evalContext();
 
   it("meets or beats the recorded baseline (MRR, recall@5)", async () => {

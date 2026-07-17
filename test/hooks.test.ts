@@ -3,6 +3,7 @@ import { systemNudge, NUDGE_SENTINEL } from "../src/hooks/system-nudge.js";
 import { shouldAutoRecall, formatAutoRecallBlock, autoRecall } from "../src/hooks/auto-recall.js";
 import { formatPreservationBlock, compactionRecall } from "../src/hooks/compaction-recall.js";
 import { partId } from "../src/hooks/part-id.js";
+import { CorpusCache } from "../src/corpus.js";
 import type { SearchResult } from "../src/types.js";
 import { TEST_LIMITS, makeFakeHarness } from "./helpers.js";
 
@@ -144,7 +145,13 @@ describe("formatAutoRecallBlock", () => {
 describe("autoRecall hook", () => {
   it("injects a synthetic part when the gate fires and hits exist", async () => {
     const h = makeFakeHarness();
-    const hook = autoRecall(h.client, h.unscoped, true, TEST_LIMITS);
+    const hook = autoRecall(
+      h.client,
+      h.unscoped,
+      true,
+      TEST_LIMITS,
+      new CorpusCache(h.client, TEST_LIMITS),
+    );
     const output = {
       message: { id: "m-x" } as never,
       parts: [
@@ -173,7 +180,13 @@ describe("autoRecall hook", () => {
 
   it("excludes the session it fires in from injected citations", async () => {
     const h = makeFakeHarness();
-    const hook = autoRecall(h.client, h.unscoped, true, TEST_LIMITS);
+    const hook = autoRecall(
+      h.client,
+      h.unscoped,
+      true,
+      TEST_LIMITS,
+      new CorpusCache(h.client, TEST_LIMITS),
+    );
     const output = {
       message: { id: "m-x" } as never,
       // "rate limit" matches both s-current (rate-limit middleware) and
@@ -192,7 +205,13 @@ describe("autoRecall hook", () => {
 
   it("does nothing when the gate does not fire", async () => {
     const h = makeFakeHarness();
-    const hook = autoRecall(h.client, h.unscoped, true, TEST_LIMITS);
+    const hook = autoRecall(
+      h.client,
+      h.unscoped,
+      true,
+      TEST_LIMITS,
+      new CorpusCache(h.client, TEST_LIMITS),
+    );
     const output = {
       message: { id: "m-x" } as never,
       parts: [{ type: "text", text: "Add a new endpoint to the API." }] as unknown[],
@@ -203,7 +222,13 @@ describe("autoRecall hook", () => {
 
   it("never throws when search fails", async () => {
     const h = makeFakeHarness({ projectListError: "boom", globalListError: "boom" });
-    const hook = autoRecall(h.client, h.unscoped, true, TEST_LIMITS);
+    const hook = autoRecall(
+      h.client,
+      h.unscoped,
+      true,
+      TEST_LIMITS,
+      new CorpusCache(h.client, TEST_LIMITS),
+    );
     const output = {
       message: { id: "m-x" } as never,
       parts: [{ type: "text", text: "what did we decide last time about caching?" }] as unknown[],
@@ -267,7 +292,13 @@ describe("formatPreservationBlock", () => {
 describe("compactionRecall hook", () => {
   it("pushes a block onto context and never sets prompt", async () => {
     const h = makeFakeHarness();
-    const hook = compactionRecall(h.client, h.unscoped, true, TEST_LIMITS);
+    const hook = compactionRecall(
+      h.client,
+      h.unscoped,
+      true,
+      TEST_LIMITS,
+      new CorpusCache(h.client, TEST_LIMITS),
+    );
     const output: { context: string[]; prompt?: string } = { context: [], prompt: undefined };
     await hook({ sessionID: "s-current" } as never, output as never);
     expect(output.prompt).toBeUndefined();
@@ -277,7 +308,13 @@ describe("compactionRecall hook", () => {
 
   it("never throws when search fails", async () => {
     const h = makeFakeHarness({ messageThrows: new Set(["s-current"]) });
-    const hook = compactionRecall(h.client, h.unscoped, true, TEST_LIMITS);
+    const hook = compactionRecall(
+      h.client,
+      h.unscoped,
+      true,
+      TEST_LIMITS,
+      new CorpusCache(h.client, TEST_LIMITS),
+    );
     const output: { context: string[]; prompt?: string } = { context: [], prompt: undefined };
     await expect(
       hook({ sessionID: "s-current" } as never, output as never),

@@ -1,6 +1,7 @@
 import type { Hooks, ToolContext, ToolDefinition } from "@opencode-ai/plugin";
 import type { OpencodeClient, Part } from "@opencode-ai/sdk/v2";
 import type { Limits, SearchOutput, SearchResult } from "../types.js";
+import type { CorpusCache } from "../corpus.js";
 import { search } from "../search.js";
 import { partId } from "./part-id.js";
 
@@ -22,10 +23,11 @@ const MAX_AUTO_HITS = 3;
 const MAX_AUTO_BLOCK_CHARS = 900;
 const MAX_QUERY_CHARS = 120;
 const MIN_MESSAGE_CHARS = 12;
-/** Hard wall-clock cap on the inline auto-recall search (critical path). */
+/** Hard wall-clock cap on the inline auto-recall search (critical path).
+ *  With the shared corpus cache there is no session-scan cap anymore: a warm
+ *  cache searches full history in well under this bound, and a cold cache on
+ *  a huge history simply times out (injecting nothing) until warm. */
 const SEARCH_TIMEOUT_MS = 1500;
-/** Bound how many sessions auto-recall will scan (history default is unbounded). */
-const AUTO_SESSION_CAP = 200;
 
 /**
  * Deictic / history cues. Word-boundary, case-insensitive. Tight on purpose so
@@ -184,7 +186,6 @@ async function runAutoSearch(
         group: "session",
         scope: "global",
         results: MAX_AUTO_HITS,
-        sessions: AUTO_SESSION_CAP,
       } as Parameters<typeof searchTool.execute>[0],
       ctx,
     );
@@ -203,8 +204,9 @@ export function autoRecall(
   unscoped: OpencodeClient,
   global: boolean,
   limits: Limits,
+  cache: CorpusCache,
 ): NonNullable<Hooks["chat.message"]> {
-  const searchTool = search(client, unscoped, global, limits);
+  const searchTool = search(client, unscoped, global, limits, cache);
 
   return async (input, output) => {
     try {
