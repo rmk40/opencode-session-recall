@@ -1212,7 +1212,14 @@ function buildSuggestions(input: {
   /** Session IDs the metadata shortlist selected (smart/fuzzy only). */
   shortlistIDs: string[];
 }): SearchSuggestion[] | undefined {
-  const suggestions: SearchSuggestion[] = [];
+  // Suggestions are ranked before the MAX_SUGGESTIONS slice so plan-mandated
+  // guidance (exact code tokens, shortlisted-but-unranked sessions) cannot be
+  // displaced by softer composition hints. Lower priority sorts first; equal
+  // priorities keep insertion order (stable sort).
+  const entries: Array<{ priority: number; suggestion: SearchSuggestion }> = [];
+  const add = (priority: number, suggestion: SearchSuggestion): void => {
+    entries.push({ priority, suggestion });
+  };
   const onlyTitleHits =
     input.results.length > 0 && input.results.every((result) => result.source === "title");
   const typeFilter = input.type && input.type !== "all" ? input.type : undefined;
@@ -1220,7 +1227,7 @@ function buildSuggestions(input: {
   // Routing hint: never override the caller, only suggest a better-fitting mode.
   const routed = classifyQuery(input.query, input.matchMode);
   if (routed.suggested === "regex") {
-    suggestions.push({
+    add(0, {
       reason: `${routed.reason} It may be intended as a pattern.`,
       action: 'Use match:"regex" to match it as a regular expression.',
       example: { match: "regex" },
@@ -1228,7 +1235,7 @@ function buildSuggestions(input: {
   }
 
   if (onlyTitleHits) {
-    suggestions.push({
+    add(0, {
       reason: "Only session-title hits matched; no message content matched the query.",
       action:
         'Inspect the returned sessions, try group:"session", or use match:"smart" with broader terms.',
@@ -1237,18 +1244,18 @@ function buildSuggestions(input: {
   }
 
   if (input.results.length === 0 && input.directory && !input.fallback) {
-    suggestions.push({
+    add(0, {
       reason: "The directory filter may be excluding useful history.",
       action: "Retry with fallback:true to broaden from this directory to project/global history.",
       example: { directory: input.directory, fallback: true },
     });
   }
 
-  // Placed ahead of the generic zero-result hints so the MAX_SUGGESTIONS cap
-  // cannot drop it: when the exclusion removed the caller's session, that is
-  // the likeliest explanation for an empty result.
+  // Ahead of the generic zero-result hints so the cap cannot drop it: when
+  // the exclusion removed the caller's session, that is the likeliest
+  // explanation for an empty result.
   if (input.results.length === 0 && input.currentSessionExcluded) {
-    suggestions.push({
+    add(0, {
       reason: "This search excluded the current session.",
       action: "Pass excludeCurrentSession:false if you meant to search this conversation.",
       example: { excludeCurrentSession: false },
@@ -1256,7 +1263,7 @@ function buildSuggestions(input: {
   }
 
   if (input.results.length === 0 && input.matchMode === "literal") {
-    suggestions.push({
+    add(0, {
       reason: "Literal search found no hits.",
       action: 'Try match:"smart" or match:"fuzzy" for typos and naming variants.',
       example: { match: "smart" },
@@ -1264,7 +1271,7 @@ function buildSuggestions(input: {
   }
 
   if (input.results.length === 0 && typeFilter) {
-    suggestions.push({
+    add(0, {
       reason: `The type:${JSON.stringify(typeFilter)} filter may be hiding other evidence.`,
       action: 'Retry with type:"all" to include text, reasoning, and tool output.',
       example: { type: "all" },
@@ -1275,48 +1282,15 @@ function buildSuggestions(input: {
     const count = input.coverage.sessionsSearched;
     const noun = count === 1 ? "session" : "sessions";
     const verb = count === 1 ? "was" : "were";
-    suggestions.push({
+    add(0, {
       reason: `Only ${count} ${noun} ${verb} searched.`,
       action: "Remove narrowing filters or increase the sessions limit.",
     });
   }
 
-  if (input.excludeExplicitOff && input.currentSessionID && input.results.length > 0) {
-    const top = input.results.slice(0, Math.min(5, input.results.length));
-    const fromCurrent = top.filter((result) => result.sessionID === input.currentSessionID).length;
-    if (fromCurrent * 2 >= top.length) {
-      suggestions.push({
-        reason: "Most top hits are from this conversation, not prior history.",
-        action: "Drop excludeCurrentSession:false so prior sessions rank instead.",
-      });
-    }
-  }
-
-  // Composition-aware guidance over non-empty results.
-  const topFive = input.results.slice(0, 5);
-  const generatedCount = topFive.filter(
-    (result) =>
-      result.why?.evidenceClass === "skill-definition" || result.why?.evidenceClass === "file-read",
-  ).length;
-  if (generatedCount >= 3) {
-    suggestions.push({
-      reason: "Most top hits are generated reference material (skill payloads, file reads).",
-      action: 'Re-run oriented to actions: type:"tool" surfaces commands and their output.',
-      example: { type: "tool" },
-    });
-  }
-
-  const topResult = input.results[0];
-  if (topResult?.hitCount != null && topResult.hitCount >= 10) {
-    suggestions.push({
-      reason: `Session ${topResult.sessionID} holds ${topResult.hitCount} matching parts.`,
-      action: 'Inspect it directly with group:"part" and sessionID.',
-      example: { group: "part", sessionID: topResult.sessionID },
-    });
-  }
-
+  // Plan-mandated hints (priority 1): must survive the cap when triggered.
   if (input.codeTokens.length > 0 && (input.matchMode === "smart" || input.matchMode === "fuzzy")) {
-    suggestions.push({
+    add(1, {
       reason: "The query contains exact code-like tokens.",
       action: 'match:"literal" pins them exactly.',
       example: { match: "literal", query: input.codeTokens[0] },
@@ -1332,7 +1306,7 @@ function buildSuggestions(input: {
           .toLowerCase()
           .split(/\s+/)
           .find((token) => token.length >= 4);
-      suggestions.push({
+      add(1, {
         reason: "Sessions whose title/directory match the query exist but none ranked.",
         action: "Narrow to them with a title filter or browse via recall_sessions.",
         ...(titleTerm && { example: { title: titleTerm } }),
@@ -1340,7 +1314,43 @@ function buildSuggestions(input: {
     }
   }
 
-  return suggestions.length > 0 ? suggestions.slice(0, MAX_SUGGESTIONS) : undefined;
+  // Composition-aware guidance over non-empty results (priority 2).
+  if (input.excludeExplicitOff && input.currentSessionID && input.results.length > 0) {
+    const top = input.results.slice(0, Math.min(5, input.results.length));
+    const fromCurrent = top.filter((result) => result.sessionID === input.currentSessionID).length;
+    if (fromCurrent * 2 >= top.length) {
+      add(2, {
+        reason: "Most top hits are from this conversation, not prior history.",
+        action: "Drop excludeCurrentSession:false so prior sessions rank instead.",
+      });
+    }
+  }
+
+  const topFive = input.results.slice(0, 5);
+  const generatedCount = topFive.filter(
+    (result) =>
+      result.why?.evidenceClass === "skill-definition" || result.why?.evidenceClass === "file-read",
+  ).length;
+  if (generatedCount >= 3) {
+    add(2, {
+      reason: "Most top hits are generated reference material (skill payloads, file reads).",
+      action: 'Re-run oriented to actions: type:"tool" surfaces commands and their output.',
+      example: { type: "tool" },
+    });
+  }
+
+  const topResult = input.results[0];
+  if (topResult?.hitCount != null && topResult.hitCount >= 10) {
+    add(3, {
+      reason: `Session ${topResult.sessionID} holds ${topResult.hitCount} matching parts.`,
+      action: 'Inspect it directly with group:"part" and sessionID.',
+      example: { group: "part", sessionID: topResult.sessionID },
+    });
+  }
+
+  if (entries.length === 0) return undefined;
+  entries.sort((a, b) => a.priority - b.priority);
+  return entries.slice(0, MAX_SUGGESTIONS).map((entry) => entry.suggestion);
 }
 
 function buildNearMisses(
@@ -2120,6 +2130,14 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
             return { collected, total, early };
           };
 
+          // Hoisted above applyGroupAndSlice, which closes over them: keeps
+          // the closure free of temporal-dead-zone hazards under reordering.
+          const queryMeta = parseQuery(args.query);
+          const commandLikeQuery =
+            queryMeta.codeTokens.length > 0 || COMMAND_VERB_RE.test(args.query);
+          // Populated by the smart path before finish() runs; empty otherwise.
+          let shortlistIDs: string[] = [];
+
           // ── Helper: apply grouping and slicing ───────────────────────
           const applyGroupAndSlice = (
             results: SearchResult[],
@@ -2159,11 +2177,6 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
             MAX_GROUPED_LITERAL_RESULTS,
             resultsArg * DIVERSITY_SCAN_MULTIPLIER,
           );
-          const queryMeta = parseQuery(args.query);
-          const commandLikeQuery =
-            queryMeta.codeTokens.length > 0 || COMMAND_VERB_RE.test(args.query);
-          // Populated by the smart path before finish() runs; empty otherwise.
-          let shortlistIDs: string[] = [];
 
           // ── Route: literal or smart/fuzzy ─────────────────────────────
           if (matchMode === "literal") {

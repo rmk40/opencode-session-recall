@@ -18,6 +18,11 @@ export type ParsedQuery = {
 
 const QUOTED_PHRASE_RE = /"([^"]*)"/g;
 
+// Known boundaries of this heuristic, accepted deliberately: ordinary
+// hyphenated English ("well-known"), decimals ("3.141"), and bare acronyms
+// ("JSON", "HTTP") count as code tokens (they are plausible exact anchors and
+// the boost is mild); mixed acronym camelCase ("parseJSONResponse") matches
+// only its lowercase-led prefix.
 const CODE_TOKEN_RE =
   /[A-Za-z0-9]+(?:[_./-][A-Za-z0-9]+)+|[a-z]+(?:[A-Z][a-z0-9]+)+|[A-Z]{2,}[A-Z0-9_]*/g;
 const MIN_CODE_TOKEN_LENGTH = 4;

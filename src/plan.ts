@@ -1,5 +1,5 @@
 import { tokenize } from "./normalize.js";
-import { compareHits, type Bm25Hit } from "./bm25.js";
+import { compareHits, MIN_RELATIVE_SCORE, type Bm25Hit } from "./bm25.js";
 import type { ParsedQuery } from "./query.js";
 
 /**
@@ -58,37 +58,50 @@ export function metadataShortlist(sessions: SessionMetaText[], query: ParsedQuer
  * Deep-pass scores are normalized relative to the deep pass's own top hit, so
  * they cannot be compared with broad scores directly: a shortlisted session
  * whose best match is globally weak would still carry a deep score of 1.0 and
- * rocket to the top. Instead, deep scores are anchored to the shortlist's
- * broad-pass ceiling (the best broad score among the deep hits): the deep
- * pass re-ranks WITHIN the neighborhood using shortlist-local IDF, while the
- * neighborhood's overall strength stays what the broad corpus says it is,
- * lifted by the shortlist multiplier (applied exactly once, here). Deduped by
- * partID keeping the higher score.
+ * rocket to the top. Each deep hit is therefore anchored to ITS OWN session's
+ * broad-pass ceiling (the best broad score among that session's deep hits):
+ * the deep pass re-ranks within each neighborhood using shortlist-local IDF,
+ * while every neighborhood's overall strength stays what the broad corpus
+ * says it is, lifted by the shortlist multiplier (applied exactly once,
+ * here). A session whose broad counterparts were all dropped by the relative
+ * score floor re-enters at the floor level (MIN_RELATIVE_SCORE × broad top):
+ * metadata says it is the right neighborhood, so it must not vanish, but its
+ * globally-weak content cannot outrank real broad hits. Deduped by partID
+ * keeping the higher score.
  */
 export function mergeShortlistHits(broad: Bm25Hit[], deep: Bm25Hit[], explain: boolean): Bm25Hit[] {
+  if (broad.length === 0) return [...deep].sort(compareHits);
+
   const byPart = new Map<string, Bm25Hit>();
   for (const hit of broad) byPart.set(hit.candidate.partID, hit);
 
-  // Every deep hit has a broad counterpart (same query over a subset of the
-  // same documents), so the ceiling is 0 only when the deep pass was empty.
-  let ceiling = 0;
+  // Per-session broad ceilings. A deep hit is not guaranteed a broad
+  // counterpart: bm25Search's relative floor can drop a shortlisted session's
+  // weak content from the broad list entirely.
+  const ceilingBySession = new Map<string, number>();
   for (const hit of deep) {
     const counterpart = byPart.get(hit.candidate.partID);
-    if (counterpart && counterpart.score > ceiling) ceiling = counterpart.score;
+    if (!counterpart) continue;
+    const sessionID = hit.candidate.sessionID;
+    const known = ceilingBySession.get(sessionID) ?? 0;
+    if (counterpart.score > known) ceilingBySession.set(sessionID, counterpart.score);
   }
-  if (ceiling > 0) {
-    for (const hit of deep) {
-      const scaled = hit.score * ceiling * SHORTLIST_MULT;
-      const existing = byPart.get(hit.candidate.partID);
-      if (existing && existing.score >= scaled) continue;
-      byPart.set(hit.candidate.partID, {
-        ...hit,
-        score: scaled,
-        matchReasons: explain
-          ? [...hit.matchReasons, `Title-shortlist deep pass: ×${SHORTLIST_MULT}`]
-          : hit.matchReasons,
-      });
-    }
+  const broadTop = broad[0]?.score ?? 0;
+  const fallbackCeiling = broadTop * MIN_RELATIVE_SCORE;
+
+  for (const hit of deep) {
+    const ceiling = ceilingBySession.get(hit.candidate.sessionID) ?? fallbackCeiling;
+    if (ceiling <= 0) continue;
+    const scaled = hit.score * ceiling * SHORTLIST_MULT;
+    const existing = byPart.get(hit.candidate.partID);
+    if (existing && existing.score >= scaled) continue;
+    byPart.set(hit.candidate.partID, {
+      ...hit,
+      score: scaled,
+      matchReasons: explain
+        ? [...hit.matchReasons, `Title-shortlist deep pass: ×${SHORTLIST_MULT}`]
+        : hit.matchReasons,
+    });
   }
   return [...byPart.values()].sort(compareHits);
 }

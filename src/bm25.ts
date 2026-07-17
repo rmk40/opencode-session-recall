@@ -67,8 +67,12 @@ const WEAK_FUZZY_THRESHOLD = 0.7;
  * MiniSearch combines terms with OR, so a single weakly-matched term can surface
  * an otherwise-irrelevant document. This floor drops that noise. It is a relative
  * floor: scores are normalized to the top hit, so the best match always survives.
+ * (Applied to the unclamped boosted score; multipliers shift hits across the
+ * floor slightly, which is intended — penalized classes may drop below it.)
+ * Exported for the shortlist merge, which uses it as the re-entry ceiling for
+ * deep hits whose broad counterparts this floor removed.
  */
-const MIN_RELATIVE_SCORE = 0.1;
+export const MIN_RELATIVE_SCORE = 0.1;
 
 const ERROR_PATTERNS = ["error", "failed", "exception"];
 

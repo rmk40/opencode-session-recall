@@ -506,6 +506,54 @@ describe("query plan (codeTokens, shortlist, merge)", () => {
     const pb = merged.find((h) => h.candidate.partID === "pb")!;
     expect(pb.score).toBe(1.0);
   });
+
+  it("re-enters counterpart-less shortlist sessions at the relative floor", () => {
+    // s1's content was dropped from the broad list by MIN_RELATIVE_SCORE; the
+    // deep pass must bring it back anchored at floor level, not discard it
+    // and not let it rocket to the top.
+    const broad = [
+      {
+        candidate: candidate({ rawText: "b", partID: "pb", sessionID: "s2" }),
+        score: 1.0,
+        matchedTerms: [],
+        matchedFields: [],
+        evidenceClass: "human-text",
+        matchReasons: [],
+      },
+    ] as never[];
+    const deep = [
+      {
+        candidate: candidate({ rawText: "a", partID: "pa", sessionID: "s1" }),
+        score: 1.0,
+        matchedTerms: [],
+        matchedFields: [],
+        evidenceClass: "human-text",
+        matchReasons: [],
+      },
+    ] as never[];
+    const merged = mergeShortlistHits(broad as never, deep as never, false);
+    const pa = merged.find((h) => h.candidate.partID === "pa")!;
+    expect(pa.score).toBeCloseTo(1.0 * 0.1 * SHORTLIST_MULT, 5);
+    expect(merged[0]?.candidate.partID).toBe("pb");
+  });
+
+  it("anchors each shortlisted session to its own broad ceiling", () => {
+    const mk = (partID: string, sessionID: string, score: number) =>
+      ({
+        candidate: candidate({ rawText: partID, partID, sessionID }),
+        score,
+        matchedTerms: [],
+        matchedFields: [],
+        evidenceClass: "human-text",
+        matchReasons: [],
+      }) as never;
+    const broad = [mk("strong-1", "s-strong", 1.0), mk("weak-1", "s-weak", 0.2)];
+    const deep = [mk("strong-1", "s-strong", 1.0), mk("weak-1", "s-weak", 1.0)];
+    const merged = mergeShortlistHits(broad as never, deep as never, false);
+    const weak = merged.find((h) => h.candidate.partID === "weak-1")!;
+    // The weak session borrows nothing from the strong one: 1.0 × 0.2 × 1.1.
+    expect(weak.score).toBeCloseTo(0.2 * SHORTLIST_MULT, 5);
+  });
 });
 
 describe("truncateExpandedPart budgets", () => {
