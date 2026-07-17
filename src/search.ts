@@ -26,7 +26,7 @@ import { parseQuery } from "./query.js";
 import type { Candidate, CandidateFilters } from "./candidates.js";
 import { assembleSession, type AssembledSession, type CorpusCache } from "./corpus.js";
 import { bm25Search, type Bm25Hit } from "./bm25.js";
-import { smartSnippet } from "./snippet.js";
+import { smartSnippet, truncatePreservingMatch } from "./snippet.js";
 import { compileRegex, regexFirstIndex, regexSnippet } from "./regex.js";
 import { classifyQuery } from "./route.js";
 
@@ -47,6 +47,9 @@ const MAX_EXPANDED_RESULTS = 3;
 const MAX_EXPANDED_CONTEXT_MESSAGES = 30;
 const MAX_EXPANDED_TOTAL_TEXT_CHARS = 30_000;
 const MAX_EXPANDED_FIELD_CHARS = 4_000;
+/** Cap on one part's total expanded text (all fields combined) so a single
+ *  oversized tool dump cannot consume the whole expansion budget. */
+const MAX_EXPANDED_PART_CHARS = 6_000;
 const DIRECTORY_FILTER_LIST_LIMIT = 5000;
 /** In part-grouped results, cap hits per session in the initial fill so one
  *  noisy session can't flood the result list; backfill if room remains. */
@@ -62,7 +65,9 @@ const MAX_NEAR_MISSES = 3;
 const EXPANSION_TRUNCATED = "\n[truncated by recall expansion]";
 
 type ExpandMode = "none" | "context" | "message";
-type ExpansionBudget = { remaining: number; truncated: boolean };
+type ExpansionBudget = { remaining: number; truncated: boolean; partCapped?: boolean };
+/** Locate the query's match position in a text, per match mode (-1 if none). */
+type MatchFinder = (text: string) => number;
 type TimeValue = number | string | undefined;
 
 // ── Types ────────────────────────────────────────────────────────────
@@ -453,6 +458,7 @@ function listLimitForDirectoryFilter(
 function truncateExpandedText(
   value: string | undefined,
   budget: ExpansionBudget,
+  findMatch?: MatchFinder,
 ): string | undefined {
   if (value == null) return undefined;
   if (budget.remaining <= 0) {
@@ -474,12 +480,24 @@ function truncateExpandedText(
   const sliceLength = allowed - EXPANSION_TRUNCATED.length;
   budget.remaining -= allowed;
   budget.truncated = true;
+  // For the matched part, keep the head plus a window around the match
+  // instead of head-only slicing that can drop the matched region entirely.
+  if (findMatch) {
+    const matchIndex = findMatch(value);
+    if (matchIndex > 0) {
+      return `${truncatePreservingMatch(value, matchIndex, sliceLength)}${EXPANSION_TRUNCATED}`;
+    }
+  }
   return `${value.slice(0, sliceLength)}${EXPANSION_TRUNCATED}`;
 }
 
 const SELF_TOOL_REDACTED = "[recall output omitted]";
 
-function truncateExpandedPart(part: PartOutput, budget: ExpansionBudget): PartOutput {
+function truncateExpandedPart(
+  part: PartOutput,
+  budget: ExpansionBudget,
+  findMatch?: MatchFinder,
+): PartOutput {
   // Never surface our own recall tool output inside expansion. Search matching
   // already excludes self-tool parts (searchableFields), but expansion formats
   // every surrounding part, so a hit adjacent to a prior recall call would leak
@@ -489,19 +507,43 @@ function truncateExpandedPart(part: PartOutput, budget: ExpansionBudget): PartOu
   if (part.type === "tool" && part.toolName && isSelfTool(part.toolName)) {
     return { ...part, content: SELF_TOOL_REDACTED, output: undefined, error: undefined };
   }
-  return {
+  // Per-part sub-budget: one part may consume at most MAX_EXPANDED_PART_CHARS
+  // of the global budget across all of its fields.
+  const initialAllowance = Math.min(MAX_EXPANDED_PART_CHARS, budget.remaining);
+  const partBudget: ExpansionBudget = { remaining: initialAllowance, truncated: false };
+  const out: PartOutput = {
     ...part,
-    content: truncateExpandedText(part.content, budget),
-    output: truncateExpandedText(part.output, budget),
-    error: truncateExpandedText(part.error, budget),
+    content: truncateExpandedText(part.content, partBudget, findMatch),
+    output: truncateExpandedText(part.output, partBudget, findMatch),
+    error: truncateExpandedText(part.error, partBudget, findMatch),
   };
+  budget.remaining -= initialAllowance - partBudget.remaining;
+  if (partBudget.truncated) {
+    budget.truncated = true;
+    // The part cap (not the global budget) was the binding constraint.
+    if (initialAllowance === MAX_EXPANDED_PART_CHARS && partBudget.remaining === 0) {
+      budget.partCapped = true;
+    }
+  }
+  return out;
 }
 
-function formatExpandedMsg(msg: MsgWithParts, budget: ExpansionBudget): MessageItem {
+function formatExpandedMsg(
+  msg: MsgWithParts,
+  budget: ExpansionBudget,
+  matchedPartID?: string,
+  findMatch?: MatchFinder,
+): MessageItem {
   const item = formatMsg(msg);
   return {
     ...item,
-    parts: item.parts.map((part) => truncateExpandedPart(part, budget)),
+    parts: item.parts.map((part) =>
+      truncateExpandedPart(
+        part,
+        budget,
+        part.id === matchedPartID && findMatch ? findMatch : undefined,
+      ),
+    ),
   };
 }
 
@@ -894,6 +936,7 @@ async function expandSearchResults(
   window: number,
   expandBudgetMessages: number,
   expandBudgetChars: number,
+  findMatch?: MatchFinder,
 ): Promise<{ expanded?: ExpandedResult[]; warnings: string[] }> {
   if (mode === "none") return { warnings: [] };
 
@@ -945,7 +988,7 @@ async function expandSearchResults(
         sessionID: result.sessionID,
         messageID: result.messageID,
         mode,
-        message: formatExpandedMsg(messages[messageIndex]!, budget),
+        message: formatExpandedMsg(messages[messageIndex]!, budget, result.partID, findMatch),
       });
       continue;
     }
@@ -968,7 +1011,12 @@ async function expandSearchResults(
     const slice = messages.slice(start, end);
     remainingContextMessages -= slice.length;
     const items: MessageItem[] = slice.map((msg) => {
-      const item = formatExpandedMsg(msg, budget);
+      const item = formatExpandedMsg(
+        msg,
+        budget,
+        msg.info.id === result.messageID ? result.partID : undefined,
+        findMatch,
+      );
       return { ...item, center: msg.info.id === result.messageID };
     });
 
@@ -986,6 +1034,11 @@ async function expandSearchResults(
   if (contextCapped) {
     warnings.push(
       `Context expansion capped at ${expandBudgetMessages} messages; expanded ${expanded.length} of ${count} requested results. Reduce window or expandResults to include more hits.`,
+    );
+  }
+  if (budget.partCapped) {
+    warnings.push(
+      `One or more parts exceeded the per-part expansion cap (${MAX_EXPANDED_PART_CHARS} chars); bodies were sampled around the match.`,
     );
   }
   if (budget.truncated) {
@@ -1766,6 +1819,22 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
             out.loadErrors = [...loadErrors];
             return out;
           };
+          // Locate the query's match position inside an expanded field so
+          // truncation can preserve the matched region, per the active mode.
+          const smartTokens =
+            matchMode === "smart" || matchMode === "fuzzy" ? parseQuery(args.query).tokens : [];
+          const queryLower = args.query.toLowerCase();
+          const findMatch: MatchFinder = (text) => {
+            if (matchMode === "regex" && regex) return regexFirstIndex(regex, text);
+            const lower = text.toLowerCase();
+            if (matchMode === "literal") return lower.indexOf(queryLower);
+            for (const token of smartTokens) {
+              const index = lower.indexOf(token);
+              if (index !== -1) return index;
+            }
+            return -1;
+          };
+
           const includeExpansion = async <T extends SearchOutput>(
             out: T,
             final: SearchResult[],
@@ -1779,6 +1848,7 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
               normalized.window,
               normalized.expandBudgetMessages,
               normalized.expandBudgetChars,
+              findMatch,
             );
             if (expansion.expanded) out.expanded = expansion.expanded;
             warnings.push(...expansion.warnings);

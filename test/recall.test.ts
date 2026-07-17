@@ -1293,6 +1293,34 @@ describe("recall", () => {
     expect(h.calls.messages).toHaveLength(1);
   });
 
+  describe("expansion match preservation", () => {
+    it("keeps the matched region of an oversized part and warns about the part cap", async () => {
+      const h = makeFakeHarness();
+      const big = session("s-bigpart", "Big Part", PROJECT_DIR, Date.now());
+      h.sessions.push(big);
+      h.globalSessions.push(globalSessionFrom(big));
+      const output = `${"x".repeat(8_000)} zebrafinch-token ${"y".repeat(2_000)}`;
+      h.messagesBySession[big.id] = [
+        bundle(assistantMessage("m-bigpart", big.id, Date.now()), [
+          completedToolPart("p-bigpart", big.id, "m-bigpart", "bash", { command: "run" }, output),
+        ]),
+      ];
+
+      const out = await runTool<SearchOutput>(recallTool(h), {
+        query: "zebrafinch-token",
+        scope: "project",
+        expand: "message",
+        excludeCurrentSession: false,
+      });
+      expect(out.results[0]?.sessionID).toBe("s-bigpart");
+      const expandedPart = out.expanded?.[0]?.message?.parts.find((p) => p.id === "p-bigpart");
+      // Head-only truncation at 4,000 chars would have dropped the match at ~8,000.
+      expect(expandedPart?.output).toContain("zebrafinch-token");
+      expect(expandedPart?.output).toContain("chars omitted");
+      expect(out.warnings?.some((w) => w.includes("truncated or omitted"))).toBe(true);
+    });
+  });
+
   describe("current-session exclusion", () => {
     it("excludes the current session by default", async () => {
       const out = await runTool<SearchOutput>(recallTool(makeFakeHarness()), {

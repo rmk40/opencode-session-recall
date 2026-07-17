@@ -19,7 +19,7 @@ import { parseQuery } from "../src/query.js";
 import { bm25Search } from "../src/bm25.js";
 import { groupBySession } from "../src/search.js";
 import type { EvidenceClass, SearchResult } from "../src/types.js";
-import { smartSnippet } from "../src/snippet.js";
+import { smartSnippet, truncatePreservingMatch } from "../src/snippet.js";
 import { errmsg, optionalString } from "../src/types.js";
 import { normalize, splitCamelCase, tokenize } from "../src/normalize.js";
 import type { Part } from "@opencode-ai/sdk/v2";
@@ -381,6 +381,40 @@ describe("evidence classification", () => {
       text: "<recall-auto> quoted in ordinary user text",
     } as unknown as Part;
     expect(searchable(plain)).toHaveLength(1);
+  });
+});
+
+describe("truncatePreservingMatch", () => {
+  const text = `HEAD:${"a".repeat(5_000)}NEEDLE${"b".repeat(5_000)}`;
+
+  it("returns short text unchanged and respects the cap", () => {
+    expect(truncatePreservingMatch("short", 2, 100)).toBe("short");
+    const out = truncatePreservingMatch(text, text.indexOf("NEEDLE"), 1_000);
+    expect(out.length).toBeLessThanOrEqual(1_000);
+  });
+
+  it("keeps the head and a window around a deep match with an omission marker", () => {
+    const out = truncatePreservingMatch(text, text.indexOf("NEEDLE"), 1_000);
+    expect(out.startsWith("HEAD:")).toBe(true);
+    expect(out).toContain("NEEDLE");
+    expect(out).toContain("chars omitted");
+  });
+
+  it("falls back to a head slice when the match is inside the kept head", () => {
+    const out = truncatePreservingMatch(text, 2, 1_000);
+    expect(out).toBe(text.slice(0, 1_000));
+  });
+
+  it("falls back to a head slice for missing matches and handles a match near the end", () => {
+    expect(truncatePreservingMatch(text, -1, 500)).toBe(text.slice(0, 500));
+    const nearEnd = truncatePreservingMatch(text, text.length - 3, 800);
+    expect(nearEnd.length).toBeLessThanOrEqual(800);
+    expect(nearEnd.endsWith(text.slice(-1))).toBe(true);
+  });
+
+  it("degrades to a head slice when the cap leaves no useful window", () => {
+    const out = truncatePreservingMatch(text, text.indexOf("NEEDLE"), 80);
+    expect(out).toBe(text.slice(0, 80));
   });
 });
 
