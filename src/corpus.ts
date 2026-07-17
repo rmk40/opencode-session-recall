@@ -83,8 +83,12 @@ export type AssembledSession = {
 /**
  * Apply a query's filters to a synced session and bind its title candidate.
  * The title candidate's representative identity is the newest eligible
- * content candidate (matching the old findRepresentativeMessage semantics; a
- * session whose messages are all filtered out yields no title hit).
+ * content CANDIDATE — a deliberate refinement of the old message-based
+ * findRepresentativeMessage: a session whose messages are all filtered out
+ * yields no title hit (as before), a session whose newest eligible message
+ * has no searchable parts binds to the newest message that does (new), and a
+ * session with zero searchable parts loses its title hit entirely (new;
+ * there is nothing to inspect behind such a hit anyway).
  */
 export function assembleSession(
   synced: SyncedSession,
@@ -211,10 +215,16 @@ export class CorpusCache {
       }
     }
 
-    let pending = this.inFlight.get(target.id);
+    // Dedupe key includes the version: two concurrent syncs that saw
+    // different `updated` values for the same session must not share a fetch,
+    // or the shared entry would be stored under the older version label and
+    // the newer caller's version check silently skipped. Same-version callers
+    // still share one fetch.
+    const inFlightKey = `${target.id}:${target.updated}`;
+    let pending = this.inFlight.get(inFlightKey);
     if (!pending) {
-      pending = this.fetch(target).finally(() => this.inFlight.delete(target.id));
-      this.inFlight.set(target.id, pending);
+      pending = this.fetch(target).finally(() => this.inFlight.delete(inFlightKey));
+      this.inFlight.set(inFlightKey, pending);
     }
     const result = await pending;
     if (result.entry) {

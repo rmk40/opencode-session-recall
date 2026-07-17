@@ -510,7 +510,10 @@ function formatExpandedMsg(msg: MsgWithParts, budget: ExpansionBudget): MessageI
 // searchableFields() built at cache-fill time, so matching semantics are
 // identical to the old per-message scans. Query filters were applied during
 // assembly; the session's bound title candidate rides at the end of the pool
-// so content hits precede the title hit, as before.
+// so content hits precede the title hit, as before. One deliberate ordering
+// change: candidates are cached newest-message-first, so within a session,
+// literal/regex hits (and the hits kept under a scan limit) are now the most
+// recent ones — the old scans iterated chronologically and kept the oldest.
 
 /** Build a SearchResult from a cached candidate hit (literal/regex paths). */
 function candidateResult(

@@ -88,6 +88,24 @@ describe("CorpusCache", () => {
     expect(b.sessions[0]!.candidates.length).toBeGreaterThan(0);
   });
 
+  it("does not share an in-flight fetch across different session versions", async () => {
+    const h = makeFakeHarness();
+    const cache = new CorpusCache(h.client, TEST_LIMITS);
+    const [older, newer] = await Promise.all([
+      cache.sync([target("s-current", 1_000)]),
+      cache.sync([target("s-current", 2_000)]),
+    ]);
+    older.release();
+    newer.release();
+    // Different versions must fetch independently so the stored entry is
+    // never labeled with a version its caller did not request.
+    expect(h.calls.messages).toHaveLength(2);
+    // A follow-up sync at the newer version is served from cache.
+    const again = await cache.sync([target("s-current", 2_000)]);
+    again.release();
+    expect(h.calls.messages).toHaveLength(2);
+  });
+
   it("evicts least-recently-used sessions over cacheMaxChars but never pinned ones", async () => {
     const h = makeFakeHarness();
     const big = "x".repeat(500);
