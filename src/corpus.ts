@@ -8,6 +8,8 @@ import {
   type Candidate,
   type CandidateFilters,
 } from "./candidates.js";
+import { normalize, tokenize } from "./normalize.js";
+import { toolNameMatches } from "./extract.js";
 
 /**
  * Incremental in-memory corpus cache.
@@ -53,6 +55,8 @@ export type CachedSession = {
   meta: CorpusSessionMeta;
   /** Unfiltered candidates, newest message first, normalized fields populated. */
   candidates: Candidate[];
+  /** Content-derived session digest (may be empty); see buildSessionDigest. */
+  digestText: string;
   messageCount: number;
   charCount: number;
   lastAccess: number;
@@ -61,6 +65,7 @@ export type CachedSession = {
 export type SyncedSession = {
   meta: CorpusSessionMeta;
   candidates: Candidate[];
+  digestText: string;
   messageCount: number;
   /** Message load/build failed for this session this query. */
   loadError?: string;
@@ -80,12 +85,168 @@ type FetchResult = { entry?: CachedSession; error?: string };
 /** Cap sample size only; loadErrorCount still reports all failures. */
 const MAX_LOAD_ERROR_SAMPLES = 5;
 
+// ── Session digest ────────────────────────────────────────────────────
+// The first session-level text derived from CONTENT rather than naming luck
+// (fixes the misleading-title finding): the first user message's head plus
+// the session's characteristic action vocabulary. Built only from statement
+// and action evidence (text/subtask parts, tool command/cwd inputs) so a
+// session that merely READ about a topic gets no digest credit for it.
+
+const DIGEST_HEAD_CHARS = 200;
+const DIGEST_TOP_TOKENS = 8;
+const DIGEST_MIN_TOKEN_LENGTH = 4;
+/** Clean word-like tokens with at least one letter; keeps JSON shards and
+ *  bare numbers (timeouts, sizes) out of the digest. */
+const DIGEST_TOKEN_RE = /^(?=.*\p{L})[\p{L}\p{N}][\p{L}\p{N}-]*$/u;
+/** Common prose/dev words that carry no session identity. */
+const DIGEST_STOPWORDS = new Set([
+  "this",
+  "that",
+  "with",
+  "from",
+  "have",
+  "will",
+  "should",
+  "would",
+  "could",
+  "when",
+  "then",
+  "than",
+  "them",
+  "they",
+  "there",
+  "here",
+  "what",
+  "which",
+  "into",
+  "onto",
+  "over",
+  "under",
+  "about",
+  "please",
+  "using",
+  "used",
+  "make",
+  "made",
+  "need",
+  "needs",
+  "want",
+  "like",
+  "just",
+  "also",
+  "only",
+  "some",
+  "more",
+  "most",
+  "very",
+  "each",
+  "every",
+  "and",
+  "the",
+  "for",
+  "not",
+  "are",
+  "was",
+  "were",
+  "been",
+  "being",
+  "does",
+  "doing",
+  "done",
+  "error",
+  "failed",
+  "session",
+  "message",
+  "config",
+  "result",
+  "tool",
+  "output",
+  "update",
+  "function",
+  "const",
+  "return",
+  "import",
+  "export",
+  "test",
+  "build",
+  "run",
+  "check",
+  "value",
+  "data",
+  "type",
+  "file",
+  "files",
+  "code",
+]);
+
+/**
+ * Deterministic content digest for a session. Deviates deliberately from the
+ * plan's "rarest by corpus document frequency" sketch: cross-session DF is
+ * unstable while the cache fills incrementally, so rarity is approximated by
+ * in-session frequency over stopworded statement/action tokens — stable per
+ * session version, and it credits sessions for what they SAID and DID, never
+ * for what they read.
+ */
+export function buildSessionDigest(candidates: Candidate[]): string {
+  const counts = new Map<string, number>();
+  let firstUserText: Candidate | undefined;
+
+  for (const candidate of candidates) {
+    const isStatement = candidate.partType === "text" || candidate.partType === "subtask";
+    if (isStatement && candidate.role === "user") {
+      // Candidates are newest-first; the last matching one is the earliest.
+      firstUserText = candidate;
+    }
+    if (isStatement) {
+      for (const token of candidate.tokens) {
+        if (token.length < DIGEST_MIN_TOKEN_LENGTH || DIGEST_STOPWORDS.has(token)) continue;
+        if (!DIGEST_TOKEN_RE.test(token)) continue;
+        counts.set(token, (counts.get(token) ?? 0) + 1);
+      }
+      continue;
+    }
+    if (candidate.partType === "tool") {
+      // Generated-reference tools (file reads, skill loads) earn no digest
+      // credit: a session that merely read about a topic must not carry its
+      // vocabulary as session identity.
+      if (
+        candidate.toolName &&
+        (toolNameMatches(candidate.toolName, "read") ||
+          toolNameMatches(candidate.toolName, "skill"))
+      ) {
+        continue;
+      }
+      for (const field of candidate.fieldTexts) {
+        if (field.field !== "command" && field.field !== "cwd") continue;
+        // toolInputTexts also files the whole JSON input under "command";
+        // only true command/cwd strings describe an action.
+        if (field.text.startsWith("{")) continue;
+        for (const token of tokenize(field.text)) {
+          if (token.length < DIGEST_MIN_TOKEN_LENGTH || DIGEST_STOPWORDS.has(token)) continue;
+          if (!DIGEST_TOKEN_RE.test(token)) continue;
+          counts.set(token, (counts.get(token) ?? 0) + 1);
+        }
+      }
+    }
+  }
+
+  const top = [...counts.entries()]
+    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+    .slice(0, DIGEST_TOP_TOKENS)
+    .map(([token]) => token);
+
+  const head = firstUserText ? firstUserText.rawText.slice(0, DIGEST_HEAD_CHARS) : "";
+  return [head, top.join(" ")].filter(Boolean).join(" ").trim();
+}
+
 export type AssembledSession = {
   meta: CorpusSessionMeta;
   /** Eligible content candidates under this query's filters, newest first. */
   candidates: Candidate[];
   /** Bound title candidate, when title search applies and a representative exists. */
   titleCandidate?: Candidate;
+  /** Content-derived session digest (may be empty). */
+  digestText: string;
   messagesSearched: number;
   partsSearched: number;
   loadError?: string;
@@ -123,7 +284,10 @@ export function assembleSession(
           time: { created: representative.time },
         },
       );
-      if (titleCandidate) populateNormalized(titleCandidate);
+      if (titleCandidate) {
+        populateNormalized(titleCandidate);
+        titleCandidate.digestText = synced.digestText ? normalize(synced.digestText) : "";
+      }
     }
   }
 
@@ -134,6 +298,7 @@ export function assembleSession(
     meta: synced.meta,
     candidates: eligible,
     titleCandidate,
+    digestText: synced.digestText,
     messagesSearched: messageIDs.size,
     partsSearched: eligible.length,
     loadError: synced.loadError,
@@ -202,6 +367,7 @@ export class CorpusCache {
           resolved.get(target.id) ?? {
             meta: target,
             candidates: [],
+            digestText: "",
             messageCount: 0,
           },
       );
@@ -222,6 +388,7 @@ export class CorpusCache {
         return {
           meta: existing.meta,
           candidates: existing.candidates,
+          digestText: existing.digestText,
           messageCount: existing.messageCount,
         };
       }
@@ -243,12 +410,14 @@ export class CorpusCache {
       return {
         meta: result.entry.meta,
         candidates: result.entry.candidates,
+        digestText: result.entry.digestText,
         messageCount: result.entry.messageCount,
       };
     }
     return {
       meta: target,
       candidates: [],
+      digestText: "",
       messageCount: 0,
       loadError: result.error ?? "unknown load failure",
     };
@@ -268,6 +437,13 @@ export class CorpusCache {
       });
       for (const candidate of candidates) populateNormalized(candidate);
 
+      // Session digest: computed once per session version, stamped onto every
+      // candidate as a normalized BM25 field so content-derived session
+      // identity participates in ranking (and in Stage A shortlisting).
+      const digestText = buildSessionDigest(candidates);
+      const normalizedDigest = digestText ? normalize(digestText) : "";
+      for (const candidate of candidates) candidate.digestText = normalizedDigest;
+
       // Opt-in semantic layer: embed each candidate once per session version,
       // amortized exactly like tokenization. Only when the model is already
       // ready — init() is never awaited here, so a cold embedder leaves
@@ -283,6 +459,7 @@ export class CorpusCache {
       const entry: CachedSession = {
         meta: { ...target },
         candidates,
+        digestText,
         messageCount: messages.length,
         charCount: charsUsed,
         lastAccess: ++this.clock,

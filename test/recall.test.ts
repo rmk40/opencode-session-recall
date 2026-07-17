@@ -526,7 +526,12 @@ describe("recall", () => {
       results: 10,
     });
 
-    expect(out.results.map((r) => `${r.partType}:${r.toolName ?? ""}`)).toEqual(["tool:bash"]);
+    // Both bash tool parts qualify: one matches in its own text, the other
+    // through the session digest field (session-level identity, like title/
+    // directory matches). The toolName filter is what's under test: only
+    // bash tool parts may appear.
+    expect(out.results.every((r) => r.partType === "tool" && r.toolName === "bash")).toBe(true);
+    expect(out.results.length).toBeGreaterThanOrEqual(1);
   });
 
   it("reports matched tool fields for smart-ranked tool hits", async () => {

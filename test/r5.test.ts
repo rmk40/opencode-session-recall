@@ -121,6 +121,7 @@ describe("result diversity (part grouping)", () => {
       scope: "global",
       group: "part",
       results: 5,
+      excludeCurrentSession: false,
     });
     expect(out.ok).toBe(true);
     if (out.results.length >= 3) {

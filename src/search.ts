@@ -800,6 +800,7 @@ function smartScan(
       id: entry.session.meta.id,
       title: entry.session.meta.title,
       directory: entry.session.meta.directory,
+      digestText: entry.session.digestText,
     })),
     pq,
   );

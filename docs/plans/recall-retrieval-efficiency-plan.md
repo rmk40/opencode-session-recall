@@ -866,6 +866,27 @@ Not scheduled; design notes so a future change-set can start cold:
 
 ## Revisions
 
+- **r2 execution notes (2026-07-16).** Recorded during implementation:
+  - Phase 10's digest deviates from the "top 8 rarest by corpus document
+    frequency" sketch: cross-session DF is unstable while the cache fills
+    incrementally, so the digest uses in-session frequency over stopworded
+    statement/action tokens (text/subtask parts and true command/cwd strings;
+    read/skill tools and JSON pseudo-commands earn no credit). The main
+    ranking signal is a DIGEST_MATCH_MULT (×1.15 when ≥ half the query tokens
+    appear in the digest) rather than the field boost alone — field-boost
+    arithmetic could not close the bridge case; the multiplier did.
+  - The LLM digest variant is dropped: the SDK's `session.prompt` only sends
+    visible messages into real sessions (create → prompt → delete), which
+    costs model quota per digested session and pollutes history when cleanup
+    fails. The deterministic digest stands.
+  - `queryPlan.variants` is a capability inventory; `selected` records what
+    ran (Phase 6 wording said "recorded from what ran" for the whole object).
+  - Internal ranking scores are unclamped (clamped once at output): clamping
+    per-hit erased every positive boost at the relative top.
+  - The mergeShortlistHits ceiling is per-session with a floor-level re-entry
+    for sessions whose broad counterparts the relative floor dropped
+    (checkpoint-review findings).
+
 - **r2 (2026-07-16).** Maintainer lifted constraints previously treated as
   hard. Added: Phase 2 incremental corpus cache (revives R3; deletes
   per-query candidate budgets, scan-order truncation, and the auto-recall

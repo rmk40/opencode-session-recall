@@ -1,9 +1,16 @@
 import { describe, expect, it } from "vitest";
-import { CorpusCache, assembleSession, type CorpusSessionMeta } from "../src/corpus.js";
+import {
+  CorpusCache,
+  assembleSession,
+  buildSessionDigest,
+  type CorpusSessionMeta,
+} from "../src/corpus.js";
+import { buildCandidates } from "../src/candidates.js";
 import {
   PROJECT_DIR,
   TEST_LIMITS,
   bundle,
+  completedToolPart,
   makeFakeHarness,
   runTool,
   session,
@@ -163,6 +170,76 @@ describe("CorpusCache", () => {
     expect(b.loadErrorCount).toBe(1);
     expect(a.sessions[0]!.loadError).toBeDefined();
     expect(b.sessions[0]!.loadError).toBeDefined();
+  });
+});
+
+describe("buildSessionDigest", () => {
+  function digestOf(messages: Parameters<typeof buildCandidates>[0]): string {
+    const { candidates } = buildCandidates(messages, {
+      id: "s",
+      title: "T",
+      directory: PROJECT_DIR,
+    });
+    return buildSessionDigest(candidates);
+  }
+
+  it("combines the first user message head with statement/command vocabulary", () => {
+    const digest = digestOf([
+      {
+        info: { id: "m1", role: "user", time: { created: 100 } },
+        parts: [textPart("p1", "s", "m1", "Investigate the flaky websocket reconnect logic")],
+      },
+      {
+        info: { id: "m2", role: "assistant", time: { created: 200 } },
+        parts: [
+          completedToolPart(
+            "p2",
+            "s",
+            "m2",
+            "bash",
+            { command: "wscat --connect ws://host" },
+            "ok",
+          ),
+        ],
+      },
+    ] as never);
+    expect(digest).toContain("Investigate the flaky websocket reconnect logic");
+    expect(digest).toContain("wscat");
+  });
+
+  it("gives no digest credit to read/skill tools or JSON pseudo-commands", () => {
+    const digest = digestOf([
+      {
+        info: { id: "m1", role: "assistant", time: { created: 100 } },
+        parts: [
+          completedToolPart(
+            "p1",
+            "s",
+            "m1",
+            "read",
+            { filePath: "/docs/zeppelin-handbook.md" },
+            "zeppelin zeppelin zeppelin airship manual",
+          ),
+          completedToolPart(
+            "p2",
+            "s",
+            "m1",
+            "mcp__host__skill",
+            { skill: "zeppelin" },
+            "zeppelin skill payload",
+          ),
+        ],
+      },
+    ] as never);
+    expect(digest).not.toContain("zeppelin");
+    expect(digest).toBe("");
+  });
+
+  it("keeps sessions with no statements or commands digest-free", () => {
+    const digest = digestOf([
+      { info: { id: "m1", role: "assistant", time: { created: 100 } }, parts: [] },
+    ] as never);
+    expect(digest).toBe("");
   });
 });
 

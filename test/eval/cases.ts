@@ -154,9 +154,19 @@ export const EVAL_CASES: EvalCase[] = [
     relevantSessionIDs: ["e-flow"],
     expect: { classInTop3: ["human-text"] },
   },
-  // The title/content bridge case ("ghostauth live test" must rank e-flow
-  // above the docs-audit session e-docs) lands with the session-digest phase:
-  // both sessions' strongest lexical hits are file reads, so only a
-  // content-derived session-level signal can order them. See the plan's
-  // Phase 10.
+  {
+    // Field report: title/content bridge — deferred from the two-stage-search
+    // phase to the session-digest phase. Both sessions' strongest lexical hits
+    // are file reads; only the content-derived digest (built from statements
+    // and commands, never reads) can order the DOING session above the
+    // READING session.
+    name: "field-report: ghostauth live test bridges metadata and content",
+    args: {
+      query: "ghostauth live test",
+      match: "smart",
+      group: "session",
+      scope: "global",
+    },
+    relevantSessionIDs: ["e-flow"],
+  },
 ];

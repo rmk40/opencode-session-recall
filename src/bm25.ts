@@ -59,6 +59,12 @@ const FILE_READ_MULT = 0.9;
  *  them, so BM25 alone cannot tell `GHOSTAUTH_LIVE_TUI` from the loose words). */
 const EXACT_TOKEN_MULT = 1.12;
 
+/** Session-identity boost: at least half the query tokens appear in the
+ *  candidate's session digest (built from the session's own statements and
+ *  commands, never from reads). A session that SAID or DID the query's terms
+ *  outranks one that merely read about them at equal lexical strength. */
+const DIGEST_MATCH_MULT = 1.15;
+
 const RECENCY_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
 const WEAK_FUZZY_THRESHOLD = 0.7;
 
@@ -186,16 +192,21 @@ type IndexedDoc = {
   secondaryText: string;
   titleText: string;
   hintText: string;
+  digestText: string;
 };
 
-const FIELDS = ["primaryText", "secondaryText", "titleText", "hintText"] as const;
+const FIELDS = ["primaryText", "secondaryText", "titleText", "hintText", "digestText"] as const;
 
-/** Field boosts mirror the old Fuse key weights (primary dominates). */
+/** Field boosts mirror the old Fuse key weights (primary dominates). The
+ *  digest sits between directory (0.6) and title (0.3): content-derived
+ *  session identity outranks naming metadata but never body text. The main
+ *  digest ranking signal is DIGEST_MATCH_MULT below, not this field boost. */
 const FIELD_BOOST: Record<(typeof FIELDS)[number], number> = {
   primaryText: 2,
   secondaryText: 0.6,
   titleText: 0.3,
   hintText: 0.15,
+  digestText: 0.4,
 };
 
 /**
@@ -216,6 +227,7 @@ export function bm25Search(
     secondaryText: c.secondaryText ?? "",
     titleText: c.titleText ?? "",
     hintText: c.hintText ?? "",
+    digestText: c.digestText ?? "",
   }));
 
   const mini = new MiniSearch<IndexedDoc>({
@@ -246,6 +258,9 @@ export function bm25Search(
   // Normalize BM25 scores to a 0..1 relative scale using the top score.
   const maxScore = rawHits[0]!.score || 1;
 
+  // Digest strings repeat across a session's candidates; tokenize each once.
+  const digestTokenCache = new Map<string, Set<string>>();
+
   const hits: Bm25Hit[] = [];
   for (const hit of rawHits) {
     const candidate = candidates[hit.id as number]!;
@@ -260,6 +275,20 @@ export function bm25Search(
     if (query.phrases.some((p) => rawLower.includes(p))) {
       mult *= EXACT_PHRASE_MULT;
       if (explain) reasons.push(`Exact phrase: ×${EXACT_PHRASE_MULT}`);
+    }
+
+    // Session-identity: the session's own statements/actions cover the query.
+    if (candidate.digestText && query.tokens.length > 0) {
+      let digestTokens = digestTokenCache.get(candidate.digestText);
+      if (!digestTokens) {
+        digestTokens = new Set(tokenize(candidate.digestText));
+        digestTokenCache.set(candidate.digestText, digestTokens);
+      }
+      const covered = query.tokens.filter((token) => digestTokens!.has(token)).length;
+      if (covered * 2 >= query.tokens.length) {
+        mult *= DIGEST_MATCH_MULT;
+        if (explain) reasons.push(`Session digest match: ×${DIGEST_MATCH_MULT}`);
+      }
     }
 
     // Verbatim code-like compound token (case-insensitive).

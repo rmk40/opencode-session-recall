@@ -1,5 +1,5 @@
 {
   "mrr": 1.0,
   "recallAt5": 1.0,
-  "_note": "Recorded from the BM25 (MiniSearch) ranker over 11 cases (8 original + field-report cases added with Phases 1 and 3 of the retrieval-efficiency plan). The prior Fuse.js ranker scored MRR 0.5 / recall@5 0.5 on the original 8. New ranking engines must meet or beat these numbers. Update only intentionally, explaining why in the change-set."
+  "_note": "Recorded from the BM25 (MiniSearch) ranker over 13 cases (8 original + field-report cases added with Phases 1, 3, 7, and 10 of the retrieval-efficiency plan). The prior Fuse.js ranker scored MRR 0.5 / recall@5 0.5 on the original 8. New ranking engines must meet or beat these numbers. Update only intentionally, explaining why in the change-set."
 }

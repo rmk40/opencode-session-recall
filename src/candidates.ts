@@ -47,6 +47,8 @@ export type Candidate = {
   secondaryText?: string;
   titleText?: string;
   hintText?: string;
+  /** Normalized session digest (stamped per session at cache-fill time). */
+  digestText?: string;
 };
 
 /** Truncate very long tool outputs per candidate. */
