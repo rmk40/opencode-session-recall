@@ -18,6 +18,7 @@ import {
 import { parseQuery } from "../src/query.js";
 import { bm25Search } from "../src/bm25.js";
 import { groupBySession } from "../src/search.js";
+import { metadataShortlist, mergeShortlistHits, SHORTLIST_MULT } from "../src/plan.js";
 import type { EvidenceClass, SearchResult } from "../src/types.js";
 import { smartSnippet, truncatePreservingMatch } from "../src/snippet.js";
 import { errmsg, optionalString } from "../src/types.js";
@@ -82,6 +83,7 @@ describe("string and error helpers", () => {
       lower: 'find "exact phrase" exact "" phrase',
       tokens: ["exact", "phrase", "find"],
       phrases: ["exact phrase"],
+      codeTokens: [],
     });
   });
 });
@@ -384,6 +386,122 @@ describe("evidence classification", () => {
   });
 });
 
+describe("query plan (codeTokens, shortlist, merge)", () => {
+  it("extracts code-like compound tokens verbatim", () => {
+    const rows: Array<[string, string[]]> = [
+      ["how did we test ghostauth", []],
+      ["find GHOSTAUTH_LIVE_TUI usage", ["GHOSTAUTH_LIVE_TUI"]],
+      ["call launchTerminal from the api", ["launchTerminal"]],
+      ["open deploy.yaml and opencode-multikey", ["deploy.yaml", "opencode-multikey"]],
+      ["path src/hooks/auto-recall.ts", ["src/hooks/auto-recall.ts"]],
+      ["abc a_b", []], // below the 4-char minimum
+    ];
+    for (const [query, expected] of rows) {
+      expect(parseQuery(query).codeTokens, query).toEqual(expected);
+    }
+  });
+
+  it("boosts verbatim code tokens over split-token equivalents", () => {
+    const candidates = [
+      indexed({ rawText: "note the ghostauth live tui lane here" }),
+      indexed({ rawText: "note the GHOSTAUTH_LIVE_TUI lane here" }),
+    ];
+    const ranked = bm25Search(candidates, parseQuery("GHOSTAUTH_LIVE_TUI"), "smart", true);
+    expect(ranked[0]?.candidate.rawText).toContain("GHOSTAUTH_LIVE_TUI");
+    expect(ranked[0]?.matchReasons.join(" ")).toContain("Exact code token");
+  });
+
+  it("shortlists sessions by metadata token overlap, capped and length-gated", () => {
+    const query = parseQuery("ghostauth live test");
+    const shortlist = metadataShortlist(
+      [
+        { id: "s1", title: "Profile and audit CLI usage", directory: "/w/ghostauth" },
+        { id: "s2", title: "Ghostauth docs audit", directory: "/w/ghostauth" },
+        { id: "s3", title: "Terminal UI spike", directory: "/w/other" },
+      ],
+      query,
+    );
+    expect(shortlist.has("s1")).toBe(true);
+    expect(shortlist.has("s2")).toBe(true);
+    expect(shortlist.has("s3")).toBe(false);
+    // Short tokens (< 4 chars) never form a shortlist by themselves.
+    expect(
+      metadataShortlist([{ id: "s1", title: "a ui fix", directory: "/w" }], parseQuery("ui fix"))
+        .size,
+    ).toBe(0);
+  });
+
+  it("deep pass uses shortlist-local IDF (fails on a filter-only implementation)", () => {
+    // "needle" is common in the broad corpus (low IDF) but rare inside the
+    // shortlisted session s1. A second, shortlist-only index must score s1's
+    // needle doc higher relative to its own corpus than the broad pass did.
+    const shortlistDoc = indexed({
+      rawText: "needle appears here amid unique session context words",
+      sessionID: "s1",
+      partID: "s1-needle",
+    });
+    const shortlistOther = indexed({
+      rawText: "unique session context words about other matters entirely",
+      sessionID: "s1",
+      partID: "s1-other",
+    });
+    const broadNoise = Array.from({ length: 8 }, (_, i) =>
+      indexed({ rawText: `needle needle filler ${i}`, sessionID: `noise-${i}`, partID: `n-${i}` }),
+    );
+    const pool = [shortlistDoc, shortlistOther, ...broadNoise];
+    const query = parseQuery("needle context");
+
+    const broad = bm25Search(pool, query, "smart", false);
+    const deep = bm25Search([shortlistDoc, shortlistOther], query, "smart", false);
+    const broadRank = broad.findIndex((h) => h.candidate.partID === "s1-needle");
+    const deepRank = deep.findIndex((h) => h.candidate.partID === "s1-needle");
+    expect(deepRank).toBe(0);
+    // Merged list must respect the deep pass's local ordering for s1 parts.
+    const merged = mergeShortlistHits(broad, deep, false);
+    const mergedS1 = merged.filter((h) => h.candidate.sessionID === "s1");
+    expect(mergedS1[0]?.candidate.partID).toBe("s1-needle");
+    expect(broadRank).toBeGreaterThanOrEqual(0);
+  });
+
+  it("anchors deep scores to the broad ceiling and applies the multiplier once", () => {
+    const broad = [
+      {
+        candidate: candidate({ rawText: "a", partID: "pa", sessionID: "s1" }),
+        score: 0.4,
+        matchedTerms: [],
+        matchedFields: [],
+        evidenceClass: "human-text",
+        matchReasons: [],
+      },
+      {
+        candidate: candidate({ rawText: "b", partID: "pb", sessionID: "s2" }),
+        score: 1.0,
+        matchedTerms: [],
+        matchedFields: [],
+        evidenceClass: "human-text",
+        matchReasons: [],
+      },
+    ] as never[];
+    const deep = [
+      {
+        candidate: candidate({ rawText: "a", partID: "pa", sessionID: "s1" }),
+        score: 1.0,
+        matchedTerms: [],
+        matchedFields: [],
+        evidenceClass: "human-text",
+        matchReasons: [],
+      },
+    ] as never[];
+    const merged = mergeShortlistHits(broad as never, deep as never, false);
+    const pa = merged.find((h) => h.candidate.partID === "pa")!;
+    // Deep 1.0 anchored to the shortlist's broad ceiling (0.4) × 1.1 = 0.44,
+    // NOT 1.0 — a weak neighborhood cannot rocket to the global top.
+    expect(pa.score).toBeCloseTo(0.4 * SHORTLIST_MULT, 5);
+    const pb = merged.find((h) => h.candidate.partID === "pb")!;
+    expect(pb.score).toBe(1.0);
+  });
+});
+
 describe("truncatePreservingMatch", () => {
   const text = `HEAD:${"a".repeat(5_000)}NEEDLE${"b".repeat(5_000)}`;
 
@@ -546,10 +664,10 @@ describe("search ranking helpers", () => {
     expect(
       ranked.find((r) => r.candidate.partType === "reasoning")?.matchReasons.join(" "),
     ).toContain("Reasoning part");
-    // Every returned score stays within 0..1.
+    // Internal ranking scores are unclamped so boosts can beat the relative
+    // top; the output layer clamps to 0..1 (asserted in recall.test.ts).
     for (const r of ranked) {
       expect(r.score).toBeGreaterThanOrEqual(0);
-      expect(r.score).toBeLessThanOrEqual(1);
     }
   });
 

@@ -1293,6 +1293,31 @@ describe("recall", () => {
     expect(h.calls.messages).toHaveLength(1);
   });
 
+  describe("query plan", () => {
+    it("reports selected variants only under explain", async () => {
+      const h = makeFakeHarness();
+      const tool = recallTool(h);
+
+      const explained = await runTool<SearchOutput>(tool, {
+        query: "Actualyze walkthrough",
+        match: "smart",
+        explain: true,
+        excludeCurrentSession: false,
+      });
+      expect(explained.queryPlan?.variants).toContain("title-shortlist");
+      expect(explained.queryPlan?.selected).toContain("bm25-broad");
+      // "Actualyze" overlaps the s-other session title, so the shortlist ran.
+      expect(explained.queryPlan?.selected.some((s) => s.startsWith("title-shortlist"))).toBe(true);
+
+      const plain = await runTool<SearchOutput>(tool, {
+        query: "Actualyze walkthrough",
+        match: "smart",
+        excludeCurrentSession: false,
+      });
+      expect(plain.queryPlan).toBeUndefined();
+    });
+  });
+
   describe("expansion match preservation", () => {
     it("keeps the matched region of an oversized part and warns about the part cap", async () => {
       const h = makeFakeHarness();

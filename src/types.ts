@@ -177,6 +177,8 @@ export type SearchOutput = {
   suggestions?: SearchSuggestion[];
   coverage?: SearchCoverage;
   nearMisses?: NearMiss[];
+  /** Present when explain:true — which query-plan variants exist and ran. */
+  queryPlan?: { variants: string[]; selected: string[] };
 };
 
 export type ExpandedResult = {

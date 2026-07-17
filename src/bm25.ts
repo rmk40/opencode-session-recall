@@ -24,7 +24,9 @@ export type Bm25Mode = "smart" | "fuzzy";
 
 export type Bm25Hit = {
   candidate: Candidate;
-  /** Final score in 0..1 (BM25 relative score × structural multiplier). */
+  /** BM25 relative score × structural multipliers. UNCLAMPED: boosts can push
+   *  it above 1 so they can break ties at the relative top; the output layer
+   *  (rankedToSearchResults) clamps to 0..1 for the public shape. */
   score: number;
   matchedTerms: string[];
   matchedFields: ResultWhy["matchedFields"];
@@ -52,6 +54,10 @@ const POOR_COVERAGE_MULT = 0.92; // was −0.08
 const TOOL_INPUT_MULT = 1.1;
 const SKILL_DEFINITION_MULT = 0.85;
 const FILE_READ_MULT = 0.9;
+
+/** Verbatim presence of a code-like compound query token (tokenization splits
+ *  them, so BM25 alone cannot tell `GHOSTAUTH_LIVE_TUI` from the loose words). */
+const EXACT_TOKEN_MULT = 1.12;
 
 const RECENCY_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
 const WEAK_FUZZY_THRESHOLD = 0.7;
@@ -95,8 +101,17 @@ function recencyMultiplier(time: number): number {
   return 1 + factor * (RECENCY_MULT_MAX - 1);
 }
 
-function clamp01(value: number): number {
+export function clamp01(value: number): number {
   return Math.max(0, Math.min(1, value));
+}
+
+/** Deterministic hit ordering: score, then recency, then partID. */
+export function compareHits(a: Bm25Hit, b: Bm25Hit): number {
+  const diff = b.score - a.score;
+  if (diff !== 0) return diff;
+  const timeDiff = b.candidate.time - a.candidate.time;
+  if (timeDiff !== 0) return timeDiff;
+  return a.candidate.partID.localeCompare(b.candidate.partID);
 }
 
 /**
@@ -243,6 +258,15 @@ export function bm25Search(
       if (explain) reasons.push(`Exact phrase: ×${EXACT_PHRASE_MULT}`);
     }
 
+    // Verbatim code-like compound token (case-insensitive).
+    if (
+      query.codeTokens.length > 0 &&
+      query.codeTokens.some((token) => rawLower.includes(token.toLowerCase()))
+    ) {
+      mult *= EXACT_TOKEN_MULT;
+      if (explain) reasons.push(`Exact code token: ×${EXACT_TOKEN_MULT}`);
+    }
+
     const matchedTerms = findMatchedTerms(query.tokens, indexedTokenPool(candidate), mode);
     const matchedFields = findMatchedFields(query, candidate, mode);
     const evidenceClass = evidenceClassFor(candidate.partType, candidate.toolName, matchedFields);
@@ -296,7 +320,9 @@ export function bm25Search(
 
     hits.push({
       candidate,
-      score: clamp01(base * mult),
+      // Deliberately unclamped: clamping here would erase positive boosts at
+      // the relative top (1.0 × 1.12 → 1.0), reducing them to tie-breaks.
+      score: base * mult,
       matchedTerms,
       matchedFields,
       evidenceClass,
@@ -304,14 +330,7 @@ export function bm25Search(
     });
   }
 
-  hits.sort((a, b) => {
-    const diff = b.score - a.score;
-    if (diff !== 0) return diff;
-    const timeDiff = b.candidate.time - a.candidate.time;
-    if (timeDiff !== 0) return timeDiff;
-    // Final deterministic tie-breaker so ordering is stable across runs.
-    return a.candidate.partID.localeCompare(b.candidate.partID);
-  });
+  hits.sort(compareHits);
 
   // Drop trailing noise from OR-combined weak single-term matches, but never
   // drop the only/best hit (the floor is relative to the top score).

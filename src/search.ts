@@ -25,7 +25,8 @@ import { snippet, matches, formatMsg, isSelfTool, evidenceClassFor } from "./ext
 import { parseQuery } from "./query.js";
 import type { Candidate, CandidateFilters } from "./candidates.js";
 import { assembleSession, type AssembledSession, type CorpusCache } from "./corpus.js";
-import { bm25Search, type Bm25Hit } from "./bm25.js";
+import { metadataShortlist, mergeShortlistHits } from "./plan.js";
+import { bm25Search, clamp01, type Bm25Hit } from "./bm25.js";
 import { smartSnippet, truncatePreservingMatch } from "./snippet.js";
 import { compileRegex, regexFirstIndex, regexSnippet } from "./regex.js";
 import { classifyQuery } from "./route.js";
@@ -682,6 +683,7 @@ function smartScan(
   total: number;
   degradeKind: DegradeKind;
   matchMode: MatchMode;
+  planSelected: string[];
 } {
   const pq = parseQuery(query);
   const startTime = performance.now();
@@ -702,7 +704,30 @@ function smartScan(
     pool.push(...entry.session.candidates);
   }
 
-  const hits = bm25Search(pool, pq, mode, explain);
+  const planSelected: string[] = ["bm25-broad"];
+  if (pq.codeTokens.length > 0) planSelected.push("exact-token-boost");
+
+  // Stage A/B of the session-first plan: shortlist sessions by metadata
+  // overlap, deep-search them with a shortlist-only index, merge.
+  const shortlist = metadataShortlist(
+    assembled.map((entry) => ({
+      id: entry.session.meta.id,
+      title: entry.session.meta.title,
+      directory: entry.session.meta.directory,
+    })),
+    pq,
+  );
+
+  let hits = bm25Search(pool, pq, mode, explain);
+  if (shortlist.size > 0) {
+    const shortlistPool = pool.filter((candidate) => shortlist.has(candidate.sessionID));
+    if (shortlistPool.length > 0) {
+      const deepHits = bm25Search(shortlistPool, pq, mode, explain);
+      hits = mergeShortlistHits(hits, deepHits, explain);
+      planSelected.push(`title-shortlist:${shortlist.size}`);
+    }
+  }
+
   const allResults = rankedToSearchResults(hits, mode, explain, pq, width, relevanceBySession);
 
   const totalTime = performance.now() - startTime;
@@ -711,6 +736,7 @@ function smartScan(
     total: allResults.length,
     degradeKind: timedOut || totalTime > TIME_BUDGET_MS ? "time" : "none",
     matchMode: mode,
+    planSelected,
   };
 }
 
@@ -748,7 +774,9 @@ function rankedToSearchResults(
       pruned: c.isPruned,
       snippet: snip,
       toolName: c.toolName,
-      score: r.score,
+      // Ranking scores are unclamped so boosts can beat the relative top;
+      // the public shape stays 0..1.
+      score: clamp01(r.score),
       matchMode: mode,
       matchedTerms: r.matchedTerms,
       source: c.source,
@@ -2059,6 +2087,16 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
           );
           if (smartResult.degradeKind === "time") pushUnique(normalized.limitedBy, "timeBudget");
 
+          const QUERY_PLAN_VARIANTS = [
+            "bm25-broad",
+            "title-shortlist",
+            "exact-token-boost",
+            "literal-fallback",
+          ];
+          const attachQueryPlan = (out: SearchOutput, selected: string[]): void => {
+            if (explain) out.queryPlan = { variants: QUERY_PLAN_VARIANTS, selected };
+          };
+
           // ── Fallback to literal if smart returns nothing ────────────
           // Skip the fallback when the smart pass was cut short rather than
           // genuinely empty: if the caller aborted (a hook timeout fired
@@ -2094,6 +2132,7 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
                 degradeKind: "fallback",
                 group: groupMode,
               };
+              attachQueryPlan(out, [...smartResult.planSelected, "literal-fallback"]);
               return JSON.stringify(await finish(out, final, "literal"));
             }
           }
@@ -2120,6 +2159,7 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
             degradeKind: smartResult.degradeKind,
             group: groupMode,
           };
+          attachQueryPlan(out, smartResult.planSelected);
           return JSON.stringify(await finish(out, final, smartResult.matchMode));
         } finally {
           sync.release();

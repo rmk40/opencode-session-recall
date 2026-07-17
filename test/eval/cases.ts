@@ -139,4 +139,9 @@ export const EVAL_CASES: EvalCase[] = [
     relevantSessionIDs: ["e-flow"],
     expect: { classInTop3: ["human-text"] },
   },
+  // The title/content bridge case ("ghostauth live test" must rank e-flow
+  // above the docs-audit session e-docs) lands with the session-digest phase:
+  // both sessions' strongest lexical hits are file reads, so only a
+  // content-derived session-level signal can order them. See the plan's
+  // Phase 10.
 ];
