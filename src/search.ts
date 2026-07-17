@@ -1950,7 +1950,14 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
         // even older history may exist beyond the window we asked for.
         let providerCapHit = false;
         const noteDiscoveryCap = (count: number): void => {
-          if (sessionListLimit === DISCOVERY_LIMIT && count >= DISCOVERY_LIMIT) {
+          // Completeness mode only: a caller-requested sessions cap routes
+          // through sessionsLimit accounting, even if it happens to equal
+          // the discovery limit numerically.
+          if (
+            requestedSessions == null &&
+            sessionListLimit === DISCOVERY_LIMIT &&
+            count >= DISCOVERY_LIMIT
+          ) {
             providerCapHit = true;
           }
         };
