@@ -339,6 +339,25 @@ describe("evidence classification", () => {
         fields: ["command"],
         expected: "tool-input",
       },
+      // Fetch-shaped tools: OUTPUT matches are fetched reference material;
+      // input-only matches stay the action they record (ordering is
+      // load-bearing — the whole JSON input files under "command").
+      { partType: "tool", toolName: "webfetch", fields: ["stdout"], expected: "web-fetch" },
+      {
+        partType: "tool",
+        toolName: "mcp__firecrawl__firecrawl_scrape",
+        fields: ["stdout"],
+        expected: "web-fetch",
+      },
+      { partType: "tool", toolName: "web_search", fields: ["stdout"], expected: "web-fetch" },
+      { partType: "tool", toolName: "code_search", fields: ["command"], expected: "tool-input" },
+      {
+        partType: "tool",
+        toolName: "archive_extract",
+        fields: ["command"],
+        expected: "tool-input",
+      },
+      { partType: "tool", toolName: "research", fields: ["stdout"], expected: "tool-output" },
       // Any output-side match makes it tool-output.
       {
         partType: "tool",
@@ -406,10 +425,16 @@ describe("query plan (codeTokens, shortlist, merge)", () => {
       ["open deploy.yaml and opencode-multikey", ["deploy.yaml", "opencode-multikey"]],
       ["path src/hooks/auto-recall.ts", ["src/hooks/auto-recall.ts"]],
       ["abc a_b", []], // below the 4-char minimum
+      ["use OpenCode here", []], // PascalCase prose naming is not an anchor
+      ["deploy myVarName now", ["myVarName"]],
+      // Lookbehind blocks a match STARTING mid-word; a legitimate
+      // lowercase-led camelCase token still matches whole.
+      ["xOpenCode", ["xOpenCode"]],
     ];
     for (const [query, expected] of rows) {
       expect(parseQuery(query).codeTokens, query).toEqual(expected);
     }
+    expect(parseQuery("xOpenCode").codeTokens).not.toContain("penCode");
   });
 
   it("boosts verbatim code tokens over split-token equivalents", () => {
@@ -676,6 +701,43 @@ describe("truncateExpandedPart budgets", () => {
     expect(budget.truncated).toBe(true);
   });
 
+  it("caps oversized tool inputs and preserves small ones by identity", () => {
+    const budget: ExpansionBudget = { remaining: 30_000, truncated: false };
+    const smallInput = { command: "npm test" };
+    const small = truncateExpandedPart(toolPart({ input: smallInput }), budget);
+    expect(small.input).toBe(smallInput);
+
+    const big = truncateExpandedPart(
+      toolPart({ input: { filePath: "/x", content: "y".repeat(50_000) } }),
+      budget,
+    );
+    expect(typeof big.input).toBe("string");
+    expect((big.input as string).length).toBeLessThanOrEqual(2_000);
+    expect(big.input as string).toContain("[truncated by recall expansion]");
+    expect(budget.truncated).toBe(true);
+  });
+
+  it("charges input length against the part budget", () => {
+    const budget: ExpansionBudget = { remaining: 30_000, truncated: false };
+    truncateExpandedPart(
+      toolPart({ input: { content: "z".repeat(5_000) }, output: "o".repeat(10_000) }),
+      budget,
+    );
+    // Input consumed 2k of the 6k part budget; output gets the remaining 4k.
+    expect(30_000 - budget.remaining).toBe(6_000);
+  });
+
+  it("omits unserializable inputs instead of throwing", () => {
+    const budget: ExpansionBudget = { remaining: 30_000, truncated: false };
+    const circular: Record<string, unknown> = {};
+    circular.self = circular;
+    const out = truncateExpandedPart(toolPart({ input: circular }), budget);
+    expect(out.input).toBeUndefined();
+
+    const fn = truncateExpandedPart(toolPart({ input: (() => {}) as never }), budget);
+    expect(fn.input).toBeUndefined();
+  });
+
   it("attributes cuts to the global budget when it is smaller than the part cap", () => {
     const budget: ExpansionBudget = { remaining: 1_000, truncated: false };
     truncateExpandedPart(toolPart({ output: "o".repeat(5_000) }), budget);
@@ -748,6 +810,18 @@ describe("capAndSlice class caps", () => {
     ];
     const final = capAndSlice(ordered, 5, false);
     expect(final.map((h) => h.partID)).toEqual(["p1", "p3", "p4", "p6", "p7"]);
+  });
+
+  it("caps web-fetch to two within the slice", () => {
+    const ordered = [
+      hit("w1", "web-fetch"),
+      hit("w2", "web-fetch"),
+      hit("w3", "web-fetch"),
+      hit("t1", "tool-output"),
+      hit("h1", "human-text"),
+    ];
+    const final = capAndSlice(ordered, 4, false);
+    expect(final.map((h) => h.partID)).toEqual(["w1", "w2", "t1", "h1"]);
   });
 
   it("backfills held-back hits when caps starve the fill", () => {
@@ -956,6 +1030,28 @@ describe("search ranking helpers", () => {
     expect(coveredHit.matchReasons.join(" ")).toContain("Session digest match");
     expect(uncoveredHit.matchReasons.join(" ")).not.toContain("Session digest match");
     expect(ranked[0]!.candidate.partID).toBe("p-covered");
+  });
+
+  it("ranks a command input above an equally-matching fetched page", () => {
+    const candidates = [
+      indexed({
+        rawText: "zephyrite calibration handbook page content " + "filler words ".repeat(20),
+        partType: "tool",
+        toolName: "mcp__firecrawl__firecrawl_scrape",
+        time: 2_000,
+      }),
+      indexed({
+        rawText: "zephyrite calibration probe --run\n\nbash",
+        partType: "tool",
+        toolName: "bash",
+        time: 1_000,
+        fieldTexts: [{ field: "command", text: "zephyrite calibration probe --run" }],
+      }),
+    ];
+    const ranked = bm25Search(candidates, parseQuery("zephyrite calibration"), "smart", true);
+    expect(ranked[0]?.candidate.toolName).toBe("bash");
+    expect(ranked[1]?.evidenceClass).toBe("web-fetch");
+    expect(ranked[1]?.matchReasons.join(" ")).toContain("Web fetch");
   });
 
   it("rewards term rarity (IDF) over boilerplate", () => {

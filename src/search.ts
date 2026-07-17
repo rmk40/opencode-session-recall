@@ -66,6 +66,10 @@ const MAX_EXPANDED_FIELD_CHARS = 4_000;
 /** Cap on one part's total expanded text (all fields combined) so a single
  *  oversized tool dump cannot consume the whole expansion budget. */
 const MAX_EXPANDED_PART_CHARS = 6_000;
+/** Cap on one part's serialized tool INPUT inside expansion: a Write-style
+ *  input embedding a whole file must not bypass the budgets. recall_get
+ *  remains the full-fidelity path. */
+const MAX_EXPANDED_INPUT_CHARS = 2_000;
 const DIRECTORY_FILTER_LIST_LIMIT = 5000;
 /** Explicit discovery limit for "all history" requests: the opencode server
  *  defaults to 100 rows when no limit is sent (silently hiding older
@@ -578,6 +582,36 @@ function truncateExpandedText(
 
 const SELF_TOOL_REDACTED = "[recall output omitted]";
 
+/** Budget a tool input for expansion. Small inputs keep their original shape
+ *  (and charge their serialized length); oversized ones are replaced with a
+ *  truncated serialized string plus the marker. Unserializable inputs
+ *  (circular, bare undefined) are omitted rather than thrown on. */
+function truncateExpandedInput(value: unknown, budget: ExpansionBudget): unknown {
+  if (value == null) return value;
+  let serialized: string | undefined;
+  try {
+    serialized = JSON.stringify(value);
+  } catch {
+    return undefined;
+  }
+  if (serialized === undefined) return undefined;
+
+  const allowed = Math.min(MAX_EXPANDED_INPUT_CHARS, budget.remaining);
+  if (serialized.length <= allowed) {
+    budget.remaining -= serialized.length;
+    return value;
+  }
+  budget.truncated = true;
+  if (allowed <= EXPANSION_TRUNCATED.length) {
+    budget.limitedByBudget = true;
+    return undefined;
+  }
+  if (budget.remaining < MAX_EXPANDED_INPUT_CHARS) budget.limitedByBudget = true;
+  const sliceLength = allowed - EXPANSION_TRUNCATED.length;
+  budget.remaining -= allowed;
+  return `${serialized.slice(0, sliceLength)}${EXPANSION_TRUNCATED}`;
+}
+
 /** Exported for direct unit tests of the per-part budget mechanics. */
 export function truncateExpandedPart(
   part: PartOutput,
@@ -591,7 +625,13 @@ export function truncateExpandedPart(
   // structure/positioning is preserved. Explicit recall_get/recall_context are
   // unaffected — this only applies to recall's inline expansion.
   if (part.type === "tool" && part.toolName && isSelfTool(part.toolName)) {
-    return { ...part, content: SELF_TOOL_REDACTED, output: undefined, error: undefined };
+    return {
+      ...part,
+      content: SELF_TOOL_REDACTED,
+      output: undefined,
+      error: undefined,
+      input: undefined,
+    };
   }
   // Per-part sub-budget: one part may consume at most MAX_EXPANDED_PART_CHARS
   // of the global budget across all of its fields.
@@ -599,6 +639,7 @@ export function truncateExpandedPart(
   const partBudget: ExpansionBudget = { remaining: initialAllowance, truncated: false };
   const out: PartOutput = {
     ...part,
+    input: truncateExpandedInput(part.input, partBudget),
     content: truncateExpandedText(part.content, partBudget, findMatch),
     output: truncateExpandedText(part.output, partBudget, findMatch),
     error: truncateExpandedText(part.error, partBudget, findMatch),
@@ -990,8 +1031,10 @@ function rankedToSearchResults(
  *  the session's best. */
 const MAX_GROUP_TRACKED = 4;
 /** A tracked hit qualifies as representative when its score is within this
- *  fraction of the session's best score. */
-const REPRESENTATIVE_TOLERANCE = 0.85;
+ *  fraction of the session's best score. Loosened from 0.85 after round-2
+ *  dogfooding: the utility ordering rarely got to act while topEvidence
+ *  held the right material. */
+const REPRESENTATIVE_TOLERANCE = 0.7;
 const TOP_EVIDENCE_SNIPPET_CHARS = 120;
 const MAX_TOP_EVIDENCE = 2;
 
@@ -1004,6 +1047,7 @@ const CLASS_PRIORITY: EvidenceClass[] = [
   "tool-output",
   "reasoning",
   "file-read",
+  "web-fetch",
   "skill-definition",
   "session-title",
 ];
@@ -1113,6 +1157,7 @@ export function groupBySession(results: SearchResult[]): SearchResult[] {
 const CLASS_CAPS: Partial<Record<EvidenceClass, number>> = {
   "skill-definition": 1,
   "file-read": 2,
+  "web-fetch": 2,
 };
 
 /** Queries that describe actions: exact code anchors or command verbs. */

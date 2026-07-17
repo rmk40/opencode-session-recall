@@ -46,6 +46,13 @@ const TOOL_INPUT_FIELDS = new Set<ResultWhy["matchedFields"][number]>([
   "toolName",
 ]);
 
+/** Fetch-shaped tool bases (suffix-matched): their OUTPUT is fetched
+ *  reference material. Order matters — the tool-input check runs first, so
+ *  an input-only match on a fetch/search tool still counts as the action it
+ *  records; toolInputTexts files the whole JSON input under the command
+ *  field, so a before-input check would swallow every fetch part. */
+const WEB_FETCH_BASES = ["webfetch", "fetch", "scrape", "crawl", "search", "extract"] as const;
+
 /**
  * Deterministic evidence classification for a hit. Note the `command` scope:
  * toolInputTexts() files the whole JSON input under the `command` matched
@@ -66,6 +73,9 @@ export function evidenceClassFor(
   if (toolName && toolNameMatches(toolName, "read")) return "file-read";
   if (matchedFields.length > 0 && matchedFields.every((field) => TOOL_INPUT_FIELDS.has(field))) {
     return "tool-input";
+  }
+  if (toolName && WEB_FETCH_BASES.some((base) => toolNameMatches(toolName, base))) {
+    return "web-fetch";
   }
   return "tool-output";
 }

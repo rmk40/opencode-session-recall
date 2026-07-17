@@ -48,6 +48,7 @@ export type EvidenceClass =
   | "tool-input" // hit matched in command/cwd/toolName fields (incl. JSON input)
   | "tool-output"
   | "file-read" // tool name suffix-matches "read"
+  | "web-fetch" // output-side match on a fetch-shaped tool (webfetch/scrape/…)
   | "skill-definition" // tool name suffix-matches "skill"
   | "session-title";
 
@@ -261,6 +262,9 @@ export type SessionItem = {
   project?: { name?: string; worktree: string };
   time: { created: number; updated: number };
   archived: boolean;
+  /** Content-derived digest, present only when the session is warm in the
+   *  shared corpus cache (best-effort; recall_sessions never fetches). */
+  digest?: string;
 };
 
 export type SessionsOutput = {

@@ -142,7 +142,7 @@ const server: Plugin = async (ctx, options) => {
 
   return {
     tool: {
-      recall_sessions: sessions(client, unscoped, global, limits),
+      recall_sessions: sessions(client, unscoped, global, limits, cache),
       recall: search(client, unscoped, global, limits, cache, semantic),
       recall_get: get(client),
       recall_context: context(client, limits),

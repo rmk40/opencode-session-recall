@@ -320,6 +320,13 @@ export class CorpusCache {
     private readonly embedder?: CandidateEmbedder,
   ) {}
 
+  /** Read-only digest lookup for already-cached sessions (no fetch, no pin).
+   *  Used by recall_sessions as a best-effort browse aid. */
+  peekDigest(id: string): string | undefined {
+    const entry = this.sessions.get(id);
+    return entry?.digestText ? entry.digestText : undefined;
+  }
+
   stats(): { sessions: number; candidates: number; chars: number } {
     let candidates = 0;
     for (const entry of this.sessions.values()) candidates += entry.candidates.length;

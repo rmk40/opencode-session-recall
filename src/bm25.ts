@@ -56,6 +56,9 @@ const POOR_COVERAGE_MULT = 0.92; // was −0.08
 const TOOL_INPUT_MULT = 1.1;
 const SKILL_DEFINITION_MULT = 0.85;
 const FILE_READ_MULT = 0.9;
+/** Fetched web content is reference material, same tier as skill payloads —
+ *  exactly the class round-2 dogfooding saw dominating workflow queries. */
+const WEB_FETCH_MULT = 0.85;
 
 /** Verbatim presence of a code-like compound query token (tokenization splits
  *  them, so BM25 alone cannot tell `GHOSTAUTH_LIVE_TUI` from the loose words). */
@@ -314,6 +317,9 @@ export function bm25Search(
     } else if (evidenceClass === "file-read") {
       mult *= FILE_READ_MULT;
       if (explain) reasons.push(`File read: ×${FILE_READ_MULT}`);
+    } else if (evidenceClass === "web-fetch") {
+      mult *= WEB_FETCH_MULT;
+      if (explain) reasons.push(`Web fetch: ×${WEB_FETCH_MULT}`);
     }
     if (explain) reasons.push(`Evidence class: ${evidenceClass}`);
     const allTokens = query.tokens.length > 0 && matchedTerms.length === query.tokens.length;

@@ -6,6 +6,34 @@ All notable changes to this project are documented here. This project follows
 
 ## Unreleased
 
+Round-2 dogfooding fixes (see `docs/plans/recall-dogfooding-round2-fixes.md`):
+
+- **Full-history discovery.** The opencode server defaults session lists to
+  100 rows; recall now always requests an explicit discovery limit (10,000),
+  so "all history" searches actually sweep all history instead of the 100
+  most-recently-updated sessions. Filling the window reports
+  `limitedBy: providerLimit` plus a warning. Prewarm warms the same window.
+- **Delegation-tree exclusion.** `excludeCurrentSession` now excludes the
+  current session's whole subagent family (ancestors, siblings, and
+  transitive children via `parentID`), so evaluation subagents that restate
+  the query can no longer take over the top ranks.
+- **Expansion input cap.** Tool inputs inside `expand` output are budgeted
+  (2,000 serialized chars per part, charged against the part budget);
+  oversized inputs truncate with the standard marker instead of leaking
+  50 KB file writes past every budget. Self-tool redaction drops inputs too.
+- **`web-fetch` evidence class.** Output-side matches on fetch-shaped tools
+  (`webfetch`/`fetch`/`scrape`/`crawl`/`search`/`extract`, suffix-matched)
+  classify as fetched reference material: ×0.85 ranking multiplier and a
+  2-hit cap in the top slice. Input-side matches on the same tools remain
+  `tool-input` — asking to scrape a URL is the recorded action.
+- **Code-token boundaries.** The code-token regex is boundary-anchored, so
+  "OpenCode" no longer yields a literal-search suggestion for "penCode".
+- **Representative tolerance** loosened 0.85 → 0.7 so the evidence-class
+  utility ordering can act when `topEvidence` holds stronger material.
+- **`recall_sessions` digests.** Sessions warm in the corpus cache include a
+  content-derived `digest` (best-effort; the browse tool never fetches), so
+  a misleading title is no longer the only signal.
+
 This release is about retrieval efficiency: making one or two `recall` calls
 sufficient for "how did we do X before" queries instead of seven progressively
 narrower ones. Search is now complete over the eligible scope (an in-memory

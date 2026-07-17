@@ -10,12 +10,16 @@ import {
   type ErrorOutput,
   type Limits,
 } from "./types.js";
+import type { CorpusCache } from "./corpus.js";
+
+const SESSION_DIGEST_CHARS = 160;
 
 export function sessions(
   client: OpencodeClient,
   unscoped: OpencodeClient,
   global: boolean,
   limits: Limits,
+  cache?: CorpusCache,
 ): ToolDefinition {
   return tool({
     description: `List session metadata: titles, directories, timestamps, archival state. Use only for recent-session browsing, finding a session ID/title/timeframe, or recency checks. Not content search; for topical discovery use recall.`,
@@ -74,6 +78,7 @@ export function sessions(
           }
           if (result.data) {
             for (const s of result.data) {
+              const digest = cache?.peekDigest(s.id);
               items.push({
                 id: s.id,
                 title: s.title,
@@ -83,6 +88,7 @@ export function sessions(
                   : undefined,
                 time: { created: s.time.created, updated: s.time.updated },
                 archived: s.time.archived != null,
+                ...(digest && { digest: digest.slice(0, SESSION_DIGEST_CHARS) }),
               });
             }
           }
@@ -100,12 +106,14 @@ export function sessions(
           }
           if (result.data) {
             for (const s of result.data) {
+              const digest = cache?.peekDigest(s.id);
               items.push({
                 id: s.id,
                 title: s.title,
                 directory: s.directory,
                 time: { created: s.time.created, updated: s.time.updated },
                 archived: s.time.archived != null,
+                ...(digest && { digest: digest.slice(0, SESSION_DIGEST_CHARS) }),
               });
             }
           }

@@ -336,6 +336,32 @@ describe("recall_sessions defensive args", () => {
   });
 });
 
+describe("recall_sessions digests", () => {
+  it("attaches digests for cache-warm sessions only", async () => {
+    const h = makeFakeHarness();
+    const cache = new CorpusCache(h.client, TEST_LIMITS);
+    const tool = sessionsTool(h.client, h.unscoped, true, TEST_LIMITS, cache);
+
+    const cold = await runTool<SessionsOutput>(tool, { scope: "global" });
+    expect(cold.sessions.every((s) => s.digest === undefined)).toBe(true);
+
+    const synced = await cache.sync([
+      {
+        id: "s-current",
+        title: "Current Debugging Session",
+        directory: "/workspace/project",
+        updated: 1_000,
+      },
+    ]);
+    synced.release();
+    const warm = await runTool<SessionsOutput>(tool, { scope: "global" });
+    const current = warm.sessions.find((s) => s.id === "s-current");
+    expect(current?.digest).toBeDefined();
+    expect(current!.digest!.length).toBeLessThanOrEqual(160);
+    expect(warm.sessions.find((s) => s.id === "s-other")?.digest).toBeUndefined();
+  });
+});
+
 describe("LLM-facing schemas", () => {
   it("reject invalid enum and capped numeric args before execute", async () => {
     const h = makeFakeHarness();

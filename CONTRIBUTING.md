@@ -226,6 +226,7 @@ BM25 scores are normalized to 0..1 relative to the top hit, then adjusted by **m
 | Weak single fuzzy  | ×0.90      | Single match, relative score < 0.7                                           |
 | File read          | ×0.90      | Evidence class `file-read` (tool name suffix-matches `read`)                 |
 | Skill definition   | ×0.85      | Evidence class `skill-definition` (tool name suffix-matches `skill`)         |
+| Web fetch          | ×0.85      | Evidence class `web-fetch` (output match on fetch/scrape/search-shaped tool) |
 | Poor coverage      | ×0.92      | < 50% of query tokens matched                                                |
 
 The evidence class comes from `evidenceClassFor()` in `extract.ts`, derived deterministically from part type, tool name, and matched fields; it is also returned on every result as `why.evidenceClass`. Internal scores are deliberately **unclamped** — clamping per hit would erase every positive boost at the relative top — and are clamped to 0–1 once at output in `rankedToSearchResults()`.
