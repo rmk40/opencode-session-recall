@@ -3,7 +3,8 @@ import { distance } from "fastest-levenshtein";
 import type { Candidate } from "./candidates.js";
 import type { ParsedQuery } from "./query.js";
 import { tokenize, tokenizeAll } from "./normalize.js";
-import type { ResultWhy } from "./types.js";
+import { evidenceClassFor } from "./extract.js";
+import type { EvidenceClass, ResultWhy } from "./types.js";
 
 /**
  * BM25 relevance ranking via an in-memory MiniSearch index built per query.
@@ -27,6 +28,7 @@ export type Bm25Hit = {
   score: number;
   matchedTerms: string[];
   matchedFields: ResultWhy["matchedFields"];
+  evidenceClass: EvidenceClass;
   matchReasons: string[];
 };
 
@@ -41,6 +43,15 @@ const USER_ROLE_MULT = 1.03; // was +0.03
 const RECENCY_MULT_MAX = 1.05; // was +0.05 at max
 const WEAK_FUZZY_MULT = 0.9; // was −0.10
 const POOR_COVERAGE_MULT = 0.92; // was −0.08
+
+// ── Evidence-class multipliers ────────────────────────────────────────
+// Concrete actions (tool inputs) beat generated reference material (skill
+// payloads, file reads) for "what did we do before" queries. Plain tool
+// output is deliberately NOT penalized: error/stdout evidence is often the
+// only record of what happened. Tuned against test/eval/.
+const TOOL_INPUT_MULT = 1.1;
+const SKILL_DEFINITION_MULT = 0.85;
+const FILE_READ_MULT = 0.9;
 
 const RECENCY_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
 const WEAK_FUZZY_THRESHOLD = 0.7;
@@ -234,6 +245,18 @@ export function bm25Search(
 
     const matchedTerms = findMatchedTerms(query.tokens, indexedTokenPool(candidate), mode);
     const matchedFields = findMatchedFields(query, candidate, mode);
+    const evidenceClass = evidenceClassFor(candidate.partType, candidate.toolName, matchedFields);
+    if (evidenceClass === "tool-input") {
+      mult *= TOOL_INPUT_MULT;
+      if (explain) reasons.push(`Tool input: ×${TOOL_INPUT_MULT}`);
+    } else if (evidenceClass === "skill-definition") {
+      mult *= SKILL_DEFINITION_MULT;
+      if (explain) reasons.push(`Skill definition: ×${SKILL_DEFINITION_MULT}`);
+    } else if (evidenceClass === "file-read") {
+      mult *= FILE_READ_MULT;
+      if (explain) reasons.push(`File read: ×${FILE_READ_MULT}`);
+    }
+    if (explain) reasons.push(`Evidence class: ${evidenceClass}`);
     const allTokens = query.tokens.length > 0 && matchedTerms.length === query.tokens.length;
     if (allTokens) {
       mult *= ALL_TOKENS_MULT;
@@ -276,6 +299,7 @@ export function bm25Search(
       score: clamp01(base * mult),
       matchedTerms,
       matchedFields,
+      evidenceClass,
       matchReasons: explain ? reasons : [],
     });
   }

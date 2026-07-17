@@ -20,7 +20,7 @@ import {
   type ResultSource,
   type ResultWhy,
 } from "./types.js";
-import { snippet, matches, formatMsg, isSelfTool } from "./extract.js";
+import { snippet, matches, formatMsg, isSelfTool, evidenceClassFor } from "./extract.js";
 import { parseQuery } from "./query.js";
 import type { Candidate, CandidateFilters } from "./candidates.js";
 import { assembleSession, type AssembledSession, type CorpusCache } from "./corpus.js";
@@ -538,6 +538,7 @@ function candidateResult(
       directoryRelevance: relevance,
       recency: recencyLabel(candidate.time),
       confidence: candidate.partType === "title" ? "medium" : "high",
+      evidenceClass: evidenceClassFor(candidate.partType, candidate.toolName, [matchedField]),
     },
   });
 }
@@ -704,6 +705,7 @@ function rankedToSearchResults(
       why: {
         ...c.why,
         directoryRelevance: relevance,
+        evidenceClass: r.evidenceClass,
         matchedFields:
           r.matchedFields.length > 0
             ? r.matchedFields

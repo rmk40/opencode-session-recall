@@ -5,30 +5,69 @@ import type {
   AssistantMessage,
   UserMessage,
 } from "@opencode-ai/sdk/v2";
-import { TOOLS, type PartOutput, type MessageItem, type ResultWhy } from "./types.js";
+import {
+  TOOLS,
+  type EvidenceClass,
+  type PartOutput,
+  type MessageItem,
+  type ResultWhy,
+} from "./types.js";
 
 const INPUT_SEARCH_LIMIT = 10_000;
-const SELF = new Set<string>(TOOLS);
 /** Separators a host may use when namespacing a tool (e.g. `mcp__server__recall`,
  *  `opencode-session-recall_recall`, `provider.recall`). */
 const SELF_BOUNDARY = /[._/-]$/;
 export type SearchableField = { field: ResultWhy["matchedFields"][number]; text: string };
 
 /**
+ * Whether a tool name is `base` or a host-namespaced variant of it (e.g.
+ * `mcp__server__read`, `provider.read`). Requires a separator before the
+ * suffix so an unrelated name such as `myread` does not match.
+ */
+export function toolNameMatches(toolName: string, base: string): boolean {
+  if (toolName === base) return true;
+  if (!toolName.endsWith(base)) return false;
+  const prefix = toolName.slice(0, toolName.length - base.length);
+  return prefix.length > 0 && SELF_BOUNDARY.test(prefix);
+}
+
+/**
  * Whether a tool-part's tool name is one of OUR recall tools, so its output is
  * never searchable by recall (prevents recall from finding prior recall
- * results). Matches the bare registered name and host-namespaced variants like
- * `mcp__opencode-session-recall__recall` — but requires a separator before the
- * suffix so an unrelated tool such as `myrecall` is not excluded.
+ * results). Matches the bare registered name and host-namespaced variants.
  */
 export function isSelfTool(toolName: string): boolean {
-  if (SELF.has(toolName)) return true;
-  for (const self of TOOLS) {
-    if (!toolName.endsWith(self)) continue;
-    const prefix = toolName.slice(0, toolName.length - self.length);
-    if (prefix.length > 0 && SELF_BOUNDARY.test(prefix)) return true;
+  return TOOLS.some((self) => toolNameMatches(toolName, self));
+}
+
+const TOOL_INPUT_FIELDS = new Set<ResultWhy["matchedFields"][number]>([
+  "command",
+  "cwd",
+  "toolName",
+]);
+
+/**
+ * Deterministic evidence classification for a hit. Note the `command` scope:
+ * toolInputTexts() files the whole JSON input under the `command` matched
+ * field in addition to the specific command/cwd strings, so a tool part whose
+ * only match is inside its JSON input classifies as tool-input regardless of
+ * tool. That is intended — "matched in what was asked of the tool" — and it
+ * makes non-bash tool invocations count as actions.
+ */
+export function evidenceClassFor(
+  partType: string,
+  toolName: string | undefined,
+  matchedFields: ResultWhy["matchedFields"],
+): EvidenceClass {
+  if (partType === "title") return "session-title";
+  if (partType === "reasoning") return "reasoning";
+  if (partType !== "tool") return "human-text";
+  if (toolName && toolNameMatches(toolName, "skill")) return "skill-definition";
+  if (toolName && toolNameMatches(toolName, "read")) return "file-read";
+  if (matchedFields.length > 0 && matchedFields.every((field) => TOOL_INPUT_FIELDS.has(field))) {
+    return "tool-input";
   }
-  return false;
+  return "tool-output";
 }
 
 function input(val: unknown): string {
@@ -64,6 +103,16 @@ export function searchableFields(part: Part): SearchableField[] {
   if (part.type === "tool" && isSelfTool(part.tool)) return [];
   switch (part.type) {
     case "text":
+      // Auto-recall injects synthetic <recall-auto> text parts that restate
+      // query-like terms; indexing them would let recall find its own prior
+      // injections. Only our sentinel is excluded — other synthetic parts
+      // (e.g. host-injected context) stay searchable.
+      if (
+        (part as { synthetic?: boolean }).synthetic === true &&
+        part.text?.startsWith("<recall-auto>")
+      ) {
+        return [];
+      }
       return part.text ? [{ field: "text", text: part.text }] : [];
     case "reasoning":
       return part.text ? [{ field: "reasoning", text: part.text }] : [];

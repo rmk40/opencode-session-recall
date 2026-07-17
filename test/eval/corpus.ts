@@ -301,6 +301,15 @@ export function makeEvalCorpus(now = Date.now()): EvalCorpus {
           { title: "Read testing docs" },
         ),
       ]),
+      bundle(assistantMessage("ef-6", sFlow.id, now - 95_000), [
+        textPart(
+          "ef-6p",
+          sFlow.id,
+          "ef-6",
+          "Wrote the live smoke test with launchTerminal from the tuistory JS API: " +
+            "it drives opencode, waits for the prompt, and asserts the auth flow.",
+        ),
+      ]),
     ],
 
     // ── e-docs: docs review, mentions without actions ────────────────────

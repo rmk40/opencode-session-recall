@@ -1,3 +1,4 @@
+import { GHOST_DIR } from "../helpers.js";
 import type { EvalCase } from "./harness.js";
 
 /**
@@ -104,5 +105,32 @@ export const EVAL_CASES: EvalCase[] = [
     ctxSessionID: "e-cur",
     relevantSessionIDs: ["e-flow"],
     expect: { notInResults: ["e-cur"] },
+  },
+  {
+    // Field report: an exact tool query must surface concrete actions (bash
+    // tool inputs), not the skill payload that mentions the tool everywhere.
+    name: "field-report: exact tool query prefers tool-input evidence",
+    args: {
+      query: "tuistory",
+      match: "smart",
+      group: "part",
+      scope: "global",
+      directory: GHOST_DIR,
+    },
+    relevantSessionIDs: ["e-flow"],
+    expect: { classInTop3: ["tool-input"] },
+  },
+  {
+    // Field report: authored usage of an API outranks the generic skill body
+    // that also contains the literal.
+    name: "field-report: authored launchTerminal usage outranks skill body",
+    args: {
+      query: "launchTerminal",
+      match: "smart",
+      group: "part",
+      scope: "global",
+    },
+    relevantSessionIDs: ["e-flow"],
+    expect: { classInTop3: ["human-text"] },
   },
 ];

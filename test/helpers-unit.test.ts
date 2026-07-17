@@ -5,7 +5,16 @@ import {
   populateNormalized,
   type Candidate,
 } from "../src/candidates.js";
-import { format, formatMsg, isSelfTool, pruned, searchable, snippet } from "../src/extract.js";
+import {
+  evidenceClassFor,
+  format,
+  formatMsg,
+  isSelfTool,
+  pruned,
+  searchable,
+  snippet,
+  toolNameMatches,
+} from "../src/extract.js";
 import { parseQuery } from "../src/query.js";
 import { bm25Search } from "../src/bm25.js";
 import { smartSnippet } from "../src/snippet.js";
@@ -277,6 +286,102 @@ function indexed(overrides: Partial<Candidate> & { rawText: string }): Candidate
   return c;
 }
 
+describe("evidence classification", () => {
+  it("maps part types, tool names, and matched fields to evidence classes", () => {
+    const rows: Array<{
+      partType: string;
+      toolName?: string;
+      fields: Parameters<typeof evidenceClassFor>[2];
+      expected: string;
+    }> = [
+      { partType: "title", fields: ["title"], expected: "session-title" },
+      { partType: "reasoning", fields: ["reasoning"], expected: "reasoning" },
+      { partType: "text", fields: ["text"], expected: "human-text" },
+      { partType: "subtask", fields: ["text"], expected: "human-text" },
+      { partType: "tool", toolName: "skill", fields: ["stdout"], expected: "skill-definition" },
+      // Host-namespaced variants classify the same way.
+      {
+        partType: "tool",
+        toolName: "mcp__server__read",
+        fields: ["stdout"],
+        expected: "file-read",
+      },
+      {
+        partType: "tool",
+        toolName: "provider.skill",
+        fields: ["stdout"],
+        expected: "skill-definition",
+      },
+      // Suffix without a separator is a different tool, not a match.
+      { partType: "tool", toolName: "myskill", fields: ["stdout"], expected: "tool-output" },
+      // Matched only in what was asked of the tool (incl. JSON input under
+      // the command field) => tool-input, regardless of tool.
+      { partType: "tool", toolName: "bash", fields: ["command"], expected: "tool-input" },
+      { partType: "tool", toolName: "bash", fields: ["command", "cwd"], expected: "tool-input" },
+      {
+        partType: "tool",
+        toolName: "custom-mcp-tool",
+        fields: ["command"],
+        expected: "tool-input",
+      },
+      // Any output-side match makes it tool-output.
+      {
+        partType: "tool",
+        toolName: "bash",
+        fields: ["stdout", "command"],
+        expected: "tool-output",
+      },
+      { partType: "tool", toolName: "bash", fields: ["stderr"], expected: "tool-output" },
+      { partType: "tool", toolName: "bash", fields: [], expected: "tool-output" },
+    ];
+    for (const row of rows) {
+      expect(
+        evidenceClassFor(row.partType, row.toolName, row.fields),
+        `${row.partType}/${row.toolName ?? "-"}/${row.fields.join("+")}`,
+      ).toBe(row.expected);
+    }
+  });
+
+  it("toolNameMatches requires a separator boundary", () => {
+    expect(toolNameMatches("read", "read")).toBe(true);
+    expect(toolNameMatches("mcp__server__read", "read")).toBe(true);
+    expect(toolNameMatches("provider.read", "read")).toBe(true);
+    expect(toolNameMatches("myread", "read")).toBe(false);
+    expect(toolNameMatches("reader", "read")).toBe(false);
+  });
+
+  it("excludes synthetic <recall-auto> parts from search but keeps other synthetic text", () => {
+    const auto = {
+      id: "p1",
+      sessionID: "s",
+      messageID: "m",
+      type: "text",
+      text: "<recall-auto>\nPossibly relevant prior history\n</recall-auto>",
+      synthetic: true,
+    } as unknown as Part;
+    expect(searchable(auto)).toEqual([]);
+
+    const otherSynthetic = {
+      id: "p2",
+      sessionID: "s",
+      messageID: "m",
+      type: "text",
+      text: "host-injected context block",
+      synthetic: true,
+    } as unknown as Part;
+    expect(searchable(otherSynthetic)).toEqual(["host-injected context block"]);
+
+    const plain = {
+      id: "p3",
+      sessionID: "s",
+      messageID: "m",
+      type: "text",
+      text: "<recall-auto> quoted in ordinary user text",
+    } as unknown as Part;
+    expect(searchable(plain)).toHaveLength(1);
+  });
+});
+
 describe("search ranking helpers", () => {
   it("ranks BM25 matches with explainable structural boosts", () => {
     const query = parseQuery('"rate limit" cache missing');
@@ -305,6 +410,35 @@ describe("search ranking helpers", () => {
       expect(r.score).toBeGreaterThanOrEqual(0);
       expect(r.score).toBeLessThanOrEqual(1);
     }
+  });
+
+  it("prefers a concrete tool input over a long skill payload with the same terms", () => {
+    const skillBody =
+      "tuistory skill reference. tuistory launch wait type press snapshot close. " +
+      "Run tuistory sessions for agents. ".repeat(30);
+    const candidates = [
+      indexed({
+        rawText: skillBody,
+        partType: "tool",
+        toolName: "skill",
+        time: 2_000,
+      }),
+      indexed({
+        rawText: 'npx tuistory launch "opencode" -s t1 --background\n\nbash',
+        partType: "tool",
+        toolName: "bash",
+        time: 1_000,
+        fieldTexts: [
+          { field: "command", text: 'npx tuistory launch "opencode" -s t1 --background' },
+        ],
+      }),
+    ];
+    const ranked = bm25Search(candidates, parseQuery("tuistory launch"), "smart", true);
+    expect(ranked[0]?.candidate.toolName).toBe("bash");
+    expect(ranked[0]?.evidenceClass).toBe("tool-input");
+    expect(ranked[1]?.evidenceClass).toBe("skill-definition");
+    expect(ranked[0]?.matchReasons.join(" ")).toContain("Tool input");
+    expect(ranked[1]?.matchReasons.join(" ")).toContain("Skill definition");
   });
 
   it("rewards term rarity (IDF) over boilerplate", () => {
