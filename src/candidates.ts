@@ -38,6 +38,10 @@ export type Candidate = {
   // Deduplicated tokens for matched-term metadata checks
   tokens: string[];
 
+  // Optional semantic embedding (L2-normalized), computed once per session
+  // version at cache-fill time when the opt-in semantic layer is enabled.
+  embedding?: Float32Array;
+
   // Normalized weighted fields indexed by the BM25 ranker (populated lazily)
   primaryText?: string;
   secondaryText?: string;

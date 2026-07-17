@@ -24,12 +24,27 @@ import {
 import { snippet, matches, formatMsg, isSelfTool, evidenceClassFor } from "./extract.js";
 import { parseQuery } from "./query.js";
 import type { Candidate, CandidateFilters } from "./candidates.js";
-import { assembleSession, type AssembledSession, type CorpusCache } from "./corpus.js";
+import {
+  assembleSession,
+  type AssembledSession,
+  type CandidateEmbedder,
+  type CorpusCache,
+} from "./corpus.js";
 import { metadataShortlist, mergeShortlistHits } from "./plan.js";
-import { bm25Search, clamp01, type Bm25Hit } from "./bm25.js";
+import { bm25Search, clamp01, compareHits, MIN_RELATIVE_SCORE, type Bm25Hit } from "./bm25.js";
+import { topK, type ScoredCandidate, type SimilarityHit } from "./semantic/similarity.js";
 import { smartSnippet, truncatePreservingMatch } from "./snippet.js";
 import { compileRegex, regexFirstIndex, regexSnippet } from "./regex.js";
 import { classifyQuery } from "./route.js";
+
+/** The embedder as the search path consumes it: the cache-facing surface plus
+ *  the init error, so the one-time "unavailable" warning can explain why. */
+export type SearchEmbedder = CandidateEmbedder & { initError?: string };
+/** Opt-in semantic config threaded from the plugin into search + hooks. */
+export type SemanticSearchConfig = { embedder: SearchEmbedder; weight: number };
+
+/** Cosine top-K taken over embedded candidates before the hybrid merge. */
+const SEMANTIC_TOP_K = 200;
 
 /** Post-fetch time budget for the entire ranking pipeline (ms) */
 const TIME_BUDGET_MS = 2000;
@@ -677,6 +692,60 @@ function scanPool(session: AssembledSession): Candidate[] {
     : session.candidates;
 }
 
+// ── Hybrid lexical/semantic merge ────────────────────────────────────
+
+/**
+ * Blend cosine similarity into the lexical hits on the LEXICAL score scale:
+ * the semantic term is multiplied by the lexical top score so a purely-semantic
+ * hit cannot dwarf real lexical matches. Candidates in the cosine top-K that
+ * had no lexical hit enter as new hits (evidence class derived with no matched
+ * fields); existing hits are re-scored and keep their reasons plus a
+ * `Semantic: <cos>` note under explain. When the lexical list is empty the
+ * blend degenerates to raw `w * cos`. Re-sorts by the standard hit order and
+ * re-applies the relative floor across the merged list.
+ */
+function mergeSemanticHits(
+  lexical: Bm25Hit[],
+  cosineTop: SimilarityHit[],
+  pool: Candidate[],
+  weight: number,
+  explain: boolean,
+): Bm25Hit[] {
+  const lexTop = lexical.reduce((max, hit) => Math.max(max, hit.score), 0);
+  const semanticTerm = (cos: number): number => (lexTop > 0 ? weight * cos * lexTop : weight * cos);
+
+  const byPart = new Map<string, Bm25Hit>();
+  for (const hit of lexical) byPart.set(hit.candidate.partID, hit);
+
+  for (const { index, score: cos } of cosineTop) {
+    const candidate = pool[index];
+    if (!candidate) continue;
+    const reason = `Semantic: ${cos.toFixed(2)}`;
+    const existing = byPart.get(candidate.partID);
+    if (existing) {
+      byPart.set(candidate.partID, {
+        ...existing,
+        score: (1 - weight) * existing.score + semanticTerm(cos),
+        matchReasons: explain ? [...existing.matchReasons, reason] : existing.matchReasons,
+      });
+    } else {
+      byPart.set(candidate.partID, {
+        candidate,
+        score: semanticTerm(cos),
+        matchedTerms: [],
+        matchedFields: [],
+        evidenceClass: evidenceClassFor(candidate.partType, candidate.toolName, []),
+        matchReasons: explain ? [reason] : [],
+      });
+    }
+  }
+
+  const merged = [...byPart.values()].sort(compareHits);
+  if (merged.length <= 1) return merged;
+  const top = merged[0]!.score || 1;
+  return merged.filter((hit) => hit.score >= top * MIN_RELATIVE_SCORE);
+}
+
 // ── Smart/fuzzy scan ─────────────────────────────────────────────────
 
 /** smartScan returns ALL ranked results (caller handles slicing/grouping).
@@ -691,6 +760,7 @@ function smartScan(
   mode: "smart" | "fuzzy",
   width?: number,
   abort?: AbortSignal,
+  semantic?: SemanticSearchConfig,
 ): {
   results: SearchResult[];
   total: number;
@@ -698,9 +768,11 @@ function smartScan(
   matchMode: MatchMode;
   planSelected: string[];
   shortlistIDs: string[];
+  warnings: string[];
 } {
   const pq = parseQuery(query);
   const startTime = performance.now();
+  const warnings: string[] = [];
 
   const pool: Candidate[] = [];
   const relevanceBySession = new Map<string, DirectoryRelevance>();
@@ -742,6 +814,40 @@ function smartScan(
     }
   }
 
+  // Opt-in hybrid semantic pass. Lexical-first is the law: this only ever adds
+  // an extra signal, and any failure leaves `hits` exactly as the lexical
+  // passes produced them. When requested but the model is not ready, emit one
+  // warning and stay lexical-only.
+  if (semantic) {
+    if (semantic.embedder.ready) {
+      try {
+        const queryVec = semantic.embedder.embed(pq.raw);
+        if (queryVec) {
+          const embedded: ScoredCandidate[] = [];
+          for (let i = 0; i < pool.length; i++) {
+            const vec = pool[i]!.embedding;
+            if (vec) embedded.push({ index: i, vec });
+          }
+          if (embedded.length > 0) {
+            hits = mergeSemanticHits(
+              hits,
+              topK(queryVec, embedded, SEMANTIC_TOP_K),
+              pool,
+              semantic.weight,
+              explain,
+            );
+            planSelected.push("semantic");
+          }
+        }
+      } catch {
+        // Never fail the search on a semantic error; results stay lexical.
+      }
+    } else {
+      const reason = semantic.embedder.initError ?? "model still loading";
+      warnings.push(`Semantic search unavailable (${reason}); results are lexical-only.`);
+    }
+  }
+
   const allResults = rankedToSearchResults(hits, mode, explain, pq, width, relevanceBySession);
 
   const totalTime = performance.now() - startTime;
@@ -752,6 +858,7 @@ function smartScan(
     matchMode: mode,
     planSelected,
     shortlistIDs: [...shortlist],
+    warnings,
   };
 }
 
@@ -1421,6 +1528,7 @@ export function search(
   global: boolean,
   limits: Limits,
   cache: CorpusCache,
+  semantic?: SemanticSearchConfig,
 ): ToolDefinition {
   return tool({
     description: `Search prior opencode conversations by message/tool-output content. Primary history-discovery tool; prefer over recall_sessions for topical discovery (titles only).
@@ -2241,14 +2349,21 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
             smartMode,
             widthArg,
             ctx.abort,
+            semantic,
           );
           if (smartResult.degradeKind === "time") pushUnique(normalized.limitedBy, "timeBudget");
           shortlistIDs = smartResult.shortlistIDs;
+          // Surface the one-time semantic-unavailable warning (and any future
+          // smartScan warnings) through the shared warnings pipeline. Applies
+          // to the literal-fallback branch below too, since finish() reads
+          // normalized.warnings.
+          for (const warning of smartResult.warnings) normalized.warnings.push(warning);
 
           const QUERY_PLAN_VARIANTS = [
             "bm25-broad",
             "title-shortlist",
             "exact-token-boost",
+            "semantic",
             "literal-fallback",
           ];
           const attachQueryPlan = (out: SearchOutput, selected: string[]): void => {

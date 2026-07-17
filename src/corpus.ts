@@ -36,6 +36,17 @@ export type CorpusSessionMeta = {
   updated: number;
 };
 
+/**
+ * The narrow slice of the semantic embedder the cache needs. `ready` is read
+ * per fetch (never awaited): an unready embedder simply leaves candidates
+ * unembedded, so searches stay lexical-only until the model warms up and the
+ * session is next re-fetched (a version bump or eviction+re-fetch).
+ */
+export type CandidateEmbedder = {
+  ready: boolean;
+  embed(text: string): Float32Array | undefined;
+};
+
 type MsgWithParts = { info: Message; parts: Part[] };
 
 export type CachedSession = {
@@ -139,6 +150,7 @@ export class CorpusCache {
   constructor(
     private readonly client: OpencodeClient,
     private readonly limits: Limits,
+    private readonly embedder?: CandidateEmbedder,
   ) {}
 
   stats(): { sessions: number; candidates: number; chars: number } {
@@ -255,6 +267,18 @@ export class CorpusCache {
         directory: target.directory,
       });
       for (const candidate of candidates) populateNormalized(candidate);
+
+      // Opt-in semantic layer: embed each candidate once per session version,
+      // amortized exactly like tokenization. Only when the model is already
+      // ready — init() is never awaited here, so a cold embedder leaves
+      // candidates unembedded and searches stay lexical until it warms.
+      // Embeddings are deliberately NOT counted toward charCount (eviction is
+      // sized by raw text, not vector memory).
+      if (this.embedder?.ready) {
+        for (const candidate of candidates) {
+          candidate.embedding = this.embedder.embed(candidate.rawText);
+        }
+      }
 
       const entry: CachedSession = {
         meta: { ...target },

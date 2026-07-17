@@ -7,6 +7,20 @@ const createOpencodeClient = vi.hoisted(() => vi.fn((options: unknown) => option
 
 vi.mock("@opencode-ai/sdk/v2", () => ({ createOpencodeClient }));
 
+// Mock the semantic embedder so the wiring test never downloads a model or
+// touches the network: init resolves immediately and the model stays unready.
+vi.mock("../src/semantic/embedder.js", () => ({
+  SemanticEmbedder: class {
+    ready = false;
+    initError: string | undefined = "mocked: init not run";
+    constructor(public model: string) {}
+    async init(): Promise<void> {}
+    embed(): Float32Array | undefined {
+      return undefined;
+    }
+  },
+}));
+
 const plugin = await import("../src/opencode-session-recall.js");
 
 function mustTool(definition: ToolDefinition | undefined): ToolDefinition {
@@ -110,6 +124,20 @@ describe("plugin entry", () => {
     await plugin.default.server(ctx({ fetch: vi.fn() }), { prewarm: true });
     await vi.waitFor(() => expect(listGlobal).toHaveBeenCalled());
     await vi.waitFor(() => expect(messages).toHaveBeenCalledWith({ sessionID: "s1" }));
+  });
+
+  it("wires the semantic layer and swallows a failed init (no network)", async () => {
+    const hooks = await plugin.default.server(ctx({ fetch: vi.fn() }), {
+      semantic: true,
+      autoRecall: true,
+      compactionRecall: true,
+    });
+    // All tools register and both search-running hooks are present, proving the
+    // semantic option threads through construction even when the model never
+    // becomes ready.
+    expect(Object.keys(hooks.tool ?? {}).sort()).toEqual([...TOOLS].sort());
+    expect(hooks["chat.message"]).toBeDefined();
+    expect(hooks["experimental.session.compacting"]).toBeDefined();
   });
 
   it("deduplicates primary tools and honors primary:false", async () => {
