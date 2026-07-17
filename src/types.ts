@@ -111,6 +111,14 @@ export type NearMiss = {
   terms?: string[];
 };
 
+/** Compact secondary evidence attached to grouped session results. */
+export type TopEvidence = {
+  messageID: string;
+  partID: string;
+  evidenceClass: EvidenceClass;
+  snippet: string;
+};
+
 export type SearchResult = {
   sessionID: string;
   sessionTitle: string;
@@ -133,6 +141,10 @@ export type SearchResult = {
   matchReasons?: string[];
   /** Present when group:"session" — number of part-level hits in this session */
   hitCount?: number;
+  /** Present when group:"session" — unique evidence classes among the session's hits */
+  evidenceKinds?: EvidenceClass[];
+  /** Present when group:"session" — up to two hits of other evidence classes */
+  topEvidence?: TopEvidence[];
   source?: ResultSource;
   why?: ResultWhy;
   directoryRelevance?: DirectoryRelevance;

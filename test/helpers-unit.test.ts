@@ -17,6 +17,8 @@ import {
 } from "../src/extract.js";
 import { parseQuery } from "../src/query.js";
 import { bm25Search } from "../src/bm25.js";
+import { groupBySession } from "../src/search.js";
+import type { EvidenceClass, SearchResult } from "../src/types.js";
 import { smartSnippet } from "../src/snippet.js";
 import { errmsg, optionalString } from "../src/types.js";
 import { normalize, splitCamelCase, tokenize } from "../src/normalize.js";
@@ -379,6 +381,111 @@ describe("evidence classification", () => {
       text: "<recall-auto> quoted in ordinary user text",
     } as unknown as Part;
     expect(searchable(plain)).toHaveLength(1);
+  });
+});
+
+describe("groupBySession representative selection", () => {
+  function hit(over: Partial<SearchResult> & { evidenceClass?: EvidenceClass }): SearchResult {
+    const { evidenceClass, ...rest } = over;
+    return {
+      sessionID: "s1",
+      sessionTitle: "Session One",
+      directory: PROJECT_DIR,
+      messageID: rest.partID ? `m-${rest.partID}` : "m1",
+      role: "assistant",
+      time: 1_000,
+      partID: "p1",
+      partType: "text",
+      pruned: false,
+      snippet: "snippet text",
+      why: { matchedFields: ["text"], evidenceClass },
+      ...rest,
+    };
+  }
+
+  it("prefers a better evidence class within the score tolerance", () => {
+    const grouped = groupBySession([
+      hit({ partID: "pa", score: 1.0, evidenceClass: "skill-definition", partType: "tool" }),
+      hit({ partID: "pb", score: 0.9, evidenceClass: "tool-input", partType: "tool" }),
+      hit({ partID: "pc", score: 0.87, evidenceClass: "human-text" }),
+    ]);
+    expect(grouped).toHaveLength(1);
+    expect(grouped[0]!.partID).toBe("pc");
+    expect(grouped[0]!.hitCount).toBe(3);
+    expect(grouped[0]!.evidenceKinds).toEqual(
+      expect.arrayContaining(["skill-definition", "tool-input", "human-text"]),
+    );
+    // Secondary evidence: classes different from the representative's, max 2.
+    expect(grouped[0]!.topEvidence).toHaveLength(2);
+    expect(grouped[0]!.topEvidence!.map((e) => e.evidenceClass)).toEqual([
+      "skill-definition",
+      "tool-input",
+    ]);
+  });
+
+  it("keeps a dominant hit as representative when others fall outside tolerance", () => {
+    const grouped = groupBySession([
+      hit({ partID: "pa", score: 1.0, evidenceClass: "skill-definition", partType: "tool" }),
+      hit({ partID: "pb", score: 0.5, evidenceClass: "human-text" }),
+    ]);
+    expect(grouped[0]!.partID).toBe("pa");
+    expect(grouped[0]!.topEvidence?.map((e) => e.evidenceClass)).toEqual(["human-text"]);
+  });
+
+  it("uses class priority for unscored (literal) hits with recency as tiebreak", () => {
+    const grouped = groupBySession([
+      hit({ partID: "pa", time: 3_000, evidenceClass: "file-read", partType: "tool" }),
+      hit({ partID: "pb", time: 2_000, evidenceClass: "tool-input", partType: "tool" }),
+      hit({ partID: "pc", time: 1_000, evidenceClass: "tool-input", partType: "tool" }),
+    ]);
+    // tool-input beats file-read despite being older; newer tool-input wins the tie.
+    expect(grouped[0]!.partID).toBe("pb");
+  });
+
+  it("uses a title hit only for title-only sessions and truncates topEvidence snippets", () => {
+    const titleOnly = groupBySession([
+      hit({
+        partID: "s1:title",
+        partType: "title",
+        source: "title",
+        evidenceClass: "session-title",
+      }),
+    ]);
+    expect(titleOnly[0]!.partType).toBe("title");
+
+    const withContent = groupBySession([
+      hit({
+        partID: "s1:title",
+        partType: "title",
+        source: "title",
+        evidenceClass: "session-title",
+      }),
+      hit({
+        partID: "pb",
+        evidenceClass: "tool-output",
+        partType: "tool",
+        snippet: "x".repeat(300),
+      }),
+    ]);
+    expect(withContent[0]!.partID).toBe("pb");
+    expect(withContent[0]!.hitCount).toBe(2);
+    // Title hits are not secondary evidence (never tracked as content).
+    expect(withContent[0]!.topEvidence).toBeUndefined();
+  });
+
+  it("tracks at most four hits and caps topEvidence at two", () => {
+    const grouped = groupBySession([
+      hit({ partID: "pa", score: 1.0, evidenceClass: "human-text" }),
+      hit({ partID: "pb", score: 0.99, evidenceClass: "tool-input", partType: "tool" }),
+      hit({ partID: "pc", score: 0.98, evidenceClass: "tool-output", partType: "tool" }),
+      hit({ partID: "pd", score: 0.97, evidenceClass: "reasoning", partType: "reasoning" }),
+      hit({ partID: "pe", score: 0.96, evidenceClass: "file-read", partType: "tool" }),
+    ]);
+    expect(grouped[0]!.partID).toBe("pa");
+    expect(grouped[0]!.hitCount).toBe(5);
+    expect(grouped[0]!.topEvidence).toHaveLength(2);
+    // file-read (5th) was never tracked; kinds still record every class seen.
+    expect(grouped[0]!.evidenceKinds).toContain("file-read");
   });
 });
 

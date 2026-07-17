@@ -17,6 +17,7 @@ import {
   type SearchSuggestion,
   type NearMiss,
   type DirectoryRelevance,
+  type EvidenceClass,
   type ResultSource,
   type ResultWhy,
 } from "./types.js";
@@ -725,42 +726,128 @@ function rankedToSearchResults(
 
 // ── Group results by session ─────────────────────────────────────────
 
-function groupBySession(results: SearchResult[]): SearchResult[] {
-  const groups = new Map<
-    string,
-    { best: SearchResult; count: number; titleMatch?: SearchResult["titleMatch"] }
-  >();
+/** How many of a session's strongest hits to track for representative
+ *  selection and secondary evidence. Results arrive pre-ranked (smart) or in
+ *  newest-first scan order (literal/regex), so the first N content hits are
+ *  the session's best. */
+const MAX_GROUP_TRACKED = 4;
+/** A tracked hit qualifies as representative when its score is within this
+ *  fraction of the session's best score. */
+const REPRESENTATIVE_TOLERANCE = 0.85;
+const TOP_EVIDENCE_SNIPPET_CHARS = 120;
+const MAX_TOP_EVIDENCE = 2;
+
+/** Utility order for similarly-scored hits: conversational statements and
+ *  concrete actions make better session representatives than generated
+ *  reference material. */
+const CLASS_PRIORITY: EvidenceClass[] = [
+  "human-text",
+  "tool-input",
+  "tool-output",
+  "reasoning",
+  "file-read",
+  "skill-definition",
+  "session-title",
+];
+
+function classPriority(cls: EvidenceClass | undefined): number {
+  if (!cls) return CLASS_PRIORITY.length;
+  const index = CLASS_PRIORITY.indexOf(cls);
+  return index === -1 ? CLASS_PRIORITY.length : index;
+}
+
+/** Among the tracked content hits, pick the representative: hits within score
+ *  tolerance of the best (all of them when scores are absent, i.e. literal or
+ *  regex mode) compete by evidence-class priority; ties fall back to the old
+ *  rules (score, then recency). */
+function pickRepresentative(tracked: SearchResult[]): SearchResult | undefined {
+  if (tracked.length === 0) return undefined;
+  const scores = tracked.map((hit) => hit.score);
+  const best = scores.every((score) => score != null)
+    ? Math.max(...(scores as number[]))
+    : undefined;
+  const qualifying =
+    best == null
+      ? tracked
+      : tracked.filter((hit) => (hit.score ?? 0) >= best * REPRESENTATIVE_TOLERANCE);
+
+  let winner = qualifying[0]!;
+  for (const hit of qualifying.slice(1)) {
+    const winnerPriority = classPriority(winner.why?.evidenceClass);
+    const hitPriority = classPriority(hit.why?.evidenceClass);
+    if (hitPriority < winnerPriority) {
+      winner = hit;
+      continue;
+    }
+    if (hitPriority > winnerPriority) continue;
+    if (hit.score != null && winner.score != null) {
+      if (hit.score > winner.score) winner = hit;
+    } else if (hit.time > winner.time) {
+      winner = hit;
+    }
+  }
+  return winner;
+}
+
+/** Exported for direct unit tests of representative selection. */
+export function groupBySession(results: SearchResult[]): SearchResult[] {
+  type Group = {
+    tracked: SearchResult[];
+    titleHit?: SearchResult;
+    count: number;
+    kinds: Set<EvidenceClass>;
+    titleMatch?: SearchResult["titleMatch"];
+  };
+  const groups = new Map<string, Group>();
 
   for (const r of results) {
-    const existing = groups.get(r.sessionID);
-    if (!existing) {
-      groups.set(r.sessionID, { best: r, count: 1, titleMatch: r.titleMatch });
-    } else {
-      existing.count++;
-      existing.titleMatch ??= r.titleMatch;
-      // Pick best representative:
-      // - Prefer content/tool/reasoning over title-only metadata when both exist
-      // - Smart/fuzzy: highest score wins
-      // - Literal (no score): most recent time wins
-      if (existing.best.source === "title" && r.source !== "title") {
-        existing.best = r;
-      } else if (r.source === "title" && existing.best.source !== "title") {
-        continue;
-      } else if (r.score != null && existing.best.score != null) {
-        if (r.score > existing.best.score) {
-          existing.best = r;
-        }
-      } else if (r.time > existing.best.time) {
-        existing.best = r;
-      }
+    let group = groups.get(r.sessionID);
+    if (!group) {
+      group = { tracked: [], count: 0, kinds: new Set() };
+      groups.set(r.sessionID, group);
+    }
+    group.count++;
+    group.titleMatch ??= r.titleMatch;
+    const cls = r.why?.evidenceClass;
+    if (cls) group.kinds.add(cls);
+    // Title hits never beat content as representative (preserved rule); they
+    // stand in only for title-only sessions.
+    if (r.source === "title") {
+      group.titleHit ??= r;
+    } else if (group.tracked.length < MAX_GROUP_TRACKED) {
+      group.tracked.push(r);
     }
   }
 
-  return [...groups.values()].map(({ best, count, titleMatch }) => ({
-    ...best,
-    hitCount: count,
-    titleMatch: best.titleMatch ?? titleMatch,
-  }));
+  return [...groups.values()].map((group) => {
+    const representative = pickRepresentative(group.tracked) ?? group.titleHit!;
+    const representativeClass = representative.why?.evidenceClass;
+    const topEvidence = group.tracked
+      .filter(
+        (hit) =>
+          hit !== representative &&
+          hit.why?.evidenceClass != null &&
+          hit.why.evidenceClass !== representativeClass,
+      )
+      .slice(0, MAX_TOP_EVIDENCE)
+      .map((hit) => ({
+        messageID: hit.messageID,
+        partID: hit.partID,
+        evidenceClass: hit.why!.evidenceClass!,
+        snippet:
+          hit.snippet.length > TOP_EVIDENCE_SNIPPET_CHARS
+            ? `${hit.snippet.slice(0, TOP_EVIDENCE_SNIPPET_CHARS)}…`
+            : hit.snippet,
+      }));
+
+    return {
+      ...representative,
+      hitCount: group.count,
+      titleMatch: representative.titleMatch ?? group.titleMatch,
+      ...(group.kinds.size > 0 && { evidenceKinds: [...group.kinds] }),
+      ...(topEvidence.length > 0 && { topEvidence }),
+    };
+  });
 }
 
 /**

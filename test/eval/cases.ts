@@ -104,7 +104,13 @@ export const EVAL_CASES: EvalCase[] = [
     },
     ctxSessionID: "e-cur",
     relevantSessionIDs: ["e-flow"],
-    expect: { notInResults: ["e-cur"] },
+    expect: {
+      notInResults: ["e-cur"],
+      // The grouped representative must be conversational or action evidence,
+      // never the skill payload that happens to score well lexically.
+      classInTop3: ["human-text", "tool-input"],
+      maxClassInTop5: { "skill-definition": 0 },
+    },
   },
   {
     // Field report: an exact tool query must surface concrete actions (bash
