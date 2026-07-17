@@ -346,3 +346,15 @@ Two change-sets, then the review loop:
 - Reviewer-session classification.
 - Changing the semantic layer's default posture (round-3 decision, after a
   semantic-enabled retest).
+
+## Revisions
+
+- **Executed (2026-07-16).** All fixes A–G shipped in two change-sets plus a
+  review-nit commit; Opus + Codex reviewed the plan (one adjudicated
+  conflict, resolved for tool-input precedence) and the implementation
+  (zero blockers/issues; two nits fixed: completeness-mode gating for the
+  provider-cap warning, CONTRIBUTING drift). Live verification against the
+  real history: discovery went from 100 sessions (server default) to 4,709
+  discovered / 4,708 searched with no false provider warning; a freshly
+  spawned subagent's marker returned 0 results with excludedSession: 2 —
+  the delegation-tree leak from the feedback, reproduced and closed.
