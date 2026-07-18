@@ -16,7 +16,7 @@ import type { Limits } from "../src/types.js";
 import { openSqlite } from "../src/sqlite.js";
 import { openStore, type Store } from "../src/store.js";
 import { deriveCard, type DistillSessionMeta } from "../src/distill.js";
-import { createFetchGate } from "../src/fetch-gate.js";
+import { createFetchGate, type FetchGate } from "../src/fetch-gate.js";
 import { createCardsRuntime } from "../src/cards.js";
 import { createDrill } from "../src/drill.js";
 import type { SearchDeps, SemanticSearchConfig } from "../src/search.js";
@@ -43,6 +43,7 @@ export const TEST_LIMITS: Limits = {
   drillPageMessages: 25,
   drillCharsPerSession: 1_500_000,
   drillCharsPerQuery: 20_000_000,
+  deepCharsPerQuery: 30_000_000,
 };
 
 type ApiFailure = { data: { message: string } };
@@ -644,7 +645,14 @@ export function seedStore(
 export async function makeRecallDeps(
   fixture: FakeHarness,
   limits: Limits = TEST_LIMITS,
-  opts: { semantic?: SemanticSearchConfig } = {},
+  opts: {
+    semantic?: SemanticSearchConfig;
+    /** Inject the deep sweep's clock + wall-clock budget for time-stop tests. */
+    now?: () => number;
+    deepWallClockMs?: number;
+    /** Inject a (spy) gate to assert fetches route through it. */
+    gate?: FetchGate;
+  } = {},
 ): Promise<{ deps: SearchDeps; store: Store; cleanup: () => void }> {
   const dir = mkdtempSync(join(tmpdir(), "recall-deps-"));
   const db = await openSqlite(join(dir, "store.db"));
@@ -653,7 +661,7 @@ export async function makeRecallDeps(
   if (!store) throw new Error("openStore returned null in test helper");
   seedStore(store, fixture, limits);
 
-  const gate = createFetchGate({ concurrency: limits.concurrency });
+  const gate = opts.gate ?? createFetchGate({ concurrency: limits.concurrency });
   const cards = createCardsRuntime({
     source: { getCards: () => store.allCards(), revision: () => store.getMeta("cards_rev") },
     embedder: opts.semantic?.embedder,
@@ -664,6 +672,8 @@ export async function makeRecallDeps(
     gate,
     limits,
     embedder: opts.semantic?.embedder,
+    now: opts.now,
+    deepWallClockMs: opts.deepWallClockMs,
   });
   return {
     deps: { gate, store, cards, drill },

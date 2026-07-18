@@ -25,12 +25,18 @@ import { snippet, matches, formatMsg, isSelfTool, evidenceClassFor } from "./ext
 import { parseQuery } from "./query.js";
 import { candidateEligible, type Candidate, type CandidateFilters } from "./candidates.js";
 import type { CandidateEmbedder } from "./corpus.js";
-import { clamp01, type Bm25Hit } from "./bm25.js";
+import { clamp01, bm25Search, type Bm25Hit } from "./bm25.js";
 import { smartSnippet, truncatePreservingMatch } from "./snippet.js";
 import { compileRegex, regexFirstIndex, regexSnippet } from "./regex.js";
 import { classifyQuery } from "./route.js";
 import type { CardsRuntime, CardHit, CardFilters } from "./cards.js";
-import type { Drill, DrillTarget, DrilledPool } from "./drill.js";
+import {
+  encodeDeepCursor,
+  decodeDeepCursor,
+  type Drill,
+  type DrillTarget,
+  type DrilledPool,
+} from "./drill.js";
 import type { Store, FtsHit, Card } from "./store.js";
 import type { FetchGate } from "./fetch-gate.js";
 import { fetchMessageWindow, type FetchRunner } from "./fetch-window.js";
@@ -1526,12 +1532,30 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
         .default("all")
         .describe("Part type filter"),
       role: tool.schema.enum(["user", "assistant", "all"]).default("all").describe("Role filter"),
-      sessions: tool.schema
+      sessionLimit: tool.schema
         .number()
         .min(1)
         .max(limits.maxSessions)
         .optional()
-        .describe("Max sessions to scan"),
+        .describe("Max sessions to drill (caps drill fan-out)"),
+      sessions: tool.schema
+        .array(tool.schema.string())
+        .optional()
+        .describe(
+          "Explicit session-id shortlist. Without deep: drill exactly these (skips card ranking for selection; results are still ranked). With deep: the sweep scope.",
+        ),
+      deep: tool.schema
+        .boolean()
+        .default(false)
+        .describe(
+          "Exhaustively sweep tool OUTPUTS across the scoped session set — the only path that searches the tool-output tier. Requires scope: pass sessions, or set a lower time bound (since/last/from) together with project/directory. A global unscoped deep is rejected.",
+        ),
+      deepCursor: tool.schema
+        .string()
+        .optional()
+        .describe(
+          "Opaque continuation from a prior deep response's nextCursor; resumes the sweep.",
+        ),
       results: tool.schema
         .number()
         .min(1)
@@ -1724,9 +1748,27 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
       const currentSessionID = optionalString(ctx.sessionID);
       const excludeCurrent = excludeExplicit ?? (scope !== "session" && !sessionID);
       const requestedSessions =
-        args.sessions == null
+        args.sessionLimit == null
           ? undefined
-          : pickNumber("sessions", args.sessions, 1, limits.maxSessions, limits.maxSessions);
+          : pickNumber(
+              "sessionLimit",
+              args.sessionLimit,
+              1,
+              limits.maxSessions,
+              limits.maxSessions,
+            );
+      // Deep-mode args (defensively coerced against the Zod-bypass host path).
+      const deepRequested = typeof args.deep === "boolean" ? args.deep : false;
+      const explicitSessions = Array.isArray(args.sessions)
+        ? [
+            ...new Set(
+              args.sessions
+                .map((id) => optionalString(id))
+                .filter((id): id is string => id !== undefined),
+            ),
+          ]
+        : [];
+      const deepCursorRaw = optionalString(args.deepCursor);
 
       const fail = (error: string): string =>
         JSON.stringify({ ok: false, error } satisfies ErrorOutput);
@@ -1811,6 +1853,33 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
         const directoryFilter = directory ?? projectString;
         const bucketDirectory = directoryFilter ?? (projectScope ? callerDirectory : undefined);
 
+        // ── Deep-mode scope gate + cursor decode ──
+        // Deep is the only path that sweeps tool OUTPUTS across sessions, so it
+        // demands explicit scope by construction: a `sessions` shortlist, a valid
+        // continuation cursor (already scoped when it was minted), or a lower time
+        // bound plus a project/directory constraint. A global unscoped deep is
+        // rejected with guidance rather than attempted.
+        const deepCursor = deepCursorRaw ? decodeDeepCursor(deepCursorRaw) : null;
+        const deepMode = deepRequested || deepCursorRaw != null;
+        if (deepMode) {
+          if (deepCursorRaw != null && !deepCursor) {
+            return fail(
+              "deepCursor is malformed; drop it to start a new deep sweep. Pass only a nextCursor returned by a prior deep response.",
+            );
+          }
+          const projectConstraint =
+            directoryFilter != null || (projectScope && bucketDirectory != null);
+          const deepScoped =
+            deepCursor != null ||
+            explicitSessions.length > 0 ||
+            (after != null && projectConstraint);
+          if (!deepScoped) {
+            return fail(
+              "deep requires scope: pass sessions:[...], or set a lower time bound (since/last/from) together with project:true or a directory. A global unscoped deep sweep is not allowed.",
+            );
+          }
+        }
+
         const skippedByReason: Record<string, number> = {};
 
         const cardMeta = (card: Card): SessionMetaInternal => ({
@@ -1834,6 +1903,22 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
         let sessionsEligible = 0;
         let shortlistIDs: string[] = [];
         let directoryBucketsSearched: SearchCoverage["directoryBucketsSearched"];
+
+        /** Register a card as a drill target (relevance + coverage metadata). */
+        const registerTarget = (card: Card, relevance: DirectoryRelevance): DrillTarget => {
+          relevanceBySession.set(card.sessionId, relevance);
+          searchedMeta.set(card.sessionId, {
+            id: card.sessionId,
+            title: card.title,
+            directory: card.directory,
+          });
+          return {
+            sessionId: card.sessionId,
+            title: card.title,
+            directory: card.directory,
+            timeUpdated: card.timeUpdated,
+          };
+        };
 
         const singleTarget = sessionID ?? (scope === "session" ? currentSessionID : undefined);
         if (scope === "session" && !singleTarget) {
@@ -1868,6 +1953,85 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
           sessionsEligible = 1;
           if (sessionID) pushUnique(normalized.limitedBy, "sessionID");
           else pushUnique(normalized.limitedBy, "scope");
+        } else if (deepMode) {
+          // ── Deep sweep: resolve the scoped session set (filters applied),
+          //    newest-first. Deep never ranks by query — it sweeps the whole
+          //    scope exhaustively. ──
+          const timeFilters: CardFilters = {};
+          if (after != null) timeFilters.since = after;
+          if (before != null) timeFilters.until = before;
+
+          if (deepCursor) {
+            // Resume: the cursor fixes the exact remaining order. Missing cards
+            // (evicted between calls) still drill by id so a sweep never stalls.
+            const order = deepCursor.current
+              ? [deepCursor.current, ...deepCursor.remaining]
+              : [...deepCursor.remaining];
+            drillTargets = order
+              .filter((id) => id !== excludeSessionID)
+              .map((id) => {
+                const card = cards.get(id);
+                if (card) return registerTarget(card, relevanceOf(card));
+                relevanceBySession.set(id, "unknown");
+                searchedMeta.set(id, { id, title: "", directory: "" });
+                return { sessionId: id, title: "", directory: "", timeUpdated: 0 };
+              });
+          } else {
+            let scopedCards: Card[];
+            if (explicitSessions.length > 0) {
+              const wanted = new Set(explicitSessions);
+              scopedCards = cards.list(timeFilters).filter((card) => wanted.has(card.sessionId));
+            } else {
+              // since + project/directory constraint (validated by the scope gate).
+              if (excludeCurrent && currentSessionID)
+                timeFilters.excludeFamilyOf = currentSessionID;
+              scopedCards = cards.list(timeFilters).filter((card) => {
+                const rel = relevanceOf(card);
+                return directoryFilter ? rel === "exact" : rel === "exact" || rel === "project";
+              });
+            }
+            drillTargets = scopedCards
+              .filter((card) => card.sessionId !== excludeSessionID)
+              .map((card) => registerTarget(card, relevanceOf(card)));
+          }
+          deepSet = new Set(drillTargets.map((t) => t.sessionId));
+          sessionsEligible = drillTargets.length;
+          pushUnique(normalized.limitedBy, "scope");
+        } else if (explicitSessions.length > 0) {
+          // ── Explicit shortlist (non-deep): drill exactly these sessions,
+          //    skipping card ranking for SELECTION; results are still ranked by
+          //    the normal drill/scoring path. ──
+          const timeFilters: CardFilters = {};
+          if (after != null) timeFilters.since = after;
+          if (before != null) timeFilters.until = before;
+          const wanted = new Set(explicitSessions);
+          let scopedCards = cards.list(timeFilters).filter((card) => wanted.has(card.sessionId));
+          if (title) {
+            const titleLower = title.toLowerCase();
+            scopedCards = scopedCards.filter((card) =>
+              card.title.toLowerCase().includes(titleLower),
+            );
+            pushUnique(normalized.limitedBy, "title");
+          }
+          const cap =
+            requestedSessions != null
+              ? Math.min(requestedSessions, Math.max(1, limits.drillSessions))
+              : Math.max(1, limits.drillSessions);
+          drillTargets = scopedCards
+            .filter((card) => card.sessionId !== excludeSessionID)
+            .slice(0, cap)
+            .map((card) => registerTarget(card, relevanceOf(card)));
+          deepSet = new Set(drillTargets.map((t) => t.sessionId));
+          sessionsEligible = scopedCards.length;
+          shortlistIDs = drillTargets.map((t) => t.sessionId);
+          if (excludeSessionID) {
+            skippedByReason.excludedSession = (skippedByReason.excludedSession ?? 0) + 1;
+            pushUnique(normalized.limitedBy, "excludedSession");
+          }
+          if (sessionsEligible > drillTargets.length) {
+            pushUnique(normalized.limitedBy, "sessionsLimit");
+          }
+          if (scope !== "global") pushUnique(normalized.limitedBy, "scope");
         } else {
           // ── Tier 1: rank cards ──
           const cardFilters: CardFilters = {};
@@ -2274,6 +2438,84 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
 
         const loadErrorSuffixOf = (count: number): string =>
           count > 0 ? `, ${count} load error${count !== 1 ? "s" : ""}` : "";
+
+        // ── Deep sweep route (exhaustive, tool-output-inclusive, budgeted) ──
+        if (deepMode) {
+          const deepResume = deepCursor?.current ? { before: deepCursor.before } : undefined;
+          const deepResult = await drill.deep({
+            sessions: drillTargets,
+            query: queryMeta,
+            filter: (candidate: Candidate) => candidateEligible(candidate, filters),
+            searchTitles,
+            charsPerQuery: limits.deepCharsPerQuery,
+            resume: deepResume,
+            abort: ctx.abort,
+          });
+          if (ctx.abort.aborted) return abortedOutput();
+          const outCtx = buildOutputContext(
+            deepResult.drilledSessions,
+            deepResult.pools,
+            deepResult.loadErrors,
+            deepResult.coverage.exhaustedBudget,
+          );
+          outCtx.coverage.deep = deepResult.coverage;
+
+          const cov = deepResult.coverage;
+          // Honest coverage line: deep searched tool outputs, and exactly how far.
+          normalized.warnings.push(
+            `Deep sweep searched tool outputs across ${cov.sessionsCovered} full + ${cov.sessionsPartial} partial of ${drillTargets.length} scoped session${drillTargets.length === 1 ? "" : "s"}${cov.sessionsRemaining > 0 ? `; ${cov.sessionsRemaining} not yet reached — pass deepCursor to continue` : ""}.`,
+          );
+
+          let final: SearchResult[];
+          let outTotal: number;
+          let truncated: boolean;
+          let effMode: MatchMode;
+          if (matchMode === "literal" || matchMode === "regex") {
+            effMode = matchMode;
+            const matcher = matchMode === "regex" && regex ? regexMatcher(regex) : literalMatcher;
+            const limit = isGrouped ? Number.MAX_SAFE_INTEGER : partScanLimit;
+            const scanned = scanPools(deepResult.pools, limit, matcher);
+            const sliced = applyGroupAndSlice(scanned.collected, scanned.total, scanned.early);
+            ({ final, total: outTotal, truncated } = sliced);
+          } else {
+            effMode = smartMode;
+            const allCandidates = deepResult.pools.flatMap((pool) => pool.candidates);
+            const hits = bm25Search(allCandidates, queryMeta, smartMode, explain);
+            const allResults = rankedToSearchResults(
+              hits,
+              smartMode,
+              explain,
+              queryMeta,
+              widthArg,
+              relevanceBySession,
+            );
+            const sliced = applyGroupAndSlice(allResults, allResults.length, false);
+            ({ final, total: outTotal, truncated } = sliced);
+          }
+
+          const unit = isGrouped ? "session" : "result";
+          ctx.metadata({
+            title: `Deep: ${final.length} ${unit}${final.length !== 1 ? "s" : ""} for "${args.query}" (${cov.sessionsCovered}/${drillTargets.length} swept${loadErrorSuffixOf(outCtx.loadErrorCount)})`,
+          });
+
+          const out: SearchOutput = {
+            ok: true,
+            results: final,
+            total: outTotal,
+            truncated,
+            group: groupMode,
+            ...(effMode !== "literal" ? { matchMode: effMode } : {}),
+          };
+          if (deepResult.continuation) {
+            out.nextCursor = encodeDeepCursor({
+              v: 1,
+              remaining: deepResult.continuation.remaining,
+              current: deepResult.continuation.current,
+              before: deepResult.continuation.before,
+            });
+          }
+          return JSON.stringify(await finish(out, final, effMode, outCtx));
+        }
 
         // ── Route: literal ──
         if (matchMode === "literal") {

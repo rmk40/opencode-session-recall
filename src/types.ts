@@ -35,6 +35,10 @@ export type Limits = {
   drillCharsPerSession: number;
   /** Per-query retained-chars budget shared across all drilled sessions. */
   drillCharsPerQuery: number;
+  /** Per-query retained-chars budget for a deep (exhaustive, output-inclusive)
+   *  sweep. Much larger than the normal drill budget because deep exists to
+   *  cover the 2.4GB tool-output tier within an explicit scope. */
+  deepCharsPerQuery: number;
 };
 
 export const DEFAULTS: Limits = {
@@ -56,6 +60,7 @@ export const DEFAULTS: Limits = {
   drillPageMessages: 25,
   drillCharsPerSession: 1_500_000,
   drillCharsPerQuery: 20_000_000,
+  deepCharsPerQuery: 30_000_000,
 };
 
 /** Explicit discovery limit for "all history" requests: the opencode server
@@ -140,6 +145,17 @@ export type SearchCoverage = {
     storeRecency: number;
     degraded: boolean;
   };
+  /** Present only for a deep sweep: how much of the scoped session set the sweep
+   *  actually covered. `sessionsCovered` were fully swept, `sessionsPartial`
+   *  stopped mid-session on a budget, `sessionsRemaining` were never reached,
+   *  and `exhaustedBudget` is true when a char/time budget stopped the sweep
+   *  (in which case `nextCursor` on the output continues it). */
+  deep?: {
+    sessionsCovered: number;
+    sessionsPartial: number;
+    sessionsRemaining: number;
+    exhaustedBudget: boolean;
+  };
 };
 
 export type ResultWhy = {
@@ -223,6 +239,10 @@ export type SearchOutput = {
   nearMisses?: NearMiss[];
   /** Present when explain:true — which query-plan variants exist and ran. */
   queryPlan?: { variants: string[]; selected: string[] };
+  /** Present only for a deep sweep that stopped on a budget: an opaque
+   *  continuation token; pass it back as `deepCursor` to resume exactly where
+   *  coverage stopped. */
+  nextCursor?: string;
 };
 
 export type ExpandedResult = {
@@ -313,9 +333,17 @@ export type SessionItem = {
   project?: { name?: string; worktree: string };
   time: { created: number; updated: number };
   archived: boolean;
-  /** Content-derived digest, present only when the session is warm in the
-   *  shared corpus cache (best-effort; recall_sessions never fetches). */
+  /** Content-derived digest (the card's summary head), present only when a
+   *  distilled card exists for the session (best-effort; recall_sessions never
+   *  fetches). */
   digest?: string;
+  /** Up to the top files the session touched (from the card, when one exists). */
+  files?: string[];
+  /** Up to the top tools the session used (from the card, when one exists). */
+  tools?: string[];
+  /** Family rollup for a root session: its id and how many descendant sessions
+   *  the card store knows about. Present only for a root that has children. */
+  family?: { rootId: string; childCount: number };
 };
 
 export type SessionsOutput = {

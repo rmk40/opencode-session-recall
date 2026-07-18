@@ -1,6 +1,6 @@
 import type { Plugin } from "@opencode-ai/plugin";
 import { createOpencodeClient, type Session } from "@opencode-ai/sdk/v2";
-import { sessions } from "./sessions.js";
+import { sessions, type SessionEnrichment } from "./sessions.js";
 import { search, DISCOVERY_LIMIT, type SearchDeps, type SemanticSearchConfig } from "./search.js";
 import { get } from "./get.js";
 import { context } from "./context.js";
@@ -74,6 +74,7 @@ const server: Plugin = async (ctx, options) => {
     drillPageMessages: clamp(opts.drillPageMessages, DEFAULTS.drillPageMessages),
     drillCharsPerSession: clamp(opts.drillCharsPerSession, DEFAULTS.drillCharsPerSession),
     drillCharsPerQuery: clamp(opts.drillCharsPerQuery, DEFAULTS.drillCharsPerQuery),
+    deepCharsPerQuery: clamp(opts.deepCharsPerQuery, DEFAULTS.deepCharsPerQuery),
   };
 
   // Extract the in-process fetch from the v1 client's internals.
@@ -180,11 +181,15 @@ const server: Plugin = async (ctx, options) => {
   if (limits.coldPass) distiller.start();
 
   const deps: SearchDeps = { gate, store, cards, drill };
-  const digestSource = { peekDigest: (id: string) => store?.getCard(id)?.summaryHead || undefined };
+  // recall_sessions serves the card store directly when it exists (digest, top
+  // files/tools, family rollups); degraded mode leaves listings bare.
+  const enrichment: SessionEnrichment | undefined = store
+    ? { cards: () => store.allCards() }
+    : undefined;
 
   return {
     tool: {
-      recall_sessions: sessions(client, unscoped, global, limits, digestSource),
+      recall_sessions: sessions(client, unscoped, global, limits, enrichment),
       recall: search(client, unscoped, global, limits, deps),
       recall_get: get(client),
       recall_context: context(client, gate, limits),
@@ -200,10 +205,10 @@ const server: Plugin = async (ctx, options) => {
       "experimental.chat.system.transform": systemNudge(),
     }),
     ...(autoRecallEnabled && {
-      "chat.message": autoRecall(client, unscoped, global, limits, deps),
+      "chat.message": autoRecall(deps),
     }),
     ...(compactionRecallEnabled && {
-      "experimental.session.compacting": compactionRecall(client, unscoped, global, limits, deps),
+      "experimental.session.compacting": compactionRecall(deps),
     }),
     ...(primary && {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any -- opencode config type not exported

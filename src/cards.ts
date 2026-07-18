@@ -109,6 +109,13 @@ export type CardsRuntimeDeps = {
 
 export type CardsRuntime = {
   rank(query: ParsedQuery, filters: CardFilters): CardHit[];
+  /** Every card passing the metadata filters (no query ranking), newest-first.
+   *  The deep sweep uses this to enumerate its scoped session set — deep is
+   *  exhaustive within scope, so it must not rank/prune by query. */
+  list(filters: CardFilters): Card[];
+  /** Single card by id from the loaded snapshot (undefined when unknown). Used
+   *  to build deep targets from an explicit `sessions` list or a resume cursor. */
+  get(sessionId: string): Card | undefined;
   exclusionFamily(currentSessionId: string): Set<string>;
   /** All cards whose `rootId` equals the given root (the root's family). */
   familyOf(rootId: string): Card[];
@@ -374,6 +381,21 @@ export function createCardsRuntime(deps: CardsRuntimeDeps): CardsRuntime {
           card,
           directoryRelevance: directoryRelevance(card, filters),
         }));
+    },
+
+    list(filters): Card[] {
+      refreshIfStale();
+      const excluded = filters.excludeFamilyOf
+        ? exclusionFamilyFromCards(cards, filters.excludeFamilyOf)
+        : new Set<string>();
+      return cards
+        .filter((card) => passesFilters(card, filters, excluded))
+        .sort((a, b) => b.timeUpdated - a.timeUpdated || a.sessionId.localeCompare(b.sessionId));
+    },
+
+    get(sessionId): Card | undefined {
+      refreshIfStale();
+      return cards.find((card) => card.sessionId === sessionId);
     },
 
     exclusionFamily(currentSessionId): Set<string> {

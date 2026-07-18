@@ -480,11 +480,11 @@ describe("recall", () => {
     expect(fallback.coverage?.directoryBucketsSearched).toEqual(["global"]);
     expect(fallback.coverage?.directoryBucketCounts?.global).toBeGreaterThan(0);
 
-    // `sessions: 1` caps the drill fan-out to a single shortlisted session.
+    // `sessionLimit: 1` caps the drill fan-out to a single shortlisted session.
     const capped = await runTool<SearchOutput>(await recallTool(h), {
       query: "rate",
       directory: PROJECT_DIR,
-      sessions: 1,
+      sessionLimit: 1,
       excludeCurrentSession: false,
     });
     expect(capped.coverage?.sessionsSearched).toBe(1);

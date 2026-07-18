@@ -422,31 +422,62 @@ describe("recall_sessions defensive args", () => {
   });
 });
 
-describe("recall_sessions digests", () => {
-  it("attaches a card-store digest when a distilled card exists", async () => {
+describe("recall_sessions enrichment", () => {
+  it("attaches card-store digest, files, tools, and family from the card store", async () => {
     const h = makeFakeHarness();
 
-    // No digest source (no store wired) → no digests, ever.
+    // No enrichment source (no store wired) → bare listings, ever.
     const cold = await runTool<SessionsOutput>(
       sessionsTool(h.client, h.unscoped, true, TEST_LIMITS),
       { scope: "global" },
     );
     expect(cold.sessions.every((s) => s.digest === undefined)).toBe(true);
+    expect(cold.sessions.every((s) => s.files === undefined && s.tools === undefined)).toBe(true);
 
-    // With a seeded card store, sessions carry their card's summary head (the
-    // distiller's content-derived digest), served from a point lookup (no fetch).
+    // With a seeded card store, sessions carry their card's summary head, top
+    // files/tools, and a family rollup for roots — served from the card store,
+    // no message fetch.
     const { store, cleanup } = await makeRecallDeps(h);
     try {
-      const digestSource = {
-        peekDigest: (id: string) => store.getCard(id)?.summaryHead || undefined,
-      };
+      const enrichment = { cards: () => store.allCards() };
       const warm = await runTool<SessionsOutput>(
-        sessionsTool(h.client, h.unscoped, true, TEST_LIMITS, digestSource),
+        sessionsTool(h.client, h.unscoped, true, TEST_LIMITS, enrichment),
         { scope: "global" },
       );
       const current = warm.sessions.find((s) => s.id === "s-current");
       expect(current?.digest).toBeDefined();
       expect(current!.digest!.length).toBeLessThanOrEqual(160);
+      // s-project-2 touched the checkout cache via a bash tool → tools present.
+      const projectTwo = warm.sessions.find((s) => s.id === "s-project-2");
+      expect(projectTwo?.tools).toContain("bash");
+      // No message fetch happened for enrichment.
+      expect(h.calls.messages).toHaveLength(0);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("filters by since/until on time.updated", async () => {
+    const h = makeFakeHarness();
+    const { store, cleanup } = await makeRecallDeps(h);
+    try {
+      const enrichment = { cards: () => store.allCards() };
+      // s-other is the newest global session (updated now-500); a tight `since`
+      // keeps only the freshest, an `until` in the future keeps all.
+      const recent = await runTool<SessionsOutput>(
+        sessionsTool(h.client, h.unscoped, true, TEST_LIMITS, enrichment),
+        { scope: "global", since: "1h" },
+      );
+      // All fixture sessions are within the last hour, so since:1h keeps them.
+      expect(recent.sessions.length).toBeGreaterThan(0);
+
+      // A future-only lower bound (very small window) drops everything.
+      const none = await runTool<SessionsOutput>(
+        sessionsTool(h.client, h.unscoped, true, TEST_LIMITS, enrichment),
+        { scope: "global", until: "10w" },
+      );
+      // until:10w = updated <= now-10w → all fixture sessions are newer → none.
+      expect(none.sessions).toHaveLength(0);
     } finally {
       cleanup();
     }

@@ -190,8 +190,8 @@ describe("plugin entry", () => {
     expect(recallArgs.parse({ query: "rate" }).sessions).toBeUndefined();
     expect(() => recallArgs.parse({ query: "rate", results: 2 })).not.toThrow();
     expect(() => recallArgs.parse({ query: "rate", results: 3 })).toThrow();
-    expect(() => recallArgs.parse({ query: "rate", sessions: 2 })).not.toThrow();
-    expect(() => recallArgs.parse({ query: "rate", sessions: 3 })).toThrow();
+    expect(() => recallArgs.parse({ query: "rate", sessionLimit: 2 })).not.toThrow();
+    expect(() => recallArgs.parse({ query: "rate", sessionLimit: 3 })).toThrow();
     expect(recallArgs.parse({ query: "rate" }).window).toBe(1);
     expect(() => recallArgs.parse({ query: "rate", window: 1 })).not.toThrow();
     expect(() => recallArgs.parse({ query: "rate", window: 2 })).not.toThrow();

@@ -95,12 +95,67 @@ export type DrillPoolsOutput = {
   loadErrors: string[];
 };
 
+/** One session to sweep in deep mode, ordered newest-first by the caller. */
+export type DeepTarget = DrillTarget;
+
+export type DeepInput = {
+  /** The scoped session set to sweep, newest-first. On a resumed sweep the
+   *  first entry is the session that was mid-sweep and {@link DeepInput.resume}
+   *  carries its page cursor. */
+  sessions: DeepTarget[];
+  query: ParsedQuery;
+  /** Per-query candidate eligibility (type/role/time/toolName), applied to each
+   *  swept session's candidates (mirrors the drill's `filter`). */
+  filter?: (candidate: Candidate) => boolean;
+  /** Append each session's bound title candidate (mirrors the drill). */
+  searchTitles?: boolean;
+  /** Retained-chars budget for the whole sweep (`limits.deepCharsPerQuery`). */
+  charsPerQuery: number;
+  /** Resume state: the page cursor to continue the FIRST session from. */
+  resume?: { before: string | null };
+  abort?: AbortSignal;
+};
+
+/** How far a deep sweep got through its scoped set. */
+export type DeepCoverage = {
+  sessionsCovered: number;
+  sessionsPartial: number;
+  sessionsRemaining: number;
+  exhaustedBudget: boolean;
+};
+
+/** Continuation state emitted when a sweep stops on a budget (opaque to callers
+ *  once encoded). `current` is the session left mid-sweep (null when the sweep
+ *  stopped cleanly between sessions), `before` its resume page cursor, and
+ *  `remaining` the session ids never reached. */
+export type DeepContinuation = {
+  current: string | null;
+  before: string | null;
+  remaining: string[];
+};
+
+export type DeepOutput = {
+  pools: DrilledPool[];
+  drilledSessions: string[];
+  loadErrors: string[];
+  coverage: DeepCoverage;
+  continuation?: DeepContinuation;
+};
+
 export type Drill = {
   drill(input: DrillInput): Promise<DrillOutput>;
   /** Collect the drilled candidate pools without BM25 scoring, for literal/regex
    *  modes that scan the pool directly. Same bounded fetch + budgets + LRU as
    *  {@link Drill.drill}. */
   pools(input: DrillInput): Promise<DrillPoolsOutput>;
+  /**
+   * Deep sweep: fetch EVERY part of each scoped session (tool outputs included),
+   * exhaustively (no anchor early-stop), under a retained-chars + wall-clock
+   * budget, returning the candidate pools plus a continuation cursor when a
+   * budget stopped the sweep. Never touches the drill LRU (sweeps are large and
+   * would thrash it).
+   */
+  deep(input: DeepInput): Promise<DeepOutput>;
   /** Retained-chars currently held by the drilled-session LRU (diagnostics/tests). */
   cachedChars(): number;
 };
@@ -110,7 +165,61 @@ export type DrillDeps = {
   gate: FetchGate;
   limits: Limits;
   embedder?: CandidateEmbedder;
+  /** Injectable clock for the deep sweep's wall-clock budget (tests). */
+  now?: () => number;
+  /** Soft wall-clock budget for a deep sweep in ms (default 20s). Injectable so
+   *  tests can force a time stop without a real 20s wait. */
+  deepWallClockMs?: number;
 };
+
+/** Messages per page during a deep sweep (the spec's exhaustive page size). */
+const DEEP_PAGE_MESSAGES = 50;
+/** Default soft wall-clock budget for a deep sweep. */
+const DEFAULT_DEEP_WALL_CLOCK_MS = 20_000;
+
+// ── Deep continuation cursor (opaque base64url JSON) ─────────────────────────
+// btoa/atob are DOM globals (available under Bun and Node), so no Node Buffer is
+// needed. The payload is ASCII (session ids, base64url page cursors, integers),
+// so no unicode escaping is required; every path is still guarded so a malformed
+// cursor degrades to a clean rejection rather than a throw.
+
+function base64urlEncode(text: string): string {
+  return btoa(text).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+function base64urlDecode(text: string): string {
+  return atob(text.replace(/-/g, "+").replace(/_/g, "/"));
+}
+
+export type DeepCursorPayload = {
+  v: 1;
+  remaining: string[];
+  current: string | null;
+  before: string | null;
+};
+
+export function encodeDeepCursor(payload: DeepCursorPayload): string {
+  return base64urlEncode(JSON.stringify(payload));
+}
+
+/** Decode a `deepCursor`; returns null (never throws) for any malformed input so
+ *  the caller can answer with guidance instead of crashing. */
+export function decodeDeepCursor(raw: string): DeepCursorPayload | null {
+  try {
+    const parsed: unknown = JSON.parse(base64urlDecode(raw));
+    if (!parsed || typeof parsed !== "object") return null;
+    const rec = parsed as Record<string, unknown>;
+    if (rec.v !== 1) return null;
+    if (!Array.isArray(rec.remaining)) return null;
+    const remaining = rec.remaining.filter((x): x is string => typeof x === "string");
+    if (remaining.length !== rec.remaining.length) return null;
+    const current = typeof rec.current === "string" ? rec.current : null;
+    const before = typeof rec.before === "string" ? rec.before : null;
+    return { v: 1, remaining, current, before };
+  } catch {
+    return null;
+  }
+}
 
 type CacheEntry = { candidates: Candidate[]; chars: number };
 
@@ -300,8 +409,13 @@ export function createDrill(deps: DrillDeps): Drill {
 
   /** The per-query scan/score pool for one drilled session: the cached
    *  (unfiltered) candidates narrowed by the query filter, with the bound title
-   *  candidate appended when title search applies. Mirrors `assembleSession`. */
-  function poolFor(target: DrillTarget, cached: Candidate[], input: DrillInput): Candidate[] {
+   *  candidate appended when title search applies. Mirrors `assembleSession`.
+   *  Shared by the bounded drill and the deep sweep. */
+  function poolFor(
+    target: DrillTarget,
+    cached: Candidate[],
+    input: { filter?: (candidate: Candidate) => boolean; searchTitles?: boolean },
+  ): Candidate[] {
     const eligible = input.filter ? cached.filter(input.filter) : cached;
     if (!input.searchTitles) return eligible;
     const representative = eligible[0]; // newest eligible, matching assembleSession
@@ -341,6 +455,128 @@ export function createDrill(deps: DrillDeps): Drill {
     async pools(input): Promise<DrillPoolsOutput> {
       const { pools, drilledSessions, loadErrors, budgetExhausted } = await collectPools(input);
       return { pools, drilledSessions, budgetExhausted, loadErrors };
+    },
+
+    async deep(input): Promise<DeepOutput> {
+      const now = deps.now ?? Date.now;
+      const wallClockMs = deps.deepWallClockMs ?? DEFAULT_DEEP_WALL_CLOCK_MS;
+      const deadline = now() + wallClockMs;
+      const charsPerQuery = input.charsPerQuery;
+
+      const budget = { retained: 0 };
+      const pools: DrilledPool[] = [];
+      const drilledSessions: string[] = [];
+      const loadErrors: string[] = [];
+      let sessionsCovered = 0;
+      let sessionsPartial = 0;
+      let continuation: DeepContinuation | undefined;
+
+      const overBudget = (): boolean =>
+        budget.retained >= charsPerQuery || now() >= deadline || input.abort?.aborted === true;
+
+      /** Sweep one session exhaustively from `startBefore`, stopping cleanly on a
+       *  budget. Always fetches at least one page so the sweep makes progress. */
+      const sweepSession = async (
+        target: DeepTarget,
+        startBefore: string | null,
+      ): Promise<{ candidates: Candidate[]; nextBefore: string | null; stopped: boolean }> => {
+        const messages: MsgWithParts[] = [];
+        let cursor: string | undefined = startBefore ?? undefined;
+        let stopped = false;
+        let fetchedAny = false;
+        for (;;) {
+          if (fetchedAny && overBudget()) {
+            stopped = true;
+            break;
+          }
+          if (!fetchedAny && input.abort?.aborted) {
+            stopped = true;
+            break;
+          }
+          const before = cursor;
+          const page = await gate.runQuery(() =>
+            fetchMessagePage(client, {
+              sessionID: target.sessionId,
+              limit: DEEP_PAGE_MESSAGES,
+              before,
+            }),
+          );
+          fetchedAny = true;
+          for (const msg of page.items) {
+            messages.push(msg);
+            budget.retained += estimateRetained(msg);
+          }
+          cursor = page.nextCursor ?? undefined;
+          if (!cursor) break; // session fully swept
+        }
+
+        const chrono = [...messages].sort(
+          (a, b) => a.info.time.created - b.info.time.created || a.info.id.localeCompare(b.info.id),
+        );
+        const { candidates } = buildCandidates(chrono, {
+          id: target.sessionId,
+          title: target.title,
+          directory: target.directory,
+        });
+        for (const candidate of candidates) populateNormalized(candidate);
+        const digestText = buildSessionDigest(candidates);
+        const normalizedDigest = digestText ? normalize(digestText) : "";
+        for (const candidate of candidates) candidate.digestText = normalizedDigest;
+        if (embedder?.ready) {
+          for (const candidate of candidates)
+            candidate.embedding = embedder.embed(candidate.rawText);
+        }
+        return { candidates, nextBefore: stopped ? (cursor ?? null) : null, stopped };
+      };
+
+      const targets = input.sessions;
+      const remainingFrom = (index: number): string[] =>
+        targets.slice(index).map((t) => t.sessionId);
+
+      for (let i = 0; i < targets.length; i++) {
+        const target = targets[i]!;
+        // Budget spent between sessions: this session and the rest are untouched.
+        if (overBudget()) {
+          continuation = { current: null, before: null, remaining: remainingFrom(i) };
+          break;
+        }
+        const startBefore = i === 0 ? (input.resume?.before ?? null) : null;
+        let swept: Awaited<ReturnType<typeof sweepSession>>;
+        try {
+          swept = await sweepSession(target, startBefore);
+        } catch (error) {
+          if (loadErrors.length < MAX_LOAD_ERROR_SAMPLES) {
+            loadErrors.push(`${target.sessionId}: ${errmsg(error)}`);
+          }
+          continue;
+        }
+        pools.push({ target, candidates: poolFor(target, swept.candidates, input) });
+        drilledSessions.push(target.sessionId);
+        if (swept.stopped) {
+          sessionsPartial++;
+          continuation = {
+            current: target.sessionId,
+            before: swept.nextBefore,
+            remaining: remainingFrom(i + 1),
+          };
+          break;
+        }
+        sessionsCovered++;
+      }
+
+      const exhaustedBudget = continuation != null;
+      return {
+        pools,
+        drilledSessions,
+        loadErrors,
+        coverage: {
+          sessionsCovered,
+          sessionsPartial,
+          sessionsRemaining: continuation ? continuation.remaining.length : 0,
+          exhaustedBudget,
+        },
+        continuation,
+      };
     },
 
     cachedChars(): number {
