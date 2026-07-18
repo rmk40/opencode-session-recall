@@ -24,6 +24,11 @@ export const TEST_LIMITS: Limits = {
   maxWindow: 10,
   defaultWidth: 120,
   cacheMaxChars: 2_000_000,
+  distillConcurrency: 2,
+  distillDelayMs: 25,
+  ftsRowsPerSession: 5000,
+  inventoryTokens: 200,
+  coldPass: true,
 };
 
 type ApiFailure = { data: { message: string } };
@@ -34,7 +39,7 @@ export type FakeCalls = {
   projectList: Array<{ search?: string; limit?: number }>;
   globalList: Array<{ search?: string; limit?: number }>;
   get: Array<{ sessionID: string }>;
-  messages: Array<{ sessionID: string }>;
+  messages: Array<{ sessionID: string; limit?: number; before?: string }>;
   message: Array<{ sessionID: string; messageID: string }>;
 };
 
@@ -257,6 +262,50 @@ export function bundle(info: Message, parts: Part[]): MessageBundle {
   return { info, parts };
 }
 
+// ── Keyset pagination shim ───────────────────────────────────────────────────
+// Mimics the real `session.messages` contract: newest-first pages, an opaque
+// base64url cursor, and a next-page cursor delivered in the `X-Next-Cursor`
+// response header (the body is the items array). The cursor encodes an index
+// into the newest-first ordering — opaque to callers, decoded only here.
+
+function encodeCursor(index: number): string {
+  return Buffer.from(String(index)).toString("base64url");
+}
+
+function decodeCursor(cursor: string | undefined): number {
+  if (!cursor) return 0;
+  try {
+    const value = Number(Buffer.from(cursor, "base64url").toString("utf8"));
+    return Number.isFinite(value) && value >= 0 ? Math.floor(value) : 0;
+  } catch {
+    return 0;
+  }
+}
+
+/** Slice one newest-first page from a chronological (oldest-first) bundle list. */
+export function paginateBundles(
+  all: MessageBundle[],
+  limit: number,
+  before?: string,
+): { items: MessageBundle[]; nextCursor: string | null } {
+  const newestFirst = [...all].reverse();
+  const start = decodeCursor(before);
+  const items = newestFirst.slice(start, start + limit);
+  const nextIndex = start + limit;
+  return { items, nextCursor: nextIndex < newestFirst.length ? encodeCursor(nextIndex) : null };
+}
+
+/** A fields-style messages response carrying the next cursor in a real `Headers`
+ *  object (so `Headers.get` is genuinely case-insensitive). */
+export function messagesResponse(
+  items: MessageBundle[],
+  nextCursor: string | null,
+): { data: MessageBundle[]; response: { headers: Headers } } {
+  const headers = new Headers();
+  if (nextCursor) headers.set("X-Next-Cursor", nextCursor);
+  return { data: items, response: { headers } };
+}
+
 export function makeFixture(now = Date.now()): {
   sessions: Session[];
   globalSessions: GlobalSession[];
@@ -417,8 +466,9 @@ export function makeFakeHarness(options: FakeOptions = {}): FakeHarness {
         const found = fixture.globalSessions.find((s) => s.id === sessionID);
         return found ? { data: found } : { error: apiFailure(`Session not found: ${sessionID}`) };
       },
-      messages: async ({ sessionID }: { sessionID: string }) => {
-        calls.messages.push({ sessionID });
+      messages: async (params: { sessionID: string; limit?: number; before?: string }) => {
+        const { sessionID, limit, before } = params;
+        calls.messages.push({ sessionID, limit, before });
         options.afterMessagesCall?.(sessionID);
         if (options.messageThrows?.has(sessionID)) throw new Error(`thrown messages: ${sessionID}`);
         if (options.messageErrors?.[sessionID]) {
@@ -426,7 +476,15 @@ export function makeFakeHarness(options: FakeOptions = {}): FakeHarness {
         }
         if (options.noMessageData?.has(sessionID)) return {};
         const data = fixture.messagesBySession[sessionID];
-        return data ? { data } : { error: apiFailure(`Unauthorized`) };
+        if (!data) return { error: apiFailure(`Unauthorized`) };
+        // Paginated path only when a limit is present (the distiller/
+        // fetchMessagePage contract); no-limit callers keep the legacy
+        // full-return behavior the older tests rely on.
+        if (limit != null) {
+          const { items, nextCursor } = paginateBundles(data, limit, before);
+          return messagesResponse(items, nextCursor);
+        }
+        return { data };
       },
       message: async ({ sessionID, messageID }: { sessionID: string; messageID: string }) => {
         calls.message.push({ sessionID, messageID });

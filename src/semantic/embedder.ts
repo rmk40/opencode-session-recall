@@ -1,4 +1,5 @@
 import { errmsg } from "../types.js";
+import { loadFs, loadPath, loadOs, type FsLike, type PathLike } from "../node-import.js";
 
 /**
  * Local, opt-in static-embedding inference (model2vec / potion family).
@@ -15,36 +16,6 @@ import { errmsg } from "../types.js";
  * missing model, offline machine, or unsupported artifact degrades the whole
  * plugin to lexical-only search rather than throwing.
  */
-
-// ── Minimal local typings for the Node builtins we touch ─────────────────
-// `src/` has no @types/node, so we declare only the surface we use and cast the
-// dynamic-import results to it. Variable specifiers keep tsc from trying (and
-// failing) to resolve the built-in module types.
-type FsLike = {
-  promises: {
-    mkdir(path: string, options: { recursive: boolean }): Promise<unknown>;
-    readFile(path: string): Promise<Uint8Array>;
-    writeFile(path: string, data: Uint8Array): Promise<void>;
-    rename(from: string, to: string): Promise<void>;
-    stat(path: string): Promise<{ size: number }>;
-  };
-};
-type PathLike = { join(...parts: string[]): string };
-type OsLike = { homedir(): string };
-
-const NODE_FS = "node:fs";
-const NODE_PATH = "node:path";
-const NODE_OS = "node:os";
-
-async function loadFs(): Promise<FsLike> {
-  return (await import(NODE_FS)) as unknown as FsLike;
-}
-async function loadPath(): Promise<PathLike> {
-  return (await import(NODE_PATH)) as unknown as PathLike;
-}
-async function loadOs(): Promise<OsLike> {
-  return (await import(NODE_OS)) as unknown as OsLike;
-}
 
 // ── Constants ────────────────────────────────────────────────────────────
 const HUGGINGFACE_BASE = "https://huggingface.co";

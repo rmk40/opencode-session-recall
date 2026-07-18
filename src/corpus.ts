@@ -10,6 +10,7 @@ import {
 } from "./candidates.js";
 import { normalize, tokenize } from "./normalize.js";
 import { toolNameMatches } from "./extract.js";
+import { DIGEST_HEAD_CHARS, isDigestToken } from "./digest.js";
 
 /**
  * Incremental in-memory corpus cache.
@@ -94,92 +95,7 @@ const MAX_LOAD_ERROR_SAMPLES = 5;
 // and action evidence (text/subtask parts, tool command/cwd inputs) so a
 // session that merely READ about a topic gets no digest credit for it.
 
-const DIGEST_HEAD_CHARS = 200;
 const DIGEST_TOP_TOKENS = 8;
-const DIGEST_MIN_TOKEN_LENGTH = 4;
-/** Clean word-like tokens with at least one letter; keeps JSON shards and
- *  bare numbers (timeouts, sizes) out of the digest. */
-const DIGEST_TOKEN_RE = /^(?=.*\p{L})[\p{L}\p{N}][\p{L}\p{N}-]*$/u;
-/** Common prose/dev words that carry no session identity. */
-const DIGEST_STOPWORDS = new Set([
-  "this",
-  "that",
-  "with",
-  "from",
-  "have",
-  "will",
-  "should",
-  "would",
-  "could",
-  "when",
-  "then",
-  "than",
-  "them",
-  "they",
-  "there",
-  "here",
-  "what",
-  "which",
-  "into",
-  "onto",
-  "over",
-  "under",
-  "about",
-  "please",
-  "using",
-  "used",
-  "make",
-  "made",
-  "need",
-  "needs",
-  "want",
-  "like",
-  "just",
-  "also",
-  "only",
-  "some",
-  "more",
-  "most",
-  "very",
-  "each",
-  "every",
-  "and",
-  "the",
-  "for",
-  "not",
-  "are",
-  "was",
-  "were",
-  "been",
-  "being",
-  "does",
-  "doing",
-  "done",
-  "error",
-  "failed",
-  "session",
-  "message",
-  "config",
-  "result",
-  "tool",
-  "output",
-  "update",
-  "function",
-  "const",
-  "return",
-  "import",
-  "export",
-  "test",
-  "build",
-  "run",
-  "check",
-  "value",
-  "data",
-  "type",
-  "file",
-  "files",
-  "code",
-]);
 
 /**
  * Deterministic content digest for a session. Deviates deliberately from the
@@ -201,8 +117,7 @@ export function buildSessionDigest(candidates: Candidate[]): string {
     }
     if (isStatement) {
       for (const token of candidate.tokens) {
-        if (token.length < DIGEST_MIN_TOKEN_LENGTH || DIGEST_STOPWORDS.has(token)) continue;
-        if (!DIGEST_TOKEN_RE.test(token)) continue;
+        if (!isDigestToken(token)) continue;
         counts.set(token, (counts.get(token) ?? 0) + 1);
       }
       continue;
@@ -224,8 +139,7 @@ export function buildSessionDigest(candidates: Candidate[]): string {
         // only true command/cwd strings describe an action.
         if (field.text.startsWith("{")) continue;
         for (const token of tokenize(field.text)) {
-          if (token.length < DIGEST_MIN_TOKEN_LENGTH || DIGEST_STOPWORDS.has(token)) continue;
-          if (!DIGEST_TOKEN_RE.test(token)) continue;
+          if (!isDigestToken(token)) continue;
           counts.set(token, (counts.get(token) ?? 0) + 1);
         }
       }

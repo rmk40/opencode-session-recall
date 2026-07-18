@@ -56,6 +56,11 @@ const server: Plugin = async (ctx, options) => {
     maxWindow: clamp(opts.maxWindow, DEFAULTS.maxWindow),
     defaultWidth: clamp(opts.defaultWidth, DEFAULTS.defaultWidth, 50),
     cacheMaxChars: clamp(opts.cacheMaxChars, DEFAULTS.cacheMaxChars),
+    distillConcurrency: clamp(opts.distillConcurrency, DEFAULTS.distillConcurrency),
+    distillDelayMs: Math.max(0, Math.floor(opts.distillDelayMs ?? DEFAULTS.distillDelayMs)),
+    ftsRowsPerSession: clamp(opts.ftsRowsPerSession, DEFAULTS.ftsRowsPerSession),
+    inventoryTokens: clamp(opts.inventoryTokens, DEFAULTS.inventoryTokens),
+    coldPass: opts.coldPass !== false,
   };
 
   // Extract the in-process fetch from the v1 client's internals.

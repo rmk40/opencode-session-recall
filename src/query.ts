@@ -31,7 +31,11 @@ const CODE_TOKEN_RE =
   /(?<![A-Za-z0-9])(?:[A-Za-z0-9]+(?:[_./-][A-Za-z0-9]+)+|[a-z]+(?:[A-Z][a-z0-9]+)+|[A-Z]{2,}[A-Z0-9_]*)/g;
 const MIN_CODE_TOKEN_LENGTH = 4;
 
-function extractCodeTokens(raw: string): string[] {
+/** Verbatim code-like compound tokens (snake/kebab/dotted/path, camelCase,
+ *  SCREAMING_CASE) at least {@link MIN_CODE_TOKEN_LENGTH} chars, deduped and
+ *  order-preserving. Exported so the distiller anchors its FTS `norm` column and
+ *  card inventory on the same compounds `parseQuery` treats as exact anchors. */
+export function extractCodeTokens(raw: string): string[] {
   const matches = raw.match(CODE_TOKEN_RE) ?? [];
   return [...new Set(matches.filter((token) => token.length >= MIN_CODE_TOKEN_LENGTH))];
 }

@@ -16,6 +16,16 @@ export type Limits = {
   defaultWidth: number;
   /** Total raw-text budget for the in-memory corpus cache (LRU-evicted). */
   cacheMaxChars: number;
+  /** Sessions the distiller keeps in flight during the cold pass. */
+  distillConcurrency: number;
+  /** Politeness delay (ms) between a session's page fetches in the cold pass. */
+  distillDelayMs: number;
+  /** Per-session slim-index row cap; giants keep their newest rows. */
+  ftsRowsPerSession: number;
+  /** Card inventory token cap (code anchors + digest tokens, combined). */
+  inventoryTokens: number;
+  /** Whether the distiller runs its background cold pass at all. */
+  coldPass: boolean;
 };
 
 export const DEFAULTS: Limits = {
@@ -27,7 +37,20 @@ export const DEFAULTS: Limits = {
   maxWindow: 10,
   defaultWidth: 200,
   cacheMaxChars: 50_000_000,
+  distillConcurrency: 2,
+  distillDelayMs: 25,
+  ftsRowsPerSession: 5000,
+  inventoryTokens: 200,
+  coldPass: true,
 };
+
+/** Explicit discovery limit for "all history" requests: the opencode server
+ *  defaults to 100 rows when no limit is sent (silently hiding older sessions),
+ *  and it applies caller limits unclamped. Lives here (not in `search.ts`) so
+ *  the distiller can share it without importing the search module, which would
+ *  cycle once search wires the distiller in. `search.ts` re-exports it for
+ *  existing importers. */
+export const DISCOVERY_LIMIT = 10_000;
 
 export type MatchMode = "literal" | "smart" | "fuzzy" | "regex";
 export type DegradeKind = "none" | "time" | "fallback";

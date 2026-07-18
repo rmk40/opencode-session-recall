@@ -105,7 +105,10 @@ function maxEditDistance(term: string, mode: Bm25Mode): number {
   return Math.min(MAX_FUZZY, Math.round(term.length * fuzzyFor(mode)));
 }
 
-function containsErrorPattern(text: string): boolean {
+/** Whether text carries an error signature (`error`/`failed`/`exception`).
+ *  Exported so the distiller mines the same error vocabulary from tool outputs
+ *  when building a card's error-signature list. */
+export function containsErrorPattern(text: string): boolean {
   const lower = text.toLowerCase();
   return ERROR_PATTERNS.some((p) => lower.includes(p));
 }

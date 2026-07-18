@@ -20,6 +20,7 @@ import {
   type EvidenceClass,
   type ResultSource,
   type ResultWhy,
+  DISCOVERY_LIMIT,
 } from "./types.js";
 import { snippet, matches, formatMsg, isSelfTool, evidenceClassFor } from "./extract.js";
 import { parseQuery } from "./query.js";
@@ -71,10 +72,9 @@ const MAX_EXPANDED_PART_CHARS = 6_000;
  *  remains the full-fidelity path. */
 const MAX_EXPANDED_INPUT_CHARS = 2_000;
 const DIRECTORY_FILTER_LIST_LIMIT = 5000;
-/** Explicit discovery limit for "all history" requests: the opencode server
- *  defaults to 100 rows when no limit is sent (silently hiding older
- *  sessions), and it applies caller limits unclamped. Exported for prewarm. */
-export const DISCOVERY_LIMIT = 10_000;
+// DISCOVERY_LIMIT now lives in types.ts (so the distiller can share it without a
+// search-module cycle); re-exported here for existing importers.
+export { DISCOVERY_LIMIT };
 /** In part-grouped results, cap hits per session in the initial fill so one
  *  noisy session can't flood the result list; backfill if room remains. */
 const MAX_HITS_PER_SESSION_INITIAL = 2;
