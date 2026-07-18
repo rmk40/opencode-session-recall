@@ -86,7 +86,12 @@ describe("fetch gate", () => {
     const b = gate.runBackground(async () => {});
     await delay(70); // stay blocked well past the 20ms threshold
     expect(pauses).toHaveLength(1);
-    expect(pauses[0]).toBeGreaterThanOrEqual(20);
+    // The reported wait is measured with Date.now(), whose ms truncation can
+    // land a hair under the threshold (observed once at 19ms for a 20ms timer),
+    // so allow a small slack margin. The point is the reported pause reflects
+    // the threshold-scale wait, not a spurious near-zero value.
+    const SLACK_MS = 3;
+    expect(pauses[0]).toBeGreaterThanOrEqual(20 - SLACK_MS);
 
     aGate.resolve();
     await Promise.all([a, b]);

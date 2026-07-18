@@ -1185,6 +1185,27 @@ describe("recall", () => {
     ).toBe(false);
   });
 
+  it("survives raw Zod-bypass since/until/project/sessionLimit (host path)", async () => {
+    // The stage 3-4 filter args (since/until, project, sessionLimit) can arrive
+    // from the live MCP host with the wrong runtime type (Zod is not applied).
+    // None may throw; each coerces to a safe default rather than crashing on
+    // .trim()/.slice() or making a bound NaN.
+    const h = makeFakeHarness();
+    const out = await runToolRaw<SearchOutput>(await recallTool(h), {
+      query: "rate",
+      scope: "project",
+      excludeCurrentSession: false,
+      since: 42, // number epoch: a valid absolute lower bound, not a crash
+      until: {}, // non-string: ignored, never reaches .trim()
+      project: 7, // non-boolean/string: no project filter, no throw
+      sessionLimit: "12", // non-number: coerced to the fan-out default + a warning
+    });
+    expect(out.ok).toBe(true);
+    expect(out.results.length).toBeGreaterThan(0);
+    // Coercion ran: the malformed sessionLimit was reported, not silently obeyed.
+    expect(out.warnings?.some((w) => /sessionLimit/i.test(w))).toBe(true);
+  });
+
   it("surfaces partial and total drilled-session load failures", async () => {
     // "rate" drills s-current and s-project-2. Load errors now come only from
     // the drilled sessions (the store is already distilled); a failing drill

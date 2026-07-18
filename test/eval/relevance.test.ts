@@ -1,8 +1,22 @@
 import { afterAll, beforeAll, describe, it, expect } from "vitest";
 import type { ToolDefinition } from "@opencode-ai/plugin";
+import type { SearchOutput } from "../../src/types.js";
 import { EVAL_CASES } from "./cases.js";
-import { evalContext, makeEvalSearch, runEval } from "./harness.js";
+import { evalContext, makeDegradedEvalSearch, makeEvalSearch, runEval } from "./harness.js";
 import BASELINE from "./baseline.json" with { type: "json" };
+
+/** Run one recall query through a tool and parse it (throws on a non-ok body). */
+async function runQuery(
+  tool: ToolDefinition,
+  args: Record<string, unknown>,
+): Promise<SearchOutput> {
+  const raw = await tool.execute(args as Parameters<typeof tool.execute>[0], evalContext());
+  const parsed = JSON.parse(raw) as SearchOutput | { ok: false; error: string };
+  if (!("ok" in parsed) || !parsed.ok) {
+    throw new Error(`query failed: ${JSON.stringify(parsed)}`);
+  }
+  return parsed;
+}
 
 /**
  * Relevance gate. Runs the live `recall` search over the labeled eval corpus and
@@ -54,6 +68,52 @@ describe("recall relevance eval", () => {
     for (const c of EVAL_CASES) {
       expect(c.relevantSessionIDs.length).toBeGreaterThan(0);
     }
+  });
+
+  it("output-only needle: honest miss without deep, hit with a scoped deep sweep", async () => {
+    // "quaxolith" lives solely in e-out's tool OUTPUT, which the distiller never
+    // indexes, and e-out is one of the three oldest sessions the tier-1 recency
+    // near-miss drops — so a non-deep smart query never drills it (the honest
+    // miss), while a deep sweep scoped to e-out reads its outputs and finds it.
+    const shallow = await runQuery(searchTool, {
+      query: "quaxolith",
+      match: "smart",
+      group: "session",
+      scope: "global",
+    });
+    expect(shallow.results.some((r) => r.sessionID === "e-out")).toBe(false);
+    expect(JSON.stringify(shallow.results)).not.toContain("quaxolith");
+
+    const deep = await runQuery(searchTool, {
+      query: "quaxolith",
+      match: "smart",
+      group: "session",
+      scope: "global",
+      deep: true,
+      sessions: ["e-out"],
+    });
+    expect(deep.results.some((r) => r.sessionID === "e-out")).toBe(true);
+    expect(deep.coverage?.deep?.sessionsCovered).toBe(1);
+    expect(deep.warnings?.some((w) => /Deep sweep searched tool outputs/i.test(w))).toBe(true);
+  });
+
+  it("virgin degraded mode: metadata-quality results with degraded coverage", async () => {
+    // Store unavailable (virgin machine): cards-lite from the session list still
+    // ranks and drills by metadata, and coverage must report the degradation.
+    const { searchTool: degraded } = makeDegradedEvalSearch();
+    const out = await runQuery(degraded, {
+      query: "postgres",
+      match: "smart",
+      group: "session",
+      scope: "global",
+    });
+    expect(out.results.length).toBeGreaterThan(0);
+    expect(out.results.some((r) => r.sessionID === "e-db")).toBe(true);
+    expect(out.coverage?.cards?.degraded).toBe(true);
+    expect(
+      out.warnings?.some((w) => /metadata-only|degraded/i.test(w)),
+      `expected a degraded-cards warning, got ${JSON.stringify(out.warnings)}`,
+    ).toBe(true);
   });
 
   it("meets per-case expectations (exclusions, evidence classes)", async () => {

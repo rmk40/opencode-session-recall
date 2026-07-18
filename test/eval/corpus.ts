@@ -98,6 +98,35 @@ export function makeEvalCorpus(now = Date.now()): EvalCorpus {
   // e-tui: unrelated recent TUI session in another directory.
   const sTui = session("e-tui", "Terminal UI spike", OTHER_DIR, now - 8_000);
 
+  // ── Distill-then-search tier probes (round-4) ────────────────────────
+  const HOUR = 60 * 60 * 1000;
+  const DAY = 24 * HOUR;
+  // e-inv: card-INVENTORY needle. A distinctive SCREAMING_CASE token lives only
+  // in a bash tool INPUT (never the title), so the distiller lifts it into the
+  // card inventory (and the FTS index). A smart query on it is answered by the
+  // tier-1 card ranker alone. Recent, so it is never a near-miss casualty.
+  const sInv = session("e-inv", "Release deploy tuning", PROJECT_DIR, now - 6_000);
+  // The three OLDEST sessions below are, by construction, the three the tier-1
+  // recency near-miss fallback drops (the corpus has exactly 12 newer sessions,
+  // and the fallback keeps only the newest 12). That is load-bearing:
+  //   • e-fts reaches the shortlist ONLY through the tier-1.5 FTS tier, proving
+  //     the FTS needle path (its card carries nothing the query matches).
+  //   • e-out is never drilled by a non-deep query, so its output-only needle is
+  //     an honest miss until an explicit deep sweep reaches it.
+  // Keep e-out/e-fts/e-temp-old the three oldest if you extend the corpus.
+  // e-fts: FTS-ONLY needle. A rare plain word ("florplaxle") appears only in a
+  // reasoning part — a class the inventory samples weakly (reasoning is not
+  // digest-bearing) and which is not a code token, so the card never carries it.
+  const sFts = session("e-fts", "Cache layer notes", PROJECT_DIR, now - 8 * DAY);
+  // e-out: OUTPUT-ONLY needle. "quaxolith" exists solely in a tool OUTPUT, which
+  // the distiller never indexes — invisible to cards and FTS alike.
+  const sOut = session("e-out", "Nightly log triage", PROJECT_DIR, now - 6 * DAY);
+  // e-temp-old / e-temp-new: same query token, different `time.updated`, for the
+  // since/until temporal-filter cases. 10 days vs 2 hours, split cleanly by a
+  // "2d" bound.
+  const sTempOld = session("e-temp-old", "Widget sync pass A", PROJECT_DIR, now - 10 * DAY);
+  const sTempNew = session("e-temp-new", "Widget sync pass B", PROJECT_DIR, now - 2 * HOUR);
+
   const messagesBySession: Record<string, MessageBundle[]> = {
     // ── e-auth: rare-term recall + exact phrase ────────────────────────
     [sAuth.id]: [
@@ -397,12 +426,100 @@ export function makeEvalCorpus(now = Date.now()): EvalCorpus {
         ),
       ]),
     ],
+
+    // ── e-inv: card-inventory needle (distinctive token in a tool INPUT) ──
+    [sInv.id]: [
+      bundle(userMessage("ei-1", sInv.id, now - 7_000), [
+        textPart("ei-1p", sInv.id, "ei-1", "Tune the release deploy flags for the prod stage."),
+      ]),
+      bundle(assistantMessage("ei-2", sInv.id, now - 6_500), [
+        completedToolPart(
+          "ei-2p",
+          sInv.id,
+          "ei-2",
+          "bash",
+          { command: "npm run deploy -- --token QUAXFLINT_CALIB --stage prod" },
+          "deploy queued",
+          { title: "Deploy" },
+        ),
+      ]),
+    ],
+
+    // ── e-fts: FTS-only needle (rare word only in a reasoning part) ───────
+    [sFts.id]: [
+      bundle(userMessage("eftq-1", sFts.id, now - 8 * DAY - 2_000), [
+        textPart(
+          "eftq-1p",
+          sFts.id,
+          "eftq-1",
+          "Review the cache warming approach for cold starts.",
+        ),
+      ]),
+      bundle(assistantMessage("eftq-2", sFts.id, now - 8 * DAY - 1_000), [
+        reasoningPart(
+          "eftq-2p",
+          sFts.id,
+          "eftq-2",
+          "The cache miss cascade traces back to florplaxle eviction under sustained load; " +
+            "florplaxle is the internal codename for the tiered eviction policy.",
+        ),
+      ]),
+      bundle(assistantMessage("eftq-3", sFts.id, now - 8 * DAY), [
+        textPart("eftq-3p", sFts.id, "eftq-3", "Documented the cache warming plan and next steps."),
+      ]),
+    ],
+
+    // ── e-out: output-only needle ("quaxolith" only in a tool OUTPUT) ─────
+    [sOut.id]: [
+      bundle(userMessage("eou-1", sOut.id, now - 6 * DAY - 1_000), [
+        textPart("eou-1p", sOut.id, "eou-1", "Review last night's batch job summary."),
+      ]),
+      bundle(assistantMessage("eou-2", sOut.id, now - 6 * DAY), [
+        completedToolPart(
+          "eou-2p",
+          sOut.id,
+          "eou-2",
+          "bash",
+          { command: "cat /var/log/nightly.log" },
+          // Benign output (no error/failed/exception tokens) so the distiller
+          // captures no error signature — the needle stays output-only.
+          "job summary: quaxolith checksum verified for 42 rows",
+          { title: "Read nightly log" },
+        ),
+      ]),
+    ],
+
+    // ── e-temp-old / e-temp-new: same token, different time.updated ───────
+    [sTempOld.id]: [
+      bundle(userMessage("eto-1", sTempOld.id, now - 10 * DAY), [
+        textPart("eto-1p", sTempOld.id, "eto-1", "Handle the sprocketwidget rollout for batch A."),
+      ]),
+    ],
+    [sTempNew.id]: [
+      bundle(userMessage("etn-1", sTempNew.id, now - 2 * HOUR), [
+        textPart("etn-1p", sTempNew.id, "etn-1", "Handle the sprocketwidget rollout for batch B."),
+      ]),
+    ],
   };
 
-  const sessions = [sAuth, sRate, sDb, sNoise, sCur, sCurSub];
-  const globalSessions = [sAuth, sRate, sDb, sNoise, sOther, sCur, sCurSub, sFlow, sDocs, sTui].map(
-    globalSessionFrom,
-  );
+  const sessions = [sAuth, sRate, sDb, sNoise, sCur, sCurSub, sInv, sFts, sOut, sTempOld, sTempNew];
+  const globalSessions = [
+    sAuth,
+    sRate,
+    sDb,
+    sNoise,
+    sOther,
+    sCur,
+    sCurSub,
+    sFlow,
+    sDocs,
+    sTui,
+    sInv,
+    sFts,
+    sOut,
+    sTempOld,
+    sTempNew,
+  ].map(globalSessionFrom);
 
   return { sessions, globalSessions, messagesBySession };
 }

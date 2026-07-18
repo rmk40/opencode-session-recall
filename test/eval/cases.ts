@@ -169,4 +169,60 @@ export const EVAL_CASES: EvalCase[] = [
     },
     relevantSessionIDs: ["e-flow"],
   },
+
+  // ── Round-4 distill-then-search tier probes ──────────────────────────
+  {
+    // Tier-1 card inventory: a distinctive token that lands in the card
+    // inventory via a tool INPUT (never the title) is found by card ranking.
+    name: "tier-1 inventory needle: QUAXFLINT_CALIB",
+    args: {
+      query: "QUAXFLINT_CALIB",
+      match: "smart",
+      group: "session",
+      scope: "global",
+    },
+    relevantSessionIDs: ["e-inv"],
+  },
+  {
+    // Tier-1.5 FTS needle: "florplaxle" lives only in a reasoning part, so the
+    // card carries nothing the query matches and e-fts is one of the three
+    // oldest sessions the tier-1 recency near-miss drops. Only the FTS tier can
+    // surface it into the shortlist — the needle-backbone the plan relies on.
+    name: "tier-1.5 fts needle: florplaxle (absent from cards)",
+    args: {
+      query: "florplaxle",
+      match: "smart",
+      group: "session",
+      scope: "global",
+    },
+    relevantSessionIDs: ["e-fts"],
+  },
+  {
+    // Temporal `since`: e-temp-old (10d) and e-temp-new (2h) both match
+    // "sprocketwidget"; a 2d lower bound must exclude the older one.
+    name: "temporal since: excludes the older match",
+    args: {
+      query: "sprocketwidget",
+      match: "smart",
+      group: "session",
+      scope: "global",
+      since: "2d",
+    },
+    relevantSessionIDs: ["e-temp-new"],
+    expect: { notInResults: ["e-temp-old"] },
+  },
+  {
+    // Temporal `until`: the symmetric case — a 2d upper bound excludes the
+    // newer match, leaving only the older session.
+    name: "temporal until: excludes the newer match",
+    args: {
+      query: "sprocketwidget",
+      match: "smart",
+      group: "session",
+      scope: "global",
+      until: "2d",
+    },
+    relevantSessionIDs: ["e-temp-old"],
+    expect: { notInResults: ["e-temp-new"] },
+  },
 ];

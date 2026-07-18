@@ -183,6 +183,20 @@ describe("recall_messages", () => {
     expect(h.calls.messages.every((c) => c.limit != null)).toBe(true);
   });
 
+  it("survives a raw non-string cursor (host path): treats it as the first page", async () => {
+    // A Zod-bypassed non-string cursor must coerce to undefined (first page),
+    // never reach the SDK as a bad `before`, and never throw.
+    const h = makeFakeHarness();
+    const out = await runToolRaw<MessagesOutput>(messagesTool(h.client, gate, TEST_LIMITS), {
+      sessionID: "s-current",
+      cursor: 123,
+    });
+    expect(out.ok).toBe(true);
+    expect(out.pagination.returned).toBeGreaterThan(0);
+    // No stray cursor was forwarded to the SDK as `before`.
+    expect(h.calls.messages.every((c) => c.before === undefined)).toBe(true);
+  });
+
   it("routes its fetches through the shared gate", async () => {
     const h = makeFakeHarness();
     const { gate: spy, queries } = makeSpyGate();
@@ -419,6 +433,20 @@ describe("recall_sessions defensive args", () => {
     expect(out.ok).toBe(true);
     expect(out.scope).toBe("project");
     expect(Array.isArray(out.sessions)).toBe(true);
+  });
+
+  it("survives raw non-string since/until (host path): ignores the filters", async () => {
+    // The since/until time bounds can arrive with the wrong type from the live
+    // MCP host. optionalString() must drop them (no .trim() on a non-string) so
+    // the listing succeeds unfiltered rather than throwing.
+    const h = makeFakeHarness();
+    const out = await runToolRaw<SessionsOutput>(
+      sessionsTool(h.client, h.unscoped, true, TEST_LIMITS),
+      { scope: "global", since: 42, until: {} },
+    );
+    expect(out.ok).toBe(true);
+    // Non-string bounds were ignored, so every listed session came through.
+    expect(out.sessions.length).toBeGreaterThan(0);
   });
 });
 

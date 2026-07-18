@@ -26,9 +26,9 @@ import { openSqlite } from "../../src/sqlite.js";
 import { openStore } from "../../src/store.js";
 import { createFetchGate } from "../../src/fetch-gate.js";
 import { createDistiller, type Distiller } from "../../src/distill.js";
-import { createCardsRuntime } from "../../src/cards.js";
+import { createCardsRuntime, cardsLiteFromSessions } from "../../src/cards.js";
 import { createDrill } from "../../src/drill.js";
-import { search, type SemanticSearchConfig } from "../../src/search.js";
+import { search, type SearchDeps, type SemanticSearchConfig } from "../../src/search.js";
 import { makeEvalCorpus, type EvalCorpus } from "./corpus.js";
 
 type ListParams = { search?: string; limit?: number };
@@ -149,6 +149,29 @@ export async function makeEvalSearch(
       rmSync(dir, { recursive: true, force: true });
     },
   };
+}
+
+/**
+ * Build the `recall` tool over the eval corpus in VIRGIN degraded mode: no card
+ * store (SQLite unavailable), only ephemeral cards-lite built from the session
+ * list — exactly the plugin's `store === null` ladder rung. Discovery metadata
+ * still ranks and drills, but content search is degraded and coverage says so.
+ * No cleanup is needed (nothing is written to disk).
+ */
+export function makeDegradedEvalSearch(corpus: EvalCorpus = makeEvalCorpus()): {
+  searchTool: ToolDefinition;
+} {
+  setStrictNoLimitMessages(true);
+  const { client, unscoped } = makeEvalClients(corpus);
+  const gate = createFetchGate({ concurrency: TEST_LIMITS.concurrency });
+  const liteCards = cardsLiteFromSessions(corpus.globalSessions);
+  const cards = createCardsRuntime({
+    source: { getCards: () => liteCards, revision: () => undefined, degraded: true },
+  });
+  const drill = createDrill({ client, gate, limits: TEST_LIMITS });
+  const deps: SearchDeps = { gate, store: null, cards, drill };
+  const searchTool = search(client, unscoped, true, TEST_LIMITS, deps);
+  return { searchTool };
 }
 
 /**
