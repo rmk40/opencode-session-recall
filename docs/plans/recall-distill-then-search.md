@@ -569,7 +569,7 @@ Fresh opencode session on the final build, virgin store, measured externally:
 - **Incident query replay** (`GHOSTAUTH_LIVE_TUI` smart global, previously minutes
   of pegged CPU at multi-GB RSS): mid-cold-pass it answered inside an 11.9s agent
   turn with honest partial coverage (1,224 cards at that moment, `degraded:
-  false`); warm, all three incident-class queries completed inside one 23.1s agent
+false`); warm, all three incident-class queries completed inside one 23.1s agent
   turn (each recall call a few seconds), every one topped by the correct session.
   The broad-paraphrase query ("how did we debug multikey authentication
   failures"), round 2's known weakness, ranked the exact multikey debugging
