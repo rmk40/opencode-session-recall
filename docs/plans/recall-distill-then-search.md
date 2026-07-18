@@ -177,9 +177,8 @@ context retrieval point lookups instead of cursor scans.
 Runtime: `bun:sqlite` (opencode runs on Bun; built in) with `node:sqlite` fallback for
 tests (Node >= 22.5). Both are stdlib; zero npm dependencies. The driver hides behind a
 dynamic-import adapter (same pattern as the semantic module) so `src/` stays free of
-Node/Bun globals; tests use the adapter's fake when neither driver exists. If neither
-exists at runtime the plugin degrades to cards-only (JSON snapshot) with tier-1.5
-disabled.
+Node/Bun globals. If neither driver exists at runtime the plugin degrades to ephemeral
+in-memory cards-lite built from `session.list` metadata (no snapshot file, no FTS).
 
 ### Query path (Tiers 1 and 2)
 
@@ -404,6 +403,161 @@ Direct reads of opencode's SQLite (rejected by direction), upstream opencode cha
 in cards (the `session.summarize` endpoint exists but costs model calls; cards are
 purely mechanical), cross-machine sync of the store.
 
+## Implementation spec (v1)
+
+Everything here was verified against the current opencode source (1-day-old checkout),
+the SDK vintage in `node_modules`, and the live runtimes (Bun 1.3.13, Node 26.4).
+
+### Verified endpoint contract
+
+- `session.messages({ sessionID, limit, before })`: `before` without `limit` is a 400;
+  `limit` omitted or 0 triggers the legacy full-session fetch (the incident path — round
+  4 always passes `limit`). Pages are ordered `time_created DESC, id DESC` (newest
+  first). `before` is an opaque base64url cursor `{id, time}`; the next-page cursor
+  arrives in the `X-Next-Cursor` response header (the body is the items array). The
+  SDK's fields-style results expose `response.headers`, so the cursor is reachable.
+- `session.message({ sessionID, messageID })`: exact message fetch; the context
+  primitive. No cursor coupling.
+- We never synthesize cursors from stored `{id, time}` even though we could; the header
+  cursor and the exact-fetch endpoint avoid coupling to the cursor format.
+
+### Module map
+
+- `src/sqlite.ts` — driver adapter. `openSqlite(path): Promise<SqliteDb | null>` via
+  dynamic import: `bun:sqlite` when `Bun` global exists, else `node:sqlite`, else null
+  (degraded mode). Surface: `exec`, `run`, `get`, `all`, `tx(fn)` (BEGIN
+  IMMEDIATE/COMMIT/ROLLBACK), `close`. No Node/Bun globals leak outside this file.
+- `src/fetch-gate.ts` — the shared fetch primitive (Codex consult): one semaphore
+  (default 4) plus an active-query counter that drill, context/messages tools, and the
+  distiller all acquire through; the distiller waits while any query is active, with
+  bounded-pause logging so a constant query stream is visible rather than silent.
+- `src/store.ts` — schema, migration, DAO: cards CRUD, per-session transactional
+  replace, FTS query, meta/lease.
+- `src/distill.ts` — human-layer extractor (new, narrower than `searchableFields`),
+  card builder (grows from `buildSessionDigest`), cold pass, incremental updates,
+  pause/resume coordination with queries.
+- `src/cards.ts` — tier-1 runtime: load all cards at startup (~5MB), MiniSearch index
+  over card fields, metadata filters, family grouping, optional embedding blend.
+- `src/drill.ts` — tier-2: bounded paginated fetch, budgets, candidate build + existing
+  rerank over drilled sessions, shared fetch semaphore.
+- `src/search.ts` — orchestrates tiers; keeps truncation, grouping, suggestions,
+  output shaping. `src/corpus.ts` shrinks to the drilled-session LRU. `src/plan.ts` is
+  deleted.
+
+### DDL v1
+
+```sql
+PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=5000;
+
+CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL) WITHOUT ROWID;
+-- keys: schema_version, distill_lease {holder,heartbeat,ttl}, coldpass_cursor
+
+CREATE TABLE card (
+  session_id TEXT PRIMARY KEY, parent_id TEXT, root_id TEXT NOT NULL,
+  title TEXT NOT NULL DEFAULT '', slug TEXT NOT NULL DEFAULT '',
+  directory TEXT NOT NULL DEFAULT '', project_id TEXT NOT NULL DEFAULT '',
+  agent TEXT, model TEXT,
+  time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL,
+  part_count INTEGER NOT NULL DEFAULT 0, retained_chars INTEGER NOT NULL DEFAULT 0,
+  summary_head TEXT NOT NULL DEFAULT '', outcome_head TEXT NOT NULL DEFAULT '',
+  inventory TEXT NOT NULL DEFAULT '',       -- space-joined top tokens
+  files TEXT NOT NULL DEFAULT '[]', tools TEXT NOT NULL DEFAULT '[]',
+  errors TEXT NOT NULL DEFAULT '[]', family_rollup TEXT NOT NULL DEFAULT '[]',
+  distill_state TEXT NOT NULL DEFAULT 'metadata',  -- 'metadata' | 'full'
+  distilled_through TEXT,                          -- checkpoint: last message id seen
+  embedding BLOB
+);
+CREATE INDEX card_updated ON card(time_updated DESC);
+CREATE INDEX card_root ON card(root_id);
+CREATE INDEX card_project ON card(project_id);
+
+CREATE TABLE part_text (
+  id INTEGER PRIMARY KEY, session_id TEXT NOT NULL, part_id TEXT NOT NULL,
+  message_id TEXT NOT NULL, prev_message_id TEXT, next_message_id TEXT,
+  class TEXT NOT NULL, time_created INTEGER NOT NULL,
+  raw TEXT NOT NULL, norm TEXT NOT NULL
+);
+CREATE INDEX part_text_session ON part_text(session_id);
+CREATE UNIQUE INDEX part_text_part ON part_text(part_id);
+
+CREATE VIRTUAL TABLE part_fts USING fts5(
+  raw, norm, content='part_text', content_rowid='id',
+  tokenize="unicode61 tokenchars '_-./'"
+);
+```
+
+No `prefix=` index in v1 (Codex consult): anchors are matched as exact quoted phrases,
+so prefix indexes are disk and write cost with no query to serve them. If explicit
+prefix queries appear later, add `prefix='3 4'`, never `2`.
+
+External-content FTS: text is stored once (in `part_text`), the FTS table holds only
+the index, session deletes walk the indexed `part_text_session` index, and `snippet()`
+still works. Per-session replace, in one `BEGIN IMMEDIATE` transaction: read old rows,
+issue `INSERT INTO part_fts(part_fts, rowid, raw, norm) VALUES('delete', ...)` per row
+(with the old values, before deleting them), delete from `part_text`, insert new rows
+into both, upsert the card, commit. Readers never see half a session.
+
+Lease acquisition/takeover is a single conditional
+`UPDATE meta SET value=? WHERE key='distill_lease' AND (<expired> OR <holder matches>)`
+inside the transaction, verified via the driver's changes count — never
+application-level read-check-write (Codex consult).
+
+### Distill caps (defaults, all configurable)
+
+Per-part indexed text: text/reasoning 2,000 chars, tool inputs 1,000, titles 200.
+FTS rows per session: 5,000 (giants hit the cap newest-first; coverage marks it).
+Inventory 200 tokens, files 30, errors 8, rollup 12 entries per root. Estimated store
+at current history: ~350-500MB on disk.
+
+### FTS query construction
+
+Anchors = code tokens + user-quoted phrases + rare plain tokens. Each anchor is
+individually double-quoted with internal `"` stripped (no user text ever reaches FTS
+syntax); multi-word phrases are quoted as phrases only when the user actually quoted
+them (phrase = adjacency semantics, never a convenience join). Join rule (Codex
+consult): strong anchors (code tokens, user phrases) are AND-joined; weak/overflow
+plain tokens join by OR. Ranked by `bm25(part_fts)` ascending with narrow selected
+columns: `SELECT p.session_id, p.part_id, p.message_id, p.prev_message_id,
+p.next_message_id, p.class, bm25(part_fts) score FROM part_fts JOIN part_text p ON
+p.id = part_fts.rowid WHERE part_fts MATCH ? ORDER BY score LIMIT 200`, grouped by
+session in JS and merged into the card shortlist.
+
+### Drill mechanics
+
+Global fetch gate: one semaphore (default 4 concurrent SDK calls) + one per-query
+retained-chars budget shared by all tiers; the distiller acquires the same semaphore at
+lower priority and pauses while any query is active. Untargeted drill: pages of
+`limit=25`, newest-first, per-part truncation to existing caps immediately after
+parse, stop at 1.5M retained chars per session or when anchors stop matching, hard cap
+~20M retained chars per query. Targeted drill (FTS hit): `session.message` point
+fetches for (message, prev, next). Drilled slices feed the existing candidate build +
+rerank (single-phase; two-phase windowing is deleted). LRU of drilled sessions keyed by
+(session id, time.updated), default budget 24M chars (repurposed `cacheMaxChars`).
+
+### Config additions (Limits)
+
+`storePath` (default `~/.cache/opencode-session-recall/store-v1.db`), `drillSessions`
+12, `drillCharsPerSession` 1.5M, `drillCharsPerQuery` 20M, `drillPageMessages` 25,
+`distillConcurrency` 2, `distillDelayMs` 25, `ftsRowsPerSession` 5000,
+`inventoryTokens` 200, `coldPass` true. Existing `cacheMaxChars` becomes the drilled
+LRU budget (new default 24M). All coerced defensively per AGENTS.md.
+
+### Degraded modes (explicit ladder)
+
+1. No SQLite driver: cards-lite in memory from `session.list` each process; no FTS; no
+   persistence; coverage says `store: unavailable`.
+2. Store present, cold pass incomplete: serve what exists; coverage reports distilled
+   fraction and `cards: partial`.
+3. Store schema newer than code: read-only refusal, degraded mode 1 behavior, log once.
+4. Corrupt store: delete file, recreate, background rebuild (mode 2 meanwhile).
+
+### Build notes
+
+`node:` imports are auto-external in tsup; `bun:sqlite` must be added to tsup
+`external`. Tests run the real `node:sqlite` (Node 26 locally and in CI) with a
+temp-file store per test; the adapter's null path is unit-tested by forcing import
+failure.
+
 ## Revisions
 
 - 2026-07-17: Codex review round 1 (verdict: direction sound, plan incomplete; 4
@@ -424,3 +578,10 @@ indexes, query escaping (8); distiller gets its own human-layer extractor,
   capped (13); one global byte budget, transient peak allowance in gates (14);
   semantic stays opt-in (15); sqlite behind a dynamic-import adapter with test fake
   (16); incident-tied regression gates enumerated (17).
+- 2026-07-17: Implementation spec (v1) added after endpoint-contract verification
+  (pagination cursor lives in the X-Next-Cursor header; `before` requires `limit`;
+  pages are newest-first; `session.message` point fetch exists). Codex consult on the
+  spec: external-content FTS confirmed; `prefix=` dropped for v1; lease takeover
+  changed to a conditional UPDATE checked via changes(); MATCH join rule refined
+  (strong anchors AND, weak OR, phrases only when user-quoted); shared `fetch-gate`
+  module added; JSON-snapshot fallback cut (degraded mode is ephemeral metadata only).
