@@ -94,6 +94,9 @@ const DIVERSITY_SCAN_MULTIPLIER = 5;
 const MAX_WARNINGS = 5;
 const MAX_SUGGESTIONS = 3;
 const MAX_NEAR_MISSES = 3;
+/** Hard cap on how many targets a resumed deep cursor may reconstitute, so an
+ *  untrusted cursor cannot inflate the swept set beyond a sane bound. */
+const MAX_RESUME_TARGETS = 500;
 const EXPANSION_TRUNCATED = "\n[truncated by recall expansion]";
 
 type ExpandMode = "none" | "context" | "message";
@@ -1869,9 +1872,14 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
           }
           const projectConstraint =
             directoryFilter != null || (projectScope && bucketDirectory != null);
+          // An explicit sessionID (or scope:"session" with a current session) is
+          // itself a concrete scope — deep treats it as sessions:[that id].
+          const hasSingleTarget =
+            sessionID != null || (scope === "session" && currentSessionID != null);
           const deepScoped =
             deepCursor != null ||
             explicitSessions.length > 0 ||
+            hasSingleTarget ||
             (after != null && projectConstraint);
           if (!deepScoped) {
             return fail(
@@ -1929,7 +1937,7 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
           return JSON.stringify(err);
         }
 
-        if (singleTarget) {
+        if (!deepMode && singleTarget) {
           let sTitle = "";
           let sDir = "";
           let sUpdated = 0;
@@ -1960,43 +1968,69 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
           const timeFilters: CardFilters = {};
           if (after != null) timeFilters.since = after;
           if (before != null) timeFilters.until = before;
+          const explicitSet = new Set(explicitSessions);
+
+          /** Build a target for an id — from its card when known, else a minimal
+           *  target so a session with no card is still swept. */
+          const targetFor = (id: string): DrillTarget => {
+            const card = cards.get(id);
+            if (card) return registerTarget(card, relevanceOf(card));
+            relevanceBySession.set(id, "unknown");
+            searchedMeta.set(id, { id, title: "", directory: "" });
+            return { sessionId: id, title: "", directory: "", timeUpdated: 0 };
+          };
 
           if (deepCursor) {
-            // Resume: the cursor fixes the exact remaining order. Missing cards
-            // (evicted between calls) still drill by id so a sweep never stalls.
+            // Resume from an UNTRUSTED cursor: keep only ids the card store knows
+            // (or that an accompanying `sessions` arg explicitly allows), cap the
+            // total, and report anything dropped. Resume stays stateless — the
+            // cursor is the only carry-over, so a proportionate validation here is
+            // the whole defense.
             const order = deepCursor.current
               ? [deepCursor.current, ...deepCursor.remaining]
               : [...deepCursor.remaining];
-            drillTargets = order
-              .filter((id) => id !== excludeSessionID)
-              .map((id) => {
-                const card = cards.get(id);
-                if (card) return registerTarget(card, relevanceOf(card));
-                relevanceBySession.set(id, "unknown");
-                searchedMeta.set(id, { id, title: "", directory: "" });
-                return { sessionId: id, title: "", directory: "", timeUpdated: 0 };
-              });
-          } else {
-            let scopedCards: Card[];
-            if (explicitSessions.length > 0) {
-              const wanted = new Set(explicitSessions);
-              scopedCards = cards.list(timeFilters).filter((card) => wanted.has(card.sessionId));
-            } else {
-              // since + project/directory constraint (validated by the scope gate).
-              if (excludeCurrent && currentSessionID)
-                timeFilters.excludeFamilyOf = currentSessionID;
-              scopedCards = cards.list(timeFilters).filter((card) => {
-                const rel = relevanceOf(card);
-                return directoryFilter ? rel === "exact" : rel === "exact" || rel === "project";
-              });
+            const kept: string[] = [];
+            const dropped: string[] = [];
+            for (const id of order) {
+              if (id === excludeSessionID) continue;
+              if (kept.length >= MAX_RESUME_TARGETS) {
+                dropped.push(id);
+                continue;
+              }
+              if (cards.get(id) || explicitSet.has(id)) kept.push(id);
+              else dropped.push(id);
             }
-            drillTargets = scopedCards
+            drillTargets = kept.map(targetFor);
+            if (dropped.length > 0) {
+              const sample = dropped.slice(0, 3).join(", ");
+              normalized.warnings.push(
+                `Deep resume dropped ${dropped.length} session id${dropped.length === 1 ? "" : "s"} not in the card store${dropped.length > MAX_RESUME_TARGETS ? " (over the resume cap)" : ""}: ${sample}${dropped.length > 3 ? ", …" : ""}.`,
+              );
+            }
+          } else if (explicitSessions.length > 0) {
+            const scoped = cards
+              .list(timeFilters)
+              .filter((card) => explicitSet.has(card.sessionId));
+            drillTargets = scoped
+              .filter((card) => card.sessionId !== excludeSessionID)
+              .map((card) => registerTarget(card, relevanceOf(card)));
+          } else if (singleTarget) {
+            // Explicit sessionID / scope:"session" → sweep exactly that session.
+            if (singleTarget !== excludeSessionID) drillTargets = [targetFor(singleTarget)];
+          } else {
+            // since + project/directory constraint (validated by the scope gate).
+            if (excludeCurrent && currentSessionID) timeFilters.excludeFamilyOf = currentSessionID;
+            const scoped = cards.list(timeFilters).filter((card) => {
+              const rel = relevanceOf(card);
+              return directoryFilter ? rel === "exact" : rel === "exact" || rel === "project";
+            });
+            drillTargets = scoped
               .filter((card) => card.sessionId !== excludeSessionID)
               .map((card) => registerTarget(card, relevanceOf(card)));
           }
           deepSet = new Set(drillTargets.map((t) => t.sessionId));
           sessionsEligible = drillTargets.length;
-          pushUnique(normalized.limitedBy, "scope");
+          pushUnique(normalized.limitedBy, sessionID ? "sessionID" : "scope");
         } else if (explicitSessions.length > 0) {
           // ── Explicit shortlist (non-deep): drill exactly these sessions,
           //    skipping card ranking for SELECTION; results are still ranked by
@@ -2462,8 +2496,12 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
 
           const cov = deepResult.coverage;
           // Honest coverage line: deep searched tool outputs, and exactly how far.
+          // On a resumed sweep the denominator is the REMAINING scope, so phrase it
+          // that way — a continuation must never read like completion of the
+          // original scope.
+          const scopeWord = deepCursor ? "remaining scoped" : "scoped";
           normalized.warnings.push(
-            `Deep sweep searched tool outputs across ${cov.sessionsCovered} full + ${cov.sessionsPartial} partial of ${drillTargets.length} scoped session${drillTargets.length === 1 ? "" : "s"}${cov.sessionsRemaining > 0 ? `; ${cov.sessionsRemaining} not yet reached — pass deepCursor to continue` : ""}.`,
+            `Deep sweep searched tool outputs across ${cov.sessionsCovered} full + ${cov.sessionsPartial} partial of ${drillTargets.length} ${scopeWord} session${drillTargets.length === 1 ? "" : "s"}${cov.sessionsRemaining > 0 ? `; ${cov.sessionsRemaining} not yet reached — pass deepCursor to continue` : ""}.`,
           );
 
           let final: SearchResult[];

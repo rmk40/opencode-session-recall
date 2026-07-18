@@ -41,6 +41,21 @@ function parseTimeBound(value: string | undefined, now: number): number | undefi
   return Number.isFinite(parsed) && parsed > 0 ? parsed : undefined;
 }
 
+function normalizeDir(value: string | undefined): string | undefined {
+  if (!value) return undefined;
+  const normalized = value.replace(/\\/g, "/").replace(/\/+$/, "");
+  return normalized || "/";
+}
+
+/** Project-scope membership for the card path: a card's directory is the caller's
+ *  directory or a descendant of it. With no caller directory, nothing is scoped
+ *  out (best-effort, matching the list call's lenient project scoping). */
+function sameProject(cardDir: string, callerDir: string | undefined): boolean {
+  if (!callerDir) return true;
+  const dir = normalizeDir(cardDir);
+  return dir === callerDir || (dir != null && dir.startsWith(`${callerDir}/`));
+}
+
 export function sessions(
   client: OpencodeClient,
   unscoped: OpencodeClient,
@@ -100,19 +115,21 @@ export function sessions(
       }
 
       // Build the enrichment lookups once (card by id, child count by root).
+      let allCards: Card[] | undefined;
       let cardById: Map<string, Card> | undefined;
       let childCountByRoot: Map<string, number> | undefined;
       if (enrichment) {
-        const cards = enrichment.cards();
-        cardById = new Map(cards.map((card) => [card.sessionId, card]));
+        allCards = enrichment.cards();
+        cardById = new Map(allCards.map((card) => [card.sessionId, card]));
         childCountByRoot = new Map();
-        for (const card of cards) {
+        for (const card of allCards) {
           if (card.rootId && card.rootId !== card.sessionId) {
             childCountByRoot.set(card.rootId, (childCountByRoot.get(card.rootId) ?? 0) + 1);
           }
         }
       }
 
+      const hasTimeFilter = since != null || until != null;
       const passesTime = (updated: number): boolean => {
         if (since != null && updated < since) return false;
         if (until != null && updated > until) return false;
@@ -138,6 +155,48 @@ export function sessions(
       };
 
       try {
+        // ── Card-authoritative time filtering ──
+        // When a card store is available and a since/until bound is set, resolve
+        // the set from the in-memory cards. session.list returns only the newest
+        // `limit` rows, so post-filtering it drops older matches entirely (e.g.
+        // until:"30d" would return ~nothing). The cards are the recency-complete,
+        // fetch-free authority, so they select; the list call is skipped.
+        if (allCards && hasTimeFilter) {
+          const searchLower = search?.toLowerCase();
+          const callerDir = normalizeDir(optionalString(ctx.directory));
+          const inScope = (card: Card): boolean =>
+            scope === "global" ? true : sameProject(card.directory, callerDir);
+          const selected = allCards
+            .filter(
+              (card) =>
+                passesTime(card.timeUpdated) &&
+                inScope(card) &&
+                (!searchLower || card.title.toLowerCase().includes(searchLower)),
+            )
+            .sort((a, b) => b.timeUpdated - a.timeUpdated || a.sessionId.localeCompare(b.sessionId))
+            .slice(0, limit)
+            .map((card) =>
+              enrich({
+                id: card.sessionId,
+                title: card.title,
+                directory: card.directory,
+                time: { created: card.timeCreated, updated: card.timeUpdated },
+                // archived is not carried on cards; the fetch-free path omits it.
+                archived: false,
+              }),
+            );
+          ctx.metadata({
+            title: `Found ${selected.length} ${scope} sessions${search ? ` matching "${search}"` : ""}`,
+          });
+          const out: SessionsOutput = {
+            ok: true,
+            sessions: selected,
+            returned: selected.length,
+            scope,
+          };
+          return JSON.stringify(out);
+        }
+
         const items: SessionItem[] = [];
 
         if (scope === "global") {
@@ -200,6 +259,14 @@ export function sessions(
           sessions: items,
           returned: items.length,
           scope: scope,
+          // Degraded path: no card store, so the time filter could only be applied
+          // within the newest-`limit` window session.list returned. Older matches
+          // beyond it are not shown — say so honestly.
+          ...(hasTimeFilter && !allCards
+            ? {
+                note: `since/until was applied within the newest ${limit} sessions only (no card store to resolve older matches).`,
+              }
+            : {}),
         };
         return JSON.stringify(out);
       } catch (e) {

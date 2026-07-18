@@ -14,13 +14,16 @@ import type {
   SessionsOutput,
 } from "../src/types.js";
 import {
+  PROJECT_DIR,
   TEST_LIMITS,
   bundle,
+  globalSessionFrom,
   makeContext,
   makeFakeHarness,
   makeRecallDeps,
   runTool,
   runToolRaw,
+  session,
   setStrictNoLimitMessages,
   textPart,
   userMessage,
@@ -209,7 +212,7 @@ describe("recall_messages", () => {
 describe("recall_get", () => {
   it("returns formatted full messages with model, pruned, and tool-state details", async () => {
     const h = makeFakeHarness();
-    const tool = getTool(h.client);
+    const tool = getTool(h.client, gate);
 
     const user = await runTool<MessageOutput>(tool, {
       sessionID: "s-current",
@@ -254,7 +257,7 @@ describe("recall_get", () => {
 
   it("handles not-found, returned errors, and context lookup failures", async () => {
     const h = makeFakeHarness();
-    const notFound = await runTool<ErrorOutput>(getTool(h.client), {
+    const notFound = await runTool<ErrorOutput>(getTool(h.client, gate), {
       sessionID: "s-current",
       messageID: "missing",
     });
@@ -263,7 +266,7 @@ describe("recall_get", () => {
     const noData = makeFakeHarness({
       noSingleMessageData: new Set(["s-current:m-current-1"]),
     });
-    const noDataOut = await runTool<ErrorOutput>(getTool(noData.client), {
+    const noDataOut = await runTool<ErrorOutput>(getTool(noData.client, gate), {
       sessionID: "s-current",
       messageID: "m-current-1",
     });
@@ -272,20 +275,31 @@ describe("recall_get", () => {
     const errored = makeFakeHarness({
       messageLookupErrors: { "s-current:m-current-1": "message API failed" },
     });
-    const errorOut = await runTool<ErrorOutput>(getTool(errored.client), {
+    const errorOut = await runTool<ErrorOutput>(getTool(errored.client, gate), {
       sessionID: "s-current",
       messageID: "m-current-1",
     });
     expect(errorOut.error).toContain("message API failed");
 
     const noContext = makeFakeHarness({ getThrows: new Set(["s-current"]) });
-    const ok = await runTool<MessageOutput>(getTool(noContext.client), {
+    const ok = await runTool<MessageOutput>(getTool(noContext.client, gate), {
       sessionID: "s-current",
       messageID: "m-current-1",
     });
     expect(ok.ok).toBe(true);
     expect(ok.context.sessionTitle).toBeUndefined();
     expect(ok.context.directory).toBeUndefined();
+  });
+
+  it("routes its fetches through the shared gate", async () => {
+    const h = makeFakeHarness();
+    const { gate: spy, queries } = makeSpyGate();
+    await runTool<MessageOutput>(getTool(h.client, spy), {
+      sessionID: "s-current",
+      messageID: "m-current-1",
+    });
+    // The message fetch (and the session.get) must go through gate.runQuery.
+    expect(queries()).toBeGreaterThan(0);
   });
 });
 
@@ -509,6 +523,49 @@ describe("recall_sessions enrichment", () => {
     } finally {
       cleanup();
     }
+  });
+
+  it("returns older matches beyond the newest page when a card store is present", async () => {
+    // The defect: session.list returns only the newest `limit` rows, so
+    // post-filtering an until bound there drops older matches. With the card
+    // store, the time-filtered set is resolved authoritatively in memory.
+    const now = Date.now();
+    const h = makeFakeHarness();
+    const old = session("s-old", "Old cache investigation", PROJECT_DIR, now - 40 * 24 * 3600_000);
+    h.sessions.push(old);
+    h.globalSessions.push(globalSessionFrom(old));
+    h.messagesBySession[old.id] = [
+      bundle(userMessage("m-old-1", old.id, now - 40 * 24 * 3600_000 - 500), [
+        textPart("p-old-1", old.id, "m-old-1", "old cache investigation notes"),
+      ]),
+    ];
+    const { store, cleanup } = await makeRecallDeps(h);
+    try {
+      const enrichment = { cards: () => store.allCards() };
+      // until:30d excludes every newest fixture session; only s-old (40d) matches.
+      // A tiny limit means the list path would return only the (excluded) newest
+      // page — the card path still surfaces the older match.
+      const out = await runTool<SessionsOutput>(
+        sessionsTool(h.client, h.unscoped, true, TEST_LIMITS, enrichment),
+        { scope: "global", until: "30d", limit: 2 },
+      );
+      expect(out.sessions.map((s) => s.id)).toContain("s-old");
+      expect(h.calls.messages).toHaveLength(0);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("notes the newest-window caveat when filtering without a card store (degraded)", async () => {
+    const h = makeFakeHarness();
+    // No enrichment → the time filter can only apply within the list's page.
+    const out = await runTool<SessionsOutput>(
+      sessionsTool(h.client, h.unscoped, true, TEST_LIMITS),
+      { scope: "global", since: "7d" },
+    );
+    expect(out.ok).toBe(true);
+    expect(out.note).toBeDefined();
+    expect(out.note).toMatch(/newest/i);
   });
 });
 

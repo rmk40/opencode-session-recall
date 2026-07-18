@@ -204,6 +204,26 @@ describe("deep finds output-only needles that non-deep honestly misses", () => {
     }
   });
 
+  it("accepts an explicit sessionID as deep scope (sessions:[that id])", async () => {
+    const h = buildHarness();
+    const { deps, cleanup } = await recallDeps(h, TEST_LIMITS);
+    try {
+      const recall = search(h.client, h.unscoped, true, TEST_LIMITS, deps);
+      const out = await runTool<SearchOutput>(recall, {
+        query: NEEDLE,
+        match: "smart",
+        group: "session",
+        deep: true,
+        sessionID: "s-deep-needle",
+      });
+      expect(out.ok).toBe(true);
+      expect(out.results.some((r) => r.sessionID === "s-deep-needle")).toBe(true);
+      expect(out.coverage?.deep?.sessionsCovered).toBe(1);
+    } finally {
+      cleanup();
+    }
+  });
+
   it("routes every deep fetch through the shared gate", async () => {
     const h = buildHarness();
     const real = createFetchGate({ concurrency: 4 });
@@ -370,27 +390,29 @@ describe("deep args survive the Zod-bypass host path", () => {
   });
 });
 
-// ── Cursor codec round-trip ──────────────────────────────────────────────────
+// ── Cursor hardening on resume ───────────────────────────────────────────────
 
-describe("deep cursor codec", () => {
-  it("round-trips through encode/decode via the tool", async () => {
-    // Sanity: an encoded payload is opaque base64url and decodes back through the
-    // tool's malformed-guard as a valid (not rejected) cursor shape.
+describe("deep cursor hardening", () => {
+  it("drops unknown ids with a warning and proceeds with known ids", async () => {
+    // A well-formed cursor is still untrusted: known ids sweep, unknown ids are
+    // dropped and reported. Resume stays stateless (the cursor is all we carry).
     const encoded = encodeDeepCursor({
       v: 1,
-      remaining: ["s-a", "s-b"],
-      current: "s-c",
-      before: "cursor-xyz",
+      remaining: ["s-unknown-xyz"],
+      current: "s-project-2",
+      before: null,
     });
     expect(encoded).not.toMatch(/[+/=]/); // url-safe, unpadded
     const h = makeFakeHarness();
     const { deps, cleanup } = await makeRecallDeps(h);
     try {
       const recall = search(h.client, h.unscoped, true, TEST_LIMITS, deps);
-      // The referenced sessions do not exist here, but a well-formed cursor must
-      // not be rejected as malformed — it resolves to an empty sweep instead.
       const out = await runTool<SearchOutput>(recall, { query: "rate", deepCursor: encoded });
       expect(out.ok).toBe(true);
+      // s-project-2 is a known card → swept; the unknown id is dropped.
+      expect(out.coverage?.deep?.sessionsCovered).toBe(1);
+      expect(out.warnings?.some((w) => /Deep resume dropped 1 session id/i.test(w))).toBe(true);
+      expect(out.warnings?.some((w) => /s-unknown-xyz/.test(w))).toBe(true);
     } finally {
       cleanup();
     }

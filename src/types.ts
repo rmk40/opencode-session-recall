@@ -351,6 +351,10 @@ export type SessionsOutput = {
   sessions: SessionItem[];
   returned: number;
   scope: string;
+  /** Explains a caveat in how the listing was produced — e.g. a since/until
+   *  filter that could only be applied within the newest-limit window because no
+   *  card store was available to resolve older sessions authoritatively. */
+  note?: string;
 };
 
 export type ErrorOutput = {
