@@ -1,20 +1,17 @@
 import { describe, expect, it } from "vitest";
-import type { OpencodeClient } from "@opencode-ai/sdk/v2";
-import { search } from "../../src/search.js";
-import { CorpusCache } from "../../src/corpus.js";
 import { SemanticEmbedder } from "../../src/semantic/embedder.js";
 import { cosineSimilarity } from "../../src/semantic/similarity.js";
 import type { SearchOutput } from "../../src/types.js";
 import {
   PROJECT_DIR,
-  TEST_LIMITS,
   bundle,
   globalSessionFrom,
   session,
   textPart,
   userMessage,
 } from "../helpers.js";
-import { evalContext } from "./harness.js";
+import type { EvalCorpus } from "./corpus.js";
+import { evalContext, makeEvalSearch } from "./harness.js";
 
 /**
  * Real-model semantic eval, gated behind RECALL_EVAL_SEMANTIC=1 because it
@@ -32,43 +29,24 @@ const WORKFLOW_TEXT =
 const DISTRACTOR_TEXT =
   "Postgres migration rollback failed with a foreign-key constraint violation on the orders table during deploy.";
 
-function makeClients(): { client: OpencodeClient; unscoped: OpencodeClient } {
+function makeCorpus(): EvalCorpus {
   const work = session("sem-work", "Terminal spike notes", PROJECT_DIR, 2_000);
   const distractor = session("sem-distractor", "DB migration incident", PROJECT_DIR, 1_000);
-  const messagesBySession: Record<string, ReturnType<typeof bundle>[]> = {
-    "sem-work": [
-      bundle(userMessage("mw", "sem-work", 1_500), [
-        textPart("pw", "sem-work", "mw", WORKFLOW_TEXT),
-      ]),
-    ],
-    "sem-distractor": [
-      bundle(userMessage("md", "sem-distractor", 1_400), [
-        textPart("pd", "sem-distractor", "md", DISTRACTOR_TEXT),
-      ]),
-    ],
-  };
-  const globals = [work, distractor].map(globalSessionFrom);
-
-  const client = {
-    session: {
-      list: async () => ({ data: [work, distractor] }),
-      get: async ({ sessionID }: { sessionID: string }) => {
-        const found = globals.find((s) => s.id === sessionID);
-        return found ? { data: found } : { error: { data: { message: "not found" } } };
-      },
-      messages: async ({ sessionID }: { sessionID: string }) => {
-        const data = messagesBySession[sessionID];
-        return data ? { data } : { error: { data: { message: "not found" } } };
-      },
-      message: async () => ({ error: { data: { message: "not found" } } }),
-    },
-  };
-  const unscoped = {
-    experimental: { session: { list: async () => ({ data: globals }) } },
-  };
   return {
-    client: client as unknown as OpencodeClient,
-    unscoped: unscoped as unknown as OpencodeClient,
+    sessions: [work, distractor],
+    globalSessions: [work, distractor].map(globalSessionFrom),
+    messagesBySession: {
+      "sem-work": [
+        bundle(userMessage("mw", "sem-work", 1_500), [
+          textPart("pw", "sem-work", "mw", WORKFLOW_TEXT),
+        ]),
+      ],
+      "sem-distractor": [
+        bundle(userMessage("md", "sem-distractor", 1_400), [
+          textPart("pd", "sem-distractor", "md", DISTRACTOR_TEXT),
+        ]),
+      ],
+    },
   };
 }
 
@@ -90,24 +68,25 @@ describe.skipIf(!process.env.RECALL_EVAL_SEMANTIC)(
       );
       expect(cosWork).toBeGreaterThan(cosDistractor);
 
-      const { client, unscoped } = makeClients();
-      const cache = new CorpusCache(client, TEST_LIMITS, embedder);
-      const tool = search(client, unscoped, true, TEST_LIMITS, cache, {
+      const { searchTool, cleanup } = await makeEvalSearch(makeCorpus(), {
         embedder,
         weight: 0.35,
       });
-
-      const raw = await tool.execute(
-        { query: QUERY, match: "smart", group: "session", scope: "global" } as Parameters<
-          typeof tool.execute
-        >[0],
-        evalContext("sem-external"),
-      );
-      const out = JSON.parse(raw) as SearchOutput;
-      const top3 = out.results.slice(0, 3).map((r) => r.sessionID);
-      expect(top3, `results: ${JSON.stringify(out.results.map((r) => r.sessionID))}`).toContain(
-        "sem-work",
-      );
+      try {
+        const raw = await searchTool.execute(
+          { query: QUERY, match: "smart", group: "session", scope: "global" } as Parameters<
+            typeof searchTool.execute
+          >[0],
+          evalContext("sem-external"),
+        );
+        const out = JSON.parse(raw) as SearchOutput;
+        const top3 = out.results.slice(0, 3).map((r) => r.sessionID);
+        expect(top3, `results: ${JSON.stringify(out.results.map((r) => r.sessionID))}`).toContain(
+          "sem-work",
+        );
+      } finally {
+        cleanup();
+      }
     }, 120_000);
   },
 );

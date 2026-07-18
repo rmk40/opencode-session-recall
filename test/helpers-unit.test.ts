@@ -24,12 +24,7 @@ import {
   type ExpansionBudget,
 } from "../src/search.js";
 import type { PartOutput } from "../src/types.js";
-import {
-  metadataShortlist,
-  mergeShortlistHits,
-  SHORTLIST_MAX,
-  SHORTLIST_MULT,
-} from "../src/plan.js";
+import { mergeShortlistHits, SHORTLIST_MULT } from "../src/rerank.js";
 import type { EvidenceClass, SearchResult } from "../src/types.js";
 import { smartSnippet, truncatePreservingMatch } from "../src/snippet.js";
 import { errmsg, optionalString } from "../src/types.js";
@@ -452,39 +447,9 @@ describe("query plan (codeTokens, shortlist, merge)", () => {
     expect(parseQuery("deploy.yaml then deploy.yaml again").codeTokens).toEqual(["deploy.yaml"]);
   });
 
-  it("caps the shortlist at SHORTLIST_MAX keeping the highest-overlap session", () => {
-    const query = parseQuery("warp drive");
-    const sessions = Array.from({ length: 30 }, (_, i) => ({
-      id: `s-${String(i).padStart(2, "0")}`,
-      title: `warp session number${i}`,
-      directory: "/w",
-    }));
-    // Two overlapping tokens: must survive the cap ahead of the one-token crowd.
-    sessions.push({ id: "s-top", title: "warp drive assembly", directory: "/w" });
-    const shortlist = metadataShortlist(sessions, query);
-    expect(shortlist.size).toBe(SHORTLIST_MAX);
-    expect(shortlist.has("s-top")).toBe(true);
-  });
-
-  it("shortlists sessions by metadata token overlap, capped and length-gated", () => {
-    const query = parseQuery("ghostauth live test");
-    const shortlist = metadataShortlist(
-      [
-        { id: "s1", title: "Profile and audit CLI usage", directory: "/w/ghostauth" },
-        { id: "s2", title: "Ghostauth docs audit", directory: "/w/ghostauth" },
-        { id: "s3", title: "Terminal UI spike", directory: "/w/other" },
-      ],
-      query,
-    );
-    expect(shortlist.has("s1")).toBe(true);
-    expect(shortlist.has("s2")).toBe(true);
-    expect(shortlist.has("s3")).toBe(false);
-    // Short tokens (< 4 chars) never form a shortlist by themselves.
-    expect(
-      metadataShortlist([{ id: "s1", title: "a ui fix", directory: "/w" }], parseQuery("ui fix"))
-        .size,
-    ).toBe(0);
-  });
+  // (metadataShortlist / SHORTLIST_MAX tests removed: the tier-1 session
+  //  shortlist is now `cards.rank`, covered by test/cards.test.ts. The
+  //  shortlist-local-IDF deep-pass merge below still lives in rerank.ts.)
 
   it("deep pass uses shortlist-local IDF (fails on a filter-only implementation)", () => {
     // "needle" is common in the broad corpus (low IDF) but rare inside the

@@ -10,7 +10,9 @@ import {
   type ErrorOutput,
   type Limits,
 } from "./types.js";
-import type { CorpusCache } from "./corpus.js";
+/** Minimal digest lookup the sessions browser needs: a best-effort per-session
+ *  head, served from the card store when a card exists (no fetch). */
+export type DigestSource = { peekDigest(id: string): string | undefined };
 
 const SESSION_DIGEST_CHARS = 160;
 
@@ -19,7 +21,7 @@ export function sessions(
   unscoped: OpencodeClient,
   global: boolean,
   limits: Limits,
-  cache?: CorpusCache,
+  cache?: DigestSource,
 ): ToolDefinition {
   return tool({
     description: `List session metadata: titles, directories, timestamps, archival state. Use only for recent-session browsing, finding a session ID/title/timeframe, or recency checks. Not content search; for topical discovery use recall.`,

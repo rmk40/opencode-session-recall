@@ -578,6 +578,20 @@ indexes, query escaping (8); distiller gets its own human-layer extractor,
   capped (13); one global byte budget, transient peak allowance in gates (14);
   semantic stays opt-in (15); sqlite behind a dynamic-import adapter with test fake
   (16); incident-tied regression gates enumerated (17).
+- 2026-07-17: Stage 3 (cards/drill/rerank + search cutover) review round. Both
+  reviewers converged on one blocker — unbounded `session.messages` calls surviving in
+  inline expansion, `recall_context`, and `recall_messages` — so the tool-bounding work
+  planned for stage 4 was pulled forward, along with deleting the dead `CorpusCache`
+  and a strict test-mode that fails any no-limit fetch. Ranking-semantics decision
+  (Codex-consulted): the two-stage shortlist rerank survives _scoped to drilled
+  candidates_ ("two-stage drilled rerank" in `src/rerank.ts`) — the deleted machinery
+  is the corpus-wide windowing, not the reviewed merge semantics. Semantic-layer
+  ruling (reviewers split; Codex position adopted): v1 stays card-tier only — a
+  semantically-surfaced session that drills to zero lexical hits drops from results;
+  card-backed evidence-less results were rejected as weakening the output contract;
+  bounded part-level semantic inside drilled candidates is the documented future
+  direction if the opt-in layer needs it. Eval baseline held at 1.0/1.0 through the
+  cutover, including the literal flood-cap case flagged as highest architectural risk.
 - 2026-07-17: Implementation spec (v1) added after endpoint-contract verification
   (pagination cursor lives in the X-Next-Cursor header; `before` requires `limit`;
   pages are newest-first; `session.message` point fetch exists). Codex consult on the

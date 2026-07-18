@@ -1,7 +1,7 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
+import type { ToolDefinition } from "@opencode-ai/plugin";
 import { search } from "../src/search.js";
-import { CorpusCache } from "../src/corpus.js";
-import type { SearchOutput, ErrorOutput } from "../src/types.js";
+import type { Limits, SearchOutput, ErrorOutput } from "../src/types.js";
 import {
   PROJECT_DIR,
   TEST_LIMITS,
@@ -12,15 +12,36 @@ import {
   globalSessionFrom,
   makeContext,
   makeFakeHarness,
+  makeRecallDeps,
   runTool,
   runToolRaw,
   session,
+  setStrictNoLimitMessages,
   textPart,
   userMessage,
+  type FakeHarness,
 } from "./helpers.js";
 
-function recallTool(h = makeFakeHarness(), global = true, limits = TEST_LIMITS) {
-  return search(h.client, h.unscoped, global, limits, new CorpusCache(h.client, limits));
+// No search path may make an unpaginated session.messages call.
+beforeAll(() => setStrictNoLimitMessages(true));
+afterAll(() => setStrictNoLimitMessages(false));
+
+// Each recall tool is built over a temp card store seeded from the harness
+// fixture (the way a completed distiller cold pass would leave it). Cleanups run
+// after every test.
+const cleanups: Array<() => void> = [];
+afterEach(() => {
+  for (const cleanup of cleanups.splice(0)) cleanup();
+});
+
+async function recallTool(
+  h: FakeHarness = makeFakeHarness(),
+  global = true,
+  limits: Limits = TEST_LIMITS,
+): Promise<ToolDefinition> {
+  const { deps, cleanup } = await makeRecallDeps(h, limits);
+  cleanups.push(cleanup);
+  return search(h.client, h.unscoped, global, limits, deps);
 }
 
 function messageTime(
@@ -36,12 +57,12 @@ function messageTime(
 describe("recall", () => {
   it("defaults to global literal search and returns valid JSON results", async () => {
     const h = makeFakeHarness();
-    const out = await runTool<SearchOutput>(recallTool(h), {
+    const out = await runTool<SearchOutput>(await recallTool(h), {
       query: "walkthrough",
     });
 
-    expect(h.calls.globalList).toEqual([{ search: undefined, limit: 10_000 }]);
-    expect(h.calls.projectList).toEqual([]);
+    // Discovery is now the distiller's job; the search tool ranks the seeded
+    // card store and drills only the shortlisted session (s-other).
     expect(out.ok).toBe(true);
     expect(out.group).toBe("part");
     expect(out.results.map((r) => r.sessionID)).toEqual(["s-other", "s-other", "s-other"]);
@@ -49,24 +70,23 @@ describe("recall", () => {
     expect(out.truncated).toBe(false);
     expect(out.coverage).toMatchObject({
       sessionsDiscovered: 3,
-      sessionsSearched: 2,
-      sessionsSkipped: 1,
+      sessionsSearched: 1,
       totalSessionsKnown: false,
-      skippedByReason: { excludedSession: 1 },
     });
+    expect(out.coverage?.cards).toMatchObject({ total: 3 });
     expect(out.coverage?.limitedBy).toContain("excludedSession");
   });
 
   it("routes project, current-session, and explicit-session searches correctly", async () => {
     const h = makeFakeHarness();
-    const tool = recallTool(h);
+    const tool = await recallTool(h);
 
     const project = await runTool<SearchOutput>(tool, {
       query: "walkthrough",
       scope: "project",
     });
+    // s-other lives in OTHER_DIR, so a project-scoped search drops it.
     expect(project.results).toEqual([]);
-    expect(h.calls.projectList).toHaveLength(1);
 
     const current = await runTool<SearchOutput>(tool, {
       query: "rate-limit",
@@ -85,7 +105,7 @@ describe("recall", () => {
 
   it("filters by part type, role, title, and timestamp windows", async () => {
     const h = makeFakeHarness();
-    const tool = recallTool(h);
+    const tool = await recallTool(h);
     const unauthorizedAt = messageTime(h, "s-current", "m-current-3");
 
     const toolOnly = await runTool<SearchOutput>(tool, {
@@ -123,16 +143,13 @@ describe("recall", () => {
       query: "walkthrough",
       title: "Actualyze",
     });
+    // The title filter now narrows the ranked cards, not a session.list call.
     expect(titled.coverage?.sessionsSearched).toBe(1);
-    expect(h.calls.globalList.at(-1)).toEqual({
-      search: "Actualyze",
-      limit: 10_000,
-    });
   });
 
   it("filters by relative time windows", async () => {
     const h = makeFakeHarness();
-    const tool = recallTool(h);
+    const tool = await recallTool(h);
 
     const recent = await runTool<SearchOutput>(tool, {
       query: "walkthrough",
@@ -195,14 +212,14 @@ describe("recall", () => {
 
     const dateNow = vi.spyOn(Date, "now").mockReturnValue(now);
     try {
-      const since = await runTool<SearchOutput>(recallTool(h), {
+      const since = await runTool<SearchOutput>(await recallTool(h), {
         query: "relative-token",
         scope: "project",
         since: "1d",
       });
       expect(since.results.map((r) => r.sessionID)).toEqual(["s-recent-relative"]);
 
-      const until = await runTool<SearchOutput>(recallTool(h), {
+      const until = await runTool<SearchOutput>(await recallTool(h), {
         query: "relative-token",
         scope: "project",
         until: "1d",
@@ -233,12 +250,12 @@ describe("recall", () => {
 
     const dateNow = vi.spyOn(Date, "now").mockReturnValue(now);
     try {
-      const last = await runTool<SearchOutput>(recallTool(h), {
+      const last = await runTool<SearchOutput>(await recallTool(h), {
         query: "window-token",
         scope: "project",
         last: "1d",
       });
-      const since = await runTool<SearchOutput>(recallTool(h), {
+      const since = await runTool<SearchOutput>(await recallTool(h), {
         query: "window-token",
         scope: "project",
         since: "1d",
@@ -247,7 +264,7 @@ describe("recall", () => {
       expect(since.results.map((r) => r.sessionID)).toEqual(last.results.map((r) => r.sessionID));
       expect(since.coverage?.messagesSearched).toBe(last.coverage?.messagesSearched);
 
-      const fromTo = await runTool<SearchOutput>(recallTool(h), {
+      const fromTo = await runTool<SearchOutput>(await recallTool(h), {
         query: "window-token",
         scope: "project",
         from: "2d ago",
@@ -255,33 +272,34 @@ describe("recall", () => {
       });
       expect(fromTo.results.map((r) => r.sessionID)).toEqual(["s-recent-window"]);
 
-      const beforeDate = await runTool<SearchOutput>(recallTool(h), {
+      const beforeDate = await runTool<SearchOutput>(await recallTool(h), {
         query: "window-token",
         scope: "project",
         before: new Date(now - 86_400_000).toISOString(),
       });
       expect(beforeDate.results.map((r) => r.sessionID)).toEqual(["s-old-window"]);
 
-      const untilNow = await runTool<SearchOutput>(recallTool(h), {
+      const untilNow = await runTool<SearchOutput>(await recallTool(h), {
         query: "window-token",
         scope: "project",
         until: "0d",
       });
-      expect(untilNow.results.map((r) => r.sessionID)).toEqual(["s-old-window", "s-recent-window"]);
+      // Recency orders the shortlist, so the recent session drills first.
+      expect(untilNow.results.map((r) => r.sessionID)).toEqual(["s-recent-window", "s-old-window"]);
       expect(untilNow.warnings?.[0]).toContain('Normalized until:"0d"');
 
-      const ignoredLast = await runTool<SearchOutput>(recallTool(h), {
+      const ignoredLast = await runTool<SearchOutput>(await recallTool(h), {
         query: "window-token",
         scope: "project",
         last: "0d",
       });
       expect(ignoredLast.results.map((r) => r.sessionID)).toEqual([
-        "s-old-window",
         "s-recent-window",
+        "s-old-window",
       ]);
       expect(ignoredLast.warnings?.[0]).toContain('Ignored last:"0d"');
 
-      const upperConflict = await runTool<SearchOutput>(recallTool(h), {
+      const upperConflict = await runTool<SearchOutput>(await recallTool(h), {
         query: "window-token",
         scope: "project",
         before: now - 86_400_000,
@@ -291,7 +309,7 @@ describe("recall", () => {
       expect(upperConflict.warnings?.[0]).toContain("Used until as the upper time bound");
 
       // Multiple lower bounds: newest (most restrictive) wins, others warned about.
-      const lowerConflict = await runTool<SearchOutput>(recallTool(h), {
+      const lowerConflict = await runTool<SearchOutput>(await recallTool(h), {
         query: "window-token",
         scope: "project",
         last: "1d",
@@ -303,7 +321,7 @@ describe("recall", () => {
       );
 
       // Impossible windows produce a hard error with bounds and an example.
-      const impossible = await runTool<ErrorOutput>(recallTool(h), {
+      const impossible = await runTool<ErrorOutput>(await recallTool(h), {
         query: "window-token",
         scope: "project",
         after: now - 86_400_000,
@@ -314,7 +332,7 @@ describe("recall", () => {
       expect(impossible.error).toContain('last:"7d"');
 
       // Malformed date strings on before/after are ignored with a warning, not a hard error.
-      const malformedDate = await runToolRaw<SearchOutput>(recallTool(h), {
+      const malformedDate = await runToolRaw<SearchOutput>(await recallTool(h), {
         query: "window-token",
         scope: "project",
         after: "not-a-date",
@@ -325,7 +343,7 @@ describe("recall", () => {
       );
 
       // Relative durations on absolute-only fields (before/after) are rejected with a warning.
-      const relativeOnAfter = await runToolRaw<SearchOutput>(recallTool(h), {
+      const relativeOnAfter = await runToolRaw<SearchOutput>(await recallTool(h), {
         query: "window-token",
         scope: "project",
         after: "7d",
@@ -347,7 +365,7 @@ describe("recall", () => {
       ]),
     ];
 
-    const out = await runTool<SearchOutput>(recallTool(h), {
+    const out = await runTool<SearchOutput>(await recallTool(h), {
       query: "minecraft",
       scope: "project",
     });
@@ -380,19 +398,21 @@ describe("recall", () => {
       ]),
     ];
 
-    const literal = await runTool<SearchOutput>(recallTool(h), {
+    const literal = await runTool<SearchOutput>(await recallTool(h), {
       query: "minecraft",
       scope: "project",
       expand: "message",
       expandResults: 1,
     });
-    expect(literal.results.map((result) => result.source)).toEqual(["title", "message"]);
+    // The content session ranks ahead of the title-only session, so the message
+    // hit precedes the title hit and is the first expandable result.
+    expect(literal.results.map((result) => result.source)).toEqual(["message", "title"]);
     expect(literal.expanded?.[0]).toMatchObject({
-      resultIndex: 1,
+      resultIndex: 0,
       messageID: "m-content-expand",
     });
 
-    const smart = await runTool<SearchOutput>(recallTool(h), {
+    const smart = await runTool<SearchOutput>(await recallTool(h), {
       query: "minecraft",
       match: "smart",
       directory: PROJECT_DIR,
@@ -425,7 +445,7 @@ describe("recall", () => {
       ]),
     ];
 
-    const out = await runTool<SearchOutput>(recallTool(h), {
+    const out = await runTool<SearchOutput>(await recallTool(h), {
       query: "rate",
       directory: PROJECT_DIR,
       results: 10,
@@ -436,14 +456,14 @@ describe("recall", () => {
     expect(out.results.some((r) => r.sessionID === "s-nested")).toBe(true);
     expect(out.results.some((r) => r.sessionID === "s-projectish")).toBe(false);
 
-    const other = await runTool<SearchOutput>(recallTool(h), {
+    const other = await runTool<SearchOutput>(await recallTool(h), {
       query: "walkthrough",
       directory: OTHER_DIR,
     });
     expect(other.results.map((r) => r.sessionID)).toEqual(["s-other", "s-other", "s-other"]);
     expect(other.coverage?.directoryBucketsSearched).toEqual(["exact"]);
 
-    const fallback = await runTool<SearchOutput>(recallTool(h), {
+    const fallback = await runTool<SearchOutput>(await recallTool(h), {
       query: "walkthrough",
       directory: PROJECT_DIR,
       fallback: true,
@@ -455,41 +475,34 @@ describe("recall", () => {
     expect(fallback.warnings).toContain(
       "Directory fallback broadened the search beyond exact matches.",
     );
-    expect(fallback.coverage?.directoryBucketsSearched).toEqual(
-      expect.arrayContaining(["exact", "global"]),
-    );
+    // Only s-other matched "walkthrough" (global bucket); no exact-bucket card
+    // matched, so the honest buckets-searched is global-only.
+    expect(fallback.coverage?.directoryBucketsSearched).toEqual(["global"]);
     expect(fallback.coverage?.directoryBucketCounts?.global).toBeGreaterThan(0);
 
-    const capped = await runTool<SearchOutput>(recallTool(h), {
+    // `sessions: 1` caps the drill fan-out to a single shortlisted session.
+    const capped = await runTool<SearchOutput>(await recallTool(h), {
       query: "rate",
       directory: PROJECT_DIR,
       sessions: 1,
       excludeCurrentSession: false,
     });
-    expect(capped.coverage).toMatchObject({
-      sessionsEligible: 3,
-      sessionsSearched: 1,
-      sessionsSkipped: 4,
-      skippedByReason: { directory: 2, sessionsLimit: 2 },
-    });
-    expect(capped.results[0]?.sessionID).toBe("s-current");
-    expect(capped.results.every((result) => result.sessionID === "s-current")).toBe(true);
-    expect(h.calls.globalList.at(-1)?.limit).toBeGreaterThan(1);
+    expect(capped.coverage?.sessionsSearched).toBe(1);
+    expect(capped.coverage?.limitedBy).toContain("sessionsLimit");
+    expect(new Set(capped.results.map((r) => r.sessionID)).size).toBe(1);
 
-    const globalCallsBeforeSessionFallback = h.calls.globalList.length;
-    const sessionFallback = await runTool<SearchOutput>(recallTool(h), {
+    const sessionFallback = await runTool<SearchOutput>(await recallTool(h), {
       query: "walkthrough",
       scope: "session",
       directory: PROJECT_DIR,
       fallback: true,
     });
     expect(sessionFallback.results).toEqual([]);
-    expect(h.calls.globalList).toHaveLength(globalCallsBeforeSessionFallback);
   });
 
   it("filters tool parts by exact tool name", async () => {
     const h = makeFakeHarness();
-    const tool = recallTool(h);
+    const tool = await recallTool(h);
 
     const bash = await runTool<SearchOutput>(tool, {
       query: "unauthorized",
@@ -518,7 +531,7 @@ describe("recall", () => {
 
   it("applies toolName filtering to smart-ranked searches", async () => {
     const h = makeFakeHarness();
-    const out = await runTool<SearchOutput>(recallTool(h), {
+    const out = await runTool<SearchOutput>(await recallTool(h), {
       query: "checkout cache",
       scope: "project",
       match: "smart",
@@ -536,7 +549,7 @@ describe("recall", () => {
 
   it("reports matched tool fields for smart-ranked tool hits", async () => {
     const h = makeFakeHarness();
-    const out = await runTool<SearchOutput>(recallTool(h), {
+    const out = await runTool<SearchOutput>(await recallTool(h), {
       query: "permission",
       scope: "project",
       match: "smart",
@@ -551,7 +564,7 @@ describe("recall", () => {
 
   it("treats zero, negative, and blank optional filters as omitted", async () => {
     const h = makeFakeHarness();
-    const tool = recallTool(h);
+    const tool = await recallTool(h);
 
     const baseline = await runTool<SearchOutput>(tool, {
       query: "rate",
@@ -576,15 +589,11 @@ describe("recall", () => {
     expect(negative.results.map((r) => r.messageID)).toEqual(
       baseline.results.map((r) => r.messageID),
     );
-    expect(h.calls.projectList).toContainEqual({
-      search: undefined,
-      limit: 10_000,
-    });
   });
 
   it("supports case-insensitive and punctuation-containing literal queries", async () => {
     const h = makeFakeHarness();
-    const tool = recallTool(h);
+    const tool = await recallTool(h);
 
     const mixedCase = await runTool<SearchOutput>(tool, {
       query: "CHECKOUT",
@@ -605,7 +614,7 @@ describe("recall", () => {
 
   it("groups by session with hit counts and reports truncation", async () => {
     const h = makeFakeHarness();
-    const tool = recallTool(h);
+    const tool = await recallTool(h);
 
     const ungrouped = await runTool<SearchOutput>(tool, {
       query: "rate",
@@ -626,15 +635,22 @@ describe("recall", () => {
     expect(grouped.results).toHaveLength(1);
     expect(grouped.total).toBe(2);
     expect(grouped.truncated).toBe(true);
-    expect(grouped.results[0]).toMatchObject({
-      sessionID: "s-current",
-      hitCount: 3,
+    expect(grouped.results[0]?.hitCount).toBeGreaterThanOrEqual(1);
+
+    // With room for both sessions, s-current reports its 3 "rate" part hits.
+    const groupedAll = await runTool<SearchOutput>(tool, {
+      query: "rate",
+      scope: "project",
+      group: "session",
+      results: 5,
+      excludeCurrentSession: false,
     });
+    expect(groupedAll.results.find((r) => r.sessionID === "s-current")?.hitCount).toBe(3);
   });
 
   it("omits expansions by default and expands full messages when requested", async () => {
     const h = makeFakeHarness();
-    const tool = recallTool(h);
+    const tool = await recallTool(h);
 
     const baseline = await runTool<SearchOutput>(tool, {
       query: "unauthorized",
@@ -664,7 +680,7 @@ describe("recall", () => {
 
   it("redacts self-recall tool output inside expansion context", async () => {
     const h = makeFakeHarness();
-    const tool = recallTool(h);
+    const tool = await recallTool(h);
 
     // s-current contains a `recall` tool part (m-current-4). Expand a wide
     // context window around a hit so that part is included, and confirm its
@@ -710,7 +726,7 @@ describe("recall", () => {
       ]),
     );
 
-    const out = await runTool<SearchOutput>(recallTool(h), {
+    const out = await runTool<SearchOutput>(await recallTool(h), {
       query: "large-expand-token",
       scope: "project",
       expand: "message",
@@ -746,7 +762,7 @@ describe("recall", () => {
       ),
     );
 
-    const out = await runTool<SearchOutput>(recallTool(h), {
+    const out = await runTool<SearchOutput>(await recallTool(h), {
       query: "budget-expand-token",
       scope: "project",
       expand: "message",
@@ -763,7 +779,7 @@ describe("recall", () => {
 
   it("expands bounded context windows with boundary flags", async () => {
     const h = makeFakeHarness();
-    const out = await runTool<SearchOutput>(recallTool(h), {
+    const out = await runTool<SearchOutput>(await recallTool(h), {
       query: "unauthorized",
       scope: "project",
       expand: "context",
@@ -790,7 +806,7 @@ describe("recall", () => {
 
   it("supports zero-width context expansion around only the matching message", async () => {
     const h = makeFakeHarness();
-    const out = await runTool<SearchOutput>(recallTool(h), {
+    const out = await runTool<SearchOutput>(await recallTool(h), {
       query: "unauthorized",
       scope: "project",
       expand: "context",
@@ -805,7 +821,7 @@ describe("recall", () => {
 
   it("auto-fits context expansion under the message budget", async () => {
     const h = makeFakeHarness();
-    const out = await runTool<SearchOutput>(recallTool(h), {
+    const out = await runTool<SearchOutput>(await recallTool(h), {
       query: "unauthorized",
       scope: "project",
       expand: "context",
@@ -820,7 +836,7 @@ describe("recall", () => {
   });
 
   it("clamps oversized expansion parameters with warnings instead of failing", async () => {
-    const out = await runToolRaw<SearchOutput>(recallTool(makeFakeHarness()), {
+    const out = await runToolRaw<SearchOutput>(await recallTool(makeFakeHarness()), {
       query: "unauthorized",
       scope: "project",
       expand: "context",
@@ -839,7 +855,7 @@ describe("recall", () => {
   });
 
   it("ignores non-numeric raw budget inputs with a clear warning", async () => {
-    const out = await runToolRaw<SearchOutput>(recallTool(makeFakeHarness()), {
+    const out = await runToolRaw<SearchOutput>(await recallTool(makeFakeHarness()), {
       query: "rate",
       scope: "project",
       expandBudgetMessages: "lots",
@@ -855,7 +871,7 @@ describe("recall", () => {
   });
 
   it("clamps below-min and invalid out-of-range numeric inputs with warnings", async () => {
-    const out = await runToolRaw<SearchOutput>(recallTool(makeFakeHarness()), {
+    const out = await runToolRaw<SearchOutput>(await recallTool(makeFakeHarness()), {
       query: "rate",
       scope: "project",
       results: 0,
@@ -875,7 +891,7 @@ describe("recall", () => {
 
   it("falls back to safe defaults for unknown enum values", async () => {
     // First batch of enums (capped at 5 warnings to keep response compact).
-    const out = await runToolRaw<SearchOutput>(recallTool(makeFakeHarness()), {
+    const out = await runToolRaw<SearchOutput>(await recallTool(makeFakeHarness()), {
       query: "walkthrough",
       scope: "garbage",
       match: "elsewhere",
@@ -895,7 +911,7 @@ describe("recall", () => {
     expect(out.results.length).toBeGreaterThan(0);
 
     // Independently verify expand: garbage falls back to "none".
-    const expandOut = await runToolRaw<SearchOutput>(recallTool(makeFakeHarness()), {
+    const expandOut = await runToolRaw<SearchOutput>(await recallTool(makeFakeHarness()), {
       query: "walkthrough",
       expand: "huge",
     });
@@ -905,7 +921,7 @@ describe("recall", () => {
 
   it("caps expansion count and returns partial results for oversized context expansion", async () => {
     const h = makeFakeHarness();
-    const expanded = await runTool<SearchOutput>(recallTool(h), {
+    const expanded = await runTool<SearchOutput>(await recallTool(h), {
       query: "rate",
       scope: "project",
       results: 10,
@@ -917,7 +933,7 @@ describe("recall", () => {
     expect(expanded.expanded).toHaveLength(2);
     expect(expanded.expanded?.map((entry) => entry.resultIndex)).toEqual([0, 1]);
 
-    const tooLarge = await runTool<SearchOutput>(recallTool(h), {
+    const tooLarge = await runTool<SearchOutput>(await recallTool(h), {
       query: "rate",
       scope: "project",
       expand: "context",
@@ -935,7 +951,7 @@ describe("recall", () => {
 
   it("expands grouped representatives", async () => {
     const h = makeFakeHarness();
-    const out = await runTool<SearchOutput>(recallTool(h), {
+    const out = await runTool<SearchOutput>(await recallTool(h), {
       query: "rate",
       scope: "project",
       group: "session",
@@ -954,7 +970,7 @@ describe("recall", () => {
 
   it("returns smart and fuzzy ranked metadata without pinning score constants", async () => {
     const h = makeFakeHarness();
-    const tool = recallTool(h);
+    const tool = await recallTool(h);
 
     const smart = await runTool<SearchOutput>(tool, {
       query: "rate limit cache",
@@ -1006,7 +1022,7 @@ describe("recall", () => {
       ]),
     ];
 
-    const out = await runTool<SearchOutput>(recallTool(h), {
+    const out = await runTool<SearchOutput>(await recallTool(h), {
       query: "xylozene calibration",
       scope: "project",
       match: "smart",
@@ -1015,30 +1031,13 @@ describe("recall", () => {
     expect(out.results.some((r) => r.sessionID === "s-rare")).toBe(true);
   });
 
-  it("reports time degradation deterministically", async () => {
-    // smartScan calls performance.now() at start and once after BM25. Make the
-    // elapsed time exceed the 2000ms total budget so it flags time degradation.
-    let call = 0;
-    const perf = vi.spyOn(performance, "now").mockImplementation(() => {
-      call++;
-      return call === 1 ? 0 : 2_001;
-    });
-    try {
-      const timed = await runTool<SearchOutput>(recallTool(makeFakeHarness()), {
-        query: "rate",
-        scope: "session",
-        match: "smart",
-      });
-      expect(timed.degradeKind).toBe("time");
-      expect(timed.coverage?.limitedBy).toContain("timeBudget");
-    } finally {
-      perf.mockRestore();
-    }
-  });
+  // (Removed "reports time degradation deterministically": the corpus-scan
+  //  ranking time budget no longer exists. Tier-2 drills a bounded shortlist, so
+  //  there is no full-corpus ranking phase to flag as time-degraded.)
 
   it("excludes recall's own tool output without hiding unrelated tool output", async () => {
     const h = makeFakeHarness();
-    const tool = recallTool(h);
+    const tool = await recallTool(h);
 
     const self = await runTool<SearchOutput>(tool, {
       query: "unique-self-recall-result",
@@ -1058,7 +1057,7 @@ describe("recall", () => {
   });
 
   it("returns suggestions and near misses for empty searches", async () => {
-    const out = await runTool<SearchOutput>(recallTool(makeFakeHarness()), {
+    const out = await runTool<SearchOutput>(await recallTool(makeFakeHarness()), {
       query: "totally-absent-token",
       scope: "project",
     });
@@ -1071,65 +1070,57 @@ describe("recall", () => {
     expect(out.nearMisses?.[0]).toHaveProperty("sessionID");
   });
 
-  it("counts messagesSearched and partsSearched in coverage", async () => {
+  it("counts messagesSearched and partsSearched over the drilled sessions", async () => {
     const h = makeFakeHarness();
-    const projectOut = await runTool<SearchOutput>(recallTool(h), {
-      query: "walkthrough",
+    // "rate" matches both project sessions, so both are drilled. Coverage counts
+    // their searchable messages/parts: s-current has 6 messages but m-current-4
+    // is recall's own tool output (self-excluded) → 5 messages / 5 parts; plus
+    // s-project-2's 3/3 = 8 each.
+    const projectOut = await runTool<SearchOutput>(await recallTool(h), {
+      query: "rate",
       scope: "project",
       excludeCurrentSession: false,
     });
-    const globalOut = await runTool<SearchOutput>(recallTool(h), {
-      query: "walkthrough",
-      excludeCurrentSession: false,
-    });
 
-    // Candidate-derived coverage: messages/parts WITH searchable content.
-    // s-current has 6 messages but m-current-4 holds only recall's own tool
-    // output (self-excluded), so 5 messages / 5 parts count; s-project-2 adds
-    // 3/3 and s-other (global only) adds 2/2.
-    const projectExpected = 8;
-    const totalExpected = 10;
-
-    expect(projectOut.coverage?.messagesSearched).toBe(projectExpected);
+    expect(projectOut.coverage?.messagesSearched).toBe(8);
     expect(projectOut.coverage?.partsSearched).toBeGreaterThan(0);
     expect(projectOut.coverage?.partsSearched).toBeGreaterThanOrEqual(
       projectOut.coverage?.messagesSearched ?? 0,
     );
-
-    expect(globalOut.coverage?.messagesSearched).toBe(totalExpected);
-    expect(globalOut.coverage?.messagesSearched).toBeGreaterThan(
-      projectOut.coverage?.messagesSearched ?? 0,
-    );
+    // Coverage also reports the card store's tier-0 state.
+    expect(projectOut.coverage?.cards?.total).toBe(3);
   });
 
   it("respects role and type filters when counting coverage", async () => {
     const h = makeFakeHarness();
-    const all = await runTool<SearchOutput>(recallTool(h), {
-      query: "walkthrough",
+    // "rate" drills s-project-2 (s-current is the excluded current session).
+    const all = await runTool<SearchOutput>(await recallTool(h), {
+      query: "rate",
       scope: "project",
     });
-    const userOnly = await runTool<SearchOutput>(recallTool(h), {
-      query: "walkthrough",
+    const userOnly = await runTool<SearchOutput>(await recallTool(h), {
+      query: "rate",
       scope: "project",
       role: "user",
     });
-    const toolOnly = await runTool<SearchOutput>(recallTool(h), {
-      query: "walkthrough",
+    const toolOnly = await runTool<SearchOutput>(await recallTool(h), {
+      query: "rate",
       scope: "project",
       type: "tool",
     });
 
+    expect(all.coverage?.messagesSearched).toBeGreaterThan(0);
     expect(userOnly.coverage?.messagesSearched).toBeLessThan(all.coverage?.messagesSearched ?? 0);
     expect(toolOnly.coverage?.partsSearched).toBeLessThan(all.coverage?.partsSearched ?? 0);
   });
 
   it("does not emit a type-filter suggestion when type is unset or 'all'", async () => {
-    const fromAll = await runTool<SearchOutput>(recallTool(makeFakeHarness()), {
+    const fromAll = await runTool<SearchOutput>(await recallTool(makeFakeHarness()), {
       query: "totally-absent-token",
       scope: "project",
       type: "all",
     });
-    const fromUnset = await runToolRaw<SearchOutput>(recallTool(makeFakeHarness()), {
+    const fromUnset = await runToolRaw<SearchOutput>(await recallTool(makeFakeHarness()), {
       query: "totally-absent-token",
       scope: "project",
     });
@@ -1143,7 +1134,7 @@ describe("recall", () => {
   });
 
   it("emits a typed type-filter suggestion only when a non-default type filter is used", async () => {
-    const out = await runTool<SearchOutput>(recallTool(makeFakeHarness()), {
+    const out = await runTool<SearchOutput>(await recallTool(makeFakeHarness()), {
       query: "totally-absent-token",
       scope: "project",
       type: "tool",
@@ -1155,7 +1146,7 @@ describe("recall", () => {
   });
 
   it("uses correct grammar for the 'sessions searched' suggestion", async () => {
-    const single = await runTool<SearchOutput>(recallTool(makeFakeHarness()), {
+    const single = await runTool<SearchOutput>(await recallTool(makeFakeHarness()), {
       query: "totally-absent-token",
       scope: "session",
     });
@@ -1164,7 +1155,7 @@ describe("recall", () => {
     expect(singleReason).toBe("Only 1 session was searched.");
 
     const multi = await runTool<SearchOutput>(
-      recallTool(makeFakeHarness(), true, { ...TEST_LIMITS, maxSessions: 3 }),
+      await recallTool(makeFakeHarness(), true, { ...TEST_LIMITS, maxSessions: 3 }),
       {
         query: "totally-absent-token",
         scope: "project",
@@ -1179,7 +1170,7 @@ describe("recall", () => {
   it("applies defensive defaults when callers bypass Zod schema parsing", async () => {
     // Live MCP hosts may forward raw caller args without applying schema defaults.
     // The plugin must still treat scope/match/type/group/role/expand/window as defaulted.
-    const out = await runToolRaw<SearchOutput>(recallTool(makeFakeHarness()), {
+    const out = await runToolRaw<SearchOutput>(await recallTool(makeFakeHarness()), {
       query: "walkthrough",
     });
 
@@ -1194,43 +1185,34 @@ describe("recall", () => {
     ).toBe(false);
   });
 
-  it("surfaces partial and total message-load failures", async () => {
-    const partial = makeFakeHarness({
-      messageErrors: { "s-project-2": "Unauthorized" },
-      messageThrows: new Set(["s-current"]),
-    });
-    const partialOut = await runTool<SearchOutput>(recallTool(partial), {
-      query: "walkthrough",
+  it("surfaces partial and total drilled-session load failures", async () => {
+    // "rate" drills s-current and s-project-2. Load errors now come only from
+    // the drilled sessions (the store is already distilled); a failing drill
+    // fetch is reported without hiding the sessions that loaded.
+    const partial = makeFakeHarness({ messageErrors: { "s-project-2": "Unauthorized" } });
+    const partialOut = await runTool<SearchOutput>(await recallTool(partial), {
+      query: "rate",
       excludeCurrentSession: false,
     });
-    expect(partialOut.results).toHaveLength(3);
-    expect(partialOut.coverage?.loadErrors?.count).toBe(2);
-    expect(partialOut.coverage?.loadErrors?.samples).toEqual(
-      expect.arrayContaining([
-        expect.stringContaining("s-project-2: Unauthorized"),
-        expect.stringContaining("s-current: thrown messages: s-current"),
-      ]),
-    );
+    expect(partialOut.results.length).toBeGreaterThan(0);
+    expect(partialOut.coverage?.loadErrors?.count).toBe(1);
+    expect(partialOut.coverage?.loadErrors?.samples[0]).toContain("s-project-2: Unauthorized");
 
     const total = makeFakeHarness({
-      messageErrors: {
-        "s-current": "Unauthorized",
-        "s-project-2": "Unauthorized",
-        "s-other": "Unauthorized",
-      },
+      messageErrors: { "s-current": "Unauthorized", "s-project-2": "Unauthorized" },
     });
-    const totalOut = await runTool<SearchOutput>(recallTool(total), {
-      query: "walkthrough",
+    const totalOut = await runTool<SearchOutput>(await recallTool(total), {
+      query: "rate",
       excludeCurrentSession: false,
     });
     expect(totalOut.results).toEqual([]);
-    expect(totalOut.coverage?.loadErrors?.count).toBe(3);
-    expect(totalOut.coverage?.loadErrors?.samples).toHaveLength(3);
+    expect(totalOut.coverage?.loadErrors?.count).toBe(2);
+    expect(totalOut.coverage?.loadErrors?.samples).toHaveLength(2);
   });
 
   it("continues explicit session searches when metadata lookup fails", async () => {
     const h = makeFakeHarness({ getThrows: new Set(["s-other"]) });
-    const out = await runTool<SearchOutput>(recallTool(h), {
+    const out = await runTool<SearchOutput>(await recallTool(h), {
       query: "walkthrough",
       sessionID: "s-other",
     });
@@ -1245,35 +1227,38 @@ describe("recall", () => {
 
   it("reports bad explicit sessionIDs as load errors, not silent no-matches", async () => {
     const h = makeFakeHarness();
-    const out = await runTool<SearchOutput>(recallTool(h), {
+    const out = await runTool<SearchOutput>(await recallTool(h), {
       query: "anything",
       sessionID: "s-missing",
     });
 
     expect(out.ok).toBe(true);
     expect(out.results).toEqual([]);
-    expect(out.coverage?.sessionsSearched).toBe(1);
+    // The drill attempted the one target but its fetch failed, so it loaded
+    // nothing (sessionsSearched 0) and reports the failure rather than a silent
+    // no-match.
+    expect(out.coverage?.sessionsSearched).toBe(0);
     expect(out.coverage?.loadErrors?.count).toBe(1);
     expect(out.coverage?.loadErrors?.samples[0]).toContain("s-missing: Unauthorized");
   });
 
   it("returns errors for disabled global search, missing current session, and aborts", async () => {
     const h = makeFakeHarness();
-    const disabled = await runTool<ErrorOutput>(recallTool(h, false), {
+    const disabled = await runTool<ErrorOutput>(await recallTool(h, false), {
       query: "walkthrough",
     });
     expect(disabled).toMatchObject({ ok: false });
     expect(disabled.error).toContain("Global scope disabled");
 
     const missingSession = await runTool<ErrorOutput>(
-      recallTool(makeFakeHarness()),
+      await recallTool(makeFakeHarness()),
       { query: "rate", scope: "session" },
       makeContext({ sessionID: "" }).ctx,
     );
     expect(missingSession.error).toContain("No sessionID provided");
 
     const aborted = await runTool<ErrorOutput>(
-      recallTool(makeFakeHarness()),
+      await recallTool(makeFakeHarness()),
       { query: "rate", scope: "project" },
       makeContext({ aborted: true }).ctx,
     );
@@ -1286,7 +1271,7 @@ describe("recall", () => {
       afterMessagesCall: () => ctx.controller.abort(),
     });
     const out = await runTool<ErrorOutput>(
-      recallTool(h, true, { ...TEST_LIMITS, concurrency: 1 }),
+      await recallTool(h, true, { ...TEST_LIMITS, concurrency: 1 }),
       { query: "rate", scope: "project" },
       ctx.ctx,
     );
@@ -1315,7 +1300,7 @@ describe("recall", () => {
         ]),
       );
 
-      const out = await runTool<SearchOutput>(recallTool(h), {
+      const out = await runTool<SearchOutput>(await recallTool(h), {
         query: "ZANTHOR_TOKEN",
         match: "smart",
         scope: "project",
@@ -1334,7 +1319,7 @@ describe("recall", () => {
       // Four priority-0 zero-result hints fire (directory, excluded session,
       // type filter, few sessions searched); the priority-1 code-token hint
       // must be the one displaced by the 3-suggestion cap.
-      const out = await runTool<SearchOutput>(recallTool(makeFakeHarness()), {
+      const out = await runTool<SearchOutput>(await recallTool(makeFakeHarness()), {
         query: "zanzibar_qux warp",
         match: "smart",
         type: "reasoning",
@@ -1364,7 +1349,9 @@ describe("recall", () => {
             worker.id,
             "m-worker",
             "bash",
-            { command: "run" },
+            // The anchor rides the tool INPUT (a human-layer field the store
+            // indexes) so the worker session actually ranks and drills.
+            { command: "deploy zanzibar service" },
             "zanzibar deployment output log",
           ),
         ]),
@@ -1373,7 +1360,7 @@ describe("recall", () => {
       // type:"tool" leaves the shortlisted session with zero eligible
       // candidates, so its metadata overlap cannot rank — the hint must
       // point at the title filter instead.
-      const out = await runTool<SearchOutput>(recallTool(h), {
+      const out = await runTool<SearchOutput>(await recallTool(h), {
         query: "zanzibar",
         match: "smart",
         type: "tool",
@@ -1396,7 +1383,7 @@ describe("recall", () => {
         ]),
       );
 
-      const out = await runTool<SearchOutput>(recallTool(h), {
+      const out = await runTool<SearchOutput>(await recallTool(h), {
         query: "flurbwidget",
         group: "session",
       });
@@ -1433,7 +1420,7 @@ describe("recall", () => {
           ),
         ]),
       ];
-      const tool = recallTool(h);
+      const tool = await recallTool(h);
 
       // The query matches output, command, AND the JSON input of one part:
       // total counts matched parts, not matched fields.
@@ -1454,7 +1441,7 @@ describe("recall", () => {
   describe("query plan", () => {
     it("reports selected variants only under explain", async () => {
       const h = makeFakeHarness();
-      const tool = recallTool(h);
+      const tool = await recallTool(h);
 
       const explained = await runTool<SearchOutput>(tool, {
         query: "Actualyze walkthrough",
@@ -1462,10 +1449,11 @@ describe("recall", () => {
         explain: true,
         excludeCurrentSession: false,
       });
-      expect(explained.queryPlan?.variants).toContain("title-shortlist");
-      expect(explained.queryPlan?.selected).toContain("bm25-broad");
-      // "Actualyze" overlaps the s-other session title, so the shortlist ran.
-      expect(explained.queryPlan?.selected.some((s) => s.startsWith("title-shortlist"))).toBe(true);
+      // The plan now names the tiered pipeline: tier-1 cards, tier-2 drill, and
+      // the FTS needle lookup (the "walkthrough" anchor hits s-other's rows).
+      expect(explained.queryPlan?.variants).toContain("cards-tier1");
+      expect(explained.queryPlan?.selected).toContain("cards-tier1");
+      expect(explained.queryPlan?.selected).toContain("drill-tier2");
 
       const plain = await runTool<SearchOutput>(tool, {
         query: "Actualyze walkthrough",
@@ -1489,7 +1477,7 @@ describe("recall", () => {
         ]),
       ];
 
-      const out = await runTool<SearchOutput>(recallTool(h), {
+      const out = await runTool<SearchOutput>(await recallTool(h), {
         query: "zebrafinch-token",
         scope: "project",
         expand: "message",
@@ -1501,6 +1489,40 @@ describe("recall", () => {
       expect(expandedPart?.output).toContain("zebrafinch-token");
       expect(expandedPart?.output).toContain("chars omitted");
       expect(out.warnings?.some((w) => w.includes("truncated or omitted"))).toBe(true);
+    });
+
+    it("keeps inline context expansion bounded on a large session", async () => {
+      // 60-message session with the needle near the top: recall + expand:context
+      // must resolve context via bounded point/page fetches (strict mode would
+      // throw on any unpaginated whole-session pull).
+      const h = makeFakeHarness();
+      const big = session("s-bigexpand", "Big Expand", PROJECT_DIR, Date.now());
+      h.globalSessions.push(globalSessionFrom(big));
+      h.messagesBySession[big.id] = Array.from({ length: 60 }, (_, i) =>
+        bundle(assistantMessage(`mb-${i}`, big.id, Date.now() - (60 - i) * 1_000), [
+          textPart(
+            `pb-${i}`,
+            big.id,
+            `mb-${i}`,
+            i === 58 ? "zephyrbounded distinctive marker" : `filler line ${i}`,
+          ),
+        ]),
+      );
+
+      const out = await runTool<SearchOutput>(await recallTool(h), {
+        query: "zephyrbounded",
+        match: "smart",
+        scope: "project",
+        excludeCurrentSession: false,
+        expand: "context",
+        window: 1,
+      });
+      expect(out.results.some((r) => r.sessionID === "s-bigexpand")).toBe(true);
+      expect((out.expanded?.length ?? 0) > 0).toBe(true);
+      // Every fetch carried an explicit, capped limit.
+      expect(
+        h.calls.messages.every((c) => c.limit != null && c.limit <= TEST_LIMITS.maxMessages),
+      ).toBe(true);
     });
   });
 
@@ -1527,50 +1549,21 @@ describe("recall", () => {
         ]),
       ];
 
-      const out = await runTool<SearchOutput>(recallTool(h), {
+      const out = await runTool<SearchOutput>(await recallTool(h), {
         query: "quixotic-artifact",
       });
+      // The distiller distilled every session into the store, so a needle far
+      // past the old 100-row list window is still ranked and drilled.
       expect(out.results.some((r) => r.sessionID === "s-deep")).toBe(true);
-      expect(h.calls.globalList[0]?.limit).toBe(10_000);
       // Well under the discovery limit: no provider-cap warning.
       expect(out.coverage?.limitedBy ?? []).not.toContain("providerLimit");
     });
 
-    it("reports providerLimit when discovery fills the completeness window", async () => {
-      const h = makeFakeHarness();
-      // Force a tiny completeness window via maxSessions... instead, emulate
-      // the cap by returning exactly DISCOVERY_LIMIT rows is impractical in a
-      // fixture; assert the accounting path directly through a patched list.
-      const original = h.unscoped.experimental.session.list.bind(h.unscoped.experimental.session);
-      (h.unscoped.experimental.session as unknown as Record<string, unknown>).list =
-        async (params: { search?: string; limit?: number }) => {
-          const resp = (await original(params)) as { data?: unknown[] };
-          if (resp.data && params.limit === 10_000) {
-            // Simulate a full window: pad metadata rows up to the limit.
-            const template = h.globalSessions[0]!;
-            const padded = [...resp.data];
-            for (let index = padded.length; index < 10_000; index++) {
-              padded.push({
-                ...template,
-                id: `s-pad-${index}`,
-                title: `Pad ${index}`,
-              });
-            }
-            return { data: padded };
-          }
-          return resp;
-        };
-
-      const out = await runTool<SearchOutput>(recallTool(h), {
-        query: "walkthrough",
-        excludeCurrentSession: false,
-      });
-      expect(out.ok).toBe(true);
-      expect(out.coverage?.limitedBy).toContain("providerLimit");
-      expect(
-        out.warnings?.some((w) => w.includes("older history may exist beyond this window")),
-      ).toBe(true);
-    }, 30_000);
+    // (Removed "reports providerLimit when discovery fills the completeness
+    //  window": discovery is now the distiller's cold pass, not a search-time
+    //  session.list. providerLimit fires when the card store holds >=
+    //  DISCOVERY_LIMIT cards — a store-size condition, not practically seeded in
+    //  a unit fixture. The accounting path is exercised by the distiller.)
   });
 
   describe("exclusion family", () => {
@@ -1616,7 +1609,7 @@ describe("recall", () => {
     it("excludes the whole delegation tree when searching from the root", async () => {
       const h = familyHarness();
       const out = await runTool<SearchOutput>(
-        recallTool(h),
+        await recallTool(h),
         { query: "family lineage evidence" },
         makeContext({ sessionID: "s-root" }).ctx,
       );
@@ -1627,7 +1620,7 @@ describe("recall", () => {
     it("excludes ancestors and siblings when searching from a subagent child", async () => {
       const h = familyHarness();
       const out = await runTool<SearchOutput>(
-        recallTool(h),
+        await recallTool(h),
         { query: "family lineage evidence" },
         makeContext({ sessionID: "s-grandchild" }).ctx,
       );
@@ -1646,14 +1639,14 @@ describe("recall", () => {
       ];
 
       const excluded = await runTool<SearchOutput>(
-        recallTool(h),
+        await recallTool(h),
         { query: "family lineage evidence" },
         makeContext({ sessionID: "s-root" }).ctx,
       );
       expect(excluded.results.map((r) => r.sessionID)).toEqual(["s-outsider"]);
 
       const optIn = await runTool<SearchOutput>(
-        recallTool(h),
+        await recallTool(h),
         { query: "family lineage evidence", excludeCurrentSession: false },
         makeContext({ sessionID: "s-root" }).ctx,
       );
@@ -1674,7 +1667,7 @@ describe("recall", () => {
         ];
       }
       const out = await runTool<SearchOutput>(
-        recallTool(h),
+        await recallTool(h),
         { query: "cycle marker" },
         makeContext({ sessionID: "s-cyc-a" }).ctx,
       );
@@ -1685,7 +1678,7 @@ describe("recall", () => {
 
   describe("current-session exclusion", () => {
     it("excludes the current session by default", async () => {
-      const out = await runTool<SearchOutput>(recallTool(makeFakeHarness()), {
+      const out = await runTool<SearchOutput>(await recallTool(makeFakeHarness()), {
         query: "rate-limit middleware",
       });
 
@@ -1697,7 +1690,7 @@ describe("recall", () => {
     });
 
     it("includes the current session when excludeCurrentSession is false", async () => {
-      const out = await runTool<SearchOutput>(recallTool(makeFakeHarness()), {
+      const out = await runTool<SearchOutput>(await recallTool(makeFakeHarness()), {
         query: "rate-limit middleware",
         excludeCurrentSession: false,
       });
@@ -1706,7 +1699,7 @@ describe("recall", () => {
     });
 
     it("applies the default when hosts bypass Zod parsing", async () => {
-      const tool = recallTool(makeFakeHarness());
+      const tool = await recallTool(makeFakeHarness());
 
       const missing = await runToolRaw<SearchOutput>(tool, {
         query: "rate-limit middleware",
@@ -1734,7 +1727,7 @@ describe("recall", () => {
     });
 
     it("excludes an arbitrary session via excludeSessionID", async () => {
-      const out = await runTool<SearchOutput>(recallTool(makeFakeHarness()), {
+      const out = await runTool<SearchOutput>(await recallTool(makeFakeHarness()), {
         query: "walkthrough",
         excludeSessionID: "s-other",
         excludeCurrentSession: false,
@@ -1746,7 +1739,7 @@ describe("recall", () => {
     });
 
     it("rejects contradictory exclusion arguments", async () => {
-      const tool = recallTool(makeFakeHarness());
+      const tool = await recallTool(makeFakeHarness());
 
       const sessionScope = await runTool<ErrorOutput>(tool, {
         query: "x",
@@ -1772,7 +1765,7 @@ describe("recall", () => {
     });
 
     it("does not apply the implicit default to an explicit current-session target", async () => {
-      const out = await runTool<SearchOutput>(recallTool(makeFakeHarness()), {
+      const out = await runTool<SearchOutput>(await recallTool(makeFakeHarness()), {
         query: "rate-limit",
         sessionID: "s-current",
       });
@@ -1786,7 +1779,7 @@ describe("recall", () => {
     });
 
     it("combines excludeSessionID with the default current-session exclusion", async () => {
-      const out = await runTool<SearchOutput>(recallTool(makeFakeHarness()), {
+      const out = await runTool<SearchOutput>(await recallTool(makeFakeHarness()), {
         query: "rate",
         excludeSessionID: "s-other",
       });
@@ -1799,7 +1792,7 @@ describe("recall", () => {
     it("omits the exclusion suggestion when the current session was not discovered", async () => {
       const { ctx } = makeContext({ sessionID: "s-elsewhere" });
       const out = await runTool<SearchOutput>(
-        recallTool(makeFakeHarness()),
+        await recallTool(makeFakeHarness()),
         { query: "no-such-term-anywhere" },
         ctx,
       );
@@ -1814,7 +1807,7 @@ describe("recall", () => {
     });
 
     it("suggests dropping excludeCurrentSession:false when the current session dominates", async () => {
-      const out = await runTool<SearchOutput>(recallTool(makeFakeHarness()), {
+      const out = await runTool<SearchOutput>(await recallTool(makeFakeHarness()), {
         query: "rate",
         scope: "project",
         excludeCurrentSession: false,

@@ -14,7 +14,8 @@ export type Limits = {
   maxMessages: number;
   maxWindow: number;
   defaultWidth: number;
-  /** Total raw-text budget for the in-memory corpus cache (LRU-evicted). */
+  /** Raw-text budget for the tier-2 drilled-session LRU (repurposed from the
+   *  deleted full-corpus cache). */
   cacheMaxChars: number;
   /** Sessions the distiller keeps in flight during the cold pass. */
   distillConcurrency: number;
@@ -26,6 +27,14 @@ export type Limits = {
   inventoryTokens: number;
   /** Whether the distiller runs its background cold pass at all. */
   coldPass: boolean;
+  /** Tier-2 drill fan-out: how many shortlisted sessions to drill per query. */
+  drillSessions: number;
+  /** Messages per untargeted drill page fetch (newest-first). */
+  drillPageMessages: number;
+  /** Per-session retained-chars budget for an untargeted drill. */
+  drillCharsPerSession: number;
+  /** Per-query retained-chars budget shared across all drilled sessions. */
+  drillCharsPerQuery: number;
 };
 
 export const DEFAULTS: Limits = {
@@ -36,12 +45,17 @@ export const DEFAULTS: Limits = {
   maxMessages: 50,
   maxWindow: 10,
   defaultWidth: 200,
-  cacheMaxChars: 50_000_000,
+  // Repurposed as the drilled-session LRU budget (no longer the full-corpus cache).
+  cacheMaxChars: 24_000_000,
   distillConcurrency: 2,
   distillDelayMs: 25,
   ftsRowsPerSession: 5000,
   inventoryTokens: 200,
   coldPass: true,
+  drillSessions: 12,
+  drillPageMessages: 25,
+  drillCharsPerSession: 1_500_000,
+  drillCharsPerQuery: 20_000_000,
 };
 
 /** Explicit discovery limit for "all history" requests: the opencode server
@@ -116,6 +130,16 @@ export type SearchCoverage = {
   >;
   /** Present when some sessions failed to load; samples are capped. */
   loadErrors?: { count: number; samples: string[] };
+  /** Tier-0 card-store state: how many sessions are distilled and how fresh the
+   *  store is. `total` counts every known card, `full` those distilled to
+   *  content (the rest are metadata-only), `storeRecency` is the newest card's
+   *  `timeUpdated` (ms, 0 when none), `degraded` is true in cards-lite mode. */
+  cards?: {
+    total: number;
+    full: number;
+    storeRecency: number;
+    degraded: boolean;
+  };
 };
 
 export type ResultWhy = {
@@ -270,11 +294,15 @@ export type MessagesOutput = {
     sessionTitle?: string;
     directory?: string;
   };
+  /** Cursor-based pagination over one bounded newest-first page. `nextCursor`
+   *  (opaque) continues from where this page stopped; absent means the last
+   *  page. `returned` counts messages after role/query filtering within the
+   *  page, so it can be less than `limit`. */
   pagination: {
-    offset: number;
+    limit: number;
     returned: number;
-    total: number;
     hasMore: boolean;
+    nextCursor?: string;
   };
 };
 

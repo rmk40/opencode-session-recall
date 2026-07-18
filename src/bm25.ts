@@ -113,7 +113,10 @@ export function containsErrorPattern(text: string): boolean {
   return ERROR_PATTERNS.some((p) => lower.includes(p));
 }
 
-function recencyMultiplier(time: number): number {
+/** Recency prior: linearly decays from {@link RECENCY_MULT_MAX} at now to 1.0 at
+ *  {@link RECENCY_WINDOW_MS} old, then flat. Exported so tier-1 card ranking
+ *  applies the same recency shape as part-level scoring. */
+export function recencyMultiplier(time: number): number {
   const ageMs = Date.now() - time;
   const factor = Math.max(0, 1 - ageMs / RECENCY_WINDOW_MS);
   return 1 + factor * (RECENCY_MULT_MAX - 1);

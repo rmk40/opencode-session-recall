@@ -1,15 +1,20 @@
 import type { Plugin } from "@opencode-ai/plugin";
-import { createOpencodeClient, type Session, type GlobalSession } from "@opencode-ai/sdk/v2";
+import { createOpencodeClient, type Session } from "@opencode-ai/sdk/v2";
 import { sessions } from "./sessions.js";
-import { search, DISCOVERY_LIMIT, type SemanticSearchConfig } from "./search.js";
+import { search, DISCOVERY_LIMIT, type SearchDeps, type SemanticSearchConfig } from "./search.js";
 import { get } from "./get.js";
 import { context } from "./context.js";
 import { messages } from "./messages.js";
 import { systemNudge } from "./hooks/system-nudge.js";
 import { autoRecall } from "./hooks/auto-recall.js";
 import { compactionRecall } from "./hooks/compaction-recall.js";
-import { CorpusCache } from "./corpus.js";
-import { TOOLS, DEFAULTS, optionalString, type Limits } from "./types.js";
+import { createFetchGate } from "./fetch-gate.js";
+import { openSqlite } from "./sqlite.js";
+import { openStore, defaultStorePath, type Store, type Card } from "./store.js";
+import { createCardsRuntime, cardsLiteFromSessions, type CardSource } from "./cards.js";
+import { createDrill } from "./drill.js";
+import { createDistiller } from "./distill.js";
+import { TOOLS, DEFAULTS, optionalString, errmsg, type Limits } from "./types.js";
 
 /** Opt-in semantic layer defaults (plugin options, off unless enabled). */
 const DEFAULT_SEMANTIC_MODEL = "minishlab/potion-base-8M";
@@ -26,8 +31,12 @@ type Options = {
   autoRecall?: boolean;
   /** Preserve durable findings into the compaction summary (R1c). Default: false. */
   compactionRecall?: boolean;
-  /** Warm the corpus cache at plugin init (fire-and-forget). Default: false. */
+  /** Deprecated no-op: the card store persists across processes, so there is
+   *  nothing to prewarm. Retained so existing configs do not error. */
   prewarm?: boolean;
+  /** Override the card-store file path (default
+   *  `~/.cache/opencode-session-recall/store-v1.db`). */
+  storePath?: string;
   /** Enable the opt-in, local-only semantic layer. Default: false. */
   semantic?: boolean;
   /** Blend weight for the semantic signal, clamped to [0.05, 0.95]. Default: 0.35. */
@@ -61,6 +70,10 @@ const server: Plugin = async (ctx, options) => {
     ftsRowsPerSession: clamp(opts.ftsRowsPerSession, DEFAULTS.ftsRowsPerSession),
     inventoryTokens: clamp(opts.inventoryTokens, DEFAULTS.inventoryTokens),
     coldPass: opts.coldPass !== false,
+    drillSessions: clamp(opts.drillSessions, DEFAULTS.drillSessions),
+    drillPageMessages: clamp(opts.drillPageMessages, DEFAULTS.drillPageMessages),
+    drillCharsPerSession: clamp(opts.drillCharsPerSession, DEFAULTS.drillCharsPerSession),
+    drillCharsPerQuery: clamp(opts.drillCharsPerQuery, DEFAULTS.drillCharsPerQuery),
   };
 
   // Extract the in-process fetch from the v1 client's internals.
@@ -110,64 +123,87 @@ const server: Plugin = async (ctx, options) => {
     }
   }
 
-  // One shared corpus cache behind every search path (the recall tool and
-  // both search-running hooks), so any of them warms the cache for all. The
-  // embedder (when enabled) rides on the cache so candidates are embedded once
-  // per session version at fill time.
-  const cache = new CorpusCache(client, limits, semantic?.embedder);
+  // Session discovery for the distiller cold pass: global scope reads the
+  // unscoped experimental list, otherwise the directory-scoped list. Always
+  // sends an explicit limit (the server defaults to 100 rows).
+  const discover = async (): Promise<Session[]> => {
+    const resp = global
+      ? await unscoped.experimental.session.list({ limit: DISCOVERY_LIMIT })
+      : await client.session.list({ limit: DISCOVERY_LIMIT });
+    if (resp.error) throw new Error(errmsg(resp.error));
+    return Array.isArray(resp.data) ? (resp.data as Session[]) : [];
+  };
 
-  if (opts.prewarm === true) {
-    // Fire-and-forget: sync whatever history is visible so the first search
-    // (including a hook's, which has a tight wall-clock budget) starts warm.
-    // Peak memory during the warm is bounded by full history, not
-    // cacheMaxChars: everything is pinned by the single sync() until its
-    // release(), after which LRU eviction settles under the cap.
-    void (async () => {
-      try {
-        // Explicit limit: the server defaults to 100 rows otherwise, which
-        // would warm only a fraction of the history.
-        const resp = global
-          ? await unscoped.experimental.session.list({ limit: DISCOVERY_LIMIT })
-          : await client.session.list({ limit: DISCOVERY_LIMIT });
-        const data = (resp.data ?? []) as Array<Session | GlobalSession>;
-        const warmed = await cache.sync(
-          data.map((s) => ({
-            id: s.id,
-            title: s.title,
-            directory: s.directory,
-            updated: s.time.updated,
-          })),
-        );
-        warmed.release();
-      } catch {
-        // Best-effort; a failed prewarm just means a cold first search.
-      }
-    })();
+  // ── Card store (Tier 0) ──
+  // The derived, versioned store is the sole persistence. If SQLite is
+  // unavailable (no driver, unwritable dir) or the schema is newer than this
+  // build understands, `store` stays null and the plugin degrades to ephemeral
+  // cards-lite built from the session list.
+  const storePath = optionalString(opts.storePath) ?? (await defaultStorePath());
+  let store: Store | null = null;
+  if (storePath) {
+    const db = await openSqlite(storePath);
+    if (db) store = openStore(db);
   }
+
+  // Degraded cards-lite: fetch the session list once (best-effort) and keep
+  // metadata-only cards in memory. The tier-1 runtime reads the live array.
+  let liteCards: Card[] = [];
+  const cardSource: CardSource = store
+    ? { getCards: () => store.allCards(), revision: () => store.getMeta("cards_rev") }
+    : { getCards: () => liteCards, revision: () => undefined, degraded: true };
+  if (!store) {
+    void discover()
+      .then((list) => {
+        liteCards = cardsLiteFromSessions(list as Parameters<typeof cardsLiteFromSessions>[0]);
+      })
+      .catch(() => {
+        // Best-effort; a failed list just leaves cards-lite empty until retried.
+      });
+  }
+
+  // One shared fetch gate gates every SDK call in the query/distill paths so the
+  // plugin never opens more than `concurrency` server connections at once.
+  const gate = createFetchGate({ concurrency: limits.concurrency });
+
+  const cards = createCardsRuntime({
+    source: cardSource,
+    embedder: semantic?.embedder,
+    semanticWeight: semantic?.weight,
+  });
+  const drill = createDrill({ client, gate, limits, embedder: semantic?.embedder });
+
+  const instanceId =
+    globalThis.crypto?.randomUUID?.() ??
+    `recall-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  const distiller = createDistiller({ client, store, gate, limits, instanceId, discover });
+  if (limits.coldPass) distiller.start();
+
+  const deps: SearchDeps = { gate, store, cards, drill };
+  const digestSource = { peekDigest: (id: string) => store?.getCard(id)?.summaryHead || undefined };
 
   return {
     tool: {
-      recall_sessions: sessions(client, unscoped, global, limits, cache),
-      recall: search(client, unscoped, global, limits, cache, semantic),
+      recall_sessions: sessions(client, unscoped, global, limits, digestSource),
+      recall: search(client, unscoped, global, limits, deps),
       recall_get: get(client),
-      recall_context: context(client, limits),
-      recall_messages: messages(client, limits),
+      recall_context: context(client, gate, limits),
+      recall_messages: messages(client, gate, limits),
+    },
+    event: async ({ event }) => {
+      // The plugin `event` hook is typed against the default SDK vintage; the
+      // distiller compiles against the v2 event union the live bus actually
+      // delivers. Bridge the vintage gap at this one boundary.
+      distiller.onEvent(event as unknown as Parameters<typeof distiller.onEvent>[0]);
     },
     ...(nudge && {
       "experimental.chat.system.transform": systemNudge(),
     }),
     ...(autoRecallEnabled && {
-      "chat.message": autoRecall(client, unscoped, global, limits, cache, semantic),
+      "chat.message": autoRecall(client, unscoped, global, limits, deps),
     }),
     ...(compactionRecallEnabled && {
-      "experimental.session.compacting": compactionRecall(
-        client,
-        unscoped,
-        global,
-        limits,
-        cache,
-        semantic,
-      ),
+      "experimental.session.compacting": compactionRecall(client, unscoped, global, limits, deps),
     }),
     ...(primary && {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any -- opencode config type not exported

@@ -1,7 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { SearchOutput } from "../src/types.js";
-import { CorpusCache } from "../src/corpus.js";
-import { TEST_LIMITS, makeFakeHarness, runTool } from "./helpers.js";
+import { TEST_LIMITS, makeFakeHarness, makeRecallDeps, runTool } from "./helpers.js";
 
 const bm25Search = vi.hoisted(() => vi.fn(() => []));
 
@@ -19,13 +18,16 @@ describe("recall smart fallback", () => {
 
   it("falls back to literal search when smart matching finds no results", async () => {
     const h = makeFakeHarness();
-    const out = await runTool<SearchOutput>(
-      search(h.client, h.unscoped, true, TEST_LIMITS, new CorpusCache(h.client, TEST_LIMITS)),
-      {
+    const { deps, cleanup } = await makeRecallDeps(h);
+    let out: SearchOutput;
+    try {
+      out = await runTool<SearchOutput>(search(h.client, h.unscoped, true, TEST_LIMITS, deps), {
         query: "walkthrough",
         match: "smart",
-      },
-    );
+      });
+    } finally {
+      cleanup();
+    }
 
     // BM25 ran (returned nothing via the mock), so the tool fell back to literal.
     expect(bm25Search).toHaveBeenCalled();

@@ -1,13 +1,23 @@
-import { describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import type { ToolDefinition } from "@opencode-ai/plugin";
 import type { ErrorOutput, SearchOutput } from "../src/types.js";
-import { TEST_LIMITS, makeFakeHarness, runTool } from "./helpers.js";
+import { TEST_LIMITS, makeFakeHarness, makeRecallDeps, runTool } from "./helpers.js";
 import { search } from "../src/search.js";
-import { CorpusCache } from "../src/corpus.js";
 import { compileRegex, regexSnippet, MAX_REGEX_PATTERN_CHARS } from "../src/regex.js";
 import { looksLikeRegex, classifyQuery } from "../src/route.js";
 
-function recallTool(h = makeFakeHarness()) {
-  return search(h.client, h.unscoped, true, TEST_LIMITS, new CorpusCache(h.client, TEST_LIMITS));
+let sharedTool: ToolDefinition;
+let cleanup: () => void = () => {};
+beforeAll(async () => {
+  const h = makeFakeHarness();
+  const { deps, cleanup: c } = await makeRecallDeps(h);
+  cleanup = c;
+  sharedTool = search(h.client, h.unscoped, true, TEST_LIMITS, deps);
+});
+afterAll(() => cleanup());
+
+function recallTool() {
+  return sharedTool;
 }
 
 // ── R5b regex mode ────────────────────────────────────────────────────

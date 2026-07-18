@@ -109,6 +109,11 @@ export type DistillerOptions = {
   instanceId: string;
   log?: (message: string) => void;
   now?: () => number;
+  /** Session discovery for the cold pass. Defaults to a scoped
+   *  `client.session.list({ limit: DISCOVERY_LIMIT })`; the plugin injects a
+   *  global-vs-scoped variant. Returns raw session rows (mapped to card metadata
+   *  internally); the distiller still routes the call through the fetch gate. */
+  discover?: () => Promise<Session[]>;
   // ── Test affordances: default to the spec values above ──
   /** Messages per page fetch (spec: 50). */
   pageMessages?: number;
@@ -616,13 +621,27 @@ export function createDistiller(options: DistillerOptions): Distiller {
 
   const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
 
+  const discover =
+    options.discover ??
+    (async (): Promise<Session[]> => {
+      const resp = await client.session.list({ limit: DISCOVERY_LIMIT });
+      if (resp.error) throw new Error(errmsg(resp.error));
+      return Array.isArray(resp.data) ? (resp.data as Session[]) : [];
+    });
+
+  /** Bump the card-revision counter after every store write, so the tier-1 card
+   *  runtime knows to reload lazily. A separate write from the data write, which
+   *  is acceptable for a refresh hint (also time-gated on the reader). */
+  function bumpCardsRev(): void {
+    const current = Number(store.getMeta("cards_rev")) || 0;
+    store.setMeta("cards_rev", String(current + 1));
+  }
+
   // ── Fetch primitives (all through the gate at background priority) ──
 
   async function discoverSessions(): Promise<DistillSessionMeta[]> {
-    const resp = await gate.runBackground(() => client.session.list({ limit: DISCOVERY_LIMIT }));
-    if (resp.error) throw new Error(errmsg(resp.error));
-    const data = Array.isArray(resp.data) ? (resp.data as Session[]) : [];
-    return data.map(toMeta);
+    const sessions = await gate.runBackground(() => discover());
+    return sessions.map(toMeta);
   }
 
   async function fetchSessionMeta(sessionID: string): Promise<DistillSessionMeta | null> {
@@ -722,6 +741,7 @@ export function createDistiller(options: DistillerOptions): Distiller {
       .allCards()
       .filter((card) => card.rootId === rootId && card.sessionId !== rootId);
     store.upsertCard({ ...root, familyRollup: buildRollup(children) });
+    bumpCardsRev();
   }
 
   function recomputeAllRootRollups(): void {
@@ -739,6 +759,7 @@ export function createDistiller(options: DistillerOptions): Distiller {
       const rollup = buildRollup(childrenByRoot.get(rootId) ?? []);
       if (rollup.length > 0 || root.familyRollup.length > 0) {
         store.upsertCard({ ...root, familyRollup: rollup });
+        bumpCardsRev();
       }
     }
   }
@@ -754,6 +775,7 @@ export function createDistiller(options: DistillerOptions): Distiller {
       caps,
     });
     store.replaceSessionParts(session.id, rows, card);
+    bumpCardsRev();
   }
 
   async function distillAppend(session: DistillSessionMeta, oldCard: Card): Promise<void> {
@@ -808,6 +830,7 @@ export function createDistiller(options: DistillerOptions): Distiller {
         embedding: oldCard.embedding,
       }),
     );
+    bumpCardsRev();
   }
 
   // ── Cold pass ──
@@ -872,6 +895,7 @@ export function createDistiller(options: DistillerOptions): Distiller {
           // skip it, counting the session as not distilled.
           if (stopped || !leaseHeld) return;
           store.replaceSessionParts(session.id, rows, card);
+          bumpCardsRev();
           distilled++;
           distilledCount = distilled; // status counts only sessions actually distilled
         }
@@ -979,6 +1003,7 @@ export function createDistiller(options: DistillerOptions): Distiller {
     if (!leaseHeld) return;
     const rootId = store.getCard(sessionID)?.rootId;
     store.deleteSession(sessionID);
+    bumpCardsRev();
     const timer = debounceTimers.get(sessionID);
     if (timer) {
       clearTimeout(timer);

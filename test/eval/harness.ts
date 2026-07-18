@@ -6,10 +6,29 @@
  * swapping the smart/fuzzy engine) can be proven to meet or beat a recorded
  * baseline rather than guessed at.
  */
-import type { OpencodeClient } from "@opencode-ai/sdk/v2";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import type { OpencodeClient, Session } from "@opencode-ai/sdk/v2";
 import type { ToolContext, ToolDefinition } from "@opencode-ai/plugin";
 import type { EvidenceClass, SearchOutput } from "../../src/types.js";
-import { PROJECT_DIR } from "../helpers.js";
+import { DISCOVERY_LIMIT } from "../../src/types.js";
+import {
+  PROJECT_DIR,
+  TEST_LIMITS,
+  paginateBundles,
+  messagesResponse,
+  strictNoLimit,
+  setStrictNoLimitMessages,
+  UNBOUNDED_MESSAGES_ERROR,
+} from "../helpers.js";
+import { openSqlite } from "../../src/sqlite.js";
+import { openStore } from "../../src/store.js";
+import { createFetchGate } from "../../src/fetch-gate.js";
+import { createDistiller, type Distiller } from "../../src/distill.js";
+import { createCardsRuntime } from "../../src/cards.js";
+import { createDrill } from "../../src/drill.js";
+import { search, type SemanticSearchConfig } from "../../src/search.js";
 import { makeEvalCorpus, type EvalCorpus } from "./corpus.js";
 
 type ListParams = { search?: string; limit?: number };
@@ -32,9 +51,17 @@ export function makeEvalClients(corpus: EvalCorpus = makeEvalCorpus()): {
         const found = corpus.globalSessions.find((s) => s.id === sessionID);
         return found ? { data: found } : { error: { data: { message: "not found" } } };
       },
-      messages: async ({ sessionID }: { sessionID: string }) => {
-        const data = corpus.messagesBySession[sessionID];
-        return data ? { data } : { error: { data: { message: "Unauthorized" } } };
+      messages: async (params: { sessionID: string; limit?: number; before?: string }) => {
+        const data = corpus.messagesBySession[params.sessionID];
+        if (!data) return { error: { data: { message: "Unauthorized" } } };
+        // Faithful keyset pagination (distiller/drill contract) when a limit is
+        // sent; a no-limit caller is the incident path and fails under strict.
+        if (params.limit != null) {
+          const { items, nextCursor } = paginateBundles(data, params.limit, params.before);
+          return messagesResponse(items, nextCursor);
+        }
+        if (strictNoLimit()) throw new Error(UNBOUNDED_MESSAGES_ERROR);
+        return { data };
       },
       message: async ({ sessionID, messageID }: { sessionID: string; messageID: string }) => {
         const found = corpus.messagesBySession[sessionID]?.find((m) => m.info.id === messageID);
@@ -56,6 +83,71 @@ export function makeEvalClients(corpus: EvalCorpus = makeEvalCorpus()): {
   return {
     client: client as unknown as OpencodeClient,
     unscoped: unscoped as unknown as OpencodeClient,
+  };
+}
+
+/** Poll a distiller until its cold pass finishes (the eval fakes resolve
+ *  synchronously, so this settles within a few event-loop turns). */
+async function awaitColdPass(distiller: Distiller, timeoutMs = 10_000): Promise<void> {
+  const start = Date.now();
+  while (distiller.status().coldPass !== "done") {
+    if (Date.now() - start > timeoutMs) {
+      throw new Error(`cold pass did not finish: ${JSON.stringify(distiller.status())}`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, 5));
+  }
+}
+
+/**
+ * Build the live `recall` tool over the eval corpus the way the plugin does:
+ * open a temp-file card store, run the distiller cold pass over the fake corpus
+ * (populating cards + the FTS slim index), then wire the tier-1 card runtime and
+ * tier-2 drill behind the new deps. Returns the tool plus a cleanup that closes
+ * and deletes the store.
+ */
+export async function makeEvalSearch(
+  corpus: EvalCorpus = makeEvalCorpus(),
+  semantic?: SemanticSearchConfig,
+): Promise<{ searchTool: ToolDefinition; cleanup: () => void }> {
+  // The whole eval path (cold pass, drill, expansion) must be bounded.
+  setStrictNoLimitMessages(true);
+  const { client, unscoped } = makeEvalClients(corpus);
+  const dir = mkdtempSync(join(tmpdir(), "recall-eval-"));
+  const db = await openSqlite(join(dir, "store.db"));
+  if (!db) throw new Error("openSqlite returned null in eval harness");
+  const store = openStore(db);
+  if (!store) throw new Error("openStore returned null in eval harness");
+
+  const gate = createFetchGate({ concurrency: TEST_LIMITS.concurrency });
+  const distiller = createDistiller({
+    client,
+    store,
+    gate,
+    limits: TEST_LIMITS,
+    instanceId: "eval-distiller",
+    discover: async () => {
+      const resp = await unscoped.experimental.session.list({ limit: DISCOVERY_LIMIT });
+      return (resp.data ?? []) as Session[];
+    },
+  });
+  distiller.start();
+  await awaitColdPass(distiller);
+  distiller.stop();
+
+  const cards = createCardsRuntime({
+    source: { getCards: () => store.allCards(), revision: () => store.getMeta("cards_rev") },
+    embedder: semantic?.embedder,
+    semanticWeight: semantic?.weight,
+  });
+  const drill = createDrill({ client, gate, limits: TEST_LIMITS, embedder: semantic?.embedder });
+  const searchTool = search(client, unscoped, true, TEST_LIMITS, { gate, store, cards, drill });
+
+  return {
+    searchTool,
+    cleanup: () => {
+      db.close();
+      rmSync(dir, { recursive: true, force: true });
+    },
   };
 }
 

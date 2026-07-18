@@ -11,7 +11,6 @@ import {
   type ErrorOutput,
   type Limits,
   type MatchMode,
-  type DegradeKind,
   type GroupMode,
   type SearchCoverage,
   type SearchSuggestion,
@@ -24,31 +23,35 @@ import {
 } from "./types.js";
 import { snippet, matches, formatMsg, isSelfTool, evidenceClassFor } from "./extract.js";
 import { parseQuery } from "./query.js";
-import type { Candidate, CandidateFilters } from "./candidates.js";
-import {
-  assembleSession,
-  type AssembledSession,
-  type CandidateEmbedder,
-  type CorpusCache,
-} from "./corpus.js";
-import { metadataShortlist, mergeShortlistHits } from "./plan.js";
-import { bm25Search, clamp01, compareHits, MIN_RELATIVE_SCORE, type Bm25Hit } from "./bm25.js";
-import { topK, type ScoredCandidate, type SimilarityHit } from "./semantic/similarity.js";
+import { candidateEligible, type Candidate, type CandidateFilters } from "./candidates.js";
+import type { CandidateEmbedder } from "./corpus.js";
+import { clamp01, type Bm25Hit } from "./bm25.js";
 import { smartSnippet, truncatePreservingMatch } from "./snippet.js";
 import { compileRegex, regexFirstIndex, regexSnippet } from "./regex.js";
 import { classifyQuery } from "./route.js";
+import type { CardsRuntime, CardHit, CardFilters } from "./cards.js";
+import type { Drill, DrillTarget, DrilledPool } from "./drill.js";
+import type { Store, FtsHit, Card } from "./store.js";
+import type { FetchGate } from "./fetch-gate.js";
+import { fetchMessageWindow, type FetchRunner } from "./fetch-window.js";
 
 /** The embedder as the search path consumes it: the cache-facing surface plus
  *  the init error, so the one-time "unavailable" warning can explain why. */
 export type SearchEmbedder = CandidateEmbedder & { initError?: string };
-/** Opt-in semantic config threaded from the plugin into search + hooks. */
+/** Opt-in semantic config threaded from the plugin into the tier-1 card runtime
+ *  and the tier-2 drill (both embed at construction, not per query). */
 export type SemanticSearchConfig = { embedder: SearchEmbedder; weight: number };
 
-/** Cosine top-K taken over embedded candidates before the hybrid merge. */
-const SEMANTIC_TOP_K = 200;
-
-/** Post-fetch time budget for the entire ranking pipeline (ms) */
-const TIME_BUDGET_MS = 2000;
+/** Tier-2 dependency bundle: the shared fetch gate, the derived card store (null
+ *  in degraded mode), the tier-1 card runtime, and the tier-2 drill. Built once
+ *  in the plugin entry and shared by the recall tool and both search-running
+ *  hooks. */
+export type SearchDeps = {
+  gate: FetchGate;
+  store: Store | null;
+  cards: CardsRuntime;
+  drill: Drill;
+};
 
 /** Wall-clock budget for the synchronous literal/regex scan loops (ms). Bounds
  *  the worst case where a fired abort can't preempt synchronous scanning (e.g.
@@ -71,7 +74,6 @@ const MAX_EXPANDED_PART_CHARS = 6_000;
  *  input embedding a whole file must not bypass the budgets. recall_get
  *  remains the full-fidelity path. */
 const MAX_EXPANDED_INPUT_CHARS = 2_000;
-const DIRECTORY_FILTER_LIST_LIMIT = 5000;
 // DISCOVERY_LIMIT now lives in types.ts (so the distiller can share it without a
 // search-module cycle); re-exported here for existing importers.
 export { DISCOVERY_LIMIT };
@@ -118,19 +120,6 @@ type SessionMetaInternal = {
   projectWorktree?: string;
   directoryRelevance?: DirectoryRelevance;
 };
-
-function meta(s: Session | GlobalSession): SessionMetaInternal {
-  const project = "project" in s ? s.project : undefined;
-  return {
-    id: s.id,
-    title: s.title,
-    directory: s.directory,
-    updated: s.time.updated,
-    parentID: s.parentID,
-    projectID: s.projectID,
-    projectWorktree: project?.worktree,
-  };
-}
 
 /** Bounded ancestor walk + descendant BFS depth for the exclusion family. */
 const MAX_FAMILY_DEPTH = 16;
@@ -511,35 +500,6 @@ function classifyDirectoryRelevance(
   return "global";
 }
 
-function withDirectoryRelevance(
-  session: SessionMetaInternal,
-  relevance: DirectoryRelevance,
-): SessionMetaInternal {
-  return { ...session, directoryRelevance: relevance };
-}
-
-function dedupeSessions(sessions: SessionMetaInternal[]): SessionMetaInternal[] {
-  const seen = new Set<string>();
-  const result: SessionMetaInternal[] = [];
-  for (const session of sessions) {
-    if (seen.has(session.id)) continue;
-    seen.add(session.id);
-    result.push(session);
-  }
-  return result;
-}
-
-function listLimitForDirectoryFilter(
-  argsLimit: number | undefined,
-  configuredLimit: number,
-): number {
-  // A finite maxSessions is a hard plugin safety cap; broaden only within it.
-  if (Number.isFinite(configuredLimit)) return configuredLimit;
-  // No cap: never send undefined — the server would default to 100 rows.
-  if (argsLimit == null) return DISCOVERY_LIMIT;
-  return Math.max(argsLimit, DIRECTORY_FILTER_LIST_LIMIT);
-}
-
 function truncateExpandedText(
   value: string | undefined,
   budget: ExpansionBudget,
@@ -783,184 +743,6 @@ function regexScanCandidates(
     }
   }
   return { results, total };
-}
-
-/** A session's per-query scan pool: eligible candidates, then the title hit. */
-function scanPool(session: AssembledSession): Candidate[] {
-  return session.titleCandidate
-    ? [...session.candidates, session.titleCandidate]
-    : session.candidates;
-}
-
-// ── Hybrid lexical/semantic merge ────────────────────────────────────
-
-/**
- * Blend cosine similarity into the lexical hits on the LEXICAL score scale:
- * the semantic term is multiplied by the lexical top score so a purely-semantic
- * hit cannot dwarf real lexical matches. Candidates in the cosine top-K that
- * had no lexical hit enter as new hits (evidence class derived with no matched
- * fields); existing hits are re-scored and keep their reasons plus a
- * `Semantic: <cos>` note under explain. When the lexical list is empty the
- * blend degenerates to raw `w * cos`. Re-sorts by the standard hit order and
- * re-applies the relative floor across the merged list.
- */
-function mergeSemanticHits(
-  lexical: Bm25Hit[],
-  cosineTop: SimilarityHit[],
-  pool: Candidate[],
-  weight: number,
-  explain: boolean,
-): Bm25Hit[] {
-  const lexTop = lexical.reduce((max, hit) => Math.max(max, hit.score), 0);
-  const semanticTerm = (cos: number): number => (lexTop > 0 ? weight * cos * lexTop : weight * cos);
-
-  const byPart = new Map<string, Bm25Hit>();
-  for (const hit of lexical) byPart.set(hit.candidate.partID, hit);
-
-  for (const { index, score: cos } of cosineTop) {
-    const candidate = pool[index];
-    if (!candidate) continue;
-    const reason = `Semantic: ${cos.toFixed(2)}`;
-    const existing = byPart.get(candidate.partID);
-    if (existing) {
-      byPart.set(candidate.partID, {
-        ...existing,
-        score: (1 - weight) * existing.score + semanticTerm(cos),
-        matchReasons: explain ? [...existing.matchReasons, reason] : existing.matchReasons,
-      });
-    } else {
-      byPart.set(candidate.partID, {
-        candidate,
-        score: semanticTerm(cos),
-        matchedTerms: [],
-        matchedFields: [],
-        evidenceClass: evidenceClassFor(candidate.partType, candidate.toolName, []),
-        matchReasons: explain ? [reason] : [],
-      });
-    }
-  }
-
-  const merged = [...byPart.values()].sort(compareHits);
-  if (merged.length <= 1) return merged;
-  const top = merged[0]!.score || 1;
-  return merged.filter((hit) => hit.score >= top * MIN_RELATIVE_SCORE);
-}
-
-// ── Smart/fuzzy scan ─────────────────────────────────────────────────
-
-/** smartScan returns ALL ranked results (caller handles slicing/grouping).
- *  Candidates come pre-built and pre-normalized from the corpus cache; there
- *  are no per-query candidate budgets, so the whole eligible corpus is ranked.
- *  The time budget remains as a safety valve (flags latency, never swaps
- *  ranking algorithms or truncates by relevance-blind scan order). */
-function smartScan(
-  assembled: Array<{ session: AssembledSession; relevance: DirectoryRelevance }>,
-  query: string,
-  explain: boolean,
-  mode: "smart" | "fuzzy",
-  width?: number,
-  abort?: AbortSignal,
-  semantic?: SemanticSearchConfig,
-): {
-  results: SearchResult[];
-  total: number;
-  degradeKind: DegradeKind;
-  matchMode: MatchMode;
-  planSelected: string[];
-  shortlistIDs: string[];
-  warnings: string[];
-} {
-  const pq = parseQuery(query);
-  const startTime = performance.now();
-  const warnings: string[] = [];
-
-  const pool: Candidate[] = [];
-  const relevanceBySession = new Map<string, DirectoryRelevance>();
-  let timedOut = false;
-
-  for (const entry of assembled) {
-    // Honor a fired abort (hook timeout) between sessions; the deadline check
-    // bounds the synchronous pool-assembly phase the abort flag can't preempt.
-    if (abort?.aborted || performance.now() - startTime > TIME_BUDGET_MS) {
-      timedOut = true;
-      break;
-    }
-    relevanceBySession.set(entry.session.meta.id, entry.relevance);
-    if (entry.session.titleCandidate) pool.push(entry.session.titleCandidate);
-    pool.push(...entry.session.candidates);
-  }
-
-  const planSelected: string[] = ["bm25-broad"];
-  if (pq.codeTokens.length > 0) planSelected.push("exact-token-boost");
-
-  // Stage A/B of the session-first plan: shortlist sessions by metadata
-  // overlap, deep-search them with a shortlist-only index, merge.
-  const shortlist = metadataShortlist(
-    assembled.map((entry) => ({
-      id: entry.session.meta.id,
-      title: entry.session.meta.title,
-      directory: entry.session.meta.directory,
-      digestText: entry.session.digestText,
-    })),
-    pq,
-  );
-
-  let hits = bm25Search(pool, pq, mode, explain);
-  if (shortlist.size > 0) {
-    const shortlistPool = pool.filter((candidate) => shortlist.has(candidate.sessionID));
-    if (shortlistPool.length > 0) {
-      const deepHits = bm25Search(shortlistPool, pq, mode, explain);
-      hits = mergeShortlistHits(hits, deepHits, explain);
-      planSelected.push(`title-shortlist:${shortlist.size}`);
-    }
-  }
-
-  // Opt-in hybrid semantic pass. Lexical-first is the law: this only ever adds
-  // an extra signal, and any failure leaves `hits` exactly as the lexical
-  // passes produced them. When requested but the model is not ready, emit one
-  // warning and stay lexical-only.
-  if (semantic) {
-    if (semantic.embedder.ready) {
-      try {
-        const queryVec = semantic.embedder.embed(pq.raw);
-        if (queryVec) {
-          const embedded: ScoredCandidate[] = [];
-          for (let i = 0; i < pool.length; i++) {
-            const vec = pool[i]!.embedding;
-            if (vec) embedded.push({ index: i, vec });
-          }
-          if (embedded.length > 0) {
-            hits = mergeSemanticHits(
-              hits,
-              topK(queryVec, embedded, SEMANTIC_TOP_K),
-              pool,
-              semantic.weight,
-              explain,
-            );
-            planSelected.push("semantic");
-          }
-        }
-      } catch {
-        // Never fail the search on a semantic error; results stay lexical.
-      }
-    } else {
-      const reason = semantic.embedder.initError ?? "model still loading";
-      warnings.push(`Semantic search unavailable (${reason}); results are lexical-only.`);
-    }
-  }
-
-  const allResults = rankedToSearchResults(hits, mode, explain, pq, width, relevanceBySession);
-
-  const totalTime = performance.now() - startTime;
-  return {
-    results: allResults,
-    total: allResults.length,
-    degradeKind: timedOut || totalTime > TIME_BUDGET_MS ? "time" : "none",
-    matchMode: mode,
-    planSelected,
-    shortlistIDs: [...shortlist],
-    warnings,
-  };
 }
 
 // ── Convert ranked results to SearchResult[] ─────────────────────────
@@ -1248,9 +1030,14 @@ function diversify(results: SearchResult[], limit: number, perSession: number): 
   return [...firstPass, ...heldBack];
 }
 
+/** Safety cap on messages fetched while locating one hit's context window. */
+const MAX_EXPAND_CONTEXT_FETCH = 200;
+
 async function expandSearchResults(
   results: SearchResult[],
   client: OpencodeClient,
+  gate: FetchGate,
+  limits: Limits,
   mode: ExpandMode,
   expandResults: number,
   window: number,
@@ -1275,41 +1062,44 @@ async function expandSearchResults(
     warnings.push("Expansion skipped title-only hits; title results do not have matched parts.");
   }
 
-  // On-demand fetch: search runs over cached candidates, so full messages are
-  // loaded here only for the (≤ expandResults) sessions actually expanded.
-  const bySession = new Map<string, MsgWithParts[]>();
-  for (const sessionID of new Set(expandable.map((entry) => entry.result.sessionID))) {
-    try {
-      const resp = await client.session.messages({ sessionID });
-      if (resp.data) {
-        bySession.set(sessionID, resp.data as MsgWithParts[]);
-      } else {
-        warnings.push(
-          `Expansion could not load session ${sessionID}: ${
-            resp.error ? errmsg(resp.error) : "no messages returned"
-          }.`,
-        );
-      }
-    } catch (error) {
-      warnings.push(`Expansion could not load session ${sessionID}: ${errmsg(error)}.`);
-    }
-  }
+  // Bounded, per-hit fetches only — never an unpaginated whole-session load.
+  // `message` mode is a single `session.message` point fetch; `context` mode is
+  // a bounded newest-first window around the hit. Everything routes through the
+  // shared gate so it counts against the same concurrency budget as the drill.
+  const runner: FetchRunner = (fn) => gate.runQuery(fn);
+  const pageMessages = Math.min(
+    limits.maxMessages,
+    Math.max(2 * window + 1, Math.min(25, limits.maxMessages)),
+  );
 
   for (const { result, resultIndex } of expandable) {
-    const messages = bySession.get(result.sessionID);
-    if (!messages) continue;
-
-    const messageIndex = messages.findIndex((msg) => msg.info.id === result.messageID);
-    if (messageIndex === -1) continue;
-
     if (mode === "message") {
-      expanded.push({
-        resultIndex,
-        sessionID: result.sessionID,
-        messageID: result.messageID,
-        mode,
-        message: formatExpandedMsg(messages[messageIndex]!, budget, result.partID, findMatch),
-      });
+      try {
+        const resp = await gate.runQuery(() =>
+          client.session.message({
+            sessionID: result.sessionID,
+            messageID: result.messageID,
+          }),
+        );
+        if (resp.error || !resp.data) {
+          warnings.push(
+            `Expansion could not load session ${result.sessionID}: ${
+              resp.error ? errmsg(resp.error) : "no message returned"
+            }.`,
+          );
+          continue;
+        }
+        const bundle = resp.data as MsgWithParts;
+        expanded.push({
+          resultIndex,
+          sessionID: result.sessionID,
+          messageID: result.messageID,
+          mode,
+          message: formatExpandedMsg(bundle, budget, result.partID, findMatch),
+        });
+      } catch (error) {
+        warnings.push(`Expansion could not load session ${result.sessionID}: ${errmsg(error)}.`);
+      }
       continue;
     }
 
@@ -1318,19 +1108,42 @@ async function expandSearchResults(
       break;
     }
 
-    const desiredStart = Math.max(0, messageIndex - window);
-    const desiredEnd = Math.min(messages.length, messageIndex + window + 1);
-    const desiredCount = desiredEnd - desiredStart;
-    const allowedCount = Math.min(desiredCount, remainingContextMessages);
-    if (allowedCount < desiredCount) contextCapped = true;
+    const win = await fetchMessageWindow(
+      client,
+      {
+        sessionID: result.sessionID,
+        messageID: result.messageID,
+        before: window,
+        after: window,
+        pageMessages,
+        maxMessages: MAX_EXPAND_CONTEXT_FETCH,
+      },
+      runner,
+    );
+    if (win.loadError) {
+      warnings.push(`Expansion could not load session ${result.sessionID}: ${win.loadError}.`);
+      continue;
+    }
+    if (win.centerIndex === -1) continue;
 
-    const half = Math.floor((allowedCount - 1) / 2);
-    let start = Math.max(desiredStart, messageIndex - half);
-    const end = Math.min(desiredEnd, start + allowedCount);
-    start = Math.max(desiredStart, end - allowedCount);
-    const slice = messages.slice(start, end);
-    remainingContextMessages -= slice.length;
-    const items: MessageItem[] = slice.map((msg) => {
+    // Apply the per-call context-message budget, trimming symmetrically around
+    // the center (mirrors the previous allowedCount logic).
+    let msgs = win.messages;
+    let hasMoreBefore = win.hasMoreBefore;
+    let hasMoreAfter = win.hasMoreAfter;
+    if (msgs.length > remainingContextMessages) {
+      contextCapped = true;
+      const allowed = remainingContextMessages;
+      const half = Math.floor((allowed - 1) / 2);
+      let start = Math.max(0, win.centerIndex - half);
+      const end = Math.min(msgs.length, start + allowed);
+      start = Math.max(0, end - allowed);
+      if (start > 0) hasMoreBefore = true;
+      if (end < msgs.length) hasMoreAfter = true;
+      msgs = msgs.slice(start, end);
+    }
+    remainingContextMessages -= msgs.length;
+    const items: MessageItem[] = msgs.map((msg) => {
       const item = formatExpandedMsg(
         msg,
         budget,
@@ -1346,8 +1159,8 @@ async function expandSearchResults(
       messageID: result.messageID,
       mode,
       messages: items,
-      hasMoreBefore: start > 0,
-      hasMoreAfter: end < messages.length,
+      hasMoreBefore,
+      hasMoreAfter,
     });
   }
 
@@ -1625,6 +1438,44 @@ function attachCommonOutput<T extends SearchOutput>(
   return out;
 }
 
+/**
+ * Merge the tier-1 card shortlist with the tier-1.5 FTS-only needle sessions,
+ * capped at `cap`. FTS-only sessions (a session whose card missed the query's
+ * anchor but whose slim-index rows carry it) are guaranteed a reserved band of
+ * slots ahead of the weakest cards, so a rare needle is never crowded out by
+ * lexically-strong-but-wrong cards. Order-preserving and deduped.
+ */
+function mergeShortlist(cardIds: string[], ftsOnly: string[], cap: number): string[] {
+  if (ftsOnly.length === 0) return cardIds.slice(0, cap);
+  // Reserve needle slots only when the cap still leaves room for at least one
+  // strong card, so cap==1 always goes to the top-ranked card, not a needle.
+  const reserve = Math.min(
+    ftsOnly.length,
+    Math.max(1, Math.floor(cap / 3)),
+    cardIds.length > 0 ? cap - 1 : cap,
+  );
+  const strong = cardIds.slice(0, Math.max(0, cap - reserve));
+  const merged: string[] = [];
+  const seen = new Set<string>();
+  const push = (id: string): void => {
+    if (!seen.has(id)) {
+      seen.add(id);
+      merged.push(id);
+    }
+  };
+  for (const id of strong) push(id);
+  for (const id of ftsOnly.slice(0, reserve)) push(id);
+  for (const id of cardIds.slice(strong.length)) {
+    if (merged.length >= cap) break;
+    push(id);
+  }
+  for (const id of ftsOnly.slice(reserve)) {
+    if (merged.length >= cap) break;
+    push(id);
+  }
+  return merged.slice(0, cap);
+}
+
 // ── Main export ──────────────────────────────────────────────────────
 
 export function search(
@@ -1632,9 +1483,9 @@ export function search(
   unscoped: OpencodeClient,
   global: boolean,
   limits: Limits,
-  cache: CorpusCache,
-  semantic?: SemanticSearchConfig,
+  deps: SearchDeps,
 ): ToolDefinition {
+  const { cards, drill, store, gate } = deps;
   return tool({
     description: `Search prior opencode conversations by message/tool-output content. Primary history-discovery tool; prefer over recall_sessions for topical discovery (titles only).
 
@@ -1702,6 +1553,10 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
       from: tool.schema.string().optional().describe("Lower bound like '365d ago' or date"),
       to: tool.schema.string().optional().describe("Upper bound like 'now' or date"),
       directory: tool.schema.string().optional().describe("Exact or descendant session dir"),
+      project: tool.schema
+        .union([tool.schema.boolean(), tool.schema.string()])
+        .optional()
+        .describe("true=current project only; a path filters to that project dir"),
       fallback: tool.schema.boolean().default(false).describe("Broaden directory search if needed"),
       toolName: tool.schema.string().optional().describe("Exact tool name; tool parts only"),
       expand: tool.schema
@@ -1872,12 +1727,6 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
         args.sessions == null
           ? undefined
           : pickNumber("sessions", args.sessions, 1, limits.maxSessions, limits.maxSessions);
-      // Never send an undefined limit: the server defaults to 100 rows,
-      // which would silently hide older history from an "all history" sweep.
-      const sessionListLimit = directory
-        ? listLimitForDirectoryFilter(requestedSessions, limits.maxSessions)
-        : (requestedSessions ??
-          (Number.isFinite(limits.maxSessions) ? limits.maxSessions : DISCOVERY_LIMIT));
 
       const fail = (error: string): string =>
         JSON.stringify({ ok: false, error } satisfies ErrorOutput);
@@ -1945,631 +1794,504 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
       }
 
       try {
-        let targets: SessionMetaInternal[] = [];
-        // A raw list response that fills our completeness-mode limit means
-        // even older history may exist beyond the window we asked for.
-        let providerCapHit = false;
-        const noteDiscoveryCap = (count: number): void => {
-          // Completeness mode only: a caller-requested sessions cap routes
-          // through sessionsLimit accounting, even if it happens to equal
-          // the discovery limit numerically.
-          if (
-            requestedSessions == null &&
-            sessionListLimit === DISCOVERY_LIMIT &&
-            count >= DISCOVERY_LIMIT
-          ) {
-            providerCapHit = true;
-          }
-        };
+        const queryMeta = parseQuery(args.query);
+        const commandLikeQuery =
+          queryMeta.codeTokens.length > 0 || COMMAND_VERB_RE.test(args.query);
+        const smartMode: "smart" | "fuzzy" = matchMode === "fuzzy" ? "fuzzy" : "smart";
+        const searchTitles = canSearchTitles(partType, toolName);
+        const filters: CandidateFilters = { type: partType, role, before, after, toolName };
+        const groupMode: GroupMode = groupArg;
+        const isGrouped = groupMode === "session";
 
-        if (sessionID) {
-          let title = "";
-          let directory = "";
-          let updated = 0;
-          let parentID: string | undefined;
-          let projectID: string | undefined;
-          let projectWorktree: string | undefined;
-          try {
-            const sess = await client.session.get({
-              sessionID,
-            });
-            if (sess.data) {
-              const data = sess.data as Session | GlobalSession;
-              title = data.title;
-              directory = data.directory;
-              updated = data.time.updated;
-              parentID = data.parentID;
-              projectID = data.projectID;
-              projectWorktree = "project" in data ? data.project?.worktree : undefined;
-            }
-          } catch {
-            // Can't get metadata, proceed anyway
-          }
-          targets = [
-            { id: sessionID, title, directory, updated, parentID, projectID, projectWorktree },
-          ];
-        } else if (scope === "session") {
-          if (!ctx.sessionID) {
-            const err: ErrorOutput = {
-              ok: false,
-              error: "No sessionID provided and no current session available",
-            };
-            return JSON.stringify(err);
-          }
+        const callerDirectory = optionalString(ctx.directory);
+        const callerWorktree = optionalString(ctx.worktree) ?? callerDirectory;
+        const projectString =
+          typeof args.project === "string" ? optionalString(args.project) : undefined;
+        const projectScope = scope === "project" || args.project === true;
+        const directoryFilter = directory ?? projectString;
+        const bucketDirectory = directoryFilter ?? (projectScope ? callerDirectory : undefined);
 
-          let title = "";
-          let directory = "";
-          let updated = 0;
-          let parentID: string | undefined;
-          let projectID: string | undefined;
-          let projectWorktree: string | undefined;
-          try {
-            const sess = await client.session.get({ sessionID: ctx.sessionID });
-            if (sess.data) {
-              const data = sess.data as Session | GlobalSession;
-              title = data.title;
-              directory = data.directory;
-              updated = data.time.updated;
-              parentID = data.parentID;
-              projectID = data.projectID;
-              projectWorktree = "project" in data ? data.project?.worktree : undefined;
-            }
-          } catch {
-            // proceed without metadata
-          }
-          targets = [
-            { id: ctx.sessionID, title, directory, updated, parentID, projectID, projectWorktree },
-          ];
-        } else if (scope === "project") {
-          const resp = await client.session.list({
-            search: title,
-            limit: sessionListLimit,
-          });
-          if (resp.error) {
-            const err: ErrorOutput = {
-              ok: false,
-              error: `Failed to list sessions: ${errmsg(resp.error)}`,
-            };
-            return JSON.stringify(err);
-          }
-          if (resp.data) {
-            noteDiscoveryCap(resp.data.length);
-            targets = resp.data.map(meta);
-          }
-        } else {
-          const resp = await unscoped.experimental.session.list({
-            search: title,
-            limit: sessionListLimit,
-          });
-          if (resp.error) {
-            const err: ErrorOutput = {
-              ok: false,
-              error: `Failed to list sessions: ${errmsg(resp.error)}`,
-            };
-            return JSON.stringify(err);
-          }
-          if (resp.data) {
-            noteDiscoveryCap(resp.data.length);
-            targets = resp.data.map(meta);
-          }
-        }
-
-        if (directory && fallback && !sessionID && scope === "project" && global) {
-          const resp = await unscoped.experimental.session.list({
-            search: title,
-            limit: sessionListLimit,
-          });
-          if (resp.data) {
-            noteDiscoveryCap(resp.data.length);
-            targets = dedupeSessions([...targets, ...resp.data.map(meta)]);
-          }
-          if (resp.error) {
-            normalized.warnings.push(
-              `Directory fallback could not list global sessions: ${errmsg(resp.error)}.`,
-            );
-          }
-        }
-
-        const discoveredTargets = dedupeSessions(targets);
         const skippedByReason: Record<string, number> = {};
 
-        // Session exclusion is a metadata filter on the eligible set.
-        // discoveredTargets stays untouched so sessionsDiscovered keeps
-        // counting everything found and the sessionsSkipped reconciliation
-        // below stays consistent.
-        const excludedIDs = new Set<string>();
-        if (excludeSessionID) excludedIDs.add(excludeSessionID);
-        if (excludeCurrent && currentSessionID) {
-          // Exclude the whole delegation tree, not just the one session:
-          // subagents spawned from this conversation restate its query and
-          // findings, and are the same self-reflection problem one level down.
-          for (const id of exclusionFamily(discoveredTargets, currentSessionID)) {
-            excludedIDs.add(id);
-          }
-        }
-        const consideredTargets =
-          excludedIDs.size > 0
-            ? discoveredTargets.filter((target) => !excludedIDs.has(target.id))
-            : discoveredTargets;
-        const excludedCount = discoveredTargets.length - consideredTargets.length;
-        const currentSessionExcluded = Boolean(
-          excludeCurrent &&
-          currentSessionID &&
-          discoveredTargets.some((target) => target.id === currentSessionID),
-        );
-        if (excludedCount > 0) {
-          skippedByReason.excludedSession = excludedCount;
-          pushUnique(normalized.limitedBy, "excludedSession");
+        const cardMeta = (card: Card): SessionMetaInternal => ({
+          id: card.sessionId,
+          title: card.title,
+          directory: card.directory,
+          updated: card.timeUpdated,
+          parentID: card.parentId ?? undefined,
+          projectID: card.projectId || undefined,
+        });
+        const relevanceOf = (card: Card): DirectoryRelevance =>
+          bucketDirectory
+            ? classifyDirectoryRelevance(cardMeta(card), bucketDirectory, callerWorktree)
+            : "unknown";
+
+        const relevanceBySession = new Map<string, DirectoryRelevance>();
+        const searchedMeta = new Map<string, { id: string; title: string; directory: string }>();
+        let drillTargets: DrillTarget[] = [];
+        let deepSet = new Set<string>();
+        let ftsBySession: Map<string, FtsHit[]> | undefined;
+        let sessionsEligible = 0;
+        let shortlistIDs: string[] = [];
+        let directoryBucketsSearched: SearchCoverage["directoryBucketsSearched"];
+
+        const singleTarget = sessionID ?? (scope === "session" ? currentSessionID : undefined);
+        if (scope === "session" && !singleTarget) {
+          const err: ErrorOutput = {
+            ok: false,
+            error: "No sessionID provided and no current session available",
+          };
+          return JSON.stringify(err);
         }
 
-        if (providerCapHit) {
+        if (singleTarget) {
+          let sTitle = "";
+          let sDir = "";
+          let sUpdated = 0;
+          try {
+            const sess = await gate.runQuery(() => client.session.get({ sessionID: singleTarget }));
+            if (sess.data) {
+              const data = sess.data as Session | GlobalSession;
+              sTitle = data.title;
+              sDir = data.directory;
+              sUpdated = data.time.updated;
+            }
+          } catch {
+            // Proceed without metadata; drill still fetches the session's parts.
+          }
+          drillTargets = [
+            { sessionId: singleTarget, title: sTitle, directory: sDir, timeUpdated: sUpdated },
+          ];
+          deepSet = new Set([singleTarget]);
+          relevanceBySession.set(singleTarget, "unknown");
+          searchedMeta.set(singleTarget, { id: singleTarget, title: sTitle, directory: sDir });
+          sessionsEligible = 1;
+          if (sessionID) pushUnique(normalized.limitedBy, "sessionID");
+          else pushUnique(normalized.limitedBy, "scope");
+        } else {
+          // ── Tier 1: rank cards ──
+          const cardFilters: CardFilters = {};
+          if (after != null) cardFilters.since = after;
+          if (before != null) cardFilters.until = before;
+          if (excludeCurrent && currentSessionID) cardFilters.excludeFamilyOf = currentSessionID;
+          let cardHits: CardHit[] = cards.rank(queryMeta, cardFilters);
+
+          if (title) {
+            const titleLower = title.toLowerCase();
+            cardHits = cardHits.filter((hit) => hit.card.title.toLowerCase().includes(titleLower));
+            pushUnique(normalized.limitedBy, "title");
+          }
+
+          // ── Directory / project bucketing (reuses the old relevance machinery) ──
+          let eligible = cardHits.map((hit) => ({ hit, relevance: relevanceOf(hit.card) }));
+          if (bucketDirectory) {
+            pushUnique(normalized.limitedBy, directoryFilter ? "directory" : "scope");
+            const exact = eligible.filter((e) => e.relevance === "exact");
+            const proj = eligible.filter((e) => e.relevance === "project");
+            const glob = eligible.filter((e) => e.relevance === "global");
+            if (directoryFilter && fallback) {
+              eligible = [...exact, ...proj, ...glob];
+              directoryBucketsSearched = [
+                ...(exact.length > 0 ? (["exact"] as const) : []),
+                ...(proj.length > 0 ? (["project"] as const) : []),
+                ...(glob.length > 0 ? (["global"] as const) : []),
+              ];
+              if (proj.length > 0 || glob.length > 0) {
+                normalized.warnings.push(
+                  "Directory fallback broadened the search beyond exact matches.",
+                );
+              }
+            } else if (projectScope && !directoryFilter) {
+              eligible = [...exact, ...proj];
+              directoryBucketsSearched = [
+                ...(exact.length > 0 ? (["exact"] as const) : []),
+                ...(proj.length > 0 ? (["project"] as const) : []),
+              ];
+              if (glob.length > 0) skippedByReason.directory = glob.length;
+            } else {
+              eligible = exact;
+              directoryBucketsSearched = exact.length > 0 ? ["exact"] : [];
+              const skipped = proj.length + glob.length;
+              if (skipped > 0) skippedByReason.directory = skipped;
+            }
+          }
+
+          for (const e of eligible) {
+            relevanceBySession.set(e.hit.sessionId, e.relevance);
+            searchedMeta.set(e.hit.sessionId, {
+              id: e.hit.sessionId,
+              title: e.hit.card.title,
+              directory: e.hit.card.directory,
+            });
+          }
+          sessionsEligible = eligible.length;
+          // Title/directory-overlap shortlist (metadata signal), distinct from
+          // the content rank: it powers the "these sessions match by name but no
+          // content hit surfaced" suggestion, where every RESULT already comes
+          // from a drilled (ranked) session.
+          const metaTokens = queryMeta.tokens.filter((token) => token.length >= 4);
+          shortlistIDs =
+            metaTokens.length > 0
+              ? eligible
+                  .filter((e) => {
+                    const meta = `${e.hit.card.title} ${e.hit.card.directory}`.toLowerCase();
+                    return metaTokens.some((token) => meta.includes(token));
+                  })
+                  .map((e) => e.hit.sessionId)
+              : [];
+
+          const cardById = new Map(eligible.map((e) => [e.hit.sessionId, e.hit.card] as const));
+          const eligibleIds = eligible.map((e) => e.hit.sessionId);
+          const eligibleIdSet = new Set(eligibleIds);
+          deepSet = eligibleIdSet;
+
+          // ── Tier 1.5: FTS needle lookup — inject sessions whose card missed the anchor ──
+          const ftsOnly: string[] = [];
+          if (store) {
+            const rows = store.ftsSearch({
+              strong: [...queryMeta.codeTokens, ...queryMeta.phrases],
+              weak: queryMeta.tokens,
+            });
+            ftsBySession = new Map<string, FtsHit[]>();
+            for (const row of rows) {
+              const list = ftsBySession.get(row.sessionId);
+              if (list) list.push(row);
+              else ftsBySession.set(row.sessionId, [row]);
+            }
+            const excludedFamily =
+              excludeCurrent && currentSessionID
+                ? cards.exclusionFamily(currentSessionID)
+                : new Set<string>();
+            for (const id of ftsBySession.keys()) {
+              if (eligibleIdSet.has(id)) continue;
+              if (id === excludeSessionID || excludedFamily.has(id)) continue;
+              const card = store.getCard(id);
+              if (!card) continue;
+              if (after != null && card.timeUpdated < after) continue;
+              if (before != null && card.timeUpdated > before) continue;
+              const relevance = relevanceOf(card);
+              if (bucketDirectory) {
+                if (relevance === "global" && !(directoryFilter && fallback)) continue;
+                if (relevance === "project" && !(projectScope || (directoryFilter && fallback))) {
+                  continue;
+                }
+              }
+              relevanceBySession.set(id, relevance);
+              searchedMeta.set(id, { id, title: card.title, directory: card.directory });
+              cardById.set(id, card);
+              ftsOnly.push(id);
+            }
+          }
+
+          // Cap the shortlist: caller sessions cap, then the drill fan-out.
+          const cap =
+            requestedSessions != null
+              ? Math.min(requestedSessions, Math.max(1, limits.drillSessions))
+              : Math.max(1, limits.drillSessions);
+          const mergedIds = mergeShortlist(eligibleIds, ftsOnly, cap);
+          drillTargets = mergedIds
+            .filter((id) => id !== excludeSessionID)
+            .map((id) => {
+              const card = cardById.get(id);
+              return {
+                sessionId: id,
+                title: card?.title ?? "",
+                directory: card?.directory ?? "",
+                timeUpdated: card?.timeUpdated ?? 0,
+              };
+            });
+
+          if (excludeSessionID) {
+            skippedByReason.excludedSession = (skippedByReason.excludedSession ?? 0) + 1;
+            pushUnique(normalized.limitedBy, "excludedSession");
+          }
+          const shortlistSkipped = Math.max(0, eligibleIds.length - drillTargets.length);
+          if (requestedSessions != null && sessionsEligible > requestedSessions) {
+            pushUnique(normalized.limitedBy, "sessionsLimit");
+          }
+          if (shortlistSkipped > 0) {
+            skippedByReason.sessionsLimit = (skippedByReason.sessionsLimit ?? 0) + shortlistSkipped;
+          }
+          if (excludeCurrent && currentSessionID) {
+            // Count the current session's whole delegation tree (the cards the
+            // family filter removed from ranking) so coverage reports the skip.
+            const family = cards.exclusionFamily(currentSessionID);
+            let excludedKnown = 0;
+            for (const id of family) {
+              if (!store || store.getCard(id)) excludedKnown++;
+            }
+            if (excludedKnown > 0) {
+              pushUnique(normalized.limitedBy, "excludedSession");
+              skippedByReason.excludedSession =
+                (skippedByReason.excludedSession ?? 0) + excludedKnown;
+            }
+          }
+          if (scope !== "global") pushUnique(normalized.limitedBy, "scope");
+        }
+
+        if (ctx.abort.aborted) {
+          const err: ErrorOutput = { ok: false, error: "aborted" };
+          return JSON.stringify(err);
+        }
+
+        const currentSessionExcluded = Boolean(
+          excludeCurrent && currentSessionID && (store ? store.getCard(currentSessionID) : true),
+        );
+        drillTargets = drillTargets.filter((t) => t.sessionId !== excludeSessionID);
+
+        const drillInput = {
+          sessions: drillTargets,
+          deepSet,
+          ftsBySession,
+          query: queryMeta,
+          explain,
+          filter: (candidate: Candidate) => candidateEligible(candidate, filters),
+          searchTitles,
+          abort: ctx.abort,
+        };
+        const abortedOutput = (): string =>
+          JSON.stringify({ ok: false, error: "aborted" } satisfies ErrorOutput);
+
+        const cardsCoverage = cards.coverage();
+        if (cardsCoverage.totalCards >= DISCOVERY_LIMIT) {
           pushUnique(normalized.limitedBy, "providerLimit");
           normalized.warnings.push(
-            "Discovery returned the maximum requested sessions; older history may exist beyond this window. Narrow with directory/title or time filters.",
+            "The card store holds the maximum discoverable sessions; older history may exist beyond it.",
+          );
+        }
+        if (cardsCoverage.degraded) {
+          normalized.warnings.push(
+            "Cards are metadata-only (card store unavailable); content search is degraded.",
+          );
+        } else if (cardsCoverage.fullCards < cardsCoverage.totalCards) {
+          normalized.warnings.push(
+            "The card store is still distilling; some sessions are metadata-only until it completes.",
           );
         }
 
-        let directoryBucketsSearched: SearchCoverage["directoryBucketsSearched"];
-        let sessionsEligible = consideredTargets.length;
-        if (directory) {
-          pushUnique(normalized.limitedBy, "directory");
-          const fallbackWorktree = optionalString(ctx.worktree) ?? optionalString(ctx.directory);
-          if (fallback && !fallbackWorktree) {
-            normalized.warnings.push(
-              "Directory fallback could not identify a project/worktree bucket; using exact and global buckets only.",
-            );
-          }
-          const bucketed = consideredTargets.map((target) =>
-            withDirectoryRelevance(
-              target,
-              classifyDirectoryRelevance(target, directory, fallbackWorktree),
-            ),
-          );
-          const exact = bucketed.filter((target) => target.directoryRelevance === "exact");
-          const project = bucketed.filter((target) => target.directoryRelevance === "project");
-          const fallbackGlobal = bucketed.filter(
-            (target) => target.directoryRelevance === "global",
-          );
-
-          if (fallback) {
-            targets = [...exact, ...project, ...fallbackGlobal];
-            sessionsEligible = targets.length;
-            directoryBucketsSearched = [
-              ...(exact.length > 0 ? (["exact"] as const) : []),
-              ...(project.length > 0 ? (["project"] as const) : []),
-              ...(fallbackGlobal.length > 0 ? (["global"] as const) : []),
-            ];
-            if (project.length > 0 || fallbackGlobal.length > 0) {
-              normalized.warnings.push(
-                "Directory fallback broadened the search beyond exact matches.",
-              );
-            }
-          } else {
-            targets = exact;
-            sessionsEligible = targets.length;
-            const skipped = consideredTargets.length - targets.length;
-            if (skipped > 0) skippedByReason.directory = skipped;
-            directoryBucketsSearched = exact.length > 0 ? ["exact"] : [];
-          }
-
-          if (requestedSessions != null && targets.length > requestedSessions) {
-            skippedByReason.sessionsLimit =
-              (skippedByReason.sessionsLimit ?? 0) + (targets.length - requestedSessions);
-            targets = targets.slice(0, requestedSessions);
-          }
-        } else {
-          targets = consideredTargets.map((target) => withDirectoryRelevance(target, "unknown"));
-          sessionsEligible = targets.length;
-        }
-
-        if (requestedSessions != null && sessionsEligible > requestedSessions) {
-          pushUnique(normalized.limitedBy, "sessionsLimit");
-        }
-        if (Number.isFinite(limits.maxSessions) && discoveredTargets.length >= limits.maxSessions) {
-          pushUnique(normalized.limitedBy, "maxSessions");
-        }
-        if (title) pushUnique(normalized.limitedBy, "title");
-        if (sessionID) pushUnique(normalized.limitedBy, "sessionID");
-        else if (scope !== "global") pushUnique(normalized.limitedBy, "scope");
-
-        // ── Sync sessions through the corpus cache ────────────────────
-        // Only changed/missing sessions are fetched; everything else is
-        // served from the in-memory corpus. release() (in the finally below)
-        // unpins the synced sessions so they become evictable again.
-        const sync = await cache.sync(
-          targets.map((t) => ({
-            id: t.id,
-            title: t.title,
-            directory: t.directory,
-            updated: t.updated,
-          })),
-          ctx.abort,
-        );
-        try {
-          if (ctx.abort.aborted) {
-            const err: ErrorOutput = { ok: false, error: "aborted" };
-            return JSON.stringify(err);
-          }
-
-          const { loadErrors, loadErrorCount } = sync;
-          const scanned = sync.sessions.length;
-          if (loadErrorCount > 0) pushUnique(normalized.limitedBy, "loadError");
-
-          // Apply this query's filters to the cached corpus. Coverage counts
-          // are derived from the eligible candidates: messages/parts WITH
-          // searchable content that passed the filters (a deliberate change
-          // from the old pre-extraction counting; see the plan's Phase 2).
-          const searchTitles = canSearchTitles(partType, toolName);
-          const filters: CandidateFilters = { type: partType, role, before, after, toolName };
-          const assembled = sync.sessions.map((entry, index) => ({
-            session: assembleSession(entry, filters, searchTitles),
-            relevance: targets[index]?.directoryRelevance ?? ("unknown" as DirectoryRelevance),
-          }));
-
-          let messagesSearched = 0;
+        // ── Build coverage + the finish() machinery from a drill result ──
+        const buildOutputContext = (
+          drilledSessions: string[],
+          pools: DrilledPool[],
+          loadErrors: string[],
+          budgetExhausted: boolean,
+        ): {
+          coverage: SearchCoverage;
+          searchedSessions: Array<{ id: string; title: string; directory: string }>;
+          loadErrorCount: number;
+          incomplete: boolean;
+        } => {
           let partsSearched = 0;
-          for (const entry of assembled) {
-            messagesSearched += entry.session.messagesSearched;
-            partsSearched += entry.session.partsSearched;
-          }
-          const searchedSessions = assembled.map((entry) => ({
-            id: entry.session.meta.id,
-            title: entry.session.meta.title,
-            directory: entry.session.meta.directory,
-          }));
-
-          const sessionsDiscovered = discoveredTargets.length;
-          const sessionsSkipped = sessionsDiscovered - scanned;
-          if (sessionsSkipped > 0) {
-            const accounted = Object.values(skippedByReason).reduce((sum, value) => sum + value, 0);
-            if (accounted < sessionsSkipped) {
-              skippedByReason.filtered = sessionsSkipped - accounted;
+          const msgIds = new Set<string>();
+          for (const pool of pools) {
+            for (const candidate of pool.candidates) {
+              if (candidate.partType === "title") continue;
+              partsSearched++;
+              msgIds.add(candidate.messageID);
             }
           }
-          const incomplete = loadErrorCount > 0;
+          const loadErrorCount = loadErrors.length;
+          if (loadErrorCount > 0) pushUnique(normalized.limitedBy, "loadError");
+          if (budgetExhausted) pushUnique(normalized.limitedBy, "rankingBudget");
+          const drillSkipped = Math.max(0, drillTargets.length - drilledSessions.length);
+          if (drillSkipped > 0) {
+            skippedByReason.rankingBudget = (skippedByReason.rankingBudget ?? 0) + drillSkipped;
+          }
+          const sessionsSkipped = Object.values(skippedByReason).reduce((a, b) => a + b, 0);
           const coverage: SearchCoverage = {
             totalSessionsKnown: false,
-            sessionsDiscovered,
+            sessionsDiscovered: cardsCoverage.totalCards,
             sessionsEligible,
-            sessionsSearched: scanned,
-            messagesSearched,
+            sessionsSearched: drilledSessions.length,
+            messagesSearched: msgIds.size,
             partsSearched,
             sessionsSkipped,
             skippedByReason: Object.keys(skippedByReason).length > 0 ? skippedByReason : undefined,
             directoryBucketsSearched,
             limitedBy: normalized.limitedBy.length > 0 ? normalized.limitedBy : undefined,
-            loadErrors: incomplete
-              ? { count: loadErrorCount, samples: [...loadErrors] }
-              : undefined,
+            loadErrors:
+              loadErrorCount > 0 ? { count: loadErrorCount, samples: [...loadErrors] } : undefined,
+            cards: {
+              total: cardsCoverage.totalCards,
+              full: cardsCoverage.fullCards,
+              storeRecency: cardsCoverage.storeRecency,
+              degraded: cardsCoverage.degraded,
+            },
           };
+          const searchedSessions = drilledSessions.map(
+            (id) => searchedMeta.get(id) ?? { id, title: "", directory: "" },
+          );
+          return { coverage, searchedSessions, loadErrorCount, incomplete: loadErrorCount > 0 };
+        };
 
-          const groupMode: GroupMode = groupArg;
-          const isGrouped = groupMode === "session";
-          const loadErrorSuffix = incomplete
-            ? `, ${loadErrorCount} load error${loadErrorCount !== 1 ? "s" : ""}`
-            : "";
-          // Locate the query's match position inside an expanded field so
-          // truncation can preserve the matched region. Built per EFFECTIVE
-          // mode: the smart-to-literal fallback path must locate literally,
-          // not with the smart token list it never matched with.
-          const queryLower = args.query.toLowerCase();
-          let smartTokensMemo: string[] | undefined;
-          const makeFindMatch = (effectiveMode: MatchMode): MatchFinder => {
-            return (text) => {
-              if (effectiveMode === "regex" && regex) return regexFirstIndex(regex, text);
-              const lower = text.toLowerCase();
-              if (effectiveMode === "literal") return lower.indexOf(queryLower);
-              smartTokensMemo ??= parseQuery(args.query).tokens;
-              for (const token of smartTokensMemo) {
-                const index = lower.indexOf(token);
-                if (index !== -1) return index;
-              }
-              return -1;
-            };
+        const queryLower = args.query.toLowerCase();
+        let smartTokensMemo: string[] | undefined;
+        const makeFindMatch = (effectiveMode: MatchMode): MatchFinder => {
+          return (text) => {
+            if (effectiveMode === "regex" && regex) return regexFirstIndex(regex, text);
+            const lower = text.toLowerCase();
+            if (effectiveMode === "literal") return lower.indexOf(queryLower);
+            smartTokensMemo ??= parseQuery(args.query).tokens;
+            for (const token of smartTokensMemo) {
+              const index = lower.indexOf(token);
+              if (index !== -1) return index;
+            }
+            return -1;
           };
+        };
 
-          const includeExpansion = async <T extends SearchOutput>(
-            out: T,
-            final: SearchResult[],
-            warnings: string[],
-            effectiveMatchMode: MatchMode,
-          ): Promise<T> => {
-            const expansion = await expandSearchResults(
+        const includeExpansion = async <T extends SearchOutput>(
+          out: T,
+          final: SearchResult[],
+          warnings: string[],
+          effectiveMatchMode: MatchMode,
+        ): Promise<T> => {
+          const expansion = await expandSearchResults(
+            final,
+            client,
+            gate,
+            limits,
+            expandMode,
+            normalized.expandResults,
+            normalized.window,
+            normalized.expandBudgetMessages,
+            normalized.expandBudgetChars,
+            makeFindMatch(effectiveMatchMode),
+          );
+          if (expansion.expanded) out.expanded = expansion.expanded;
+          warnings.push(...expansion.warnings);
+          return out;
+        };
+
+        const finish = async <T extends SearchOutput>(
+          out: T,
+          final: SearchResult[],
+          effectiveMatchMode: MatchMode,
+          outCtx: ReturnType<typeof buildOutputContext>,
+        ): Promise<T> => {
+          const warnings = [...normalized.warnings];
+          if (outCtx.incomplete) {
+            warnings.push(
+              `${outCtx.loadErrorCount} session${outCtx.loadErrorCount === 1 ? "" : "s"} failed to load; results may be partial.`,
+            );
+          }
+          return attachCommonOutput(
+            await includeExpansion(out, final, warnings, effectiveMatchMode),
+            {
               final,
-              client,
-              expandMode,
-              normalized.expandResults,
-              normalized.window,
-              normalized.expandBudgetMessages,
-              normalized.expandBudgetChars,
-              makeFindMatch(effectiveMatchMode),
+              searchedSessions: outCtx.searchedSessions,
+              coverage: outCtx.coverage,
+              warnings,
+              directory: directoryFilter,
+              fallback,
+              matchMode: effectiveMatchMode,
+              type: partType,
+              query: args.query,
+              currentSessionID,
+              currentSessionExcluded,
+              excludeExplicitOff: excludeExplicit === false,
+              codeTokens: queryMeta.codeTokens,
+              shortlistIDs,
+            },
+          );
+        };
+
+        // ── Part-mode over-collection bound (grouped scans broadly) ──
+        const partScanLimit = Math.min(
+          MAX_PART_SCAN_RESULTS,
+          resultsArg * DIVERSITY_SCAN_MULTIPLIER,
+        );
+
+        const applyGroupAndSlice = (
+          results: SearchResult[],
+          partTotal: number,
+          earlyExit: boolean,
+        ): { final: SearchResult[]; total: number; truncated: boolean } => {
+          if (isGrouped) {
+            const grouped = orderForDirectoryFallback(
+              groupBySession(results),
+              Boolean(bucketDirectory && fallback),
             );
-            if (expansion.expanded) out.expanded = expansion.expanded;
-            warnings.push(...expansion.warnings);
-            return out;
-          };
-          const finish = async <T extends SearchOutput>(
-            out: T,
-            final: SearchResult[],
-            effectiveMatchMode: MatchMode,
-          ): Promise<T> => {
-            const warnings = [...normalized.warnings];
-            if (incomplete) {
-              warnings.push(
-                `${loadErrorCount} session${loadErrorCount === 1 ? "" : "s"} failed to load; results may be partial.`,
-              );
-            }
-            return attachCommonOutput(
-              await includeExpansion(out, final, warnings, effectiveMatchMode),
-              {
-                final,
-                searchedSessions,
-                coverage,
-                warnings,
-                directory,
-                fallback,
-                matchMode: effectiveMatchMode,
-                type: partType,
-                query: args.query,
-                currentSessionID,
-                currentSessionExcluded,
-                excludeExplicitOff: excludeExplicit === false,
-                codeTokens: queryMeta.codeTokens,
-                shortlistIDs,
-              },
-            );
-          };
-
-          // ── Helper: run literal scan (full or limited) ───────────────
-          const literalScan = (
-            scanLimit: number,
-          ): { collected: SearchResult[]; total: number; early: boolean } => {
-            const collected: SearchResult[] = [];
-            let total = 0;
-            let early = false;
-            const scanStart = performance.now();
-
-            for (const entry of assembled) {
-              if (collected.length >= scanLimit) {
-                early = true;
-                break;
-              }
-              // Bound synchronous scanning by wall-clock and honor a fired abort
-              // (a hook timeout may have landed mid-scan, where the abort flag
-              // couldn't be observed until now).
-              if (ctx.abort.aborted || performance.now() - scanStart > SCAN_TIME_BUDGET_MS) {
-                early = true;
-                break;
-              }
-              const remaining = scanLimit - collected.length;
-              const result = scan(
-                scanPool(entry.session),
-                entry.relevance,
-                args.query,
-                remaining,
-                widthArg,
-              );
-              collected.push(...result.results);
-              total += result.total;
-            }
-            return { collected, total, early };
-          };
-
-          // ── Helper: run regex scan (full or limited) ─────────────────
-          const regexScanAll = (
-            re: RegExp,
-            scanLimit: number,
-          ): { collected: SearchResult[]; total: number; early: boolean } => {
-            const collected: SearchResult[] = [];
-            let total = 0;
-            let early = false;
-            const scanStart = performance.now();
-
-            for (const entry of assembled) {
-              if (collected.length >= scanLimit) {
-                early = true;
-                break;
-              }
-              // Bound synchronous scanning by wall-clock and honor a fired abort.
-              if (ctx.abort.aborted || performance.now() - scanStart > SCAN_TIME_BUDGET_MS) {
-                early = true;
-                break;
-              }
-              const remaining = scanLimit - collected.length;
-              const result = regexScanCandidates(
-                scanPool(entry.session),
-                entry.relevance,
-                re,
-                remaining,
-                widthArg,
-              );
-              collected.push(...result.results);
-              total += result.total;
-            }
-            return { collected, total, early };
-          };
-
-          // Hoisted above applyGroupAndSlice, which closes over them: keeps
-          // the closure free of temporal-dead-zone hazards under reordering.
-          const queryMeta = parseQuery(args.query);
-          const commandLikeQuery =
-            queryMeta.codeTokens.length > 0 || COMMAND_VERB_RE.test(args.query);
-          // Populated by the smart path before finish() runs; empty otherwise.
-          let shortlistIDs: string[] = [];
-
-          // ── Helper: apply grouping and slicing ───────────────────────
-          const applyGroupAndSlice = (
-            results: SearchResult[],
-            partTotal: number,
-            earlyExit: boolean,
-          ): { final: SearchResult[]; total: number; truncated: boolean } => {
-            if (isGrouped) {
-              const grouped = orderForDirectoryFallback(
-                groupBySession(results),
-                Boolean(directory && fallback),
-              );
-              const final = grouped.slice(0, resultsArg);
-              return {
-                final,
-                total: grouped.length,
-                truncated: earlyExit || grouped.length > final.length,
-              };
-            }
-            // Diversify first (caps per-session hits), then restore directory
-            // relevance ordering — otherwise a held-back exact-directory hit can
-            // land behind a global-directory hit, inverting the fallback ordering
-            // the caller asked for. Class caps and the tool-input guarantee run
-            // last, over the directory-ordered list (capAndSlice).
-            const diversified = diversify(results, resultsArg, MAX_HITS_PER_SESSION_INITIAL);
-            const ordered = orderForDirectoryFallback(diversified, Boolean(directory && fallback));
-            const final = capAndSlice(ordered, resultsArg, commandLikeQuery);
+            const final = grouped.slice(0, resultsArg);
             return {
               final,
-              total: partTotal,
-              truncated: earlyExit || partTotal > final.length,
+              total: grouped.length,
+              truncated: earlyExit || grouped.length > final.length,
             };
-          };
-
-          // Part-mode literal/regex over-collect so the diversity pass has
-          // cross-session material; grouped mode already scans broadly.
-          const partScanLimit = Math.min(
-            MAX_PART_SCAN_RESULTS,
-            resultsArg * DIVERSITY_SCAN_MULTIPLIER,
-          );
-
-          // ── Route: literal or smart/fuzzy ─────────────────────────────
-          if (matchMode === "literal") {
-            // When grouping by session, scan all sessions (no early exit)
-            // so we get representative hits from every matching session
-            const limit = isGrouped ? Number.MAX_SAFE_INTEGER : partScanLimit;
-            const { collected, total, early } = literalScan(limit);
-            const {
-              final,
-              total: outTotal,
-              truncated,
-            } = applyGroupAndSlice(collected, total, early);
-
-            const unit = isGrouped ? "session" : "result";
-            ctx.metadata({
-              title: `Found ${final.length} ${unit}${final.length !== 1 ? "s" : ""} for "${args.query}" (${scanned} session${scanned !== 1 ? "s" : ""} searched${loadErrorSuffix})`,
-            });
-
-            const out: SearchOutput = {
-              ok: true,
-              results: final,
-              total: outTotal,
-              truncated,
-              group: groupMode,
-            };
-            return JSON.stringify(await finish(out, final, "literal"));
           }
-
-          // ── Route: regex ──────────────────────────────────────────────
-          if (matchMode === "regex" && regex) {
-            const limit = isGrouped ? Number.MAX_SAFE_INTEGER : partScanLimit;
-            const { collected, total, early } = regexScanAll(regex, limit);
-            const {
-              final,
-              total: outTotal,
-              truncated,
-            } = applyGroupAndSlice(collected, total, early);
-
-            const unit = isGrouped ? "session" : "result";
-            ctx.metadata({
-              title: `Found ${final.length} ${unit}${final.length !== 1 ? "s" : ""} for /${args.query}/ (regex, ${scanned} session${scanned !== 1 ? "s" : ""}${loadErrorSuffix})`,
-            });
-
-            const out: SearchOutput = {
-              ok: true,
-              results: final,
-              total: outTotal,
-              truncated,
-              matchMode: "regex",
-              group: groupMode,
-            };
-            return JSON.stringify(await finish(out, final, "regex"));
-          }
-
-          // ── Smart/fuzzy path ────────────────────────────────────────
-          // literal and regex modes returned above; only smart/fuzzy remain.
-          const smartMode: "smart" | "fuzzy" = matchMode === "fuzzy" ? "fuzzy" : "smart";
-          const smartResult = smartScan(
-            assembled,
-            args.query,
-            explain,
-            smartMode,
-            widthArg,
-            ctx.abort,
-            semantic,
+          const diversified = diversify(results, resultsArg, MAX_HITS_PER_SESSION_INITIAL);
+          const ordered = orderForDirectoryFallback(
+            diversified,
+            Boolean(bucketDirectory && fallback),
           );
-          if (smartResult.degradeKind === "time") pushUnique(normalized.limitedBy, "timeBudget");
-          shortlistIDs = smartResult.shortlistIDs;
-          // Surface the one-time semantic-unavailable warning (and any future
-          // smartScan warnings) through the shared warnings pipeline. Applies
-          // to the literal-fallback branch below too, since finish() reads
-          // normalized.warnings.
-          for (const warning of smartResult.warnings) normalized.warnings.push(warning);
+          const final = capAndSlice(ordered, resultsArg, commandLikeQuery);
+          return { final, total: partTotal, truncated: earlyExit || partTotal > final.length };
+        };
 
-          const QUERY_PLAN_VARIANTS = [
-            "bm25-broad",
-            "title-shortlist",
-            "exact-token-boost",
-            "semantic",
-            "literal-fallback",
-          ];
-          const attachQueryPlan = (out: SearchOutput, selected: string[]): void => {
-            if (explain) out.queryPlan = { variants: QUERY_PLAN_VARIANTS, selected };
-          };
-
-          // ── Fallback to literal if smart returns nothing ────────────
-          // Skip the fallback when the smart pass was cut short rather than
-          // genuinely empty: if the caller aborted (a hook timeout fired
-          // mid-smartScan) or the wall-clock budget was hit, a synchronous literal
-          // re-scan would run past the budget the timeout just enforced, and would
-          // also mask the time-degradation signal.
-          if (
-            smartResult.results.length === 0 &&
-            smartResult.degradeKind !== "time" &&
-            !ctx.abort.aborted
-          ) {
-            const limit = isGrouped ? Number.MAX_SAFE_INTEGER : partScanLimit;
-            const { collected, total, early } = literalScan(limit);
-            const {
-              final,
-              total: outTotal,
-              truncated,
-            } = applyGroupAndSlice(collected, total, early);
-
-            if (final.length > 0) {
-              const unit = isGrouped ? "session" : "result";
-              ctx.metadata({
-                title: `Found ${final.length} ${unit}${final.length !== 1 ? "s" : ""} for "${args.query}" (literal fallback, ${scanned} session${scanned !== 1 ? "s" : ""}${loadErrorSuffix})`,
-              });
-
-              const out: SearchOutput = {
-                ok: true,
-                results: final,
-                total: outTotal,
-                truncated,
-                matchMode: "literal",
-                degradeKind: "fallback",
-                group: groupMode,
-              };
-              attachQueryPlan(out, [...smartResult.planSelected, "literal-fallback"]);
-              return JSON.stringify(await finish(out, final, "literal"));
+        // ── Literal / regex scan over drilled pools ──
+        const scanPools = (
+          pools: DrilledPool[],
+          scanLimit: number,
+          matcher: (
+            candidates: Candidate[],
+            relevance: DirectoryRelevance,
+            remaining: number,
+          ) => {
+            results: SearchResult[];
+            total: number;
+          },
+        ): { collected: SearchResult[]; total: number; early: boolean } => {
+          const collected: SearchResult[] = [];
+          let total = 0;
+          let early = false;
+          const scanStart = performance.now();
+          for (const pool of pools) {
+            if (collected.length >= scanLimit) {
+              early = true;
+              break;
             }
+            if (ctx.abort.aborted || performance.now() - scanStart > SCAN_TIME_BUDGET_MS) {
+              early = true;
+              break;
+            }
+            const relevance = relevanceBySession.get(pool.target.sessionId) ?? "unknown";
+            const remaining = scanLimit - collected.length;
+            const result = matcher(pool.candidates, relevance, remaining);
+            collected.push(...result.results);
+            total += result.total;
           }
+          return { collected, total, early };
+        };
+        const literalMatcher = (
+          candidates: Candidate[],
+          relevance: DirectoryRelevance,
+          remaining: number,
+        ) => scan(candidates, relevance, args.query, remaining, widthArg);
+        const regexMatcher =
+          (re: RegExp) =>
+          (candidates: Candidate[], relevance: DirectoryRelevance, remaining: number) =>
+            regexScanCandidates(candidates, relevance, re, remaining, widthArg);
 
-          // ── Return smart/fuzzy results ──────────────────────────────
-          const {
-            final,
-            total: outTotal,
-            truncated,
-          } = applyGroupAndSlice(smartResult.results, smartResult.total, false);
+        const loadErrorSuffixOf = (count: number): string =>
+          count > 0 ? `, ${count} load error${count !== 1 ? "s" : ""}` : "";
+
+        // ── Route: literal ──
+        if (matchMode === "literal") {
+          const drilled = await drill.pools({ ...drillInput, mode: smartMode });
+          if (ctx.abort.aborted) return abortedOutput();
+          const outCtx = buildOutputContext(
+            drilled.drilledSessions,
+            drilled.pools,
+            drilled.loadErrors,
+            drilled.budgetExhausted,
+          );
+          const limit = isGrouped ? Number.MAX_SAFE_INTEGER : partScanLimit;
+          const { collected, total, early } = scanPools(drilled.pools, limit, literalMatcher);
+          const { final, total: outTotal, truncated } = applyGroupAndSlice(collected, total, early);
 
           const unit = isGrouped ? "session" : "result";
           ctx.metadata({
-            title: `Found ${final.length} ${unit}${final.length !== 1 ? "s" : ""} for "${args.query}" (${matchMode}, ${scanned} session${scanned !== 1 ? "s" : ""}${loadErrorSuffix})`,
+            title: `Found ${final.length} ${unit}${final.length !== 1 ? "s" : ""} for "${args.query}" (${drilled.drilledSessions.length} session${drilled.drilledSessions.length !== 1 ? "s" : ""} drilled${loadErrorSuffixOf(outCtx.loadErrorCount)})`,
           });
 
           const out: SearchOutput = {
@@ -2577,15 +2299,123 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
             results: final,
             total: outTotal,
             truncated,
-            matchMode: smartResult.matchMode,
-            degradeKind: smartResult.degradeKind,
             group: groupMode,
           };
-          attachQueryPlan(out, smartResult.planSelected);
-          return JSON.stringify(await finish(out, final, smartResult.matchMode));
-        } finally {
-          sync.release();
+          return JSON.stringify(await finish(out, final, "literal", outCtx));
         }
+
+        // ── Route: regex ──
+        if (matchMode === "regex" && regex) {
+          const drilled = await drill.pools({ ...drillInput, mode: smartMode });
+          if (ctx.abort.aborted) return abortedOutput();
+          const outCtx = buildOutputContext(
+            drilled.drilledSessions,
+            drilled.pools,
+            drilled.loadErrors,
+            drilled.budgetExhausted,
+          );
+          const limit = isGrouped ? Number.MAX_SAFE_INTEGER : partScanLimit;
+          const { collected, total, early } = scanPools(drilled.pools, limit, regexMatcher(regex));
+          const { final, total: outTotal, truncated } = applyGroupAndSlice(collected, total, early);
+
+          const unit = isGrouped ? "session" : "result";
+          ctx.metadata({
+            title: `Found ${final.length} ${unit}${final.length !== 1 ? "s" : ""} for /${args.query}/ (regex, ${drilled.drilledSessions.length} session${drilled.drilledSessions.length !== 1 ? "s" : ""}${loadErrorSuffixOf(outCtx.loadErrorCount)})`,
+          });
+
+          const out: SearchOutput = {
+            ok: true,
+            results: final,
+            total: outTotal,
+            truncated,
+            matchMode: "regex",
+            group: groupMode,
+          };
+          return JSON.stringify(await finish(out, final, "regex", outCtx));
+        }
+
+        // ── Route: smart / fuzzy (tier-2 drilled BM25 rerank) ──
+        const drilled = await drill.drill({ ...drillInput, mode: smartMode });
+        if (ctx.abort.aborted) return abortedOutput();
+        const outCtx = buildOutputContext(
+          drilled.drilledSessions,
+          drilled.pools,
+          drilled.loadErrors,
+          drilled.budgetExhausted,
+        );
+        // Documented v1 decision (plan Revisions): semantic ranking is card-tier
+        // only. A session the card runtime surfaced by embedding similarity but
+        // whose drilled parts yield NO lexical BM25 hit produces no `drilled.hits`
+        // entry, so it simply does not appear here. We deliberately do NOT
+        // back-fill card-derived results or add part-level drill semantics — the
+        // agent can issue a narrower query. Revisit only with measured demand.
+        const allResults = rankedToSearchResults(
+          drilled.hits,
+          smartMode,
+          explain,
+          queryMeta,
+          widthArg,
+          relevanceBySession,
+        );
+
+        const planSelected: string[] = ["cards-tier1", "drill-tier2"];
+        if (queryMeta.codeTokens.length > 0) planSelected.push("exact-token-boost");
+        if (ftsBySession && ftsBySession.size > 0) planSelected.push("fts-needle");
+        const QUERY_PLAN_VARIANTS = [
+          "cards-tier1",
+          "fts-needle",
+          "exact-token-boost",
+          "drill-tier2",
+          "literal-fallback",
+        ];
+        const attachQueryPlan = (out: SearchOutput, selected: string[]): void => {
+          if (explain) out.queryPlan = { variants: QUERY_PLAN_VARIANTS, selected };
+        };
+
+        // ── Fallback to a literal scan over the SAME drilled pools if smart is empty ──
+        if (allResults.length === 0 && !ctx.abort.aborted) {
+          const limit = isGrouped ? Number.MAX_SAFE_INTEGER : partScanLimit;
+          const { collected, total, early } = scanPools(drilled.pools, limit, literalMatcher);
+          const { final, total: outTotal, truncated } = applyGroupAndSlice(collected, total, early);
+          if (final.length > 0) {
+            const unit = isGrouped ? "session" : "result";
+            ctx.metadata({
+              title: `Found ${final.length} ${unit}${final.length !== 1 ? "s" : ""} for "${args.query}" (literal fallback, ${drilled.drilledSessions.length} session${drilled.drilledSessions.length !== 1 ? "s" : ""}${loadErrorSuffixOf(outCtx.loadErrorCount)})`,
+            });
+            const out: SearchOutput = {
+              ok: true,
+              results: final,
+              total: outTotal,
+              truncated,
+              matchMode: "literal",
+              degradeKind: "fallback",
+              group: groupMode,
+            };
+            attachQueryPlan(out, [...planSelected, "literal-fallback"]);
+            return JSON.stringify(await finish(out, final, "literal", outCtx));
+          }
+        }
+
+        const {
+          final,
+          total: outTotal,
+          truncated,
+        } = applyGroupAndSlice(allResults, allResults.length, false);
+        const unit = isGrouped ? "session" : "result";
+        ctx.metadata({
+          title: `Found ${final.length} ${unit}${final.length !== 1 ? "s" : ""} for "${args.query}" (${smartMode}, ${drilled.drilledSessions.length} session${drilled.drilledSessions.length !== 1 ? "s" : ""}${loadErrorSuffixOf(outCtx.loadErrorCount)})`,
+        });
+        const out: SearchOutput = {
+          ok: true,
+          results: final,
+          total: outTotal,
+          truncated,
+          matchMode: smartMode,
+          degradeKind: "none",
+          group: groupMode,
+        };
+        attachQueryPlan(out, planSelected);
+        return JSON.stringify(await finish(out, final, smartMode, outCtx));
       } catch (e) {
         const err: ErrorOutput = { ok: false, error: errmsg(e) };
         return JSON.stringify(err);

@@ -543,7 +543,9 @@ class SqliteStore implements Store {
     const rows = this.db.all(
       `SELECT p.session_id, p.part_id, p.message_id, p.prev_message_id, p.next_message_id, p.class, bm25(part_fts) AS score
        FROM part_fts JOIN part_text p ON p.id = part_fts.rowid
-       WHERE part_fts MATCH ? ORDER BY score LIMIT ?`,
+       WHERE part_fts MATCH ?
+       ORDER BY score, p.time_created DESC, p.session_id, p.part_id
+       LIMIT ?`,
       [match, limit],
     );
     return rows.map((row) => ({

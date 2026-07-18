@@ -1,11 +1,29 @@
-import { describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { systemNudge, NUDGE_SENTINEL } from "../src/hooks/system-nudge.js";
 import { shouldAutoRecall, formatAutoRecallBlock, autoRecall } from "../src/hooks/auto-recall.js";
 import { formatPreservationBlock, compactionRecall } from "../src/hooks/compaction-recall.js";
 import { partId } from "../src/hooks/part-id.js";
-import { CorpusCache } from "../src/corpus.js";
 import type { SearchResult } from "../src/types.js";
-import { TEST_LIMITS, makeFakeHarness } from "./helpers.js";
+import {
+  TEST_LIMITS,
+  makeFakeHarness,
+  makeRecallDeps,
+  setStrictNoLimitMessages,
+  type FakeHarness,
+} from "./helpers.js";
+
+// The hook search paths must fetch bounded pages only.
+beforeAll(() => setStrictNoLimitMessages(true));
+afterAll(() => setStrictNoLimitMessages(false));
+
+/** Build the recall deps for a hook test and register cleanup on the harness. */
+async function hookDeps(h: FakeHarness): Promise<{
+  deps: Awaited<ReturnType<typeof makeRecallDeps>>["deps"];
+  cleanup: () => void;
+}> {
+  const { deps, cleanup } = await makeRecallDeps(h);
+  return { deps, cleanup };
+}
 
 function result(over: Partial<SearchResult> = {}): SearchResult {
   return {
@@ -145,13 +163,8 @@ describe("formatAutoRecallBlock", () => {
 describe("autoRecall hook", () => {
   it("injects a synthetic part when the gate fires and hits exist", async () => {
     const h = makeFakeHarness();
-    const hook = autoRecall(
-      h.client,
-      h.unscoped,
-      true,
-      TEST_LIMITS,
-      new CorpusCache(h.client, TEST_LIMITS),
-    );
+    const { deps, cleanup } = await hookDeps(h);
+    const hook = autoRecall(h.client, h.unscoped, true, TEST_LIMITS, deps);
     const output = {
       message: { id: "m-x" } as never,
       parts: [
@@ -159,6 +172,7 @@ describe("autoRecall hook", () => {
       ] as unknown[],
     };
     await hook({ sessionID: "s-current" } as never, output as never);
+    cleanup();
     const synthetic = (
       output.parts as Array<{
         id?: string;
@@ -180,13 +194,8 @@ describe("autoRecall hook", () => {
 
   it("excludes the session it fires in from injected citations", async () => {
     const h = makeFakeHarness();
-    const hook = autoRecall(
-      h.client,
-      h.unscoped,
-      true,
-      TEST_LIMITS,
-      new CorpusCache(h.client, TEST_LIMITS),
-    );
+    const { deps, cleanup } = await hookDeps(h);
+    const hook = autoRecall(h.client, h.unscoped, true, TEST_LIMITS, deps);
     const output = {
       message: { id: "m-x" } as never,
       // "rate limit" matches both s-current (rate-limit middleware) and
@@ -196,6 +205,7 @@ describe("autoRecall hook", () => {
       ] as unknown[],
     };
     await hook({ sessionID: "s-current" } as never, output as never);
+    cleanup();
     const synthetic = (output.parts as Array<{ synthetic?: boolean; text?: string }>).find(
       (p) => p.synthetic,
     );
@@ -205,30 +215,26 @@ describe("autoRecall hook", () => {
 
   it("does nothing when the gate does not fire", async () => {
     const h = makeFakeHarness();
-    const hook = autoRecall(
-      h.client,
-      h.unscoped,
-      true,
-      TEST_LIMITS,
-      new CorpusCache(h.client, TEST_LIMITS),
-    );
+    const { deps, cleanup } = await hookDeps(h);
+    const hook = autoRecall(h.client, h.unscoped, true, TEST_LIMITS, deps);
     const output = {
       message: { id: "m-x" } as never,
       parts: [{ type: "text", text: "Add a new endpoint to the API." }] as unknown[],
     };
     await hook({ sessionID: "s-current" } as never, output as never);
+    cleanup();
     expect(output.parts).toHaveLength(1);
   });
 
-  it("never throws when search fails", async () => {
-    const h = makeFakeHarness({ projectListError: "boom", globalListError: "boom" });
-    const hook = autoRecall(
-      h.client,
-      h.unscoped,
-      true,
-      TEST_LIMITS,
-      new CorpusCache(h.client, TEST_LIMITS),
-    );
+  it("never throws when the drilled fetch fails", async () => {
+    // Discovery no longer happens inside search (the store is pre-distilled), so
+    // the failure surface is the drill's paginated fetch: make every session's
+    // messages throw and assert the hook still resolves and injects nothing.
+    const h = makeFakeHarness({
+      messageThrows: new Set(["s-current", "s-project-2", "s-other"]),
+    });
+    const { deps, cleanup } = await hookDeps(h);
+    const hook = autoRecall(h.client, h.unscoped, true, TEST_LIMITS, deps);
     const output = {
       message: { id: "m-x" } as never,
       parts: [{ type: "text", text: "what did we decide last time about caching?" }] as unknown[],
@@ -236,7 +242,8 @@ describe("autoRecall hook", () => {
     await expect(
       hook({ sessionID: "s-current" } as never, output as never),
     ).resolves.toBeUndefined();
-    // No synthetic part added on failure.
+    cleanup();
+    // No synthetic part added when the drill yields nothing.
     expect((output.parts as Array<{ synthetic?: boolean }>).some((p) => p.synthetic)).toBe(false);
   });
 });
@@ -292,15 +299,11 @@ describe("formatPreservationBlock", () => {
 describe("compactionRecall hook", () => {
   it("pushes a block onto context and never sets prompt", async () => {
     const h = makeFakeHarness();
-    const hook = compactionRecall(
-      h.client,
-      h.unscoped,
-      true,
-      TEST_LIMITS,
-      new CorpusCache(h.client, TEST_LIMITS),
-    );
+    const { deps, cleanup } = await hookDeps(h);
+    const hook = compactionRecall(h.client, h.unscoped, true, TEST_LIMITS, deps);
     const output: { context: string[]; prompt?: string } = { context: [], prompt: undefined };
     await hook({ sessionID: "s-current" } as never, output as never);
+    cleanup();
     expect(output.prompt).toBeUndefined();
     // Session has durable-ish content, so expect a pushed block (or none, but never a throw).
     expect(Array.isArray(output.context)).toBe(true);
@@ -308,17 +311,13 @@ describe("compactionRecall hook", () => {
 
   it("never throws when search fails", async () => {
     const h = makeFakeHarness({ messageThrows: new Set(["s-current"]) });
-    const hook = compactionRecall(
-      h.client,
-      h.unscoped,
-      true,
-      TEST_LIMITS,
-      new CorpusCache(h.client, TEST_LIMITS),
-    );
+    const { deps, cleanup } = await hookDeps(h);
+    const hook = compactionRecall(h.client, h.unscoped, true, TEST_LIMITS, deps);
     const output: { context: string[]; prompt?: string } = { context: [], prompt: undefined };
     await expect(
       hook({ sessionID: "s-current" } as never, output as never),
     ).resolves.toBeUndefined();
+    cleanup();
     expect(output.context).toHaveLength(0);
   });
 });

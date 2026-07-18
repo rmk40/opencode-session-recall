@@ -732,6 +732,69 @@ describe("cold pass", () => {
     distiller.stop();
     db.close();
   });
+
+  it("uses an injected discover function instead of client.session.list", async () => {
+    const s1 = session("s1", "One", PROJECT_DIR, 3000);
+    const s2 = session("s2", "Two", PROJECT_DIR, 2000);
+    const graph: Graph = {
+      sessions: [s1, s2],
+      messagesBySession: {
+        s1: [bundle(userMessage("m1", "s1", 100), [textPart("p1", "s1", "m1", "one content")])],
+        s2: [bundle(userMessage("m2", "s2", 100), [textPart("p2", "s2", "m2", "two content")])],
+      },
+    };
+    const { client, sdk } = makeDistillFake(graph);
+    const { db, store } = await freshStore();
+    const { gate, background } = makeSpyGate();
+    const distiller = createDistiller({
+      client,
+      store,
+      gate,
+      limits: TEST_LIMITS,
+      instanceId: "disc",
+      discover: async () => [s1], // only s1 is discovered
+    });
+
+    distiller.start();
+    await waitFor(() => distiller.status().coldPass === "done");
+
+    expect(store.getCard("s1")?.distillState).toBe("full");
+    expect(store.getCard("s2")).toBeUndefined(); // never discovered
+    expect(sdk.list).toBe(0); // client.session.list bypassed
+    expect(background()).toBeGreaterThan(0); // discover still routed through the gate
+    distiller.stop();
+    db.close();
+  });
+
+  it("bumps cards_rev on every store write so tier-1 can detect changes", async () => {
+    const graph: Graph = {
+      sessions: [session("s1", "One", PROJECT_DIR, 3000)],
+      messagesBySession: {
+        s1: [bundle(userMessage("m1", "s1", 100), [textPart("p1", "s1", "m1", "one content")])],
+      },
+    };
+    const { client } = makeDistillFake(graph);
+    const { db, store } = await freshStore();
+    const { gate } = makeSpyGate();
+    const distiller = createDistiller({
+      client,
+      store,
+      gate,
+      limits: TEST_LIMITS,
+      instanceId: "rev",
+      idleDebounceMs: 5,
+    });
+
+    distiller.start();
+    await waitFor(() => distiller.status().coldPass === "done");
+    const afterCold = Number(store.getMeta("cards_rev"));
+    expect(afterCold).toBeGreaterThan(0);
+
+    distiller.onEvent(idleEvent("s1")); // an incremental re-distill bumps it again
+    await waitFor(() => Number(store.getMeta("cards_rev")) > afterCold);
+    distiller.stop();
+    db.close();
+  });
 });
 
 // ── Lease ────────────────────────────────────────────────────────────────────

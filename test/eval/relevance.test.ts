@@ -1,9 +1,7 @@
-import { describe, it, expect } from "vitest";
-import { search } from "../../src/search.js";
-import { CorpusCache } from "../../src/corpus.js";
-import { TEST_LIMITS } from "../helpers.js";
+import { afterAll, beforeAll, describe, it, expect } from "vitest";
+import type { ToolDefinition } from "@opencode-ai/plugin";
 import { EVAL_CASES } from "./cases.js";
-import { makeEvalClients, evalContext, runEval } from "./harness.js";
+import { evalContext, makeEvalSearch, runEval } from "./harness.js";
 import BASELINE from "./baseline.json" with { type: "json" };
 
 /**
@@ -16,15 +14,15 @@ import BASELINE from "./baseline.json" with { type: "json" };
  * baseline.json in the same change-set and explain why.
  */
 describe("recall relevance eval", () => {
-  const { client, unscoped } = makeEvalClients();
-  const searchTool = search(
-    client,
-    unscoped,
-    true,
-    TEST_LIMITS,
-    new CorpusCache(client, TEST_LIMITS),
-  );
+  let searchTool: ToolDefinition;
+  let cleanup: () => void = () => {};
   const ctx = evalContext();
+
+  // Seed the card store via the distiller cold pass once for the whole suite.
+  beforeAll(async () => {
+    ({ searchTool, cleanup } = await makeEvalSearch());
+  });
+  afterAll(() => cleanup());
 
   it("meets or beats the recorded baseline (MRR, recall@5)", async () => {
     const summary = await runEval(searchTool, EVAL_CASES, ctx);

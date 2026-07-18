@@ -1,8 +1,7 @@
 import type { Hooks, ToolContext, ToolDefinition } from "@opencode-ai/plugin";
 import type { OpencodeClient, Part } from "@opencode-ai/sdk/v2";
 import type { Limits, SearchOutput, SearchResult } from "../types.js";
-import type { CorpusCache } from "../corpus.js";
-import { search, type SemanticSearchConfig } from "../search.js";
+import { search, type SearchDeps } from "../search.js";
 import { partId } from "./part-id.js";
 
 /**
@@ -205,10 +204,9 @@ export function autoRecall(
   unscoped: OpencodeClient,
   global: boolean,
   limits: Limits,
-  cache: CorpusCache,
-  semantic?: SemanticSearchConfig,
+  deps: SearchDeps,
 ): NonNullable<Hooks["chat.message"]> {
-  const searchTool = search(client, unscoped, global, limits, cache, semantic);
+  const searchTool = search(client, unscoped, global, limits, deps);
 
   return async (input, output) => {
     try {

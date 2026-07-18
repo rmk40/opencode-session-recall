@@ -1,4 +1,7 @@
 import { expect } from "vitest";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { tool, type ToolContext, type ToolDefinition } from "@opencode-ai/plugin";
 import type {
   AssistantMessage,
@@ -10,6 +13,13 @@ import type {
   UserMessage,
 } from "@opencode-ai/sdk/v2";
 import type { Limits } from "../src/types.js";
+import { openSqlite } from "../src/sqlite.js";
+import { openStore, type Store } from "../src/store.js";
+import { deriveCard, type DistillSessionMeta } from "../src/distill.js";
+import { createFetchGate } from "../src/fetch-gate.js";
+import { createCardsRuntime } from "../src/cards.js";
+import { createDrill } from "../src/drill.js";
+import type { SearchDeps, SemanticSearchConfig } from "../src/search.js";
 
 export const PROJECT_DIR = "/workspace/project";
 export const OTHER_DIR = "/workspace/other";
@@ -29,11 +39,32 @@ export const TEST_LIMITS: Limits = {
   ftsRowsPerSession: 5000,
   inventoryTokens: 200,
   coldPass: true,
+  drillSessions: 12,
+  drillPageMessages: 25,
+  drillCharsPerSession: 1_500_000,
+  drillCharsPerQuery: 20_000_000,
 };
 
 type ApiFailure = { data: { message: string } };
 type MessageBundle = { info: Message; parts: Part[] };
 type MetadataCall = { title?: string; metadata?: Record<string, unknown> };
+
+// ── Strict no-limit enforcement ─────────────────────────────────────────────
+// The incident path was an unpaginated `session.messages({ sessionID })`. When
+// strict mode is on, the fake client throws on any no-limit call, and the
+// runTool helpers hard-fail the test if a tool swallows that into an error
+// output — so a reintroduced unbounded fetch cannot regress silently. Enabled
+// per suite via setStrictNoLimitMessages(true); the distiller/legacy fixtures
+// that intentionally exercise the no-limit full-return path opt out by leaving
+// it off.
+export const UNBOUNDED_MESSAGES_ERROR = "unbounded session.messages() call without a limit";
+let strictNoLimitMessages = false;
+export function setStrictNoLimitMessages(value: boolean): void {
+  strictNoLimitMessages = value;
+}
+export function strictNoLimit(): boolean {
+  return strictNoLimitMessages;
+}
 
 export type FakeCalls = {
   projectList: Array<{ search?: string; limit?: number }>;
@@ -478,12 +509,14 @@ export function makeFakeHarness(options: FakeOptions = {}): FakeHarness {
         const data = fixture.messagesBySession[sessionID];
         if (!data) return { error: apiFailure(`Unauthorized`) };
         // Paginated path only when a limit is present (the distiller/
-        // fetchMessagePage contract); no-limit callers keep the legacy
-        // full-return behavior the older tests rely on.
+        // fetchMessagePage contract). A no-limit call is the incident path:
+        // under strict mode it throws so a regressed unbounded fetch fails the
+        // test; otherwise it keeps the legacy full-return the older fixtures use.
         if (limit != null) {
           const { items, nextCursor } = paginateBundles(data, limit, before);
           return messagesResponse(items, nextCursor);
         }
+        if (strictNoLimitMessages) throw new Error(UNBOUNDED_MESSAGES_ERROR);
         return { data };
       },
       message: async ({ sessionID, messageID }: { sessionID: string; messageID: string }) => {
@@ -548,6 +581,111 @@ export function makeContext(
   return { ctx, metadata, controller };
 }
 
+// ── Card-store seeding for the tier-1/tier-2 recall pipeline ────────────────
+// Unit tests drive the live `recall` tool over a distilled card store. Seeding
+// via `deriveCard` (the distiller's pure card builder) instead of the async
+// cold-pass scheduler keeps each test synchronous and deterministic while
+// producing byte-identical cards + FTS rows.
+
+function toDistillMeta(s: Session | GlobalSession): DistillSessionMeta {
+  return {
+    id: s.id,
+    parentId: s.parentID ?? null,
+    title: s.title ?? "",
+    slug: s.slug ?? "",
+    directory: s.directory ?? "",
+    projectId: s.projectID ?? "",
+    agent: null,
+    model: null,
+    timeCreated: s.time.created,
+    timeUpdated: s.time.updated,
+  };
+}
+
+/** Seed a store from a fixture's sessions + messages (every session the search
+ *  path can reach), the way a completed cold pass would leave it. Unions the
+ *  project (`sessions`) and global (`globalSessions`) rows by id so tests that
+ *  push to either list are picked up; the richer global row wins on conflict. */
+export function seedStore(
+  store: Store,
+  fixture: {
+    sessions?: (Session | GlobalSession)[];
+    globalSessions: GlobalSession[];
+    messagesBySession: Record<string, { info: Message; parts: Part[] }[]>;
+  },
+  limits: Limits = TEST_LIMITS,
+): void {
+  const byId = new Map<string, Session | GlobalSession>();
+  for (const s of fixture.sessions ?? []) byId.set(s.id, s);
+  for (const s of fixture.globalSessions) byId.set(s.id, s);
+  const all = [...byId.values()];
+  const parentById = new Map<string, string | null>(
+    all.map((s) => [s.id, s.parentID ?? null] as const),
+  );
+  const caps = {
+    ftsRowsPerSession: limits.ftsRowsPerSession,
+    inventoryTokens: limits.inventoryTokens,
+  };
+  for (const s of all) {
+    const { card, rows } = deriveCard({
+      session: toDistillMeta(s),
+      messages: fixture.messagesBySession[s.id] ?? [],
+      parentById,
+      caps,
+    });
+    store.replaceSessionParts(s.id, rows, card);
+  }
+  store.setMeta("cards_rev", "1");
+}
+
+/** Build the live `recall` deps over a seeded temp-file card store. Async only
+ *  because opening SQLite is (dynamic import); the seed itself is synchronous.
+ *  The caller MUST invoke `cleanup()` (closes and deletes the store). */
+export async function makeRecallDeps(
+  fixture: FakeHarness,
+  limits: Limits = TEST_LIMITS,
+  opts: { semantic?: SemanticSearchConfig } = {},
+): Promise<{ deps: SearchDeps; store: Store; cleanup: () => void }> {
+  const dir = mkdtempSync(join(tmpdir(), "recall-deps-"));
+  const db = await openSqlite(join(dir, "store.db"));
+  if (!db) throw new Error("openSqlite returned null in test helper");
+  const store = openStore(db);
+  if (!store) throw new Error("openStore returned null in test helper");
+  seedStore(store, fixture, limits);
+
+  const gate = createFetchGate({ concurrency: limits.concurrency });
+  const cards = createCardsRuntime({
+    source: { getCards: () => store.allCards(), revision: () => store.getMeta("cards_rev") },
+    embedder: opts.semantic?.embedder,
+    semanticWeight: opts.semantic?.weight,
+  });
+  const drill = createDrill({
+    client: fixture.client,
+    gate,
+    limits,
+    embedder: opts.semantic?.embedder,
+  });
+  return {
+    deps: { gate, store, cards, drill },
+    store,
+    cleanup: () => {
+      db.close();
+      rmSync(dir, { recursive: true, force: true });
+    },
+  };
+}
+
+/** Hard-fail if a tool swallowed a strict no-limit throw into an error output. */
+function guardUnbounded(parsed: { ok: boolean; error?: unknown }): void {
+  if (
+    parsed.ok === false &&
+    typeof parsed.error === "string" &&
+    parsed.error.includes(UNBOUNDED_MESSAGES_ERROR)
+  ) {
+    throw new Error(`strict mode: a tool made an ${UNBOUNDED_MESSAGES_ERROR}`);
+  }
+}
+
 export async function runTool<T extends { ok: boolean }>(
   definition: ToolDefinition,
   rawArgs: Record<string, unknown>,
@@ -557,6 +695,7 @@ export async function runTool<T extends { ok: boolean }>(
   const raw = await definition.execute(parsedArgs, ctx);
   const parsed = JSON.parse(raw) as T;
   expect(parsed).toHaveProperty("ok");
+  guardUnbounded(parsed as { ok: boolean; error?: unknown });
   return parsed;
 }
 
@@ -572,5 +711,6 @@ export async function runToolRaw<T extends { ok: boolean }>(
   const raw = await definition.execute(rawArgs as Parameters<typeof definition.execute>[0], ctx);
   const parsed = JSON.parse(raw) as T;
   expect(parsed).toHaveProperty("ok");
+  guardUnbounded(parsed as { ok: boolean; error?: unknown });
   return parsed;
 }
