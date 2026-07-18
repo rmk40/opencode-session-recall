@@ -558,6 +558,33 @@ LRU budget (new default 24M). All coerced defensively per AGENTS.md.
 temp-file store per test; the adapter's null path is unit-tested by forcing import
 failure.
 
+## Live verification results (2026-07-18, real 19GB store)
+
+Fresh opencode session on the final build, virgin store, measured externally:
+
+- **Cold pass**: 4,718 sessions distilled to full cards + 317,353 FTS rows in
+  roughly 8 minutes, producing a 526MB store file (the plan estimated ~500MB and
+  2 to 6 minutes; the pass also served a live query mid-flight). Lease held and
+  heartbeated correctly; `coldpass_cursor` checkpointing observed.
+- **Incident query replay** (`GHOSTAUTH_LIVE_TUI` smart global, previously minutes
+  of pegged CPU at multi-GB RSS): mid-cold-pass it answered inside an 11.9s agent
+  turn with honest partial coverage (1,224 cards at that moment, `degraded:
+  false`); warm, all three incident-class queries completed inside one 23.1s agent
+  turn (each recall call a few seconds), every one topped by the correct session.
+  The broad-paraphrase query ("how did we debug multikey authentication
+  failures"), round 2's known weakness, ranked the exact multikey debugging
+  session first.
+- **Memory, measured honestly**: opencode instances on this machine idle at 1.2 to
+  2.5GB RSS before this plugin does anything. The test instance launched at
+  ~1.95GB, reached 3.29GB at cold-pass completion, 4.38GB after the first three
+  warm queries (first warm query +0.9GB, next two +0.15GB combined), and 4.65GB
+  after six (~90MB/query creep on the later three). This is not the incident's
+  runaway climb, and CPU stayed unpegged with the server responsive throughout,
+  but process RSS does not meet the plan's 80MB-overhead framing at face value:
+  Bun/JSC holds heap high-water lazily, so RSS conflates transients with steady
+  state. Follow-up if it matters in practice: sample in-process heap instead of
+  RSS, and revisit drill-LRU sizing.
+
 ## Revisions
 
 - 2026-07-17: Codex review round 1 (verdict: direction sound, plan incomplete; 4
