@@ -10,6 +10,8 @@ import {
 } from "./candidates.js";
 import { normalize, tokenize } from "./normalize.js";
 import { toolNameMatches } from "./extract.js";
+import { createIndex, candidateToDoc, searchRawHits, type Bm25Mode, type RawHit } from "./bm25.js";
+import type { ParsedQuery } from "./query.js";
 
 /**
  * Incremental in-memory corpus cache.
@@ -55,6 +57,12 @@ export type CachedSession = {
   meta: CorpusSessionMeta;
   /** Unfiltered candidates, newest message first, normalized fields populated. */
   candidates: Candidate[];
+  /** Canonical title candidate (representative = newest content candidate),
+   *  present when the session has a non-empty title and at least one content
+   *  candidate. Held so it can be discarded from the persistent index on
+   *  replace/evict. Its output identity (representative message) is re-bound
+   *  per query by assembleSession; only its title text is indexed. */
+  titleCandidate?: Candidate;
   /** Content-derived session digest (may be empty); see buildSessionDigest. */
   digestText: string;
   /** Candidate embeddings were computed (or no embedder is configured). */
@@ -200,7 +208,9 @@ export function buildSessionDigest(candidates: Candidate[]): string {
       firstUserText = candidate;
     }
     if (isStatement) {
-      for (const token of candidate.tokens) {
+      // tokens are no longer retained on the candidate (memory cut); recompute
+      // a transient deduped set here at fill time.
+      for (const token of tokenize(candidate.rawText)) {
         if (token.length < DIGEST_MIN_TOKEN_LENGTH || DIGEST_STOPWORDS.has(token)) continue;
         if (!DIGEST_TOKEN_RE.test(token)) continue;
         counts.set(token, (counts.get(token) ?? 0) + 1);
@@ -314,11 +324,75 @@ export class CorpusCache {
   private totalChars = 0;
   private clock = 0;
 
+  /**
+   * One long-lived BM25 index over every cached session's candidates, keyed by
+   * the stable string partID. The corpus changes per session version, not per
+   * query, so this replaces the old per-query index rebuild (the dominant cost
+   * at scale). `candidateByPartID` resolves a search hit's id back to its
+   * candidate for the post-scoring filter and for materialization. IDF spans
+   * ALL cached sessions (corpus-global), a deliberate, documented semantic
+   * shift; scope filters run post-scoring via MiniSearch's `filter`.
+   */
+  private readonly index = createIndex();
+  private readonly candidateByPartID = new Map<string, Candidate>();
+
   constructor(
     private readonly client: OpencodeClient,
     private readonly limits: Limits,
     private readonly embedder?: CandidateEmbedder,
   ) {}
+
+  /** Resolve a partID to its cached candidate (persistent-index hits). */
+  getCandidate(partID: string): Candidate | undefined {
+    return this.candidateByPartID.get(partID);
+  }
+
+  /**
+   * Search the persistent index. `filter` runs post-scoring (MiniSearch design)
+   * so the caller applies target-set membership and per-query eligibility; the
+   * base score is normalized to the top filter-eligible hit. No `await` sits
+   * between index mutation and this call, so a query's pinned sessions cannot be
+   * evicted out from under it mid-search.
+   */
+  searchPersistent(
+    query: ParsedQuery,
+    mode: Bm25Mode,
+    filter: (candidate: Candidate) => boolean,
+  ): RawHit[] {
+    return searchRawHits(this.index, query, mode, (id) => this.candidateByPartID.get(id), filter);
+  }
+
+  /** Add a cached session's candidates (content + canonical title) to the
+   *  persistent index, defensively discarding any pre-existing partID first so
+   *  a partID-uniqueness violation degrades to replace-not-crash. Releases each
+   *  content candidate's primaryText after indexing (memory cut); side/deep
+   *  index builds rehydrate it from rawText. */
+  private indexAdd(entry: CachedSession): void {
+    const indexed = entry.titleCandidate
+      ? [...entry.candidates, entry.titleCandidate]
+      : entry.candidates;
+    for (const candidate of indexed) {
+      if (this.index.has(candidate.partID)) this.index.discard(candidate.partID);
+    }
+    this.index.addAll(indexed.map((candidate) => candidateToDoc(candidate)));
+    for (const candidate of indexed) this.candidateByPartID.set(candidate.partID, candidate);
+    // primaryText is now held only by the inverted index; drop the retained
+    // copy. Never released for title candidates (their primaryText is already
+    // "" and candidateToDoc rehydrates content, not titles).
+    for (const candidate of entry.candidates) candidate.primaryText = undefined;
+  }
+
+  /** Remove a session's candidates from the persistent index (guarded: discard
+   *  throws on an absent id). */
+  private indexRemove(entry: CachedSession): void {
+    const indexed = entry.titleCandidate
+      ? [...entry.candidates, entry.titleCandidate]
+      : entry.candidates;
+    for (const candidate of indexed) {
+      if (this.index.has(candidate.partID)) this.index.discard(candidate.partID);
+      this.candidateByPartID.delete(candidate.partID);
+    }
+  }
 
   /** Read-only digest lookup for already-cached sessions (no fetch, no pin).
    *  Used by recall_sessions as a best-effort browse aid. */
@@ -454,9 +528,32 @@ export class CorpusCache {
       const normalizedDigest = digestText ? normalize(digestText) : "";
       for (const candidate of candidates) candidate.digestText = normalizedDigest;
 
+      // Canonical title candidate for the persistent index: representative is
+      // the newest content candidate (candidates are newest-first). Its title
+      // text is what ranks; per query, assembleSession re-binds the output
+      // representative to the newest ELIGIBLE candidate under that query's
+      // filters. Absent when the session has no title or no content candidate.
+      let titleCandidate: Candidate | undefined;
+      const representative = candidates[0];
+      if (representative && target.title.trim()) {
+        titleCandidate = buildTitleCandidate(
+          { id: target.id, title: target.title, directory: target.directory },
+          {
+            id: representative.messageID,
+            role: representative.role,
+            time: { created: representative.time },
+          },
+        );
+        if (titleCandidate) {
+          populateNormalized(titleCandidate);
+          titleCandidate.digestText = normalizedDigest;
+        }
+      }
+
       const entry: CachedSession = {
         meta: { ...target },
         candidates,
+        titleCandidate,
         digestText,
         embedded: false,
         messageCount: messages.length,
@@ -475,9 +572,16 @@ export class CorpusCache {
       if (!(target.updated > 0)) return { entry };
 
       const previous = this.sessions.get(target.id);
-      if (previous) this.totalChars -= previous.charCount;
+      if (previous) {
+        this.totalChars -= previous.charCount;
+        this.indexRemove(previous);
+      }
       this.sessions.set(target.id, entry);
       this.totalChars += entry.charCount;
+      // No await between the index mutation and the searches that depend on it:
+      // the store completes synchronously here, and the caller's pins keep these
+      // sessions in the index until the query releases them.
+      this.indexAdd(entry);
       return { entry };
     } catch (error) {
       return { error: errmsg(error) };
@@ -520,6 +624,7 @@ export class CorpusCache {
       if ((this.pins.get(entry.meta.id) ?? 0) > 0) continue;
       this.sessions.delete(entry.meta.id);
       this.totalChars -= entry.charCount;
+      this.indexRemove(entry);
     }
   }
 }

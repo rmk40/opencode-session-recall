@@ -62,7 +62,6 @@ function candidate(overrides: Partial<Candidate> & { rawText: string }): Candida
     isPruned: false,
     rawText,
     fieldTexts: [{ field: "text", text: rawText }],
-    tokens: tokenize(rawText),
     ...rest,
   };
 }

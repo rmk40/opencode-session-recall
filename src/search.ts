@@ -31,7 +31,18 @@ import {
   type CorpusCache,
 } from "./corpus.js";
 import { metadataShortlist, mergeShortlistHits } from "./plan.js";
-import { bm25Search, clamp01, compareHits, MIN_RELATIVE_SCORE, type Bm25Hit } from "./bm25.js";
+import {
+  sideSearch,
+  phase1Score,
+  phase2Hit,
+  applyRelativeFloor,
+  clamp01,
+  compareHits,
+  MIN_RELATIVE_SCORE,
+  type Bm25Hit,
+  type Bm25Mode,
+  type RawHit,
+} from "./bm25.js";
 import { topK, type ScoredCandidate, type SimilarityHit } from "./semantic/similarity.js";
 import { smartSnippet, truncatePreservingMatch } from "./snippet.js";
 import { compileRegex, regexFirstIndex, regexSnippet } from "./regex.js";
@@ -45,6 +56,34 @@ export type SemanticSearchConfig = { embedder: SearchEmbedder; weight: number };
 
 /** Cosine top-K taken over embedded candidates before the hybrid merge. */
 const SEMANTIC_TOP_K = 200;
+
+/** Below this many eligible candidates a NARROW-scope query (session scope,
+ *  explicit sessionID, or a directory filter) builds a fresh per-query index
+ *  over exactly its targets instead of traversing the corpus-wide persistent
+ *  index and filtering post-scoring. Unknown-version sessions are never in the
+ *  persistent index, so a query touching any of them also takes this side
+ *  path. Broad (global/project) scopes over known versions use the persistent
+ *  index regardless of size, so their corpus-global IDF is exercised. */
+const SIDE_INDEX_THRESHOLD = 20_000;
+
+/** The shortlist deep pass builds its own per-query index (shortlist-local IDF
+ *  is the point). Above this many shortlisted candidates the deep pass is
+ *  skipped and noted in queryPlan.selected, so a huge shortlist cannot
+ *  reintroduce the unbounded per-query rebuild the persistent index removed. */
+const DEEP_PASS_MAX_CANDIDATES = 20_000;
+
+/** Bounded refinement window: only the top `max(RANK_WINDOW_MIN,
+ *  results × RANK_WINDOW_PER_RESULT)` phase-1 hits get the full phase-2 stack.
+ *  The multiplier range (~×0.7–×2.1) keeps any hit that could reach the final
+ *  slice well inside this window. */
+const RANK_WINDOW_MIN = 500;
+const RANK_WINDOW_PER_RESULT = 50;
+
+/** Grouped mode refines only the top `results × GROUP_SESSION_HEADROOM`
+ *  sessions by best phase-1 score; the ×5 headroom covers directory-fallback
+ *  reordering. Sessions past this window appear in `total` but are never
+ *  returned. */
+const GROUP_SESSION_HEADROOM = 5;
 
 /** Post-fetch time budget for the entire ranking pipeline (ms) */
 const TIME_BUDGET_MS = 2000;
@@ -718,18 +757,34 @@ function candidateResult(
   });
 }
 
+/** A coarse in-loop budget for the synchronous scan loops: a fired abort or a
+ *  passed deadline, checked every SCAN_BUDGET_CHECK_INTERVAL candidates so a
+ *  single huge session cannot overrun the wall-clock budget by itself. */
+type ScanGuard = { deadline: number; abort?: AbortSignal };
+/** How often (in candidates) to poll the scan guard. */
+const SCAN_BUDGET_CHECK_INTERVAL = 512;
+
+function scanBudgetHit(guard: ScanGuard | undefined, index: number): boolean {
+  if (!guard) return false;
+  if (index % SCAN_BUDGET_CHECK_INTERVAL !== 0) return false;
+  return guard.abort?.aborted === true || performance.now() > guard.deadline;
+}
+
 function scan(
   candidates: Candidate[],
   relevance: DirectoryRelevance,
   query: string,
   limit: number,
   width?: number,
-): { results: SearchResult[]; total: number } {
+  guard?: ScanGuard,
+): { results: SearchResult[]; total: number; early: boolean } {
   const results: SearchResult[] = [];
   let total = 0;
 
-  for (const candidate of candidates) {
+  for (let index = 0; index < candidates.length; index++) {
     if (results.length >= limit) break;
+    if (scanBudgetHit(guard, index)) return { results, total, early: true };
+    const candidate = candidates[index]!;
     let matched = false;
     for (const field of candidate.fieldTexts) {
       if (!matches(field.text, query)) continue;
@@ -746,7 +801,7 @@ function scan(
       }
     }
   }
-  return { results, total };
+  return { results, total, early: false };
 }
 
 /** Regex scan over cached candidate fields. Mirrors scan() but uses a RegExp. */
@@ -756,12 +811,15 @@ function regexScanCandidates(
   re: RegExp,
   limit: number,
   width?: number,
-): { results: SearchResult[]; total: number } {
+  guard?: ScanGuard,
+): { results: SearchResult[]; total: number; early: boolean } {
   const results: SearchResult[] = [];
   let total = 0;
 
-  for (const candidate of candidates) {
+  for (let index = 0; index < candidates.length; index++) {
     if (results.length >= limit) break;
+    if (scanBudgetHit(guard, index)) return { results, total, early: true };
+    const candidate = candidates[index]!;
     let matched = false;
     for (const field of candidate.fieldTexts) {
       const matchIndex = regexFirstIndex(re, field.text);
@@ -782,7 +840,7 @@ function regexScanCandidates(
       }
     }
   }
-  return { results, total };
+  return { results, total, early: false };
 }
 
 /** A session's per-query scan pool: eligible candidates, then the title hit. */
@@ -848,22 +906,44 @@ function mergeSemanticHits(
 
 // ── Smart/fuzzy scan ─────────────────────────────────────────────────
 
-/** smartScan returns ALL ranked results (caller handles slicing/grouping).
- *  Candidates come pre-built and pre-normalized from the corpus cache; there
- *  are no per-query candidate budgets, so the whole eligible corpus is ranked.
- *  The time budget remains as a safety valve (flags latency, never swaps
- *  ranking algorithms or truncates by relevance-blind scan order). */
+/** Deterministic phase-1 ordering key: score desc, recency desc, partID asc. */
+function comparePhase1(a: { raw: RawHit; s1: number }, b: { raw: RawHit; s1: number }): number {
+  const diff = b.s1 - a.s1;
+  if (diff !== 0) return diff;
+  const timeDiff = b.raw.candidate.time - a.raw.candidate.time;
+  if (timeDiff !== 0) return timeDiff;
+  return a.raw.candidate.partID.localeCompare(b.raw.candidate.partID);
+}
+
+/**
+ * Rank the eligible corpus for smart/fuzzy and produce the final sliced
+ * results. Broad BM25 hits come from the CorpusCache's persistent index (broad
+ * scopes over known versions) or a freshly built side index (narrow scopes and
+ * unknown-version sessions). Scoring is two-phase (see bm25.ts): a cheap
+ * phase-1 over every hit picks a bounded window; phase 2 (the full stack) and
+ * materialization run only over that window, or — in grouped mode — only over
+ * the tracked hits of the sessions that can reach the final slice, while group
+ * discovery/hitCount stay complete over the full phase-1 list. The time budget
+ * remains a latency safety valve; it never swaps ranking algorithms.
+ */
 function smartScan(
   assembled: Array<{ session: AssembledSession; relevance: DirectoryRelevance }>,
   query: string,
   explain: boolean,
-  mode: "smart" | "fuzzy",
+  mode: Bm25Mode,
+  cache: CorpusCache,
+  narrowScope: boolean,
+  isGrouped: boolean,
+  resultsArg: number,
+  directoryFallback: boolean,
+  commandLike: boolean,
   width?: number,
   abort?: AbortSignal,
   semantic?: SemanticSearchConfig,
 ): {
-  results: SearchResult[];
+  final: SearchResult[];
   total: number;
+  truncated: boolean;
   degradeKind: DegradeKind;
   matchMode: MatchMode;
   planSelected: string[];
@@ -874,8 +954,13 @@ function smartScan(
   const startTime = performance.now();
   const warnings: string[] = [];
 
-  const pool: Candidate[] = [];
   const relevanceBySession = new Map<string, DirectoryRelevance>();
+  const titleBySession = new Map<string, Candidate>();
+  const eligiblePartIDs = new Set<string>();
+  const sidePool: Candidate[] = [];
+  const semanticPool: Candidate[] = [];
+  let eligibleCount = 0;
+  let hasUnknown = false;
   let timedOut = false;
 
   for (const entry of assembled) {
@@ -885,16 +970,27 @@ function smartScan(
       timedOut = true;
       break;
     }
-    relevanceBySession.set(entry.session.meta.id, entry.relevance);
-    if (entry.session.titleCandidate) pool.push(entry.session.titleCandidate);
-    pool.push(...entry.session.candidates);
+    const s = entry.session;
+    relevanceBySession.set(s.meta.id, entry.relevance);
+    // Unknown-version sessions were fetched fresh and never stored in the
+    // persistent index, so a query touching any of them cannot use it.
+    if (!(s.meta.updated > 0)) hasUnknown = true;
+    for (const c of s.candidates) {
+      eligiblePartIDs.add(c.partID);
+      sidePool.push(c);
+      semanticPool.push(c);
+    }
+    eligibleCount += s.candidates.length;
+    if (s.titleCandidate) {
+      eligiblePartIDs.add(s.titleCandidate.partID);
+      titleBySession.set(s.meta.id, s.titleCandidate);
+      sidePool.push(s.titleCandidate);
+    }
   }
 
   const planSelected: string[] = ["bm25-broad"];
   if (pq.codeTokens.length > 0) planSelected.push("exact-token-boost");
 
-  // Stage A/B of the session-first plan: shortlist sessions by metadata
-  // overlap, deep-search them with a shortlist-only index, merge.
   const shortlist = metadataShortlist(
     assembled.map((entry) => ({
       id: entry.session.meta.id,
@@ -905,56 +1001,167 @@ function smartScan(
     pq,
   );
 
-  let hits = bm25Search(pool, pq, mode, explain);
+  // Broad pass: persistent index for large/broad scopes, side index otherwise.
+  const useSidePath = hasUnknown || (narrowScope && eligibleCount < SIDE_INDEX_THRESHOLD);
+  const broadRaw: RawHit[] = useSidePath
+    ? sideSearch(sidePool, pq, mode)
+    : cache.searchPersistent(pq, mode, (candidate) => eligiblePartIDs.has(candidate.partID));
+
+  // Deep pass over the shortlist's own bounded index (shortlist-local IDF).
+  let deepRaw: RawHit[] = [];
   if (shortlist.size > 0) {
-    const shortlistPool = pool.filter((candidate) => shortlist.has(candidate.sessionID));
-    if (shortlistPool.length > 0) {
-      const deepHits = bm25Search(shortlistPool, pq, mode, explain);
-      hits = mergeShortlistHits(hits, deepHits, explain);
+    const shortlistPool = sidePool.filter((candidate) => shortlist.has(candidate.sessionID));
+    if (shortlistPool.length > DEEP_PASS_MAX_CANDIDATES) {
+      planSelected.push("title-shortlist:skipped-size");
+    } else if (shortlistPool.length > 0) {
+      deepRaw = sideSearch(shortlistPool, pq, mode);
       planSelected.push(`title-shortlist:${shortlist.size}`);
     }
   }
 
-  // Opt-in hybrid semantic pass. Lexical-first is the law: this only ever adds
-  // an extra signal, and any failure leaves `hits` exactly as the lexical
-  // passes produced them. When requested but the model is not ready, emit one
-  // warning and stay lexical-only.
-  if (semantic) {
-    if (semantic.embedder.ready) {
-      try {
-        const queryVec = semantic.embedder.embed(pq.raw);
-        if (queryVec) {
-          const embedded: ScoredCandidate[] = [];
-          for (let i = 0; i < pool.length; i++) {
-            const vec = pool[i]!.embedding;
-            if (vec) embedded.push({ index: i, vec });
-          }
-          if (embedded.length > 0) {
-            hits = mergeSemanticHits(
-              hits,
-              topK(queryVec, embedded, SEMANTIC_TOP_K),
-              pool,
-              semantic.weight,
-              explain,
-            );
-            planSelected.push("semantic");
-          }
-        }
-      } catch {
-        // Never fail the search on a semantic error; results stay lexical.
-      }
-    } else {
-      const reason = semantic.embedder.initError ?? "model still loading";
-      warnings.push(`Semantic search unavailable (${reason}); results are lexical-only.`);
-    }
-  }
+  const digestCache = new Map<string, Set<string>>();
+  const windowSize = Math.max(RANK_WINDOW_MIN, resultsArg * RANK_WINDOW_PER_RESULT);
 
-  const allResults = rankedToSearchResults(hits, mode, explain, pq, width, relevanceBySession);
+  /** Phase-2 refine a bounded set of raw hits, then sort + floor — the exact
+   *  output of the pre-split ranker when the window covers everything. */
+  const refineFloor = (window: RawHit[]): Bm25Hit[] => {
+    if (window.length === 0) return [];
+    const hits = window.map((raw) => phase2Hit(raw, pq, mode, explain, digestCache));
+    hits.sort(compareHits);
+    return applyRelativeFloor(hits);
+  };
+
+  // Deep window refined once (shared by part/grouped); its neighborhood-local
+  // scores anchor to the broad ceilings inside mergeShortlistHits.
+  const deepWindow = deepRaw
+    .map((raw) => ({ raw, s1: phase1Score(raw.candidate, raw.base) }))
+    .sort(comparePhase1)
+    .slice(0, windowSize)
+    .map((s) => s.raw);
+  const deepRefined = refineFloor(deepWindow);
+
+  /** Refine → shortlist merge → semantic merge → floor, refine-before-merge so
+   *  the merge anchors read fully-boosted heads (Fix 2.4). */
+  const mergeAll = (broadWindow: RawHit[]): Bm25Hit[] => {
+    let hits = refineFloor(broadWindow);
+    if (deepRefined.length > 0) hits = mergeShortlistHits(hits, deepRefined, explain);
+
+    if (semantic) {
+      if (semantic.embedder.ready) {
+        try {
+          const queryVec = semantic.embedder.embed(pq.raw);
+          if (queryVec) {
+            const embedded: ScoredCandidate[] = [];
+            for (let i = 0; i < semanticPool.length; i++) {
+              const vec = semanticPool[i]!.embedding;
+              if (vec) embedded.push({ index: i, vec });
+            }
+            if (embedded.length > 0) {
+              hits = mergeSemanticHits(
+                hits,
+                topK(queryVec, embedded, SEMANTIC_TOP_K),
+                semanticPool,
+                semantic.weight,
+                explain,
+              );
+              if (!planSelected.includes("semantic")) planSelected.push("semantic");
+            }
+          }
+        } catch {
+          // Never fail the search on a semantic error; results stay lexical.
+        }
+      } else if (!warnings.length) {
+        const reason = semantic.embedder.initError ?? "model still loading";
+        warnings.push(`Semantic search unavailable (${reason}); results are lexical-only.`);
+      }
+    }
+    return hits;
+  };
+
+  const scored = broadRaw
+    .map((raw) => ({ raw, s1: phase1Score(raw.candidate, raw.base) }))
+    .sort(comparePhase1);
+
+  let final: SearchResult[];
+  let total: number;
+  let truncated: boolean;
+
+  if (!isGrouped) {
+    // Part mode: refine and materialize the top window only.
+    const hits = mergeAll(scored.slice(0, windowSize).map((s) => s.raw));
+    const results = rankedToSearchResults(
+      hits,
+      mode,
+      explain,
+      pq,
+      width,
+      relevanceBySession,
+      titleBySession,
+    );
+    const diversified = diversify(results, resultsArg, MAX_HITS_PER_SESSION_INITIAL);
+    const ordered = orderForDirectoryFallback(diversified, directoryFallback);
+    final = capAndSlice(ordered, resultsArg, commandLike);
+    total = results.length;
+    truncated = total > final.length;
+  } else {
+    // Grouped mode: discovery over the FULL phase-1 list (complete total /
+    // hitCount), refinement + materialization over tracked hits of the top
+    // sessions only.
+    type Group = { best: number; count: number; tracked: RawHit[]; titleRaw?: RawHit };
+    const bySession = new Map<string, Group>();
+    for (const s of scored) {
+      const sessionID = s.raw.candidate.sessionID;
+      let group = bySession.get(sessionID);
+      if (!group) {
+        // scored is best-first, so the first hit seen is the session's best.
+        group = { best: s.s1, count: 0, tracked: [] };
+        bySession.set(sessionID, group);
+      }
+      group.count++;
+      if (s.raw.candidate.partType === "title") group.titleRaw ??= s.raw;
+      else if (group.tracked.length < MAX_GROUP_TRACKED) group.tracked.push(s.raw);
+    }
+
+    const selected = [...bySession.entries()]
+      .sort((a, b) => b[1].best - a[1].best || a[0].localeCompare(b[0]))
+      .slice(0, resultsArg * GROUP_SESSION_HEADROOM);
+    const broadWindow: RawHit[] = [];
+    for (const [, group] of selected) {
+      broadWindow.push(...group.tracked);
+      if (group.titleRaw) broadWindow.push(group.titleRaw);
+    }
+
+    const hits = mergeAll(broadWindow);
+    const results = rankedToSearchResults(
+      hits,
+      mode,
+      explain,
+      pq,
+      width,
+      relevanceBySession,
+      titleBySession,
+    );
+    const grouped = groupBySession(results);
+    // hitCount stays COMPLETE from the phase-1 discovery; a semantic-only
+    // session (no phase-1 hit) keeps groupBySession's own count.
+    for (const group of grouped) {
+      const complete = bySession.get(group.sessionID)?.count;
+      if (complete != null) group.hitCount = complete;
+    }
+    const ordered = orderForDirectoryFallback(grouped, directoryFallback);
+    final = ordered.slice(0, resultsArg);
+    // Distinct sessions with any hit (phase-1 discovery ∪ semantic-only).
+    const discovered = new Set(bySession.keys());
+    for (const group of grouped) discovered.add(group.sessionID);
+    total = discovered.size;
+    truncated = total > final.length;
+  }
 
   const totalTime = performance.now() - startTime;
   return {
-    results: allResults,
-    total: allResults.length,
+    final,
+    total,
+    truncated,
     degradeKind: timedOut || totalTime > TIME_BUDGET_MS ? "time" : "none",
     matchMode: mode,
     planSelected,
@@ -972,9 +1179,17 @@ function rankedToSearchResults(
   query: ReturnType<typeof parseQuery>,
   width: number | undefined,
   relevanceBySession: Map<string, DirectoryRelevance>,
+  titleBySession: Map<string, Candidate>,
 ): SearchResult[] {
   return ranked.map((r) => {
-    const c = r.candidate;
+    // A persistent-index title hit carries the CANONICAL title candidate (its
+    // representative is the newest content candidate at fill time). Re-bind the
+    // output identity to this query's assembled title candidate (newest
+    // ELIGIBLE under the query's filters); scoring/metadata stay from the hit.
+    const c =
+      r.candidate.partType === "title"
+        ? (titleBySession.get(r.candidate.sessionID) ?? r.candidate)
+        : r.candidate;
     // Directory relevance is per-query (it depends on the caller's directory
     // filter), so it comes from the query's session map, never from the
     // cached candidate.
@@ -2328,6 +2543,10 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
             let total = 0;
             let early = false;
             const scanStart = performance.now();
+            const guard: ScanGuard = {
+              deadline: scanStart + SCAN_TIME_BUDGET_MS,
+              abort: ctx.abort,
+            };
 
             for (const entry of assembled) {
               if (collected.length >= scanLimit) {
@@ -2336,8 +2555,10 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
               }
               // Bound synchronous scanning by wall-clock and honor a fired abort
               // (a hook timeout may have landed mid-scan, where the abort flag
-              // couldn't be observed until now).
-              if (ctx.abort.aborted || performance.now() - scanStart > SCAN_TIME_BUDGET_MS) {
+              // couldn't be observed until now). The same guard also runs INSIDE
+              // scan() every SCAN_BUDGET_CHECK_INTERVAL candidates so a single
+              // huge session cannot overrun the budget by itself.
+              if (ctx.abort.aborted || performance.now() > guard.deadline) {
                 early = true;
                 break;
               }
@@ -2348,9 +2569,14 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
                 args.query,
                 remaining,
                 widthArg,
+                guard,
               );
               collected.push(...result.results);
               total += result.total;
+              if (result.early) {
+                early = true;
+                break;
+              }
             }
             return { collected, total, early };
           };
@@ -2364,6 +2590,10 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
             let total = 0;
             let early = false;
             const scanStart = performance.now();
+            const guard: ScanGuard = {
+              deadline: scanStart + SCAN_TIME_BUDGET_MS,
+              abort: ctx.abort,
+            };
 
             for (const entry of assembled) {
               if (collected.length >= scanLimit) {
@@ -2371,7 +2601,9 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
                 break;
               }
               // Bound synchronous scanning by wall-clock and honor a fired abort.
-              if (ctx.abort.aborted || performance.now() - scanStart > SCAN_TIME_BUDGET_MS) {
+              // The guard also runs inside regexScanCandidates every
+              // SCAN_BUDGET_CHECK_INTERVAL candidates (see literalScan).
+              if (ctx.abort.aborted || performance.now() > guard.deadline) {
                 early = true;
                 break;
               }
@@ -2382,9 +2614,14 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
                 re,
                 remaining,
                 widthArg,
+                guard,
               );
               collected.push(...result.results);
               total += result.total;
+              if (result.early) {
+                early = true;
+                break;
+              }
             }
             return { collected, total, early };
           };
@@ -2493,11 +2730,22 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
           // ── Smart/fuzzy path ────────────────────────────────────────
           // literal and regex modes returned above; only smart/fuzzy remain.
           const smartMode: "smart" | "fuzzy" = matchMode === "fuzzy" ? "fuzzy" : "smart";
+          // Narrow scopes (session, explicit sessionID, directory filter) target
+          // a small slice of the corpus; below the side-index threshold they
+          // build a fresh per-query index instead of traversing the whole
+          // persistent index and filtering post-scoring.
+          const narrowScope = scope === "session" || Boolean(sessionID) || Boolean(directory);
           const smartResult = smartScan(
             assembled,
             args.query,
             explain,
             smartMode,
+            cache,
+            narrowScope,
+            isGrouped,
+            resultsArg,
+            Boolean(directory && fallback),
+            commandLikeQuery,
             widthArg,
             ctx.abort,
             semantic,
@@ -2528,7 +2776,7 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
           // re-scan would run past the budget the timeout just enforced, and would
           // also mask the time-degradation signal.
           if (
-            smartResult.results.length === 0 &&
+            smartResult.final.length === 0 &&
             smartResult.degradeKind !== "time" &&
             !ctx.abort.aborted
           ) {
@@ -2561,11 +2809,10 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
           }
 
           // ── Return smart/fuzzy results ──────────────────────────────
-          const {
-            final,
-            total: outTotal,
-            truncated,
-          } = applyGroupAndSlice(smartResult.results, smartResult.total, false);
+          // Grouping, slicing, and materialization already happened inside
+          // smartScan (lazy materialization over the refined window / tracked
+          // hits), so the final list is ready to return.
+          const final = smartResult.final;
 
           const unit = isGrouped ? "session" : "result";
           ctx.metadata({
@@ -2575,8 +2822,8 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
           const out: SearchOutput = {
             ok: true,
             results: final,
-            total: outTotal,
-            truncated,
+            total: smartResult.total,
+            truncated: smartResult.truncated,
             matchMode: smartResult.matchMode,
             degradeKind: smartResult.degradeKind,
             group: groupMode,

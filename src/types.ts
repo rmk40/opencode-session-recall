@@ -19,7 +19,9 @@ export type Limits = {
 };
 
 export const DEFAULTS: Limits = {
-  concurrency: 3,
+  // Cold sync of a full history (thousands of sessions) is serialized localhost
+  // HTTP; a low concurrency turns it into minutes of latency for no benefit.
+  concurrency: 8,
   maxSessions: Infinity,
   maxResults: 50,
   maxSessionList: 100,
@@ -51,6 +53,17 @@ export type EvidenceClass =
   | "web-fetch" // output-side match on a fetch-shaped tool (webfetch/scrape/…)
   | "skill-definition" // tool name suffix-matches "skill"
   | "session-title";
+
+/**
+ * The name-derived slice of a tool part's evidence class, precomputed once per
+ * session version at cache fill so phase-1 ranking can apply the skill/read
+ * penalties in O(1) without re-inspecting the tool name. `web-fetch` is tracked
+ * but NOT penalized at phase 1: whether a fetch-shaped tool is an action
+ * (tool-input) or reference material (web-fetch) depends on which fields the
+ * query matched, so the decision is deferred to phase 2. `undefined` means the
+ * tool name carries no name-based class (an ordinary tool).
+ */
+export type NameClass = "skill-definition" | "file-read" | "web-fetch" | undefined;
 
 export type SearchSuggestion = {
   reason: string;

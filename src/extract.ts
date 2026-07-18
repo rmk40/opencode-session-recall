@@ -8,6 +8,7 @@ import type {
 import {
   TOOLS,
   type EvidenceClass,
+  type NameClass,
   type PartOutput,
   type MessageItem,
   type ResultWhy,
@@ -78,6 +79,30 @@ export function evidenceClassFor(
     return "web-fetch";
   }
   return "tool-output";
+}
+
+/**
+ * The name-based evidence class for a tool part, from the tool name alone.
+ * Precomputed at cache fill (see buildCandidates) so phase-1 ranking applies
+ * the skill/read penalties without re-inspecting the name. Mirrors the
+ * name-based branches of evidenceClassFor exactly, in the same precedence:
+ * skill wins over read wins over fetch. `undefined` for a plain tool.
+ */
+export function nameClassFor(toolName: string | undefined): NameClass {
+  if (!toolName) return undefined;
+  if (toolNameMatches(toolName, "skill")) return "skill-definition";
+  if (toolNameMatches(toolName, "read")) return "file-read";
+  if (WEB_FETCH_BASES.some((base) => toolNameMatches(toolName, base))) return "web-fetch";
+  return undefined;
+}
+
+/** Substrings whose presence marks a tool part as error evidence (a mild
+ *  phase-1 boost). Precomputed as `hasErrorText` at cache fill. */
+export const ERROR_PATTERNS = ["error", "failed", "exception"];
+
+export function containsErrorPattern(text: string): boolean {
+  const lower = text.toLowerCase();
+  return ERROR_PATTERNS.some((p) => lower.includes(p));
 }
 
 function input(val: unknown): string {

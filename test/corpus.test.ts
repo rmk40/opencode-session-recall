@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   CorpusCache,
   assembleSession,
@@ -11,6 +11,8 @@ import {
   TEST_LIMITS,
   bundle,
   completedToolPart,
+  globalSessionFrom,
+  makeContext,
   makeFakeHarness,
   reasoningPart,
   runTool,
@@ -124,8 +126,9 @@ describe("CorpusCache", () => {
       ];
       void s;
     }
-    // Budget fits roughly one big session at a time.
-    const cache = new CorpusCache(h.client, { ...TEST_LIMITS, cacheMaxChars: 600 });
+    // charCount now counts rawText + field texts, so a 500-char part session
+    // is ~1000 chars retained. Budget fits roughly one big session at a time.
+    const cache = new CorpusCache(h.client, { ...TEST_LIMITS, cacheMaxChars: 1_200 });
 
     const first = await cache.sync([target("s-big-1", 1_000)]);
     // Still pinned: syncing a second session over budget must not evict the
@@ -136,7 +139,7 @@ describe("CorpusCache", () => {
     first.release();
     second.release();
     // After release, LRU eviction brings the cache back under budget.
-    expect(cache.stats().chars).toBeLessThanOrEqual(600);
+    expect(cache.stats().chars).toBeLessThanOrEqual(1_200);
     expect(cache.stats().sessions).toBe(1);
 
     // The evicted session is simply re-fetched next time: same results.
@@ -221,6 +224,120 @@ describe("CorpusCache", () => {
     expect(b.loadErrorCount).toBe(1);
     expect(a.sessions[0]!.loadError).toBeDefined();
     expect(b.sessions[0]!.loadError).toBeDefined();
+  });
+});
+
+describe("persistent index (smart search)", () => {
+  function bumpUpdated(h: ReturnType<typeof makeFakeHarness>, id: string, updated: number): void {
+    for (const list of [h.sessions, h.globalSessions]) {
+      const found = list.find((s) => s.id === id);
+      if (found) (found.time as { updated: number }).updated = updated;
+    }
+  }
+
+  it("reflects a version replace: old content leaves the index, new content is found", async () => {
+    const h = makeFakeHarness();
+    const s = session("s-rep", "Replace Session", PROJECT_DIR, 1_000);
+    h.sessions.push(s);
+    h.globalSessions.push(globalSessionFrom(s));
+    h.messagesBySession["s-rep"] = [
+      bundle(userMessage("m1", "s-rep", 1_000), [
+        textPart("p1", "s-rep", "m1", "zanzibar alpha content"),
+      ]),
+    ];
+    const cache = new CorpusCache(h.client, TEST_LIMITS);
+    const tool = search(h.client, h.unscoped, true, TEST_LIMITS, cache);
+    const q = (query: string) =>
+      runTool<SearchOutput>(tool, { query, match: "smart", scope: "global", group: "part" });
+
+    expect((await q("zanzibar")).results.some((r) => r.sessionID === "s-rep")).toBe(true);
+
+    // New version: content changes, updated bumps. The persistent index must
+    // discard the old partIDs, not accumulate stale hits.
+    h.messagesBySession["s-rep"] = [
+      bundle(userMessage("m2", "s-rep", 2_000), [
+        textPart("p2", "s-rep", "m2", "wombat beta content"),
+      ]),
+    ];
+    bumpUpdated(h, "s-rep", 2_000);
+
+    expect((await q("zanzibar")).results.some((r) => r.sessionID === "s-rep")).toBe(false);
+    expect((await q("wombat")).results.some((r) => r.sessionID === "s-rep")).toBe(true);
+  });
+
+  it("re-adds an evicted session to the index on the next search (no duplicate-id crash)", async () => {
+    const h = makeFakeHarness();
+    const s = session("s-evict", "Evict Session", PROJECT_DIR, 1_000);
+    h.sessions.push(s);
+    h.globalSessions.push(globalSessionFrom(s));
+    h.messagesBySession["s-evict"] = [
+      bundle(userMessage("m1", "s-evict", 1_000), [
+        textPart("p1", "s-evict", "m1", "quokka ".repeat(200)),
+      ]),
+    ];
+    // A tiny budget evicts every unpinned session as soon as each query
+    // releases, so the second search must re-fetch and re-add from scratch.
+    const cache = new CorpusCache(h.client, { ...TEST_LIMITS, cacheMaxChars: 100 });
+    const tool = search(h.client, h.unscoped, true, TEST_LIMITS, cache);
+    const q = () =>
+      runTool<SearchOutput>(tool, {
+        query: "quokka",
+        match: "smart",
+        scope: "global",
+        group: "part",
+      });
+
+    expect((await q()).results.some((r) => r.sessionID === "s-evict")).toBe(true);
+    // Everything is unpinned and over budget once the query released.
+    expect(cache.stats().sessions).toBe(0);
+    // Re-adding an evicted session must not throw on a duplicate partID.
+    expect((await q()).results.some((r) => r.sessionID === "s-evict")).toBe(true);
+  });
+
+  it("routes narrow/unknown-version searches to the side index, broad ones to the persistent index", async () => {
+    // s-current's metadata get() throws, so a session-scope sync sees updated<=0
+    // (unknown): its candidates are never stored in the persistent index, so
+    // only the side path can search it.
+    const h = makeFakeHarness({ getThrows: new Set(["s-current"]) });
+    const cache = new CorpusCache(h.client, TEST_LIMITS);
+    const spy = vi.spyOn(cache, "searchPersistent");
+    const tool = search(h.client, h.unscoped, true, TEST_LIMITS, cache);
+
+    const scoped = await runTool<SearchOutput>(
+      tool,
+      { query: "unauthorized", match: "smart", scope: "session", excludeCurrentSession: false },
+      makeContext({ sessionID: "s-current" }).ctx,
+    );
+    expect(scoped.results.some((r) => r.sessionID === "s-current")).toBe(true);
+    expect(spy).not.toHaveBeenCalled();
+
+    // A broad global search over known versions uses the persistent index.
+    spy.mockClear();
+    await runTool<SearchOutput>(tool, { query: "walkthrough", match: "smart", scope: "global" });
+    expect(spy).toHaveBeenCalled();
+  });
+
+  it("shares one cold sync across two racing searches (Fix 5.5)", async () => {
+    const h = makeFakeHarness();
+    const cache = new CorpusCache(h.client, TEST_LIMITS);
+    const tool = search(h.client, h.unscoped, true, TEST_LIMITS, cache);
+
+    const [a, b] = await Promise.all([
+      runTool<SearchOutput>(tool, { query: "walkthrough", match: "smart", scope: "global" }),
+      runTool<SearchOutput>(tool, { query: "walkthrough", match: "smart", scope: "global" }),
+    ]);
+
+    expect(a.ok).toBe(true);
+    expect(b.ok).toBe(true);
+    // The per-session-version in-flight map single-flights the fetch: each
+    // session is loaded exactly once despite two concurrent cold searches.
+    const perSession = new Map<string, number>();
+    for (const call of h.calls.messages) {
+      perSession.set(call.sessionID, (perSession.get(call.sessionID) ?? 0) + 1);
+    }
+    for (const [, count] of perSession) expect(count).toBe(1);
+    expect(a.results.some((r) => r.sessionID === "s-other")).toBe(true);
+    expect(b.results.some((r) => r.sessionID === "s-other")).toBe(true);
   });
 });
 

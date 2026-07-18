@@ -3,18 +3,25 @@ import type { SearchOutput } from "../src/types.js";
 import { CorpusCache } from "../src/corpus.js";
 import { TEST_LIMITS, makeFakeHarness, runTool } from "./helpers.js";
 
-const bm25Search = vi.hoisted(() => vi.fn(() => []));
+// The smart broad pass gets its BM25 hits from either the persistent index
+// (searchRawHits, via CorpusCache.searchPersistent) or a per-query side index
+// (sideSearch). Stub BOTH to return nothing so the smart pass finds no results
+// and the tool falls back to literal.
+const searchRawHits = vi.hoisted(() => vi.fn(() => []));
+const sideSearch = vi.hoisted(() => vi.fn(() => []));
 
 vi.mock("../src/bm25.js", async (importOriginal) => ({
   ...((await importOriginal()) as object),
-  bm25Search,
+  searchRawHits,
+  sideSearch,
 }));
 
 const { search } = await import("../src/search.js");
 
 describe("recall smart fallback", () => {
   beforeEach(() => {
-    bm25Search.mockClear();
+    searchRawHits.mockClear();
+    sideSearch.mockClear();
   });
 
   it("falls back to literal search when smart matching finds no results", async () => {
@@ -27,13 +34,9 @@ describe("recall smart fallback", () => {
       },
     );
 
-    // BM25 ran (returned nothing via the mock), so the tool fell back to literal.
-    expect(bm25Search).toHaveBeenCalled();
-    const firstCall = bm25Search.mock.calls[0] as unknown[] | undefined;
-    if (!firstCall) throw new Error("missing bm25Search call");
-    const candidates = firstCall[0] as unknown[];
-    expect(candidates.length).toBeGreaterThan(0);
-    expect(firstCall[2]).toBe("smart");
+    // The broad BM25 pass ran (returned nothing via the stub), so the tool fell
+    // back to literal, which finds the "walkthrough" hits including the title.
+    expect(searchRawHits.mock.calls.length + sideSearch.mock.calls.length).toBeGreaterThan(0);
     expect(out.results).toHaveLength(3);
     expect(out.results.some((result) => result.source === "title")).toBe(true);
     expect(out.matchMode).toBe("literal");

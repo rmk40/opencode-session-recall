@@ -1,7 +1,13 @@
 import type { Part } from "@opencode-ai/sdk/v2";
-import { tokenize, normalize } from "./normalize.js";
-import { searchableFields, pruned, type SearchableField } from "./extract.js";
-import type { DirectoryRelevance, ResultSource, ResultWhy } from "./types.js";
+import { normalize } from "./normalize.js";
+import {
+  searchableFields,
+  pruned,
+  nameClassFor,
+  containsErrorPattern,
+  type SearchableField,
+} from "./extract.js";
+import type { DirectoryRelevance, NameClass, ResultSource, ResultWhy } from "./types.js";
 
 export type SessionMeta = {
   id: string;
@@ -35,8 +41,12 @@ export type Candidate = {
   directoryRelevance?: DirectoryRelevance;
   titleMatch?: { title: string; matchedTerms?: string[] };
 
-  // Deduplicated tokens for matched-term metadata checks
-  tokens: string[];
+  /** Name-based evidence class (tool parts only), precomputed at fill so
+   *  phase-1 ranking applies skill/read penalties in O(1). See NameClass. */
+  nameClass?: NameClass;
+  /** Whether the raw text contains an error pattern (tool parts only),
+   *  precomputed at fill for the O(1) phase-1 error-text boost. */
+  hasErrorText?: boolean;
 
   // Optional semantic embedding (L2-normalized), computed once per session
   // version at cache-fill time when the opt-in semantic layer is enabled.
@@ -110,7 +120,12 @@ export function buildCandidates(
       if (rawText.length > MAX_CHARS_PER_CANDIDATE) {
         rawText = rawText.slice(0, MAX_CHARS_PER_CANDIDATE);
       }
+      // charCount is what the cache actually RETAINS after fill: the rawText
+      // plus the field texts (both kept for scoring/literal scans). The
+      // normalized fields are released (primaryText) or tiny (secondaryText
+      // etc.), so they are not counted. See the cacheMaxChars semantics note.
       charsUsed += rawText.length;
+      for (const field of fields) charsUsed += field.text.length;
 
       const candidate: Candidate = {
         sessionID: session.id,
@@ -124,7 +139,6 @@ export function buildCandidates(
         isPruned: pruned(part),
         rawText,
         fieldTexts: fields,
-        tokens: tokenize(rawText),
         source: part.type === "tool" ? "tool" : part.type === "reasoning" ? "reasoning" : "message",
         why: {
           matchedFields: [],
@@ -133,6 +147,8 @@ export function buildCandidates(
 
       if (part.type === "tool") {
         candidate.toolName = part.tool;
+        candidate.nameClass = nameClassFor(part.tool);
+        candidate.hasErrorText = containsErrorPattern(rawText);
       }
 
       candidates.push(candidate);
@@ -161,7 +177,6 @@ export function buildTitleCandidate(
     isPruned: false,
     rawText: title,
     fieldTexts: [{ field: "title", text: title }],
-    tokens: tokenize(title),
     source: "title",
     directoryRelevance: session.directoryRelevance,
     why: {
