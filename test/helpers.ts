@@ -40,6 +40,7 @@ export const TEST_LIMITS: Limits = {
   inventoryTokens: 200,
   coldPass: true,
   drillSessions: 12,
+  semanticSlots: 2,
   drillPageMessages: 25,
   drillCharsPerSession: 1_500_000,
   drillCharsPerQuery: 20_000_000,

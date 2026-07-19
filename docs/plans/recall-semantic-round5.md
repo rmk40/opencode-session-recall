@@ -58,10 +58,10 @@ session (title sentinel `[recall-summarizer]`), batch prompts (~15 card digests 
 turn, JSON-in/JSON-out), a cheap configured model, deleted or reused across runs.
 
 1. **Schema**: additive migration v1 -> v2: `ALTER TABLE card ADD COLUMN nl_summary
-   TEXT NOT NULL DEFAULT ''` plus meta `summary_rev` (prompt-version stamp). Additive
+TEXT NOT NULL DEFAULT ''` plus meta `summary_rev` (prompt-version stamp). Additive
    means no store rebuild; v1 stores upgrade in place.
 2. **Summarizer** (`src/summarize.ts`): opt-in via plugin option `summaries: { model:
-   "provider/model", enabled: true }` (off by default; spends the user's tokens).
+"provider/model", enabled: true }` (off by default; spends the user's tokens).
    Cold pass: after distillation, batch through undistilled-summary cards
    newest-first through the fetch gate at background priority; per-batch prompt
    renders each card's mechanical fields and asks for 2-3 plain sentences of what the

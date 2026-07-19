@@ -25,6 +25,7 @@ import { snippet, matches, formatMsg, isSelfTool, evidenceClassFor } from "./ext
 import { parseQuery } from "./query.js";
 import { candidateEligible, type Candidate, type CandidateFilters } from "./candidates.js";
 import type { CandidateEmbedder } from "./corpus.js";
+import { cosineSimilarity } from "./semantic/similarity.js";
 import { clamp01, bm25Search, type Bm25Hit } from "./bm25.js";
 import { smartSnippet, truncatePreservingMatch } from "./snippet.js";
 import { compileRegex, regexFirstIndex, regexSnippet } from "./regex.js";
@@ -57,6 +58,11 @@ export type SearchDeps = {
   store: Store | null;
   cards: CardsRuntime;
   drill: Drill;
+  /** Opt-in semantic layer. When present and ready, the tier-1 card runtime
+   *  already blends its signal; the search tool additionally uses the embedder
+   *  here for the bounded zero-lexical-hit part-level rescue (semantic-
+   *  shortlisted sessions only). Absent = lexical-only. */
+  semantic?: SemanticSearchConfig;
 };
 
 /** Wall-clock budget for the synchronous literal/regex scan loops (ms). Bounds
@@ -814,6 +820,122 @@ function rankedToSearchResults(
   });
 }
 
+// ── Zero-lexical-hit semantic rescue ─────────────────────────────────
+// Bounded part-level rescue for sessions the reserved-slot band surfaced that
+// then drilled to zero lexical hits. This is the ONLY place the search path
+// embeds parts, and only for those sessions — the drill itself stays embedding-
+// free (drill.test.ts guards that). Capped candidates per session keep the extra
+// embed work within the drill budgets already spent to fetch them.
+
+/** Per-session cap on parts embedded during rescue. Drilled pools are already
+ *  budget-bounded; this bounds the extra embed work regardless. */
+const MAX_RESCUE_CANDIDATES = 60;
+
+/** Build a rescue result from the top-cosine drilled part: labeled semantic in
+ *  `why` (no lexical match), scored from the blended card+part similarity. */
+function semanticRescueResult(
+  candidate: Candidate,
+  relevance: DirectoryRelevance,
+  query: ReturnType<typeof parseQuery>,
+  partSimilarity: number,
+  blendedScore: number,
+  width: number | undefined,
+  mode: MatchMode,
+  explain: boolean,
+): SearchResult {
+  const result = annotateResult({
+    sessionID: candidate.sessionID,
+    sessionTitle: candidate.sessionTitle,
+    directory: candidate.directory,
+    messageID: candidate.messageID,
+    role: candidate.role,
+    time: candidate.time,
+    partID: candidate.partID,
+    partType: candidate.partType,
+    pruned: candidate.isPruned,
+    snippet: smartSnippet(candidate.rawText, query, width),
+    toolName: candidate.toolName,
+    score: clamp01(blendedScore),
+    matchMode: mode,
+    source: candidate.source ?? sourceForPartType(candidate.partType),
+    titleMatch: candidate.titleMatch,
+    why: {
+      matchedFields: [],
+      directoryRelevance: relevance,
+      recency: recencyLabel(candidate.time),
+      confidence: "low",
+      evidenceClass: evidenceClassFor(candidate.partType, candidate.toolName, []),
+      semanticSimilarity: partSimilarity,
+    },
+  });
+  if (explain) {
+    result.matchReasons = [
+      `Semantic evidence (no lexical hit): cosine similarity ${partSimilarity.toFixed(3)}`,
+    ];
+  }
+  return result;
+}
+
+/** For each semantic-shortlisted session with zero lexical drill hits, embed its
+ *  drilled parts (bounded), pick the top-cosine part, and build one rescue result
+ *  scored from the blended card+part similarity. Returns [] when semantic is off,
+ *  the embedder is not ready, the query does not embed, or nothing qualifies. */
+function rescueZeroHitSessions(input: {
+  reserved: string[];
+  hitSessions: Set<string>;
+  pools: DrilledPool[];
+  semantic: SemanticSearchConfig | undefined;
+  semanticBySession: Map<string, number>;
+  relevanceBySession: Map<string, DirectoryRelevance>;
+  query: ReturnType<typeof parseQuery>;
+  width: number | undefined;
+  mode: MatchMode;
+  explain: boolean;
+}): SearchResult[] {
+  const embedder = input.semantic?.embedder;
+  if (input.reserved.length === 0 || !embedder?.ready) return [];
+  const queryVec = embedder.embed(input.query.raw);
+  if (!queryVec) return [];
+
+  const weight = input.semantic!.weight;
+  const reserved = new Set(input.reserved);
+  const results: SearchResult[] = [];
+  for (const pool of input.pools) {
+    const sessionId = pool.target.sessionId;
+    if (!reserved.has(sessionId) || input.hitSessions.has(sessionId)) continue;
+
+    let best: { candidate: Candidate; sim: number } | undefined;
+    let embedded = 0;
+    for (const candidate of pool.candidates) {
+      if (candidate.partType === "title" || !candidate.rawText) continue;
+      if (embedded >= MAX_RESCUE_CANDIDATES) break;
+      const vec = embedder.embed(candidate.rawText);
+      embedded++;
+      if (!vec) continue;
+      const sim = clamp01((cosineSimilarity(queryVec, vec) + 1) / 2);
+      if (!best || sim > best.sim) best = { candidate, sim };
+    }
+    if (!best) continue;
+
+    const cardSim = input.semanticBySession.get(sessionId) ?? best.sim;
+    const blended = clamp01(weight * best.sim + (1 - weight) * cardSim);
+    const relevance = input.relevanceBySession.get(sessionId) ?? "unknown";
+    results.push(
+      semanticRescueResult(
+        best.candidate,
+        relevance,
+        input.query,
+        best.sim,
+        blended,
+        input.width,
+        input.mode,
+        input.explain,
+      ),
+    );
+  }
+  return results;
+}
+
 // ── Group results by session ─────────────────────────────────────────
 
 /** How many of a session's strongest hits to track for representative
@@ -1448,22 +1570,28 @@ function attachCommonOutput<T extends SearchOutput>(
 }
 
 /**
- * Merge the tier-1 card shortlist with the tier-1.5 FTS-only needle sessions,
- * capped at `cap`. FTS-only sessions (a session whose card missed the query's
- * anchor but whose slim-index rows carry it) are guaranteed a reserved band of
- * slots ahead of the weakest cards, so a rare needle is never crowded out by
- * lexically-strong-but-wrong cards. Order-preserving and deduped.
+ * Merge the tier-1 card shortlist with the tier-1.5 FTS-only needle sessions and
+ * the tier-1 top pure-semantic sessions, capped at `cap`.
+ *
+ * Two reserved bands sit ahead of the weakest strong cards so a signal the blend
+ * buries still gets a drill slot: FTS-only sessions (a session whose card missed
+ * the query's anchor but whose slim-index rows carry it) get a dynamic band, and
+ * the top pure-semantic sessions (card ids the lexical+semantic blend ranks too
+ * low to shortlist, but which the semantic signal ranks highest) get a fixed
+ * `semanticSlots` band. Both reservations honor the same cap==1 guard: when the
+ * cap leaves no room beyond one strong card, that single slot always goes to the
+ * top-ranked card, never a reserved band. `semanticIds` is a subset of `cardIds`
+ * (reordered by semantic score); dedup keeps a reserved id that is also strong
+ * from taking two slots. Order-preserving and deduped. Exported for direct unit
+ * tests of the reservation and cap guards.
  */
-function mergeShortlist(cardIds: string[], ftsOnly: string[], cap: number): string[] {
-  if (ftsOnly.length === 0) return cardIds.slice(0, cap);
-  // Reserve needle slots only when the cap still leaves room for at least one
-  // strong card, so cap==1 always goes to the top-ranked card, not a needle.
-  const reserve = Math.min(
-    ftsOnly.length,
-    Math.max(1, Math.floor(cap / 3)),
-    cardIds.length > 0 ? cap - 1 : cap,
-  );
-  const strong = cardIds.slice(0, Math.max(0, cap - reserve));
+export function mergeShortlist(
+  cardIds: string[],
+  ftsOnly: string[],
+  semanticIds: string[],
+  cap: number,
+  semanticSlots: number,
+): string[] {
   const merged: string[] = [];
   const seen = new Set<string>();
   const push = (id: string): void => {
@@ -1472,13 +1600,34 @@ function mergeShortlist(cardIds: string[], ftsOnly: string[], cap: number): stri
       merged.push(id);
     }
   };
+
+  // Only reserve when the cap leaves room for at least one strong card.
+  const roomForReserved = cardIds.length > 0 ? cap - 1 : cap;
+  const ftsReserve =
+    ftsOnly.length === 0
+      ? 0
+      : Math.min(ftsOnly.length, Math.max(1, Math.floor(cap / 3)), Math.max(0, roomForReserved));
+  const semReserve =
+    semanticIds.length === 0 || semanticSlots <= 0
+      ? 0
+      : Math.min(semanticIds.length, semanticSlots, Math.max(0, roomForReserved - ftsReserve));
+
+  // The reserved-semantic ids are card ids the blend ranked too low to make the
+  // strong prefix; pulling them out first is what rescues them. Exclude them from
+  // the strong prefix so the reservation is additive, not a reorder of the top.
+  const reservedSemantic = semanticIds.slice(0, semReserve);
+  const reservedSemanticSet = new Set(reservedSemantic);
+  const strongCount = Math.max(0, cap - ftsReserve - semReserve);
+  const strong = cardIds.filter((id) => !reservedSemanticSet.has(id)).slice(0, strongCount);
+
   for (const id of strong) push(id);
-  for (const id of ftsOnly.slice(0, reserve)) push(id);
-  for (const id of cardIds.slice(strong.length)) {
+  for (const id of ftsOnly.slice(0, ftsReserve)) push(id);
+  for (const id of reservedSemantic) push(id);
+  for (const id of cardIds) {
     if (merged.length >= cap) break;
     push(id);
   }
-  for (const id of ftsOnly.slice(reserve)) {
+  for (const id of ftsOnly.slice(ftsReserve)) {
     if (merged.length >= cap) break;
     push(id);
   }
@@ -1911,6 +2060,11 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
         let sessionsEligible = 0;
         let shortlistIDs: string[] = [];
         let directoryBucketsSearched: SearchCoverage["directoryBucketsSearched"];
+        // Semantic bookkeeping for the smart/fuzzy route (empty unless the tier-1
+        // rank branch ran with the semantic layer active): per-session semantic
+        // score, and the sessions the reserved-slot band pulled into the drill.
+        const semanticBySession = new Map<string, number>();
+        let semanticReserved: string[] = [];
 
         /** Register a card as a drill target (relevance + coverage metadata). */
         const registerTarget = (card: Card, relevance: DirectoryRelevance): DrillTarget => {
@@ -2143,6 +2297,22 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
           const eligibleIdSet = new Set(eligibleIds);
           deepSet = eligibleIdSet;
 
+          // Pure-semantic ordering for the reserved shortlist band: the eligible
+          // cards the semantic layer scored, highest cosine first. Empty unless
+          // the card runtime ran with semantic active (each hit then carries a
+          // `semanticScore`); the lexical-only path leaves it empty, so the
+          // reservation and everything downstream of it is a no-op.
+          for (const e of eligible) {
+            if (e.hit.semanticScore != null)
+              semanticBySession.set(e.hit.sessionId, e.hit.semanticScore);
+          }
+          const semanticIds =
+            semanticBySession.size > 0
+              ? [...semanticBySession.entries()]
+                  .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+                  .map(([id]) => id)
+              : [];
+
           // ── Tier 1.5: FTS needle lookup — inject sessions whose card missed the anchor ──
           const ftsOnly: string[] = [];
           if (store) {
@@ -2186,7 +2356,17 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
             requestedSessions != null
               ? Math.min(requestedSessions, Math.max(1, limits.drillSessions))
               : Math.max(1, limits.drillSessions);
-          const mergedIds = mergeShortlist(eligibleIds, ftsOnly, cap);
+          const semanticSlots = semanticIds.length > 0 ? limits.semanticSlots : 0;
+          const mergedIds = mergeShortlist(eligibleIds, ftsOnly, semanticIds, cap, semanticSlots);
+          // Which sessions the semantic reservation actually surfaced: the ids in
+          // the shortlist that the lexical-only merge would NOT have selected.
+          // These are the rescue-eligible / semantically-contributed sessions —
+          // a lexically-strong card that also scores well semantically is NOT
+          // counted, since it would be here regardless.
+          if (semanticSlots > 0) {
+            const lexicalOnly = new Set(mergeShortlist(eligibleIds, ftsOnly, [], cap, 0));
+            semanticReserved = mergedIds.filter((id) => !lexicalOnly.has(id));
+          }
           drillTargets = mergedIds
             .filter((id) => id !== excludeSessionID)
             .map((id) => {
@@ -2251,6 +2431,13 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
           JSON.stringify({ ok: false, error: "aborted" } satisfies ErrorOutput);
 
         const cardsCoverage = cards.coverage();
+        // Semantic diagnostics: static status from the card runtime (ready,
+        // model, weight, vector count), always present when semantic is
+        // configured on; `contributed` is filled per route in finish() from the
+        // returned results. The set of sessions the semantic reservation
+        // surfaced is `semanticReserved` (populated only in the tier-1 branch).
+        const semanticStatus = cards.semanticStatus();
+        const semanticReservedSet = new Set(semanticReserved);
         if (cardsCoverage.totalCards >= DISCOVERY_LIMIT) {
           pushUnique(normalized.limitedBy, "providerLimit");
           normalized.warnings.push(
@@ -2315,6 +2502,7 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
               storeRecency: cardsCoverage.storeRecency,
               degraded: cardsCoverage.degraded,
             },
+            ...(semanticStatus && { semantic: { ...semanticStatus, contributed: 0 } }),
           };
           const searchedSessions = drilledSessions.map(
             (id) => searchedMeta.get(id) ?? { id, title: "", directory: "" },
@@ -2368,6 +2556,14 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
           outCtx: ReturnType<typeof buildOutputContext>,
         ): Promise<T> => {
           const warnings = [...normalized.warnings];
+          // Count the returned results the semantic tier surfaced (reserved-slot
+          // inclusions plus zero-lexical-hit rescues, both keyed by the session
+          // set the reservation added).
+          if (outCtx.coverage.semantic) {
+            outCtx.coverage.semantic.contributed = final.filter((r) =>
+              semanticReservedSet.has(r.sessionID),
+            ).length;
+          }
           if (outCtx.incomplete) {
             warnings.push(
               `${outCtx.loadErrorCount} session${outCtx.loadErrorCount === 1 ? "" : "s"} failed to load; results may be partial.`,
@@ -2623,13 +2819,7 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
           drilled.loadErrors,
           drilled.budgetExhausted,
         );
-        // Documented v1 decision (plan Revisions): semantic ranking is card-tier
-        // only. A session the card runtime surfaced by embedding similarity but
-        // whose drilled parts yield NO lexical BM25 hit produces no `drilled.hits`
-        // entry, so it simply does not appear here. We deliberately do NOT
-        // back-fill card-derived results or add part-level drill semantics — the
-        // agent can issue a narrower query. Revisit only with measured demand.
-        const allResults = rankedToSearchResults(
+        let allResults = rankedToSearchResults(
           drilled.hits,
           smartMode,
           explain,
@@ -2638,7 +2828,47 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
           relevanceBySession,
         );
 
+        // ── Zero-lexical-hit semantic rescue (Path A) ──
+        // A session the reserved-slot band surfaced by embedding similarity but
+        // whose drilled parts yield NO lexical BM25 hit no longer vanishes: embed
+        // its drilled candidates (bounded), take the top-cosine part as evidence,
+        // scored from the blended card+part similarity and labeled semantic in
+        // `why`. Scoped to semantic-shortlisted, zero-lexical-hit sessions only —
+        // the drill itself never embeds (see the drill.test.ts guard).
+        const rescued = rescueZeroHitSessions({
+          reserved: semanticReserved,
+          hitSessions: new Set(drilled.hits.map((h) => h.candidate.sessionID)),
+          pools: drilled.pools,
+          semantic: deps.semantic,
+          semanticBySession,
+          relevanceBySession,
+          query: queryMeta,
+          width: widthArg,
+          mode: smartMode,
+          explain,
+        });
+        if (rescued.length > 0) {
+          allResults = [...allResults, ...rescued].sort(
+            (a, b) => (b.score ?? 0) - (a.score ?? 0) || b.time - a.time,
+          );
+        }
+        // Explain: surface each result's card-level semantic similarity in why +
+        // matchReasons (the rescue results already carry their own part-level one).
+        if (explain && semanticBySession.size > 0) {
+          for (const result of allResults) {
+            if (!result.why || result.why.semanticSimilarity != null) continue;
+            const sim = semanticBySession.get(result.sessionID);
+            if (sim == null) continue;
+            result.why = { ...result.why, semanticSimilarity: sim };
+            result.matchReasons = [
+              ...(result.matchReasons ?? []),
+              `Card semantic similarity: ${sim.toFixed(3)}`,
+            ];
+          }
+        }
+
         const planSelected: string[] = ["cards-tier1", "drill-tier2"];
+        if (rescued.length > 0) planSelected.push("semantic-rescue");
         if (queryMeta.codeTokens.length > 0) planSelected.push("exact-token-boost");
         if (ftsBySession && ftsBySession.size > 0) planSelected.push("fts-needle");
         const QUERY_PLAN_VARIANTS = [
@@ -2646,6 +2876,7 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
           "fts-needle",
           "exact-token-boost",
           "drill-tier2",
+          "semantic-rescue",
           "literal-fallback",
         ];
         const attachQueryPlan = (out: SearchOutput, selected: string[]): void => {

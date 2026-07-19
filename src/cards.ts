@@ -2,6 +2,7 @@ import MiniSearch from "minisearch";
 import type { Card } from "./store.js";
 import type { ParsedQuery } from "./query.js";
 import { normalize, tokenizeAll } from "./normalize.js";
+import { embeddingTextOf, cardVectorStamp } from "./embedding-text.js";
 import { clamp01, recencyMultiplier } from "./bm25.js";
 import { cosineSimilarity } from "./semantic/similarity.js";
 import type { CandidateEmbedder } from "./corpus.js";
@@ -59,6 +60,12 @@ export type CardHit = {
   score: number;
   card: Card;
   directoryRelevance: DirectoryRelevance;
+  /** Pure semantic score (cosine-derived, 0..1) for this card, present only when
+   *  the semantic layer is active for the query. Distinct from `score` (the
+   *  lexical+semantic blend): the reserved-slot shortlist uses it to rank cards
+   *  by semantic similarity alone, so a session the blend buries can still be
+   *  guaranteed a drill slot. Undefined when semantic is off/unready. */
+  semanticScore?: number;
 };
 
 export type CardFilters = {
@@ -87,6 +94,20 @@ export type CardsCoverage = {
   /** Newest `timeUpdated` among distilled cards (0 when none). */
   storeRecency: number;
   degraded: boolean;
+};
+
+/** Semantic-layer diagnostics for the search coverage block. Present only when
+ *  the semantic layer is configured on (an embedder plus a positive weight). */
+export type SemanticStatus = {
+  /** The embedder has finished loading; searches embed until then they stay lexical. */
+  ready: boolean;
+  /** Configured embedding model id (the clean id, without the representation
+   *  stamp suffix). Undefined when no model id was configured (some tests). */
+  model?: string;
+  /** Blend weight for the semantic signal, 0..1. */
+  weight: number;
+  /** How many loaded cards currently have a computed vector. */
+  cardsWithVectors: number;
 };
 
 export type CardSource = {
@@ -139,6 +160,9 @@ export type CardsRuntime = {
   /** All cards whose `rootId` equals the given root (the root's family). */
   familyOf(rootId: string): Card[];
   coverage(): CardsCoverage;
+  /** Semantic-layer diagnostics, or undefined when semantic is not configured on.
+   *  Reflects live readiness and the current vector count. */
+  semanticStatus(): SemanticStatus | undefined;
   /** Force the next rank() to rebuild from the source (tests). */
   invalidate(): void;
 };
@@ -271,7 +295,11 @@ export function createCardsRuntime(deps: CardsRuntimeDeps): CardsRuntime {
   const refreshIntervalMs = deps.refreshIntervalMs ?? REFRESH_INTERVAL_MS;
   const semanticWeight = deps.semanticWeight ?? 0;
   const embedder = deps.embedder;
-  const configuredModel = deps.semanticModel;
+  // The clean model id is what diagnostics report; the persisted-vector stamp
+  // folds in the representation version so an embedding-input change recomputes
+  // vectors once (see embedding-text.ts).
+  const semanticModelId = deps.semanticModel;
+  const configuredModel = semanticModelId != null ? cardVectorStamp(semanticModelId) : undefined;
 
   let cards: Card[] = [];
   let mini: MiniSearch<CardDoc> | undefined;
@@ -302,7 +330,7 @@ export function createCardsRuntime(deps: CardsRuntimeDeps): CardsRuntime {
         vectors.set(card.sessionId, blobToVector(card.embedding));
         continue;
       }
-      const text = `${card.title} ${card.summaryHead} ${card.inventory}`.trim();
+      const text = embeddingTextOf(card);
       if (!text) continue;
       const vec = embedder.embed(text);
       if (!vec) continue;
@@ -447,6 +475,7 @@ export function createCardsRuntime(deps: CardsRuntimeDeps): CardsRuntime {
           score,
           card,
           directoryRelevance: directoryRelevance(card, filters),
+          ...(semantic.size > 0 && { semanticScore: sem }),
         });
       }
 
@@ -507,6 +536,17 @@ export function createCardsRuntime(deps: CardsRuntimeDeps): CardsRuntime {
         fullCards: full,
         storeRecency: recency,
         degraded: deps.source.degraded === true,
+      };
+    },
+
+    semanticStatus(): SemanticStatus | undefined {
+      if (!embedder || semanticWeight <= 0) return undefined;
+      refreshIfStale();
+      return {
+        ready: embedder.ready,
+        ...(semanticModelId != null && { model: semanticModelId }),
+        weight: semanticWeight,
+        cardsWithVectors: cardVectors?.size ?? 0,
       };
     },
 

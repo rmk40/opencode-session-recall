@@ -11,7 +11,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { OpencodeClient, Session } from "@opencode-ai/sdk/v2";
 import type { ToolContext, ToolDefinition } from "@opencode-ai/plugin";
-import type { EvidenceClass, SearchOutput } from "../../src/types.js";
+import type { EvidenceClass, Limits, SearchOutput } from "../../src/types.js";
 import { DISCOVERY_LIMIT } from "../../src/types.js";
 import {
   PROJECT_DIR,
@@ -32,6 +32,11 @@ import { search, type SearchDeps, type SemanticSearchConfig } from "../../src/se
 import { makeEvalCorpus, type EvalCorpus } from "./corpus.js";
 
 type ListParams = { search?: string; limit?: number };
+
+/** Synthetic model id stamped on eval card vectors (the fake embedder has no
+ *  HuggingFace id). Only its role as a persistence stamp / diagnostics label
+ *  matters here. */
+export const EVAL_SEMANTIC_MODEL = "eval/fake-embedder";
 
 /** Build fake scoped + unscoped clients backed by the eval corpus. */
 export function makeEvalClients(corpus: EvalCorpus = makeEvalCorpus()): {
@@ -108,6 +113,7 @@ async function awaitColdPass(distiller: Distiller, timeoutMs = 10_000): Promise<
 export async function makeEvalSearch(
   corpus: EvalCorpus = makeEvalCorpus(),
   semantic?: SemanticSearchConfig,
+  limits: Limits = TEST_LIMITS,
 ): Promise<{ searchTool: ToolDefinition; cleanup: () => void }> {
   // The whole eval path (cold pass, drill, expansion) must be bounded.
   setStrictNoLimitMessages(true);
@@ -118,12 +124,12 @@ export async function makeEvalSearch(
   const store = openStore(db);
   if (!store) throw new Error("openStore returned null in eval harness");
 
-  const gate = createFetchGate({ concurrency: TEST_LIMITS.concurrency });
+  const gate = createFetchGate({ concurrency: limits.concurrency });
   const distiller = createDistiller({
     client,
     store,
     gate,
-    limits: TEST_LIMITS,
+    limits,
     instanceId: "eval-distiller",
     discover: async () => {
       const resp = await unscoped.experimental.session.list({ limit: DISCOVERY_LIMIT });
@@ -134,13 +140,28 @@ export async function makeEvalSearch(
   await awaitColdPass(distiller);
   distiller.stop();
 
+  // Mirror the plugin's persistent card source so the semantic eval exercises
+  // the Path C vector persistence path (withEmbeddings forwarding + model stamp +
+  // write-back), not just in-memory vectors.
   const cards = createCardsRuntime({
-    source: { getCards: () => store.allCards(), revision: () => store.getMeta("cards_rev") },
+    source: {
+      getCards: (opts) => store.allCards(opts),
+      revision: () => store.getMeta("cards_rev"),
+      semanticModel: () => store.getMeta("semantic_model"),
+      writeEmbeddings: (model, rows) => store.writeCardEmbeddings(model, rows),
+    },
     embedder: semantic?.embedder,
     semanticWeight: semantic?.weight,
+    semanticModel: semantic ? EVAL_SEMANTIC_MODEL : undefined,
   });
-  const drill = createDrill({ client, gate, limits: TEST_LIMITS });
-  const searchTool = search(client, unscoped, true, TEST_LIMITS, { gate, store, cards, drill });
+  const drill = createDrill({ client, gate, limits });
+  const searchTool = search(client, unscoped, true, limits, {
+    gate,
+    store,
+    cards,
+    drill,
+    semantic,
+  });
 
   return {
     searchTool,

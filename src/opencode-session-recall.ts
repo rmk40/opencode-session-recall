@@ -71,6 +71,12 @@ const server: Plugin = async (ctx, options) => {
     inventoryTokens: clamp(opts.inventoryTokens, DEFAULTS.inventoryTokens),
     coldPass: opts.coldPass !== false,
     drillSessions: clamp(opts.drillSessions, DEFAULTS.drillSessions),
+    // Reserved semantic slots: min 0 (0 disables the reservation), never more
+    // than the drill fan-out itself.
+    semanticSlots: Math.min(
+      clamp(opts.drillSessions, DEFAULTS.drillSessions),
+      Math.max(0, Math.floor(opts.semanticSlots ?? DEFAULTS.semanticSlots)),
+    ),
     drillPageMessages: clamp(opts.drillPageMessages, DEFAULTS.drillPageMessages),
     drillCharsPerSession: clamp(opts.drillCharsPerSession, DEFAULTS.drillCharsPerSession),
     drillCharsPerQuery: clamp(opts.drillCharsPerQuery, DEFAULTS.drillCharsPerQuery),
@@ -192,7 +198,7 @@ const server: Plugin = async (ctx, options) => {
   const distiller = createDistiller({ client, store, gate, limits, instanceId, discover });
   if (limits.coldPass) distiller.start();
 
-  const deps: SearchDeps = { gate, store, cards, drill };
+  const deps: SearchDeps = { gate, store, cards, drill, semantic };
   // recall_sessions serves the card store directly when it exists (digest, top
   // files/tools, family rollups); degraded mode leaves listings bare.
   const enrichment: SessionEnrichment | undefined = store

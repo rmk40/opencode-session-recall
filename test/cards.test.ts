@@ -10,6 +10,7 @@ import {
   exclusionFamilyFromCards,
   type CardSource,
 } from "../src/cards.js";
+import { cardVectorStamp } from "../src/embedding-text.js";
 import { exclusionFamily } from "../src/search.js";
 import { parseQuery } from "../src/query.js";
 import { makeEvalCorpus } from "./eval/corpus.js";
@@ -247,7 +248,7 @@ describe("cards semantic persistence", () => {
     });
     first.list({}); // triggers the rebuild → embed pass (list does no query embed)
     expect(embed).toHaveBeenCalled();
-    expect(store.getMeta("semantic_model")).toBe("model-x");
+    expect(store.getMeta("semantic_model")).toBe(cardVectorStamp("model-x"));
     expect(store.allCards({ withEmbeddings: true })[0]?.embedding).not.toBeNull();
 
     // A fresh runtime (new process) with the same stamp reuses the stored
@@ -281,7 +282,7 @@ describe("cards semantic persistence", () => {
       semanticWeight: 0.5,
       semanticModel: "model-old",
     }).list({});
-    expect(store.getMeta("semantic_model")).toBe("model-old");
+    expect(store.getMeta("semantic_model")).toBe(cardVectorStamp("model-old"));
     expect(store.allCards({ withEmbeddings: true })[0]?.embedding).not.toBeNull();
 
     // A runtime on a DIFFERENT model must ignore the persisted vector, recompute,
@@ -294,7 +295,7 @@ describe("cards semantic persistence", () => {
       semanticModel: "model-new",
     }).list({});
     expect(embed).toHaveBeenCalled(); // recomputed despite an existing vector
-    expect(store.getMeta("semantic_model")).toBe("model-new"); // stamp advanced
+    expect(store.getMeta("semantic_model")).toBe(cardVectorStamp("model-new")); // stamp advanced
     db.close();
   });
 
@@ -351,7 +352,7 @@ describe("cards semantic persistence", () => {
       semanticWeight: 0.5,
       semanticModel: "model-old",
     }).list({});
-    expect(store.getMeta("semantic_model")).toBe("model-old");
+    expect(store.getMeta("semantic_model")).toBe(cardVectorStamp("model-old"));
     expect(store.allCards({ withEmbeddings: true })[0]?.embedding).not.toBeNull();
 
     // The new model cannot embed s1 (no in-vocab tokens → undefined). Its
@@ -363,7 +364,7 @@ describe("cards semantic persistence", () => {
       semanticWeight: 0.5,
       semanticModel: "model-new",
     }).list({});
-    expect(store.getMeta("semantic_model")).toBe("model-new"); // stamp advanced
+    expect(store.getMeta("semantic_model")).toBe(cardVectorStamp("model-new")); // stamp advanced
     expect(store.allCards({ withEmbeddings: true })[0]?.embedding).toBeNull(); // old BLOB cleared
     db.close();
   });

@@ -29,6 +29,10 @@ export type Limits = {
   coldPass: boolean;
   /** Tier-2 drill fan-out: how many shortlisted sessions to drill per query. */
   drillSessions: number;
+  /** Of `drillSessions`, how many slots to reserve for the top pure-semantic
+   *  cards not already shortlisted (semantic on + ready only). Clamped; 0
+   *  disables the reservation. */
+  semanticSlots: number;
   /** Messages per untargeted drill page fetch (newest-first). */
   drillPageMessages: number;
   /** Per-session retained-chars budget for an untargeted drill. */
@@ -57,6 +61,7 @@ export const DEFAULTS: Limits = {
   inventoryTokens: 200,
   coldPass: true,
   drillSessions: 12,
+  semanticSlots: 2,
   drillPageMessages: 25,
   drillCharsPerSession: 1_500_000,
   drillCharsPerQuery: 20_000_000,
@@ -145,6 +150,18 @@ export type SearchCoverage = {
     storeRecency: number;
     degraded: boolean;
   };
+  /** Present only when the semantic layer is configured on. `ready` is the
+   *  embedder load state, `model` the configured model id, `weight` the blend
+   *  weight, `cardsWithVectors` how many cards carry a vector, and `contributed`
+   *  how many of THIS query's returned results the semantic tier surfaced
+   *  (reserved-slot inclusions plus zero-lexical-hit rescues). */
+  semantic?: {
+    ready: boolean;
+    model?: string;
+    weight: number;
+    cardsWithVectors: number;
+    contributed: number;
+  };
   /** Present only for a deep sweep: how much of the scoped session set the sweep
    *  actually covered. `sessionsCovered` were fully swept, `sessionsPartial`
    *  stopped mid-session on a budget, `sessionsRemaining` were never reached,
@@ -167,6 +184,10 @@ export type ResultWhy = {
   recency?: "recent" | "older" | "unknown";
   confidence?: "high" | "medium" | "low";
   evidenceClass?: EvidenceClass;
+  /** Semantic (cosine-derived, 0..1) similarity behind this result. Present for
+   *  a zero-lexical-hit semantic rescue (its whole basis), and for any result
+   *  under explain:true when the semantic layer scored its session. */
+  semanticSimilarity?: number;
 };
 
 export type NearMiss = {
