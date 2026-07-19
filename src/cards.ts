@@ -90,12 +90,23 @@ export type CardsCoverage = {
 };
 
 export type CardSource = {
-  /** Snapshot of all cards (e.g. `store.allCards()` or static cards-lite). */
-  getCards: () => Card[];
+  /** Snapshot of all cards. Pass `withEmbeddings` to include the persisted
+   *  `embedding` BLOB — the semantic layer needs it to reuse card vectors; the
+   *  lexical-only default omits it so no blobs load when semantic is off. */
+  getCards: (opts?: { withEmbeddings?: boolean }) => Card[];
   /** Monotonic write revision (`cards_rev`); undefined for static/degraded. */
   revision: () => string | undefined;
   /** True when cards are metadata-only (degraded, no store). */
   degraded?: boolean;
+  /** The store's persisted semantic-model stamp (`meta.semantic_model`), or
+   *  undefined with no store / no stamp yet. Gates card-vector reuse. */
+  semanticModel?: () => string | undefined;
+  /** Persist newly computed card vectors plus the model stamp. Absent in
+   *  degraded mode (no store to write to). */
+  writeEmbeddings?: (
+    model: string,
+    rows: Array<{ sessionId: string; embedding: Uint8Array }>,
+  ) => void;
 };
 
 export type CardsRuntimeDeps = {
@@ -103,6 +114,14 @@ export type CardsRuntimeDeps = {
   embedder?: CandidateEmbedder;
   /** Blend weight for the semantic signal, 0..1. */
   semanticWeight?: number;
+  /** Model id stamped on persisted card vectors. When it matches the store's
+   *  stamp, vectors are reused across process starts instead of recomputed. */
+  semanticModel?: string;
+  /** Resolves when the embedder finishes loading (the embedder's init promise).
+   *  Lets the runtime run one embed pass the moment the model is ready, so
+   *  semantic activates on a warm store without waiting for a distill
+   *  (`cards_rev`) bump. */
+  semanticReady?: Promise<void>;
   now?: () => number;
   refreshIntervalMs?: number;
 };
@@ -230,11 +249,29 @@ export function cardsLiteFromSessions(
   }));
 }
 
+const F32_BYTES = 4;
+
+/** Serialize an L2-normalized vector to a store BLOB (native-endian float32
+ *  bytes). The card store is a machine-local, rebuildable cache, so native byte
+ *  order needs no portability handling. */
+function vectorToBlob(vec: Float32Array): Uint8Array {
+  return new Uint8Array(vec.buffer, vec.byteOffset, vec.byteLength);
+}
+
+/** Reconstruct a vector from a store BLOB. Copies into a fresh, aligned buffer
+ *  (SQLite blobs are not guaranteed 4-byte aligned) and drops any trailing
+ *  bytes that don't complete a float. */
+function blobToVector(blob: Uint8Array): Float32Array {
+  const copy = blob.slice();
+  return new Float32Array(copy.buffer, 0, Math.floor(copy.byteLength / F32_BYTES));
+}
+
 export function createCardsRuntime(deps: CardsRuntimeDeps): CardsRuntime {
   const now = deps.now ?? Date.now;
   const refreshIntervalMs = deps.refreshIntervalMs ?? REFRESH_INTERVAL_MS;
   const semanticWeight = deps.semanticWeight ?? 0;
   const embedder = deps.embedder;
+  const configuredModel = deps.semanticModel;
 
   let cards: Card[] = [];
   let mini: MiniSearch<CardDoc> | undefined;
@@ -244,22 +281,56 @@ export function createCardsRuntime(deps: CardsRuntimeDeps): CardsRuntime {
   let loaded = false;
 
   function embedCards(): void {
-    if (!embedder || semanticWeight <= 0) {
-      cardVectors = undefined;
+    if (!embedder || semanticWeight <= 0 || !embedder.ready) {
+      // Semantic off, or the model is still warming (the query path also stays
+      // lexical until the embedder is ready). Nothing to compute or persist.
+      cardVectors = embedder && semanticWeight > 0 ? new Map() : undefined;
       return;
     }
+
+    // Reuse persisted vectors when the store's stamp matches this model. A card
+    // whose vector was cleared by a re-distill (embedding null), or a model
+    // change (stamp mismatch), falls through to recompute. Newly computed
+    // vectors are written back under the model stamp so the next start reuses.
+    const stampMatches =
+      configuredModel != null && deps.source.semanticModel?.() === configuredModel;
     const vectors = new Map<string, Float32Array>();
+    const toWrite: Array<{ sessionId: string; embedding: Uint8Array }> = [];
+
     for (const card of cards) {
+      if (stampMatches && card.embedding) {
+        vectors.set(card.sessionId, blobToVector(card.embedding));
+        continue;
+      }
       const text = `${card.title} ${card.summaryHead} ${card.inventory}`.trim();
       if (!text) continue;
       const vec = embedder.embed(text);
-      if (vec) vectors.set(card.sessionId, vec);
+      if (!vec) continue;
+      vectors.set(card.sessionId, vec);
+      toWrite.push({ sessionId: card.sessionId, embedding: vectorToBlob(vec) });
     }
+
     cardVectors = vectors;
+
+    // Persist when anything was (re)computed, or when the stamp must advance to
+    // this model so a later start reuses instead of recomputing. Accepted
+    // cross-process race: this write can lose to a concurrent re-distill that
+    // cleared the same card's embedding, leaving a one-generation-stale vector;
+    // the next re-distill of that card clears it again, so it self-heals.
+    if (
+      configuredModel != null &&
+      deps.source.writeEmbeddings &&
+      (toWrite.length > 0 || !stampMatches)
+    ) {
+      deps.source.writeEmbeddings(configuredModel, toWrite);
+    }
   }
 
   function rebuild(): void {
-    cards = deps.source.getCards();
+    const wantEmbeddings = embedder != null && semanticWeight > 0;
+    cards = wantEmbeddings
+      ? deps.source.getCards({ withEmbeddings: true })
+      : deps.source.getCards();
     const index = new MiniSearch<CardDoc>({
       idField: "id",
       fields: [...CARD_FIELDS],
@@ -332,6 +403,19 @@ export function createCardsRuntime(deps: CardsRuntimeDeps): CardsRuntime {
       scores.set(sessionId, clamp01((cosineSimilarity(queryVec, vec) + 1) / 2));
     }
     return scores;
+  }
+
+  // Warm-store activation: when the embedder is still loading, hook its init
+  // completion to run one embed pass the moment it is ready, so semantic turns
+  // on without waiting for a distill (`cards_rev`) bump. Single-flight: the init
+  // promise resolves once, and the pass is skipped when vectors already exist or
+  // no snapshot is loaded yet (the next query then rebuilds and embeds).
+  if (embedder && semanticWeight > 0 && deps.semanticReady) {
+    void deps.semanticReady.then(() => {
+      if (!embedder.ready || !loaded) return;
+      if (cardVectors && cardVectors.size > 0) return;
+      embedCards();
+    });
   }
 
   return {

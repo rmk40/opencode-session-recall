@@ -139,7 +139,7 @@ export async function makeEvalSearch(
     embedder: semantic?.embedder,
     semanticWeight: semantic?.weight,
   });
-  const drill = createDrill({ client, gate, limits: TEST_LIMITS, embedder: semantic?.embedder });
+  const drill = createDrill({ client, gate, limits: TEST_LIMITS });
   const searchTool = search(client, unscoped, true, TEST_LIMITS, { gate, store, cards, drill });
 
   return {

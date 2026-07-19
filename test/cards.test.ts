@@ -1,4 +1,4 @@
-import { afterAll, describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it, vi } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -8,6 +8,7 @@ import {
   cardsLiteFromSessions,
   createCardsRuntime,
   exclusionFamilyFromCards,
+  type CardSource,
 } from "../src/cards.js";
 import { exclusionFamily } from "../src/search.js";
 import { parseQuery } from "../src/query.js";
@@ -215,6 +216,204 @@ describe("cards tier-1 rank", () => {
       storeRecency: 0,
       degraded: true,
     });
+  });
+});
+
+describe("cards semantic persistence", () => {
+  // A store-backed source with the persistence hooks wired, mirroring the plugin
+  // entry. Forwards `withEmbeddings` and the semantic_model stamp both ways.
+  const persistentSource = (store: Store): CardSource => ({
+    getCards: (opts) => store.allCards(opts),
+    revision: () => store.getMeta("cards_rev"),
+    semanticModel: () => store.getMeta("semantic_model"),
+    writeEmbeddings: (model, rows) => store.writeCardEmbeddings(model, rows),
+  });
+
+  it("reuses persisted card vectors on a matching model stamp (no re-embed on reload)", async () => {
+    const embed = vi.fn((text: string) =>
+      Float32Array.from(text.includes("alpha") ? [1, 0] : [0, 1]),
+    );
+    const embedder = { ready: true, embed };
+    const { db, store } = await freshStore();
+    store.upsertCard(makeCard("s1", { inventory: "alpha topic" }));
+    store.setMeta("cards_rev", "1");
+
+    // First runtime computes the vector and persists it under the model stamp.
+    const first = createCardsRuntime({
+      source: persistentSource(store),
+      embedder,
+      semanticWeight: 0.5,
+      semanticModel: "model-x",
+    });
+    first.list({}); // triggers the rebuild → embed pass (list does no query embed)
+    expect(embed).toHaveBeenCalled();
+    expect(store.getMeta("semantic_model")).toBe("model-x");
+    expect(store.allCards({ withEmbeddings: true })[0]?.embedding).not.toBeNull();
+
+    // A fresh runtime (new process) with the same stamp reuses the stored
+    // vector: the load must not embed anything.
+    embed.mockClear();
+    const second = createCardsRuntime({
+      source: persistentSource(store),
+      embedder,
+      semanticWeight: 0.5,
+      semanticModel: "model-x",
+    });
+    second.list({});
+    expect(embed).not.toHaveBeenCalled(); // vectors came from the store
+
+    // The reused vector still ranks: a query embed happens now, blend works.
+    expect(ids(second.rank(parseQuery("alpha"), {}))).toContain("s1");
+    db.close();
+  });
+
+  it("recomputes and rewrites card vectors when the stored model stamp differs", async () => {
+    const embed = vi.fn(() => Float32Array.from([1, 0]));
+    const embedder = { ready: true, embed };
+    const { db, store } = await freshStore();
+    store.upsertCard(makeCard("s1", { inventory: "alpha topic" }));
+    store.setMeta("cards_rev", "1");
+
+    // Seed the store as if an OLDER model had persisted a vector + stamp.
+    createCardsRuntime({
+      source: persistentSource(store),
+      embedder,
+      semanticWeight: 0.5,
+      semanticModel: "model-old",
+    }).list({});
+    expect(store.getMeta("semantic_model")).toBe("model-old");
+    expect(store.allCards({ withEmbeddings: true })[0]?.embedding).not.toBeNull();
+
+    // A runtime on a DIFFERENT model must ignore the persisted vector, recompute,
+    // and advance the stamp — even though a (stale-model) vector exists.
+    embed.mockClear();
+    createCardsRuntime({
+      source: persistentSource(store),
+      embedder,
+      semanticWeight: 0.5,
+      semanticModel: "model-new",
+    }).list({});
+    expect(embed).toHaveBeenCalled(); // recomputed despite an existing vector
+    expect(store.getMeta("semantic_model")).toBe("model-new"); // stamp advanced
+    db.close();
+  });
+
+  it("re-embeds a card whose persisted vector a re-distill cleared, reusing the rest", async () => {
+    const embed = vi.fn((text: string) =>
+      Float32Array.from(text.includes("gamma") ? [0, 1] : [1, 0]),
+    );
+    const embedder = { ready: true, embed };
+    const { db, store } = await freshStore();
+    store.upsertCard(makeCard("s1", { inventory: "alpha one" }));
+    store.upsertCard(makeCard("s2", { inventory: "alpha two" }));
+    store.setMeta("cards_rev", "1");
+
+    createCardsRuntime({
+      source: persistentSource(store),
+      embedder,
+      semanticWeight: 0.5,
+      semanticModel: "model-x",
+    }).list({}); // computes + persists both
+    expect(store.allCards({ withEmbeddings: true }).every((c) => c.embedding != null)).toBe(true);
+
+    // Simulate a re-distill of s1: its content changed and the distiller upserted
+    // it with embedding=null (the append-path clear). cards_rev bumps.
+    store.upsertCard(makeCard("s1", { inventory: "gamma changed", embedding: null }));
+    store.setMeta("cards_rev", "2");
+
+    embed.mockClear();
+    createCardsRuntime({
+      source: persistentSource(store),
+      embedder,
+      semanticWeight: 0.5,
+      semanticModel: "model-x",
+    }).list({}); // reuse s2, recompute s1
+
+    const embeddedTexts = embed.mock.calls.map(([t]) => t);
+    expect(embeddedTexts.some((t) => t.includes("gamma"))).toBe(true); // s1 recomputed
+    expect(embeddedTexts.some((t) => t.includes("alpha"))).toBe(false); // s2 reused, not re-embedded
+    // s1's fresh vector is persisted again.
+    const s1 = store.allCards({ withEmbeddings: true }).find((c) => c.sessionId === "s1");
+    expect(s1?.embedding).not.toBeNull();
+    db.close();
+  });
+
+  it("clears an old-model vector the new model cannot embed (no stale reuse under the new stamp)", async () => {
+    const { db, store } = await freshStore();
+    store.upsertCard(makeCard("s1", { inventory: "alpha topic" }));
+    store.setMeta("cards_rev", "1");
+
+    // An older model persisted a vector for s1 under its stamp.
+    const oldEmbedder = { ready: true, embed: vi.fn(() => Float32Array.from([1, 0])) };
+    createCardsRuntime({
+      source: persistentSource(store),
+      embedder: oldEmbedder,
+      semanticWeight: 0.5,
+      semanticModel: "model-old",
+    }).list({});
+    expect(store.getMeta("semantic_model")).toBe("model-old");
+    expect(store.allCards({ withEmbeddings: true })[0]?.embedding).not.toBeNull();
+
+    // The new model cannot embed s1 (no in-vocab tokens → undefined). Its
+    // old-model BLOB must be dropped, not left to be reused under the new stamp.
+    const newEmbedder = { ready: true, embed: vi.fn(() => undefined) };
+    createCardsRuntime({
+      source: persistentSource(store),
+      embedder: newEmbedder,
+      semanticWeight: 0.5,
+      semanticModel: "model-new",
+    }).list({});
+    expect(store.getMeta("semantic_model")).toBe("model-new"); // stamp advanced
+    expect(store.allCards({ withEmbeddings: true })[0]?.embedding).toBeNull(); // old BLOB cleared
+    db.close();
+  });
+
+  it("activates semantic on a warm store when the model becomes ready without a cards_rev bump", async () => {
+    let ready = false;
+    let resolveReady!: () => void;
+    const readyPromise = new Promise<void>((resolve) => {
+      resolveReady = () => {
+        ready = true;
+        resolve();
+      };
+    });
+    const embed = vi.fn((text: string) =>
+      Float32Array.from(text.includes("alpha") ? [1, 0] : [0, 1]),
+    );
+    const embedder = {
+      get ready() {
+        return ready;
+      },
+      embed,
+    };
+    const { db, store } = await freshStore();
+    store.upsertCard(makeCard("s1", { inventory: "alpha topic" }));
+    store.setMeta("cards_rev", "1"); // warm store; no further distillation follows
+
+    const runtime = createCardsRuntime({
+      source: persistentSource(store),
+      embedder,
+      semanticWeight: 0.5,
+      semanticModel: "model-x",
+      semanticReady: readyPromise,
+    });
+
+    // A query arrives while the model is still warming: cards load, no vectors.
+    runtime.rank(parseQuery("alpha"), {});
+    expect(embed).not.toHaveBeenCalled(); // not ready → no embed pass yet
+
+    // The model finishes loading. No cards_rev bump follows.
+    resolveReady();
+    await readyPromise;
+    await Promise.resolve(); // flush the readiness .then microtask
+
+    // The readiness hook ran one embed pass: vectors computed and persisted.
+    expect(embed).toHaveBeenCalledTimes(1); // one card embedded once
+    expect(store.allCards({ withEmbeddings: true })[0]?.embedding).not.toBeNull();
+
+    // A subsequent semantic rank now uses the vectors.
+    expect(ids(runtime.rank(parseQuery("alpha"), {}))).toContain("s1");
+    db.close();
   });
 });
 

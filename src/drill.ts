@@ -10,7 +10,7 @@ import {
   MAX_CHARS_PER_CANDIDATE,
   type Candidate,
 } from "./candidates.js";
-import { buildSessionDigest, type CandidateEmbedder } from "./corpus.js";
+import { buildSessionDigest } from "./corpus.js";
 import { normalize } from "./normalize.js";
 import { searchable } from "./extract.js";
 import { bm25Search, type Bm25Hit, type Bm25Mode } from "./bm25.js";
@@ -164,7 +164,6 @@ export type DrillDeps = {
   client: OpencodeClient;
   gate: FetchGate;
   limits: Limits;
-  embedder?: CandidateEmbedder;
   /** Injectable clock for the deep sweep's wall-clock budget (tests). */
   now?: () => number;
   /** Soft wall-clock budget for a deep sweep in ms (default 20s). Injectable so
@@ -253,7 +252,7 @@ function estimateRetained(msg: MsgWithParts): number {
 }
 
 export function createDrill(deps: DrillDeps): Drill {
-  const { client, gate, limits, embedder } = deps;
+  const { client, gate, limits } = deps;
   // Drilled-session LRU keyed by (session, time.updated); Map order is LRU order.
   const cache = new Map<string, CacheEntry>();
   let cachedTotal = 0;
@@ -357,10 +356,6 @@ export function createDrill(deps: DrillDeps): Drill {
     const digestText = buildSessionDigest(candidates);
     const normalizedDigest = digestText ? normalize(digestText) : "";
     for (const candidate of candidates) candidate.digestText = normalizedDigest;
-
-    if (embedder?.ready) {
-      for (const candidate of candidates) candidate.embedding = embedder.embed(candidate.rawText);
-    }
 
     const entry: CacheEntry = { candidates, chars: charsUsed };
     cache.set(key, entry);
@@ -522,10 +517,6 @@ export function createDrill(deps: DrillDeps): Drill {
         const digestText = buildSessionDigest(candidates);
         const normalizedDigest = digestText ? normalize(digestText) : "";
         for (const candidate of candidates) candidate.digestText = normalizedDigest;
-        if (embedder?.ready) {
-          for (const candidate of candidates)
-            candidate.embedding = embedder.embed(candidate.rawText);
-        }
         return { candidates, nextBefore: stopped ? (cursor ?? null) : null, stopped };
       };
 

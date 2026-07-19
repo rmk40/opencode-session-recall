@@ -10,7 +10,7 @@ import { autoRecall } from "./hooks/auto-recall.js";
 import { compactionRecall } from "./hooks/compaction-recall.js";
 import { createFetchGate } from "./fetch-gate.js";
 import { openSqlite } from "./sqlite.js";
-import { openStore, defaultStorePath, type Store, type Card } from "./store.js";
+import { openStore, defaultStorePath, SEMANTIC_MODEL_KEY, type Store, type Card } from "./store.js";
 import { createCardsRuntime, cardsLiteFromSessions, type CardSource } from "./cards.js";
 import { createDrill } from "./drill.js";
 import { createDistiller } from "./distill.js";
@@ -108,17 +108,22 @@ const server: Plugin = async (ctx, options) => {
   // semantic signal (lexical-only). init() is fired and forgotten — it never
   // throws to callers, and searches stay lexical until the model warms.
   let semantic: SemanticSearchConfig | undefined;
+  let semanticModel: string | undefined;
+  let semanticReady: Promise<void> | undefined;
   if (opts.semantic === true) {
     try {
       const { SemanticEmbedder } = await import("./semantic/embedder.js");
       const model = optionalString(opts.semanticModel) ?? DEFAULT_SEMANTIC_MODEL;
       const embedder = new SemanticEmbedder(model);
-      void embedder.init();
+      // Idempotent: start loading and keep the promise so the card runtime can
+      // run its first embed pass the moment the model is ready.
+      semanticReady = embedder.init();
       const weight =
         typeof opts.semanticWeight === "number" && Number.isFinite(opts.semanticWeight)
           ? Math.max(MIN_SEMANTIC_WEIGHT, Math.min(MAX_SEMANTIC_WEIGHT, opts.semanticWeight))
           : DEFAULT_SEMANTIC_WEIGHT;
       semantic = { embedder, weight };
+      semanticModel = model;
     } catch {
       // Plain cache, no semantic.
     }
@@ -151,7 +156,12 @@ const server: Plugin = async (ctx, options) => {
   // metadata-only cards in memory. The tier-1 runtime reads the live array.
   let liteCards: Card[] = [];
   const cardSource: CardSource = store
-    ? { getCards: () => store.allCards(), revision: () => store.getMeta("cards_rev") }
+    ? {
+        getCards: (embOpts) => store.allCards(embOpts),
+        revision: () => store.getMeta("cards_rev"),
+        semanticModel: () => store.getMeta(SEMANTIC_MODEL_KEY),
+        writeEmbeddings: (model, rows) => store.writeCardEmbeddings(model, rows),
+      }
     : { getCards: () => liteCards, revision: () => undefined, degraded: true };
   if (!store) {
     void discover()
@@ -171,8 +181,10 @@ const server: Plugin = async (ctx, options) => {
     source: cardSource,
     embedder: semantic?.embedder,
     semanticWeight: semantic?.weight,
+    semanticModel,
+    semanticReady,
   });
-  const drill = createDrill({ client, gate, limits, embedder: semantic?.embedder });
+  const drill = createDrill({ client, gate, limits });
 
   const instanceId =
     globalThis.crypto?.randomUUID?.() ??

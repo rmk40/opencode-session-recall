@@ -208,6 +208,31 @@ describe("cards CRUD", () => {
     expect(store.allCards()).toHaveLength(1);
     db.close();
   });
+
+  it("writeCardEmbeddings stamps the model, sets blobs in one pass, and skips cards_rev", async () => {
+    const { db, store } = await fresh();
+    store.upsertCard(makeCard("s1"));
+    store.upsertCard(makeCard("s2"));
+
+    const vec = new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]);
+    store.writeCardEmbeddings("minishlab/potion-base-8M", [{ sessionId: "s1", embedding: vec }]);
+
+    expect(store.getMeta("semantic_model")).toBe("minishlab/potion-base-8M");
+    const withEmb = store.allCards({ withEmbeddings: true });
+    expect(withEmb.find((c) => c.sessionId === "s1")?.embedding).toEqual(vec);
+    expect(withEmb.find((c) => c.sessionId === "s2")?.embedding).toBeNull(); // untouched
+    // Vectors are invisible to the lexical layer, so no reader-reload trigger.
+    expect(store.getMeta("cards_rev")).toBeUndefined();
+
+    // An unknown session id updates nothing and does not throw.
+    expect(() =>
+      store.writeCardEmbeddings("minishlab/potion-base-8M", [
+        { sessionId: "ghost", embedding: vec },
+      ]),
+    ).not.toThrow();
+    expect(store.getCard("ghost")).toBeUndefined();
+    db.close();
+  });
 });
 
 describe("slim part index", () => {

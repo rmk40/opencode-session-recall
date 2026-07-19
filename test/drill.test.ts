@@ -219,4 +219,42 @@ describe("drill tier-2", () => {
     await drill.drill(input); // same (session, timeUpdated) → cache hit
     expect(calls.messages.length).toBe(afterFirst); // no refetch
   });
+
+  it("does not embed drilled or swept candidates (semantic lives in the card tier)", async () => {
+    // Path C removed the drill's per-candidate embed pass: the semantic blend is
+    // a card-tier concern (cards.ts). The drill takes no embedder, and neither a
+    // drilled nor a deep-swept candidate may carry an embedding. Guards against
+    // regressing that dead per-candidate work back in.
+    const graph: Graph = {
+      messagesBySession: {
+        "s-a": [
+          bundle(userMessage("ma", "s-a", 1000), [
+            textPart("pa", "s-a", "ma", "widget parser alpha content"),
+          ]),
+        ],
+      },
+    };
+    const { client } = makeDrillFake(graph);
+    const { gate } = makeSpyGate();
+    const drill = createDrill({ client, gate, limits: TEST_LIMITS });
+
+    const drilled = await drill.drill({
+      sessions: [target("s-a")],
+      deepSet: new Set(["s-a"]),
+      query: parseQuery("widget parser"),
+      mode: "smart",
+      explain: false,
+    });
+    const swept = await drill.deep({
+      sessions: [target("s-a")],
+      query: parseQuery("widget parser"),
+      charsPerQuery: 1_000_000,
+    });
+
+    const candidates = [...drilled.pools, ...swept.pools].flatMap((p) => p.candidates);
+    expect(candidates.length).toBeGreaterThan(0);
+    for (const candidate of candidates) {
+      expect((candidate as { embedding?: unknown }).embedding).toBeUndefined();
+    }
+  });
 });

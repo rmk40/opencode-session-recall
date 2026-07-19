@@ -693,6 +693,52 @@ describe("cold pass", () => {
     db.close();
   });
 
+  it("a cold pass over an already-distilled store keeps persisted root vectors intact", async () => {
+    const root = session("R", "Root Session", PROJECT_DIR, 9000);
+    const child = session("C0", "Child 0", PROJECT_DIR, 1000, undefined, "R");
+    const messagesBySession: Record<string, MessageBundle[]> = {
+      R: [bundle(userMessage("mR", "R", 100), [textPart("pR", "R", "mR", "root coordination")])],
+      C0: [bundle(userMessage("mC0", "C0", 100), [textPart("pC0", "C0", "mC0", "child work")])],
+    };
+    const { client } = makeDistillFake({ sessions: [root, child], messagesBySession });
+    const { db, store } = await freshStore();
+    const { gate } = makeSpyGate();
+
+    // First pass distills the family and builds the root's rollup.
+    const first = createDistiller({
+      client,
+      store,
+      gate,
+      limits: TEST_LIMITS,
+      instanceId: "first",
+    });
+    first.start();
+    await waitFor(() => first.status().coldPass === "done");
+    expect(store.getCard("R")!.familyRollup.length).toBeGreaterThan(0);
+    first.stop(); // releases the lease
+
+    // A prior semantic run persisted the root's card vector.
+    const vec = new Uint8Array([7, 7, 7, 7]);
+    store.writeCardEmbeddings("model-x", [{ sessionId: "R", embedding: vec }]);
+    expect(store.getCard("R")!.embedding).toEqual(vec);
+
+    // Warm restart: the cold pass skips the up-to-date cards but still recomputes
+    // every root's rollup. That rollup upsert must NOT wipe the persisted vector.
+    const second = createDistiller({
+      client,
+      store,
+      gate,
+      limits: TEST_LIMITS,
+      instanceId: "second",
+    });
+    second.start();
+    await waitFor(() => second.status().coldPass === "done");
+    expect(store.getCard("R")!.embedding).toEqual(vec); // survived the rollup recompute
+    expect(store.getCard("R")!.familyRollup.length).toBeGreaterThan(0); // rollup still intact
+    second.stop();
+    db.close();
+  });
+
   it("recovers a concurrency-2 cold pass from a mid-pass failure via backoff retry", async () => {
     const graph: Graph = {
       sessions: [
@@ -1024,6 +1070,15 @@ describe("incremental", () => {
     await waitFor(() => distiller.status().coldPass === "done");
     expect(store.getCard("s1")!.partCount).toBeGreaterThan(1); // append-eligible
 
+    // Persist a card vector before the append so the append path must decide
+    // whether to carry it forward (stale) or clear it. It must clear it — the
+    // append changed the inventory/heads the vector is derived from — matching a
+    // full re-distill, which stores a null embedding.
+    store.writeCardEmbeddings("model-x", [
+      { sessionId: "s1", embedding: new Uint8Array([9, 9, 9, 9]) },
+    ]);
+    expect(store.getCard("s1")!.embedding).not.toBeNull();
+
     const appended: MessageBundle[] = [
       bundle(assistantMessage("m6", "s1", 1006), [
         completedToolPart("p6", "s1", "m6", "edit", { filePath: "src/new.ts" }, "edited new"),
@@ -1049,6 +1104,7 @@ describe("incremental", () => {
       parentById: new Map<string, string | null>([["s1", null]]),
     }).card;
     expect(store.getCard("s1")).toEqual(full); // equivalence: append == full re-distill
+    expect(store.getCard("s1")!.embedding).toBeNull(); // append cleared the stale vector
     distiller.stop();
     db.close();
   });

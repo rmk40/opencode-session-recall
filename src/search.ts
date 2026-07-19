@@ -44,8 +44,8 @@ import { fetchMessageWindow, type FetchRunner } from "./fetch-window.js";
 /** The embedder as the search path consumes it: the cache-facing surface plus
  *  the init error, so the one-time "unavailable" warning can explain why. */
 export type SearchEmbedder = CandidateEmbedder & { initError?: string };
-/** Opt-in semantic config threaded from the plugin into the tier-1 card runtime
- *  and the tier-2 drill (both embed at construction, not per query). */
+/** Opt-in semantic config threaded from the plugin into the tier-1 card runtime,
+ *  which embeds card text once per load. The drill does not embed candidates. */
 export type SemanticSearchConfig = { embedder: SearchEmbedder; weight: number };
 
 /** Tier-2 dependency bundle: the shared fetch gate, the derived card store (null

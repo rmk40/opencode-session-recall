@@ -19,6 +19,10 @@ export const SCHEMA_VERSION = 1;
 
 const SCHEMA_VERSION_KEY = "schema_version";
 const LEASE_KEY = "distill_lease";
+/** Meta stamp recording which embedding model produced the persisted card
+ *  vectors. The card runtime reuses vectors only when this matches its
+ *  configured model (see {@link Store.writeCardEmbeddings}). */
+export const SEMANTIC_MODEL_KEY = "semantic_model";
 const DEFAULT_FTS_LIMIT = 200;
 
 // A lease whose heartbeat predates any realistic (or injected) cutoff, so a
@@ -143,6 +147,23 @@ export type Store = {
   upsertCard(card: Card): void;
   getCard(sessionId: string): Card | undefined;
   allCards(opts?: { withEmbeddings?: boolean }): Card[];
+  /**
+   * Persist card vectors from a semantic embed pass and stamp the model that
+   * produced them ({@link SEMANTIC_MODEL_KEY}). One transaction: on a model
+   * change it first clears every existing vector (so no old-model BLOB survives
+   * under the new stamp), then sets the stamp and updates each listed row's
+   * `embedding` blob. Rows whose session id is unknown update nothing.
+   * Deliberately does NOT bump `cards_rev` — vectors are invisible to the
+   * lexical layer, so a bump would only trigger a needless reader reload (and a
+   * rebuild/embed/write loop). Callers write from the query path without the
+   * distill lease: a write may lose to a concurrent cross-process re-distill
+   * that cleared the row's embedding, and self-heals on that card's next
+   * re-distill.
+   */
+  writeCardEmbeddings(
+    model: string,
+    rows: Array<{ sessionId: string; embedding: Uint8Array }>,
+  ): void;
   deleteSession(sessionId: string): void;
   replaceSessionParts(sessionId: string, rows: PartTextRow[], card: Card): void;
   /**
@@ -414,6 +435,28 @@ class SqliteStore implements Store {
     const columns = opts?.withEmbeddings === true ? CARD_COLUMNS_ALL : CARD_COLUMNS_NO_EMBEDDING;
     const rows = this.db.all(`SELECT ${columns} FROM card ORDER BY time_updated DESC`);
     return rows.map(rowToCard);
+  }
+
+  writeCardEmbeddings(
+    model: string,
+    rows: Array<{ sessionId: string; embedding: Uint8Array }>,
+  ): void {
+    this.db.tx(() => {
+      // On a model change, drop every existing vector before writing the new
+      // ones: a card the new model cannot embed (embed returned undefined, so it
+      // is absent from `rows`) would otherwise keep an old-model BLOB that the
+      // next load reuses as current under the new stamp.
+      if (this.getMeta(SEMANTIC_MODEL_KEY) !== model) {
+        this.db.run("UPDATE card SET embedding=NULL WHERE embedding IS NOT NULL");
+      }
+      this.setMeta(SEMANTIC_MODEL_KEY, model);
+      for (const row of rows) {
+        this.db.run("UPDATE card SET embedding=? WHERE session_id=?", [
+          row.embedding,
+          row.sessionId,
+        ]);
+      }
+    });
   }
 
   deleteSession(sessionId: string): void {

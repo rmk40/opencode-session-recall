@@ -747,7 +747,11 @@ export function createDistiller(options: DistillerOptions): Distiller {
   function recomputeAllRootRollups(): void {
     const rootCards = new Map<string, Card>();
     const childrenByRoot = new Map<string, Card[]>();
-    for (const card of store.allCards()) {
+    // Load embeddings too: the rollup upsert below rewrites every card column, so
+    // a root loaded without its persisted vector would wipe it on write —
+    // silently defeating vector persistence for every family root on each cold
+    // pass, including warm restarts that skip re-distilling those cards.
+    for (const card of store.allCards({ withEmbeddings: true })) {
       if (card.rootId === card.sessionId) rootCards.set(card.sessionId, card);
       else {
         const siblings = childrenByRoot.get(card.rootId);
@@ -827,7 +831,11 @@ export function createDistiller(options: DistillerOptions): Distiller {
         familyRollup: oldCard.familyRollup,
         distillState: "full",
         distilledThrough: walk.newestMessageId ?? checkpoint,
-        embedding: oldCard.embedding,
+        // Clear any persisted vector: the append changed the inventory and
+        // heads the embedding is derived from, so a carried-over vector would be
+        // stale. Null forces the semantic layer to recompute on the next load,
+        // matching a full re-distill (deriveCard also stores a null embedding).
+        embedding: null,
       }),
     );
     bumpCardsRev();

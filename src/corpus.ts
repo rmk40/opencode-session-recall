@@ -12,7 +12,7 @@ import { DIGEST_HEAD_CHARS, isDigestToken } from "./digest.js";
  * (and its unpaginated whole-session fetch) is gone. `buildSessionDigest` still
  * builds the content-derived session identity that the drill stamps onto every
  * candidate for ranking, and `CandidateEmbedder` is the narrow embedder surface
- * the card runtime and drill consume.
+ * the card runtime consumes.
  */
 
 /**

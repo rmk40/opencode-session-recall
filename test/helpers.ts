@@ -671,7 +671,6 @@ export async function makeRecallDeps(
     client: fixture.client,
     gate,
     limits,
-    embedder: opts.semantic?.embedder,
     now: opts.now,
     deepWallClockMs: opts.deepWallClockMs,
   });
