@@ -30,8 +30,15 @@ const REP_MAX_CHARS = 2_000;
  * changes. {@link cardVectorStamp} folds this into the stored model stamp so a
  * bump here makes every existing vector recompute exactly once (stamp mismatch),
  * without touching the schema version or forcing a store rebuild.
+ *
+ * rep3 (Path B): the projection now leads with the LLM summary when present.
+ * Bumped unconditionally so the one-time recompute is simple and correct — cards
+ * without a summary re-embed to an identical vector (the extra work is bounded
+ * and background), cards with one pick up the compounded summary text. A
+ * per-card conditional bump would save that no-op work but adds bookkeeping for
+ * no correctness gain, so the simplest correct approach is used.
  */
-export const EMBED_REPRESENTATION = "rep2";
+export const EMBED_REPRESENTATION = "rep3";
 
 /** Stamp persisted alongside card vectors: the embedding model plus the
  *  representation version, so a change to EITHER recomputes the vectors. */
@@ -65,6 +72,9 @@ export function embeddingTextOf(card: Card): string {
     if (words) segments.push(`${label}: ${words}`);
   };
 
+  // The LLM summary (Path B), when present, is the strongest natural-language
+  // signal, so it leads and claims its words first.
+  addSection("summary", card.nlSummary);
   addSection("about", `${card.summaryHead} ${card.outcomeHead}`);
   addSection("title", card.title);
   // File paths split into basename + directory + segment words (tokenizeAll

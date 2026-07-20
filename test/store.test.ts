@@ -53,6 +53,8 @@ function makeCard(sessionId: string, over: Partial<Card> = {}): Card {
     distillState: "metadata",
     distilledThrough: null,
     embedding: null,
+    nlSummary: "",
+    summaryHash: "",
     ...over,
   };
 }
@@ -108,20 +110,20 @@ describe("sqlite adapter", () => {
 });
 
 describe("store migration", () => {
-  it("creates schema v1 on a fresh db", async () => {
+  it("creates schema v2 on a fresh db", async () => {
     const { db, store } = await fresh();
-    expect(store.getMeta("schema_version")).toBe("1");
+    expect(store.getMeta("schema_version")).toBe("2");
     expect(store.allCards()).toEqual([]);
     db.close();
   });
 
-  it("drops everything and rebuilds when the on-disk version is older", async () => {
+  it("drops everything and rebuilds when the on-disk version is older than v1", async () => {
     const path = freshDbPath();
     const db1 = await openSqlite(path);
     const store1 = db1 && openStore(db1);
     if (!db1 || !store1) throw new Error("open failed");
     store1.upsertCard(makeCard("s1"));
-    // Simulate an older layout: an earlier version stamp plus a foreign table.
+    // Simulate a pre-v1 layout: an older version stamp plus a foreign table.
     store1.setMeta("schema_version", "0");
     db1.exec("CREATE TABLE junk(x)");
     db1.close();
@@ -130,9 +132,98 @@ describe("store migration", () => {
     if (!db2) throw new Error("reopen failed");
     const store2 = openStore(db2);
     if (!store2) throw new Error("reopen store failed");
-    expect(store2.getMeta("schema_version")).toBe("1");
+    expect(store2.getMeta("schema_version")).toBe("2");
     expect(store2.allCards()).toEqual([]);
     expect(db2.get("SELECT name FROM sqlite_master WHERE name='junk'")).toBeUndefined();
+    db2.close();
+  });
+
+  it("upgrades a populated v1 store to v2 in place, preserving cards/FTS/vectors", async () => {
+    const path = freshDbPath();
+    // Build a v1-shaped store by hand (the v1 card table has no summary columns),
+    // populated with a card, its slim-index/FTS rows, a persisted vector, and the
+    // semantic-model stamp — exactly what an existing install carries.
+    const db1 = await openSqlite(path);
+    if (!db1) throw new Error("open failed");
+    db1.exec("PRAGMA journal_mode=WAL;");
+    db1.exec(`
+      CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL) WITHOUT ROWID;
+      CREATE TABLE card (
+        session_id TEXT PRIMARY KEY, parent_id TEXT, root_id TEXT NOT NULL,
+        title TEXT NOT NULL DEFAULT '', slug TEXT NOT NULL DEFAULT '',
+        directory TEXT NOT NULL DEFAULT '', project_id TEXT NOT NULL DEFAULT '',
+        agent TEXT, model TEXT,
+        time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL,
+        part_count INTEGER NOT NULL DEFAULT 0, retained_chars INTEGER NOT NULL DEFAULT 0,
+        summary_head TEXT NOT NULL DEFAULT '', outcome_head TEXT NOT NULL DEFAULT '',
+        inventory TEXT NOT NULL DEFAULT '',
+        files TEXT NOT NULL DEFAULT '[]', tools TEXT NOT NULL DEFAULT '[]',
+        errors TEXT NOT NULL DEFAULT '[]', family_rollup TEXT NOT NULL DEFAULT '[]',
+        distill_state TEXT NOT NULL DEFAULT 'metadata',
+        distilled_through TEXT,
+        embedding BLOB
+      );
+      CREATE TABLE part_text (
+        id INTEGER PRIMARY KEY, session_id TEXT NOT NULL, part_id TEXT NOT NULL,
+        message_id TEXT NOT NULL, prev_message_id TEXT, next_message_id TEXT,
+        class TEXT NOT NULL, time_created INTEGER NOT NULL,
+        raw TEXT NOT NULL, norm TEXT NOT NULL
+      );
+      CREATE VIRTUAL TABLE part_fts USING fts5(
+        raw, norm, content='part_text', content_rowid='id',
+        tokenize="unicode61 tokenchars '_-./'"
+      );
+    `);
+    db1.run("INSERT INTO meta(key, value) VALUES(?, ?)", ["schema_version", "1"]);
+    db1.run("INSERT INTO meta(key, value) VALUES(?, ?)", ["semantic_model", "model-x:rep2"]);
+    db1.run("INSERT INTO meta(key, value) VALUES(?, ?)", ["cards_rev", "7"]);
+    const vector = new Uint8Array([1, 2, 3, 4]);
+    db1.run(
+      "INSERT INTO card(session_id, root_id, title, time_created, time_updated, distill_state, inventory, embedding) VALUES(?, ?, ?, ?, ?, 'full', ?, ?)",
+      ["s-v1", "s-v1", "V1 session", 1000, 2000, "widget parser", vector],
+    );
+    db1.run(
+      "INSERT INTO part_text(session_id, part_id, message_id, class, time_created, raw, norm) VALUES(?, ?, ?, ?, ?, ?, ?)",
+      [
+        "s-v1",
+        "p1",
+        "m1",
+        "human-text",
+        1000,
+        "widget parser florplaxle",
+        "widget parser florplaxle",
+      ],
+    );
+    db1.run("INSERT INTO part_fts(rowid, raw, norm) VALUES(?, ?, ?)", [
+      1,
+      "widget parser florplaxle",
+      "widget parser florplaxle",
+    ]);
+    db1.close();
+
+    // Reopen with the current (v2) code: additive upgrade, no rebuild.
+    const db2 = await openSqlite(path);
+    if (!db2) throw new Error("reopen failed");
+    const store2 = openStore(db2);
+    if (!store2) throw new Error("reopen store failed");
+
+    expect(store2.getMeta("schema_version")).toBe("2");
+    // Everything survived: card, its vector, the semantic stamp, cards_rev.
+    expect(store2.getMeta("semantic_model")).toBe("model-x:rep2");
+    expect(store2.getMeta("cards_rev")).toBe("7");
+    const card = store2.allCards({ withEmbeddings: true })[0];
+    expect(card?.sessionId).toBe("s-v1");
+    expect(card?.inventory).toBe("widget parser");
+    expect(card?.embedding).not.toBeNull();
+    // The new columns exist and default empty; writeSummary lands.
+    expect(card?.nlSummary).toBe("");
+    expect(card?.summaryHash).toBe("");
+    // The FTS index survived the migration.
+    expect(store2.ftsSearch({ strong: ["florplaxle"], weak: [] }).length).toBeGreaterThan(0);
+    store2.writeSummary("s-v1", "Did widget parser work.", "hash1");
+    const after = store2.getCard("s-v1");
+    expect(after?.nlSummary).toBe("Did widget parser work.");
+    expect(after?.summaryHash).toBe("hash1");
     db2.close();
   });
 
@@ -215,7 +306,9 @@ describe("cards CRUD", () => {
     store.upsertCard(makeCard("s2"));
 
     const vec = new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]);
-    store.writeCardEmbeddings("minishlab/potion-base-8M", [{ sessionId: "s1", embedding: vec }]);
+    store.writeCardEmbeddings("minishlab/potion-base-8M", [
+      { sessionId: "s1", embedding: vec, expectedSummaryHash: "" },
+    ]);
 
     expect(store.getMeta("semantic_model")).toBe("minishlab/potion-base-8M");
     const withEmb = store.allCards({ withEmbeddings: true });
@@ -227,10 +320,31 @@ describe("cards CRUD", () => {
     // An unknown session id updates nothing and does not throw.
     expect(() =>
       store.writeCardEmbeddings("minishlab/potion-base-8M", [
-        { sessionId: "ghost", embedding: vec },
+        { sessionId: "ghost", embedding: vec, expectedSummaryHash: "" },
       ]),
     ).not.toThrow();
     expect(store.getCard("ghost")).toBeUndefined();
+    db.close();
+  });
+
+  it("writeCardEmbeddings skips a row whose summary_hash changed since the snapshot", async () => {
+    const { db, store } = await fresh();
+    store.upsertCard(makeCard("s1"));
+    // A summary landed after the embed snapshot was taken (hash "h2", vector
+    // cleared). A write-back that expected the pre-summary hash must NOT clobber
+    // the cleared vector with the stale, summary-less one.
+    store.writeSummary("s1", "the new summary", "h2");
+    const stale = new Uint8Array([1, 2, 3, 4]);
+    store.writeCardEmbeddings("m", [
+      { sessionId: "s1", embedding: stale, expectedSummaryHash: "" },
+    ]);
+    expect(store.getCard("s1")?.embedding).toBeNull(); // race lost, vector stays cleared
+
+    // A write-back carrying the current hash lands normally.
+    store.writeCardEmbeddings("m", [
+      { sessionId: "s1", embedding: stale, expectedSummaryHash: "h2" },
+    ]);
+    expect(store.allCards({ withEmbeddings: true })[0]?.embedding).toEqual(stale);
     db.close();
   });
 });

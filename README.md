@@ -121,17 +121,18 @@ A search tool only helps if the agent reaches for it. The plugin has three featu
 
 ## Options
 
-| Option             | Type      | Default                    | Description                                                                                         |
-| ------------------ | --------- | -------------------------- | --------------------------------------------------------------------------------------------------- |
-| `primary`          | `boolean` | `true`                     | Register tools as primary (available to all agents)                                                 |
-| `global`           | `boolean` | `true`                     | Allow cross-project search via `scope: "global"`                                                    |
-| `nudge`            | `boolean` | `true`                     | Inject a short system-prompt reminder to use recall for past work                                   |
-| `autoRecall`       | `boolean` | `false`                    | On user messages that reference prior work, auto-run a bounded recall and inject the top cited hits |
-| `compactionRecall` | `boolean` | `false`                    | Before compaction, preserve the session's distilled card into the summary                           |
-| `prewarm`          | `boolean` | `false`                    | Deprecated no-op, kept so existing configs don't error; the card store persists across processes    |
-| `semantic`         | `boolean` | `false`                    | Enable the opt-in local [semantic layer](#semantic-search-opt-in)                                   |
-| `semanticWeight`   | `number`  | `0.35`                     | Blend weight for the semantic signal, clamped to 0.05–0.95                                          |
-| `semanticModel`    | `string`  | `minishlab/potion-base-8M` | Hugging Face model id for the static-embedding model                                                |
+| Option             | Type      | Default                    | Description                                                                                                             |
+| ------------------ | --------- | -------------------------- | ----------------------------------------------------------------------------------------------------------------------- |
+| `primary`          | `boolean` | `true`                     | Register tools as primary (available to all agents)                                                                     |
+| `global`           | `boolean` | `true`                     | Allow cross-project search via `scope: "global"`                                                                        |
+| `nudge`            | `boolean` | `true`                     | Inject a short system-prompt reminder to use recall for past work                                                       |
+| `autoRecall`       | `boolean` | `false`                    | On user messages that reference prior work, auto-run a bounded recall and inject the top cited hits                     |
+| `compactionRecall` | `boolean` | `false`                    | Before compaction, preserve the session's distilled card into the summary                                               |
+| `prewarm`          | `boolean` | `false`                    | Deprecated no-op, kept so existing configs don't error; the card store persists across processes                        |
+| `semantic`         | `boolean` | `false`                    | Enable the opt-in local [semantic layer](#semantic-search-opt-in)                                                       |
+| `semanticWeight`   | `number`  | `0.35`                     | Blend weight for the semantic signal, clamped to 0.05–0.95                                                              |
+| `semanticModel`    | `string`  | `minishlab/potion-base-8M` | Hugging Face model id for the static-embedding model                                                                    |
+| `summaries`        | `object`  | off                        | Opt-in LLM card summaries; `{ enabled: true, model: "providerID/modelID" }`. See [LLM summaries](#llm-summaries-opt-in) |
 
 Advanced limits (all have sensible defaults):
 
@@ -291,9 +292,41 @@ The plugin always answers something. With no SQLite driver, it serves metadata-o
 
 ### Semantic search (opt-in)
 
-Lexical ranking is the default and the only thing that runs unless you set `semantic: true`. With it on, the tier-1 card ranking blends a cosine-similarity signal from local static embeddings over card text into each card's lexical score. Treat it as a mild opt-in nudge, not a fix for vocabulary gaps: card text is mostly identifiers, so on a real corpus the blend only reorders borderline paraphrases at the margin. When your wording misses the history's, rephrasing the query is the reliable path, and the blend is a small assist on top of lexical ranking. It decides which sessions get drilled, and final result ranking stays lexical over the drilled parts, so a session the embedding surfaced but whose parts yield no lexical hit simply does not appear.
+Lexical ranking is the default and the only thing that runs unless you set `semantic: true`. With it on, the tier-1 card ranking blends a cosine-similarity signal from local static embeddings into each card's lexical score. The embedded text is a natural-language projection of the card, not its raw fields: identifiers are split into words (`launchTerminal` becomes `launch terminal`, `GHOSTAUTH_LIVE_TUI` becomes `ghostauth live tui`), and file paths, tools, and heads are rendered as plain prose, so a paraphrase query lands closer to the session that did the work. Two of the drill slots are reserved for the top pure-semantic cards, and a session the semantic tier surfaced that then produces no lexical hit is rescued with its top-cosine part as the evidence, labeled semantic in `why`. With `explain: true` each result reports a `why.semanticSimilarity`, and `coverage.semantic` reports the model, the blend weight, how many cards carry a vector, and how many of the returned results the tier contributed.
+
+The default embedding model is small, so treat semantic as a real help on some vocabulary gaps rather than a guarantee on all of them. It lifts paraphrases whose concepts the model relates and misses ones it does not; enabling [LLM summaries](#llm-summaries-opt-in) improves it further by embedding a written description of each session instead of only its mechanical fields. When a query still misses, rephrasing toward the history's wording stays the reliable fallback.
 
 The model (`minishlab/potion-base-8M` by default, roughly 30 MB) is downloaded once to `~/.cache/opencode-session-recall/models/` on first use; nothing else leaves the machine, and inference is a plain matrix lookup in-process, with no ONNX runtime and no native addon. Ranking stays lexical while the model loads, with a warning in the output, and the blend switches on automatically once loading finishes, with no need for new activity to trigger it. Any failure (download, load, or inference) degrades to lexical-only rather than erroring. To disable it, omit the option; nothing is downloaded unless `semantic: true` is set.
+
+### LLM summaries (opt-in)
+
+`summaries` runs your own model over your session history to write a short natural-language summary for each card, then folds those summaries into search. It is off by default and it spends your tokens, so turn it on deliberately:
+
+```jsonc
+{
+  "opencode-session-recall": {
+    "summaries": { "enabled": true, "model": "anthropic/claude-haiku-4-5" },
+  },
+}
+```
+
+The `model` is required as `"providerID/modelID"`; without a valid one the feature stays off, because it never guesses a model. Pick a cheap, fast one: each summary is two or three plain sentences about what a session did and how it ended, so a small model is enough.
+
+A written summary improves three things when present. It joins both the lexical card index and the semantic embedding text, so a paraphrase query has more to match than raw identifiers (this compounds with the semantic layer). It becomes the `recall_sessions` digest. And the auto-recall and compaction hook payloads prefer it over the mechanical summary head.
+
+The cost is bounded by construction. The SDK has no completion endpoint, so the summarizer drives a throwaway worker session per batch (titled `[recall-summarizer]`, tools disabled, excluded from every recall path) and batches about fifteen cards per prompt. All summary work runs through one serialized queue on the process holding the distill lease, after the distiller cold pass and on the same idle path a re-distill uses, so only one prompt is ever in flight. A content hash skips any card whose fields have not changed. A shared per-pass prompt budget bounds how many prompts run, a per-prompt timeout aborts a stuck generation (so it caps spend, not just waiting), and the run stops early if the model fails several times in a row. Worker create, delete, and list calls share the recall fetch gate; the long-running prompt itself does not, so it never holds a permit that would stall a foreground query. Changing the prompt template re-summarizes everything once. Summaries do not sync across machines; each machine builds its own from the local store.
+
+On safety: the worker prompt carries only card fields (never message bodies), disables tools best-effort, and only its text reply is read. That best-effort disable is not a hard guarantee, because opencode derives tool access from the agent, not the prompt. For an enforced block, define a deny-all agent and point `summaries.agent` at it, so the model behind the summarizer literally cannot run a tool:
+
+```json title="opencode.json"
+{
+  "agent": {
+    "recall-summarizer": { "permission": { "*": "deny" } }
+  }
+}
+```
+
+Then set `summaries` to `{ "enabled": true, "model": "…", "agent": "recall-summarizer" }`.
 
 ## Contributing
 

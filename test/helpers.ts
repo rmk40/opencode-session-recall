@@ -559,6 +559,124 @@ export function makeFakeHarness(options: FakeOptions = {}): FakeHarness {
   };
 }
 
+// ── Fake worker-session prompt surface (Path B summarizer) ──────────────────
+// A minimal client exposing session.create/list/prompt/delete/abort for
+// summarizer tests: it tracks the worker sessions it creates, records every
+// prompt (with the tools map it was disabled by), and returns a scripted reply.
+
+export type SummaryPromptCall = {
+  sessionID: string;
+  model?: { providerID: string; modelID: string };
+  system?: string;
+  agent?: string;
+  tools?: Record<string, boolean>;
+  /** The batch text sent as the single text part. */
+  text: string;
+};
+
+/** A scripted reply: `text` is the model's raw reply body (optionally delayed
+ *  past the summarizer's timeout via `delayMs`), `error` returns an SDK error,
+ *  `throw` makes the call reject. */
+export type SummaryPromptResult =
+  | { text: string; delayMs?: number }
+  | { error: string }
+  | { throw: true };
+
+export type SummarizerClient = {
+  client: OpencodeClient;
+  calls: {
+    creates: Array<{ title?: string; permission?: unknown }>;
+    deletes: string[];
+    aborts: string[];
+    lists: number;
+    prompts: SummaryPromptCall[];
+  };
+  /** The sentinel-titled worker sessions currently alive (for orphan tests). */
+  liveWorkers: () => Session[];
+  /** Seed a pre-existing worker session (e.g. a crash orphan). */
+  seedWorker: (id: string, title: string) => void;
+};
+
+export function makeSummarizerClient(
+  respond: (call: SummaryPromptCall, index: number) => SummaryPromptResult,
+): SummarizerClient {
+  const workers = new Map<string, Session>();
+  let seq = 0;
+  const calls: SummarizerClient["calls"] = {
+    creates: [],
+    deletes: [],
+    aborts: [],
+    lists: 0,
+    prompts: [],
+  };
+
+  const client = {
+    session: {
+      list: async (params?: { search?: string; limit?: number }) => {
+        calls.lists++;
+        const search = params?.search?.toLowerCase();
+        return {
+          data: [...workers.values()].filter(
+            (s) => !search || s.title.toLowerCase().includes(search),
+          ),
+        };
+      },
+      create: async (params?: { title?: string; permission?: unknown }) => {
+        calls.creates.push({ title: params?.title, permission: params?.permission });
+        const id = `worker-${++seq}`;
+        const created = session(id, params?.title ?? "", PROJECT_DIR, 1_000 + seq);
+        workers.set(id, created);
+        return { data: created };
+      },
+      delete: async ({ sessionID }: { sessionID: string }) => {
+        calls.deletes.push(sessionID);
+        workers.delete(sessionID);
+        return { data: true };
+      },
+      abort: async ({ sessionID }: { sessionID: string }) => {
+        calls.aborts.push(sessionID);
+        return { data: true };
+      },
+      prompt: async (params: {
+        sessionID: string;
+        model?: { providerID: string; modelID: string };
+        system?: string;
+        agent?: string;
+        tools?: Record<string, boolean>;
+        parts?: Array<{ type: string; text?: string }>;
+      }) => {
+        const text = (params.parts ?? [])
+          .filter((p) => p.type === "text")
+          .map((p) => p.text ?? "")
+          .join("");
+        const call: SummaryPromptCall = {
+          sessionID: params.sessionID,
+          model: params.model,
+          system: params.system,
+          agent: params.agent,
+          tools: params.tools,
+          text,
+        };
+        calls.prompts.push(call);
+        const result = respond(call, calls.prompts.length - 1);
+        if ("throw" in result) throw new Error("prompt threw");
+        if ("error" in result) return { error: apiFailure(result.error) };
+        if (result.delayMs) await new Promise((r) => setTimeout(r, result.delayMs));
+        return { data: { info: {}, parts: [{ type: "text", text: result.text }] } };
+      },
+    },
+  };
+
+  return {
+    client: client as unknown as OpencodeClient,
+    calls,
+    liveWorkers: () => [...workers.values()],
+    seedWorker: (id, title) => {
+      workers.set(id, session(id, title, PROJECT_DIR, 500));
+    },
+  };
+}
+
 export function makeContext(
   overrides: Partial<Omit<ToolContext, "abort" | "metadata" | "ask">> & {
     aborted?: boolean;

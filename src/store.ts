@@ -15,7 +15,7 @@ import { loadFs, loadPath, loadOs } from "./node-import.js";
  * never observe half a replaced session.
  */
 
-export const SCHEMA_VERSION = 1;
+export const SCHEMA_VERSION = 2;
 
 const SCHEMA_VERSION_KEY = "schema_version";
 const LEASE_KEY = "distill_lease";
@@ -23,6 +23,9 @@ const LEASE_KEY = "distill_lease";
  *  vectors. The card runtime reuses vectors only when this matches its
  *  configured model (see {@link Store.writeCardEmbeddings}). */
 export const SEMANTIC_MODEL_KEY = "semantic_model";
+/** Meta stamp recording the summarizer prompt-template version the persisted
+ *  `nl_summary` values were produced under (see {@link Store.writeSummary}). */
+export const SUMMARY_REV_KEY = "summary_rev";
 const DEFAULT_FTS_LIMIT = 200;
 
 // A lease whose heartbeat predates any realistic (or injected) cutoff, so a
@@ -54,7 +57,9 @@ CREATE TABLE card (
   errors TEXT NOT NULL DEFAULT '[]', family_rollup TEXT NOT NULL DEFAULT '[]',
   distill_state TEXT NOT NULL DEFAULT 'metadata',
   distilled_through TEXT,
-  embedding BLOB
+  embedding BLOB,
+  nl_summary TEXT NOT NULL DEFAULT '',
+  summary_hash TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX card_updated ON card(time_updated DESC);
 CREATE INDEX card_root ON card(root_id);
@@ -112,6 +117,15 @@ export type Card = {
   distillState: "metadata" | "full";
   distilledThrough: string | null;
   embedding: Uint8Array | null;
+  /** LLM-written natural-language summary (Path B), or "" when none. Preserved
+   *  across re-distills (the distiller's card upsert never overwrites it — only
+   *  {@link Store.writeSummary} does), joins the lexical index and the embedding
+   *  text, and is preferred over `summaryHead` in browse/hook digests. */
+  nlSummary: string;
+  /** Change-detection hash of the mechanical fields (plus the prompt-template
+   *  version) the current `nlSummary` was produced from; "" when unsummarized.
+   *  The summarizer skips a card whose recomputed hash still matches. */
+  summaryHash: string;
 };
 
 /** One slim-index row to be written for a session (session id comes from the
@@ -153,6 +167,14 @@ export type Store = {
    * change it first clears every existing vector (so no old-model BLOB survives
    * under the new stamp), then sets the stamp and updates each listed row's
    * `embedding` blob. Rows whose session id is unknown update nothing.
+   *
+   * Each row's write is CONDITIONAL on `expectedSummaryHash`: it lands only when
+   * the card's `summary_hash` still matches what the snapshot was embedded from.
+   * A concurrent {@link Store.writeSummary} changes the hash and nulls the vector
+   * to force a re-embed with the summary text; the guard makes the older,
+   * summary-less vector from a snapshot-in-flight lose that race instead of
+   * clobbering the cleared vector back to stale.
+   *
    * Deliberately does NOT bump `cards_rev` — vectors are invisible to the
    * lexical layer, so a bump would only trigger a needless reader reload (and a
    * rebuild/embed/write loop). Callers write from the query path without the
@@ -162,8 +184,18 @@ export type Store = {
    */
   writeCardEmbeddings(
     model: string,
-    rows: Array<{ sessionId: string; embedding: Uint8Array }>,
+    rows: Array<{ sessionId: string; embedding: Uint8Array; expectedSummaryHash: string }>,
   ): void;
+  /**
+   * Persist a card's LLM summary and the change-detection hash it was produced
+   * from ({@link Card.nlSummary}/{@link Card.summaryHash}). Owns those two
+   * columns exclusively — the card upsert never writes them, so a summary
+   * survives re-distills. Also clears the persisted vector: the embedding text
+   * includes the summary, so a carried-over vector would be stale; null forces
+   * the semantic layer to recompute with the summary on the next load (matching
+   * the re-distill clear). A no-op when the session id is unknown.
+   */
+  writeSummary(sessionId: string, summary: string, hash: string): void;
   deleteSession(sessionId: string): void;
   replaceSessionParts(sessionId: string, rows: PartTextRow[], card: Card): void;
   /**
@@ -223,12 +255,22 @@ const CARD_COLUMNS = [
   "distill_state",
   "distilled_through",
   "embedding",
+  "nl_summary",
+  "summary_hash",
 ] as const;
+
+// Columns the card upsert must NEVER overwrite: they are owned by a separate
+// write path ({@link Store.writeSummary}) and would otherwise be wiped on every
+// re-distill (deriveCard has no summary to supply). On a new-card insert they
+// take their DEFAULT ''; on conflict they are simply left out of the UPDATE SET.
+const SUMMARY_OWNED_COLUMNS = new Set<string>(["nl_summary", "summary_hash"]);
 
 const CARD_COLUMNS_ALL = CARD_COLUMNS.join(", ");
 const CARD_COLUMNS_NO_EMBEDDING = CARD_COLUMNS.filter((c) => c !== "embedding").join(", ");
 const CARD_PLACEHOLDERS = CARD_COLUMNS.map(() => "?").join(", ");
-const CARD_UPSERT_SET = CARD_COLUMNS.filter((c) => c !== "session_id")
+const CARD_UPSERT_SET = CARD_COLUMNS.filter(
+  (c) => c !== "session_id" && !SUMMARY_OWNED_COLUMNS.has(c),
+)
   .map((c) => `${c}=excluded.${c}`)
   .join(", ");
 const CARD_UPSERT_SQL = `INSERT INTO card(${CARD_COLUMNS_ALL}) VALUES(${CARD_PLACEHOLDERS}) ON CONFLICT(session_id) DO UPDATE SET ${CARD_UPSERT_SET}`;
@@ -306,6 +348,8 @@ function rowToCard(row: Row): Card {
     distillState: row.distill_state === "full" ? "full" : "metadata",
     distilledThrough: asNullableString(row.distilled_through),
     embedding: row.embedding instanceof Uint8Array ? row.embedding : null,
+    nlSummary: asString(row.nl_summary),
+    summaryHash: asString(row.summary_hash),
   };
 }
 
@@ -334,6 +378,8 @@ function cardValues(card: Card): SqlValue[] {
     card.distillState,
     card.distilledThrough,
     card.embedding,
+    card.nlSummary,
+    card.summaryHash,
   ];
 }
 
@@ -392,6 +438,22 @@ function rebuild(db: SqliteDb): void {
 }
 
 /**
+ * Additive v1 -> v2 upgrade: add the Path B summary columns in place, preserving
+ * every existing card row, slim-index row, FTS entry, and persisted vector. No
+ * rebuild, no re-distill. The columns carry a DEFAULT so existing rows read as
+ * unsummarized. Idempotent within its own transaction (only runs when the stamp
+ * is exactly 1).
+ */
+function migrateV1ToV2(db: SqliteDb): void {
+  db.exec("ALTER TABLE card ADD COLUMN nl_summary TEXT NOT NULL DEFAULT ''");
+  db.exec("ALTER TABLE card ADD COLUMN summary_hash TEXT NOT NULL DEFAULT ''");
+  db.run(
+    "INSERT INTO meta(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+    [SCHEMA_VERSION_KEY, String(SCHEMA_VERSION)],
+  );
+}
+
+/**
  * Open a {@link Store} over an already-open {@link SqliteDb}. Applies the
  * connection PRAGMAs, then checks/repairs the schema under one transaction.
  * Returns `null` when the on-disk schema is newer than this code understands, or
@@ -403,8 +465,13 @@ export function openStore(db: SqliteDb, opts?: StoreOptions): Store | null {
     db.exec(PRAGMAS);
     const outcome = db.tx((): "ok" | "newer" => {
       const current = readSchemaVersion(db);
+      // Newer than this build understands: refuse (degrade), never misread it.
       if (current !== null && current > SCHEMA_VERSION) return "newer";
-      if (current !== SCHEMA_VERSION) rebuild(db);
+      if (current === SCHEMA_VERSION) return "ok";
+      // Exactly v1: additive in-place upgrade, keeping all data. Anything else
+      // older (absent stamp or a foreign layout) is dropped and rebuilt fresh.
+      if (current === 1) migrateV1ToV2(db);
+      else rebuild(db);
       return "ok";
     });
     if (outcome === "newer") return null;
@@ -439,7 +506,7 @@ class SqliteStore implements Store {
 
   writeCardEmbeddings(
     model: string,
-    rows: Array<{ sessionId: string; embedding: Uint8Array }>,
+    rows: Array<{ sessionId: string; embedding: Uint8Array; expectedSummaryHash: string }>,
   ): void {
     this.db.tx(() => {
       // On a model change, drop every existing vector before writing the new
@@ -451,12 +518,24 @@ class SqliteStore implements Store {
       }
       this.setMeta(SEMANTIC_MODEL_KEY, model);
       for (const row of rows) {
-        this.db.run("UPDATE card SET embedding=? WHERE session_id=?", [
+        // Conditional on the summary hash: skip when a summary landed since the
+        // snapshot was embedded (writeSummary changed the hash and cleared the
+        // vector), so this stale, summary-less vector never wins that race.
+        this.db.run("UPDATE card SET embedding=? WHERE session_id=? AND summary_hash=?", [
           row.embedding,
           row.sessionId,
+          row.expectedSummaryHash,
         ]);
       }
     });
+  }
+
+  writeSummary(sessionId: string, summary: string, hash: string): void {
+    this.db.run("UPDATE card SET nl_summary=?, summary_hash=?, embedding=NULL WHERE session_id=?", [
+      summary,
+      hash,
+      sessionId,
+    ]);
   }
 
   deleteSession(sessionId: string): void {

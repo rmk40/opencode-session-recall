@@ -40,6 +40,21 @@ export function isSelfTool(toolName: string): boolean {
   return TOOLS.some((self) => toolNameMatches(toolName, self));
 }
 
+/** Title sentinel marking the Path B summarizer's worker session. Bracketed so
+ *  it is distinctive and unlikely to collide with a real session title. */
+export const SUMMARIZER_SENTINEL = "[recall-summarizer]";
+
+/**
+ * Whether a session title identifies our summarizer worker session, so it is
+ * never distilled, carded, searched, or listed (its prompts embed card digests —
+ * recall must not surface them). Substring match, mirroring the self-tool
+ * suffix-matching discipline: a host that prefixes/suffixes the title (e.g.
+ * `provider: [recall-summarizer] #3`) is still excluded.
+ */
+export function isSummarizerTitle(title: string | undefined | null): boolean {
+  return typeof title === "string" && title.includes(SUMMARIZER_SENTINEL);
+}
+
 const TOOL_INPUT_FIELDS = new Set<ResultWhy["matchedFields"][number]>([
   "command",
   "cwd",

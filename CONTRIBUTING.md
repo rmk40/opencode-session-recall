@@ -69,41 +69,43 @@ The plugin registers five tools via the OpenCode plugin API, plus optional event
 
 ### Module map
 
-| Module                       | Purpose                                                                                                                                    |
-| ---------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
-| `opencode-session-recall.ts` | Plugin entry point. Creates SDK clients, the shared fetch gate, card store, drill, and distiller; registers tools and hooks                |
-| `search.ts`                  | `recall` tool. Orchestrates the tiers (cards → slim FTS → drill), deep-sweep mode, literal/regex/smart paths, filters, expansion, grouping |
-| `store.ts`                   | SQLite card + slim-FTS store: schema, versioned migration/rebuild, per-session transactional replace, FTS query, distill lease             |
-| `distill.ts`                 | The distiller: human-layer extractor, card builder, resumable cold pass, event-driven incremental updates, and `fetchMessagePage()`        |
-| `cards.ts`                   | Tier-1 card runtime: MiniSearch over card fields, metadata filters, family exclusion, optional semantic blend                              |
-| `drill.ts`                   | Tier-2 bounded drill and the deep sweep: paginated fetch, budgets, drilled-session LRU, deep continuation cursor                           |
-| `rerank.ts`                  | Two-stage drilled rerank (`mergeShortlistHits`): broad pass plus a shortlist-local deep pass over drilled candidates                       |
-| `fetch-gate.ts`              | Shared fetch semaphore all SDK calls pass through; foreground queries have priority over the background distiller                          |
-| `fetch-window.ts`            | Bounded newest-first message-window fetch for `recall_context` and inline expansion                                                        |
-| `sqlite.ts`                  | Runtime-detected driver adapter: `bun:sqlite`, else `node:sqlite`, else null (degraded)                                                    |
-| `corpus.ts`                  | Session-digest derivation and the embedder surface (the surviving remnant of the deleted CorpusCache)                                      |
-| `extract.ts`                 | Text extraction from message parts. `searchableFields()`, `matches()`, `evidenceClassFor()`, `isSelfTool()`                                |
-| `types.ts`                   | Shared types and `Limits`/`DEFAULTS`; defensive coercers (`coerceEnum`/`coerceInt`)                                                        |
-| `sessions.ts`                | `recall_sessions` tool (card-backed enrichment, since/until)                                                                               |
-| `get.ts`                     | `recall_get` tool                                                                                                                          |
-| `context.ts`                 | `recall_context` tool                                                                                                                      |
-| `messages.ts`                | `recall_messages` tool (cursor-paginated, newest-first)                                                                                    |
-| `normalize.ts`               | Tokenizers/normalizer: `tokenizeAll()` (dup-preserving, for BM25) and `tokenize()` (deduped)                                               |
-| `query.ts`                   | Query parsing: `parseQuery()` → `ParsedQuery` with raw, lower, tokens, phrases, codeTokens                                                 |
-| `candidates.ts`              | Candidate construction over drilled messages; `candidateEligible()` query-time filter predicate                                            |
-| `digest.ts`                  | Digest-token rules (`isDigestToken`, stopwords) shared by the distiller and session digests                                                |
-| `bm25.ts`                    | BM25 relevance ranking (MiniSearch) with structural boosts/penalties, applied within drilled sessions                                      |
-| `node-import.ts`             | Dynamic `node:fs`/`node:path`/`node:os` loaders, so `src/` stays free of Node type deps                                                    |
-| `semantic/embedder.ts`       | Opt-in static-embedding model: download, load, embed (the only Node-touching module)                                                       |
-| `semantic/similarity.ts`     | Brute-force cosine similarity over card embeddings                                                                                         |
-| `regex.ts`                   | `regex` match mode: pattern compile, bounded scan, match snippet                                                                           |
-| `route.ts`                   | Query-shape classification (`looksLikeRegex`, `classifyQuery`) that drives mode suggestions                                                |
-| `snippet.ts`                 | Token-density sliding window snippet selection                                                                                             |
-| `hooks/system-nudge.ts`      | `nudge` option: system-prompt reminder to use recall                                                                                       |
-| `hooks/card-recall.ts`       | Shared zero-fetch card query (`cardRecall`) used by both proactive hooks                                                                   |
-| `hooks/auto-recall.ts`       | `autoRecall` option: cue-gated card-tier recall on `chat.message`, injects cited hits                                                      |
-| `hooks/compaction-recall.ts` | `compactionRecall` option: preserves the session's own card into the compaction summary                                                    |
-| `hooks/part-id.ts`           | Generates opencode-compatible ascending `prt_` part IDs for injected synthetic parts                                                       |
+| Module                       | Purpose                                                                                                                                     |
+| ---------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------- |
+| `opencode-session-recall.ts` | Plugin entry point. Creates SDK clients, the shared fetch gate, card store, drill, and distiller; registers tools and hooks                 |
+| `search.ts`                  | `recall` tool. Orchestrates the tiers (cards → slim FTS → drill), deep-sweep mode, literal/regex/smart paths, filters, expansion, grouping  |
+| `store.ts`                   | SQLite card + slim-FTS store: schema, versioned migration (v1→v2 additive)/rebuild, per-session transactional replace, FTS query, lease     |
+| `distill.ts`                 | The distiller: human-layer extractor, card builder, resumable cold pass, event-driven incremental updates, and `fetchMessagePage()`         |
+| `summarize.ts`               | Opt-in Path B summarizer: a worker-session that batches card digests through a cheap model, content-hash gated, driven by the distiller     |
+| `embedding-text.ts`          | `embeddingTextOf()`: the natural-language projection embedded for each card, plus the persisted-vector representation stamp                 |
+| `cards.ts`                   | Tier-1 card runtime: MiniSearch over card fields (incl. `nl_summary`), metadata filters, family exclusion, optional semantic blend + rescue |
+| `drill.ts`                   | Tier-2 bounded drill and the deep sweep: paginated fetch, budgets, drilled-session LRU, deep continuation cursor                            |
+| `rerank.ts`                  | Two-stage drilled rerank (`mergeShortlistHits`): broad pass plus a shortlist-local deep pass over drilled candidates                        |
+| `fetch-gate.ts`              | Shared fetch semaphore all SDK calls pass through; foreground queries have priority over the background distiller                           |
+| `fetch-window.ts`            | Bounded newest-first message-window fetch for `recall_context` and inline expansion                                                         |
+| `sqlite.ts`                  | Runtime-detected driver adapter: `bun:sqlite`, else `node:sqlite`, else null (degraded)                                                     |
+| `corpus.ts`                  | Session-digest derivation and the embedder surface (the surviving remnant of the deleted CorpusCache)                                       |
+| `extract.ts`                 | Text extraction from message parts. `searchableFields()`, `matches()`, `evidenceClassFor()`, `isSelfTool()`, `isSummarizerTitle()`          |
+| `types.ts`                   | Shared types and `Limits`/`DEFAULTS`; defensive coercers (`coerceEnum`/`coerceInt`)                                                         |
+| `sessions.ts`                | `recall_sessions` tool (card-backed enrichment, since/until)                                                                                |
+| `get.ts`                     | `recall_get` tool                                                                                                                           |
+| `context.ts`                 | `recall_context` tool                                                                                                                       |
+| `messages.ts`                | `recall_messages` tool (cursor-paginated, newest-first)                                                                                     |
+| `normalize.ts`               | Tokenizers/normalizer: `tokenizeAll()` (dup-preserving, for BM25) and `tokenize()` (deduped)                                                |
+| `query.ts`                   | Query parsing: `parseQuery()` → `ParsedQuery` with raw, lower, tokens, phrases, codeTokens                                                  |
+| `candidates.ts`              | Candidate construction over drilled messages; `candidateEligible()` query-time filter predicate                                             |
+| `digest.ts`                  | Digest-token rules (`isDigestToken`, stopwords) shared by the distiller and session digests                                                 |
+| `bm25.ts`                    | BM25 relevance ranking (MiniSearch) with structural boosts/penalties, applied within drilled sessions                                       |
+| `node-import.ts`             | Dynamic `node:fs`/`node:path`/`node:os` loaders, so `src/` stays free of Node type deps                                                     |
+| `semantic/embedder.ts`       | Opt-in static-embedding model: download, load, embed (the only Node-touching module)                                                        |
+| `semantic/similarity.ts`     | Brute-force cosine similarity over card embeddings                                                                                          |
+| `regex.ts`                   | `regex` match mode: pattern compile, bounded scan, match snippet                                                                            |
+| `route.ts`                   | Query-shape classification (`looksLikeRegex`, `classifyQuery`) that drives mode suggestions                                                 |
+| `snippet.ts`                 | Token-density sliding window snippet selection                                                                                              |
+| `hooks/system-nudge.ts`      | `nudge` option: system-prompt reminder to use recall                                                                                        |
+| `hooks/card-recall.ts`       | Shared zero-fetch card query (`cardRecall`) used by both proactive hooks                                                                    |
+| `hooks/auto-recall.ts`       | `autoRecall` option: cue-gated card-tier recall on `chat.message`, injects cited hits                                                       |
+| `hooks/compaction-recall.ts` | `compactionRecall` option: preserves the session's own card into the compaction summary                                                     |
+| `hooks/part-id.ts`           | Generates opencode-compatible ascending `prt_` part IDs for injected synthetic parts                                                        |
 
 ### Search paths
 

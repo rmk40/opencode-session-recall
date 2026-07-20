@@ -134,7 +134,11 @@ export function formatAutoRecallBlock(hits: CardRecallHit[]): string | undefined
     const title = card.title.trim() || "(untitled session)";
     const id8 = card.sessionId.slice(0, 8);
     const dir = dirTail(card.directory);
-    const summary = card.summaryHead.replace(/\s+/g, " ").trim().slice(0, SUMMARY_SLICE_CHARS);
+    // Prefer the LLM summary (Path B) over the mechanical summary head.
+    const summary = (card.nlSummary || card.summaryHead)
+      .replace(/\s+/g, " ")
+      .trim()
+      .slice(0, SUMMARY_SLICE_CHARS);
     const anchorNote = anchors.length > 0 ? ` (anchors: ${anchors.join(", ")})` : "";
     const dirNote = dir ? ` [${dir}]` : "";
     lines.push(

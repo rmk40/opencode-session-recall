@@ -58,6 +58,8 @@ function makeCard(sessionId: string, over: Partial<Card> = {}): Card {
     distillState: "full",
     distilledThrough: "m1",
     embedding: null,
+    nlSummary: "",
+    summaryHash: "",
     ...over,
   };
 }

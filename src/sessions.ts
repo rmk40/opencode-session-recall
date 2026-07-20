@@ -11,6 +11,7 @@ import {
   type Limits,
 } from "./types.js";
 import type { Card } from "./store.js";
+import { isSummarizerTitle } from "./extract.js";
 
 /** Card-backed enrichment for the sessions browser: a snapshot of all cards the
  *  distiller has built. `session.list` stays the authoritative listing; when a
@@ -144,9 +145,11 @@ export function sessions(
         const files = card.files.slice(0, MAX_FILES);
         const tools = card.tools.slice(0, MAX_TOOLS);
         const childCount = childCountByRoot?.get(item.id) ?? 0;
+        // Prefer the LLM summary (Path B) over the mechanical summary head.
+        const digest = (card.nlSummary || card.summaryHead).slice(0, SESSION_DIGEST_CHARS);
         return {
           ...item,
-          ...(card.summaryHead && { digest: card.summaryHead.slice(0, SESSION_DIGEST_CHARS) }),
+          ...(digest && { digest }),
           ...(files.length > 0 && { files }),
           ...(tools.length > 0 && { tools }),
           ...(card.rootId === item.id &&
@@ -169,6 +172,7 @@ export function sessions(
           const selected = allCards
             .filter(
               (card) =>
+                !isSummarizerTitle(card.title) &&
                 passesTime(card.timeUpdated) &&
                 inScope(card) &&
                 (!searchLower || card.title.toLowerCase().includes(searchLower)),
@@ -210,6 +214,7 @@ export function sessions(
           }
           if (result.data) {
             for (const s of result.data) {
+              if (isSummarizerTitle(s.title)) continue;
               if (!passesTime(s.time.updated)) continue;
               items.push(
                 enrich({
@@ -236,6 +241,7 @@ export function sessions(
           }
           if (result.data) {
             for (const s of result.data) {
+              if (isSummarizerTitle(s.title)) continue;
               if (!passesTime(s.time.updated)) continue;
               items.push(
                 enrich({

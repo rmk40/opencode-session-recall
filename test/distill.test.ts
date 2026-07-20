@@ -192,6 +192,8 @@ function fullCard(id: string, timeUpdated: number): Card {
     distillState: "full",
     distilledThrough: "seed",
     embedding: null,
+    nlSummary: "",
+    summaryHash: "",
   };
 }
 
@@ -719,7 +721,9 @@ describe("cold pass", () => {
 
     // A prior semantic run persisted the root's card vector.
     const vec = new Uint8Array([7, 7, 7, 7]);
-    store.writeCardEmbeddings("model-x", [{ sessionId: "R", embedding: vec }]);
+    store.writeCardEmbeddings("model-x", [
+      { sessionId: "R", embedding: vec, expectedSummaryHash: "" },
+    ]);
     expect(store.getCard("R")!.embedding).toEqual(vec);
 
     // Warm restart: the cold pass skips the up-to-date cards but still recomputes
@@ -1075,7 +1079,7 @@ describe("incremental", () => {
     // append changed the inventory/heads the vector is derived from — matching a
     // full re-distill, which stores a null embedding.
     store.writeCardEmbeddings("model-x", [
-      { sessionId: "s1", embedding: new Uint8Array([9, 9, 9, 9]) },
+      { sessionId: "s1", embedding: new Uint8Array([9, 9, 9, 9]), expectedSummaryHash: "" },
     ]);
     expect(store.getCard("s1")!.embedding).not.toBeNull();
 

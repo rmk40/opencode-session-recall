@@ -21,7 +21,14 @@ import {
   type ResultWhy,
   DISCOVERY_LIMIT,
 } from "./types.js";
-import { snippet, matches, formatMsg, isSelfTool, evidenceClassFor } from "./extract.js";
+import {
+  snippet,
+  matches,
+  formatMsg,
+  isSelfTool,
+  isSummarizerTitle,
+  evidenceClassFor,
+} from "./extract.js";
 import { parseQuery } from "./query.js";
 import { candidateEligible, type Candidate, type CandidateFilters } from "./candidates.js";
 import type { CandidateEmbedder } from "./corpus.js";
@@ -2335,6 +2342,9 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
               if (id === excludeSessionID || excludedFamily.has(id)) continue;
               const card = store.getCard(id);
               if (!card) continue;
+              // A direct store read bypasses the card runtime's filter, so a stray
+              // worker card (crash leftover) must be rejected here too.
+              if (isSummarizerTitle(card.title)) continue;
               if (after != null && card.timeUpdated < after) continue;
               if (before != null && card.timeUpdated > before) continue;
               const relevance = relevanceOf(card);

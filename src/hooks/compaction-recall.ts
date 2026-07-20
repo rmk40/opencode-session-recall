@@ -30,7 +30,8 @@ const MAX_FILES = 5;
 export function formatPreservationBlock(card: Card | undefined): string | undefined {
   if (!card) return undefined;
 
-  const summary = card.summaryHead.replace(/\s+/g, " ").trim();
+  // Prefer the LLM summary (Path B) over the mechanical summary head.
+  const summary = (card.nlSummary || card.summaryHead).replace(/\s+/g, " ").trim();
   const outcome = card.outcomeHead.replace(/\s+/g, " ").trim();
   const lines: string[] = [];
   if (summary) lines.push(`- Focus: ${summary.slice(0, FIELD_CHARS)}`);

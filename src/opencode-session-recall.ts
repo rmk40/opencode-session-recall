@@ -14,7 +14,20 @@ import { openStore, defaultStorePath, SEMANTIC_MODEL_KEY, type Store, type Card 
 import { createCardsRuntime, cardsLiteFromSessions, type CardSource } from "./cards.js";
 import { createDrill } from "./drill.js";
 import { createDistiller } from "./distill.js";
+import { createSummarizer, parseModelId, type Summarizer } from "./summarize.js";
 import { TOOLS, DEFAULTS, optionalString, errmsg, type Limits } from "./types.js";
+
+/** Guarded, Node-free logger: `console` is a std global, but `src/` declares no
+ *  types, so reach it defensively. */
+function pluginLog(message: string): void {
+  try {
+    (globalThis as { console?: { log?: (msg: string) => void } }).console?.log?.(
+      `[recall] ${message}`,
+    );
+  } catch {
+    // Logging is best-effort; never let it throw into plugin init.
+  }
+}
 
 /** Opt-in semantic layer defaults (plugin options, off unless enabled). */
 const DEFAULT_SEMANTIC_MODEL = "minishlab/potion-base-8M";
@@ -43,6 +56,10 @@ type Options = {
   semanticWeight?: number;
   /** HuggingFace model id for static embeddings. Default: minishlab/potion-base-8M. */
   semanticModel?: string;
+  /** Opt-in Path B LLM card summaries (off by default; spends the user's tokens).
+   *  `model` is required as "providerID/modelID" — no model disables it. `agent`
+   *  optionally prompts as a restricted opencode agent (the enforced tool block). */
+  summaries?: { enabled?: boolean; model?: string; agent?: string; maxPromptsPerPass?: number };
 } & Partial<Limits>;
 
 const server: Plugin = async (ctx, options) => {
@@ -195,7 +212,53 @@ const server: Plugin = async (ctx, options) => {
   const instanceId =
     globalThis.crypto?.randomUUID?.() ??
     `recall-${Date.now()}-${Math.random().toString(36).slice(2)}`;
-  const distiller = createDistiller({ client, store, gate, limits, instanceId, discover });
+
+  // Path B summarizer (opt-in). The distiller drives it — after the cold pass and
+  // on the idle-debounce re-distill path — so it only ever runs while this
+  // process holds the distill lease.
+  let summarizer: Summarizer | undefined;
+  const distiller = createDistiller({
+    client,
+    store,
+    gate,
+    limits,
+    instanceId,
+    discover,
+    onColdPassDone: () => {
+      void summarizer?.runColdPass();
+    },
+    onSessionDistilled: (sessionId) => summarizer?.queue(sessionId),
+  });
+  if (store && opts.summaries?.enabled === true) {
+    const model = optionalString(opts.summaries.model);
+    const parsed = model ? parseModelId(model) : undefined;
+    if (parsed) {
+      const maxPromptsPerPass =
+        typeof opts.summaries.maxPromptsPerPass === "number" &&
+        Number.isFinite(opts.summaries.maxPromptsPerPass) &&
+        opts.summaries.maxPromptsPerPass > 0
+          ? Math.floor(opts.summaries.maxPromptsPerPass)
+          : undefined;
+      const agent = optionalString(opts.summaries.agent);
+      summarizer = createSummarizer({
+        client,
+        store,
+        gate,
+        config: {
+          ...parsed,
+          ...(agent != null && { agent }),
+          ...(maxPromptsPerPass != null && { maxPromptsPerPass }),
+        },
+        leaseHeld: () => distiller.status().leaseHeld,
+        log: pluginLog,
+      });
+    } else {
+      // Never guess a model; disable with a one-time note.
+      pluginLog(
+        'summaries enabled but "model" is missing or malformed (expected "providerID/modelID"); summaries disabled',
+      );
+    }
+  }
   if (limits.coldPass) distiller.start();
 
   const deps: SearchDeps = { gate, store, cards, drill, semantic };

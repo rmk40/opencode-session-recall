@@ -1,6 +1,7 @@
 import type { CardsRuntime, CardFilters } from "../cards.js";
 import type { Card, Store } from "../store.js";
 import { parseQuery } from "../query.js";
+import { isSummarizerTitle } from "../extract.js";
 
 /**
  * Card-tier query for the hooks — the whole answer, no drill, no message fetch.
@@ -71,6 +72,8 @@ export function cardRecall(
       if (byId.has(row.sessionId) || excluded.has(row.sessionId)) continue;
       const card = deps.store.getCard(row.sessionId);
       if (!card) continue;
+      // Direct store read: reject a stray worker card the FTS index still lists.
+      if (isSummarizerTitle(card.title)) continue;
       if (filters.since != null && card.timeUpdated < filters.since) continue;
       if (filters.until != null && card.timeUpdated > filters.until) continue;
       byId.set(row.sessionId, { card, score: 0, anchors: anchorsFor(card) });

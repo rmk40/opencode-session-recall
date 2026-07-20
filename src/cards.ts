@@ -3,6 +3,7 @@ import type { Card } from "./store.js";
 import type { ParsedQuery } from "./query.js";
 import { normalize, tokenizeAll } from "./normalize.js";
 import { embeddingTextOf, cardVectorStamp } from "./embedding-text.js";
+import { isSummarizerTitle } from "./extract.js";
 import { clamp01, recencyMultiplier } from "./bm25.js";
 import { cosineSimilarity } from "./semantic/similarity.js";
 import type { CandidateEmbedder } from "./corpus.js";
@@ -34,11 +35,22 @@ const CODE_TOKEN_MULT = 1.25;
 /** Recency-only near-miss fallback size when nothing matches lexically. */
 const NEAR_MISS_LIMIT = 12;
 
-const CARD_FIELDS = ["title", "summary", "outcome", "inventory", "errors", "files"] as const;
+const CARD_FIELDS = [
+  "title",
+  "summary",
+  "nlSummary",
+  "outcome",
+  "inventory",
+  "errors",
+  "files",
+] as const;
 
 const FIELD_BOOST: Record<(typeof CARD_FIELDS)[number], number> = {
   title: 1.0,
   summary: 1.6,
+  // The LLM summary (Path B) is coherent prose about what the session did, so it
+  // is the strongest lexical field when present.
+  nlSummary: 1.8,
   outcome: 0.8,
   inventory: 2.0,
   errors: 1.2,
@@ -49,6 +61,7 @@ type CardDoc = {
   id: string;
   title: string;
   summary: string;
+  nlSummary: string;
   outcome: string;
   inventory: string;
   errors: string;
@@ -123,10 +136,12 @@ export type CardSource = {
    *  undefined with no store / no stamp yet. Gates card-vector reuse. */
   semanticModel?: () => string | undefined;
   /** Persist newly computed card vectors plus the model stamp. Absent in
-   *  degraded mode (no store to write to). */
+   *  degraded mode (no store to write to). Each row carries the summary hash the
+   *  vector was embedded from so the store can skip a row a concurrent summary
+   *  write has since changed (see {@link import("./store.js").Store.writeCardEmbeddings}). */
   writeEmbeddings?: (
     model: string,
-    rows: Array<{ sessionId: string; embedding: Uint8Array }>,
+    rows: Array<{ sessionId: string; embedding: Uint8Array; expectedSummaryHash: string }>,
   ) => void;
 };
 
@@ -178,6 +193,7 @@ function toDoc(card: Card): CardDoc {
     id: card.sessionId,
     title: normalize(card.title),
     summary: normalize(card.summaryHead),
+    nlSummary: normalize(card.nlSummary),
     outcome: normalize(card.outcomeHead),
     // inventory is already a normalized-ish token stream; index it verbatim so
     // both split and whole code tokens survive.
@@ -270,6 +286,8 @@ export function cardsLiteFromSessions(
     distillState: "metadata",
     distilledThrough: null,
     embedding: null,
+    nlSummary: "",
+    summaryHash: "",
   }));
 }
 
@@ -323,9 +341,16 @@ export function createCardsRuntime(deps: CardsRuntimeDeps): CardsRuntime {
     const stampMatches =
       configuredModel != null && deps.source.semanticModel?.() === configuredModel;
     const vectors = new Map<string, Float32Array>();
-    const toWrite: Array<{ sessionId: string; embedding: Uint8Array }> = [];
+    const toWrite: Array<{
+      sessionId: string;
+      embedding: Uint8Array;
+      expectedSummaryHash: string;
+    }> = [];
 
     for (const card of cards) {
+      // Never embed a stray summarizer worker card (a crash can leave one in the
+      // store); it is excluded from every result anyway.
+      if (isSummarizerTitle(card.title)) continue;
       if (stampMatches && card.embedding) {
         vectors.set(card.sessionId, blobToVector(card.embedding));
         continue;
@@ -335,7 +360,13 @@ export function createCardsRuntime(deps: CardsRuntimeDeps): CardsRuntime {
       const vec = embedder.embed(text);
       if (!vec) continue;
       vectors.set(card.sessionId, vec);
-      toWrite.push({ sessionId: card.sessionId, embedding: vectorToBlob(vec) });
+      // Carry the summary hash the vector was embedded from, so the store skips
+      // the write if a summary landed (and cleared the vector) since this snapshot.
+      toWrite.push({
+        sessionId: card.sessionId,
+        embedding: vectorToBlob(vec),
+        expectedSummaryHash: card.summaryHash,
+      });
     }
 
     cardVectors = vectors;
@@ -355,6 +386,11 @@ export function createCardsRuntime(deps: CardsRuntimeDeps): CardsRuntime {
   }
 
   function rebuild(): void {
+    // Sample the revision BEFORE snapshotting: a summary write (which bumps
+    // cards_rev) that lands during this rebuild must leave the sampled revision
+    // stale, so the next refresh reloads and picks the summary up. Sampling it
+    // after embedding could swallow that bump and serve a summary-less snapshot.
+    const revision = deps.source.revision();
     const wantEmbeddings = embedder != null && semanticWeight > 0;
     cards = wantEmbeddings
       ? deps.source.getCards({ withEmbeddings: true })
@@ -368,7 +404,7 @@ export function createCardsRuntime(deps: CardsRuntimeDeps): CardsRuntime {
     mini = index;
     embedCards();
     lastLoad = now();
-    lastRevision = deps.source.revision();
+    lastRevision = revision;
     loaded = true;
   }
 
@@ -391,6 +427,9 @@ export function createCardsRuntime(deps: CardsRuntimeDeps): CardsRuntime {
   }
 
   function passesFilters(card: Card, filters: CardFilters, excluded: Set<string>): boolean {
+    // A summarizer worker card (a crash can leave one persisted) is never a
+    // result; centralize the exclusion here so rank() and list() both honor it.
+    if (isSummarizerTitle(card.title)) return false;
     if (excluded.has(card.sessionId)) return false;
     if (filters.since != null && card.timeUpdated < filters.since) return false;
     if (filters.until != null && card.timeUpdated > filters.until) return false;
@@ -508,7 +547,9 @@ export function createCardsRuntime(deps: CardsRuntimeDeps): CardsRuntime {
 
     get(sessionId): Card | undefined {
       refreshIfStale();
-      return cards.find((card) => card.sessionId === sessionId);
+      const card = cards.find((c) => c.sessionId === sessionId);
+      // A worker card is never a valid drill/deep target (see passesFilters).
+      return card && !isSummarizerTitle(card.title) ? card : undefined;
     },
 
     exclusionFamily(currentSessionId): Set<string> {

@@ -2,7 +2,7 @@ import type { OpencodeClient, Event, Message, Part, Session } from "@opencode-ai
 import { errmsg, DISCOVERY_LIMIT, type Limits } from "./types.js";
 import type { Card, FamilyRollup, PartTextRow, Store } from "./store.js";
 import type { FetchGate } from "./fetch-gate.js";
-import { isSelfTool, toolNameMatches, pruned } from "./extract.js";
+import { isSelfTool, toolNameMatches, pruned, isSummarizerTitle } from "./extract.js";
 import { tokenize } from "./normalize.js";
 import { extractCodeTokens } from "./query.js";
 import { isDigestToken, DIGEST_HEAD_CHARS } from "./digest.js";
@@ -126,6 +126,12 @@ export type DistillerOptions = {
   /** Backoff before re-arming a cold pass that aborted on a transient error
    *  (spec: 60000ms). */
   coldPassRetryMs?: number;
+  /** Called (while holding the lease) once the cold pass finishes, so the Path B
+   *  summarizer can run its own pass over the freshly distilled cards. */
+  onColdPassDone?: () => void;
+  /** Called (while holding the lease) after an incremental re-distill lands, so
+   *  the summarizer can queue a content-hash-gated re-summarize of that session. */
+  onSessionDistilled?: (sessionId: string) => void;
 };
 
 // ── Small text helpers ───────────────────────────────────────────────────────
@@ -498,6 +504,11 @@ export function deriveCard(input: DeriveCardInput): DerivedCard {
     distillState: "full",
     distilledThrough: walk.newestMessageId,
     embedding: null,
+    // Summaries are owned by the summarizer's separate write path; these
+    // defaults apply only on a brand-new insert (the card upsert preserves any
+    // existing summary across re-distills).
+    nlSummary: "",
+    summaryHash: "",
   };
   return { card, rows };
 }
@@ -641,7 +652,9 @@ export function createDistiller(options: DistillerOptions): Distiller {
 
   async function discoverSessions(): Promise<DistillSessionMeta[]> {
     const sessions = await gate.runBackground(() => discover());
-    return sessions.map(toMeta);
+    // Never distill the summarizer's worker session — its prompts embed card
+    // digests, which recall must not surface (see isSummarizerTitle).
+    return sessions.map(toMeta).filter((meta) => !isSummarizerTitle(meta.title));
   }
 
   async function fetchSessionMeta(sessionID: string): Promise<DistillSessionMeta | null> {
@@ -836,6 +849,10 @@ export function createDistiller(options: DistillerOptions): Distiller {
         // stale. Null forces the semantic layer to recompute on the next load,
         // matching a full re-distill (deriveCard also stores a null embedding).
         embedding: null,
+        // Preserved by the store's card upsert (excluded from its UPDATE SET);
+        // these values apply only to a first insert.
+        nlSummary: "",
+        summaryHash: "",
       }),
     );
     bumpCardsRev();
@@ -923,6 +940,7 @@ export function createDistiller(options: DistillerOptions): Distiller {
       logMsg(
         `cold pass done (${distilled} distilled / ${examined} examined / ${knownCount} known)`,
       );
+      options.onColdPassDone?.();
     } catch (error) {
       lastError = errmsg(error);
       coldPassState = "idle"; // resumable: per-card skip resumes on the next run
@@ -980,6 +998,9 @@ export function createDistiller(options: DistillerOptions): Distiller {
     let succeeded = false;
     try {
       const session = await fetchSessionMeta(sessionID);
+      // The summarizer's worker session emits idle events as it is prompted; it
+      // is never distilled or carded (its prompts embed card digests).
+      if (session && isSummarizerTitle(session.title)) return;
       if (session) {
         const existing = store.getCard(sessionID);
         const canAppend =
@@ -993,6 +1014,7 @@ export function createDistiller(options: DistillerOptions): Distiller {
         const stored = store.getCard(sessionID);
         if (stored && stored.rootId !== sessionID) recomputeRootRollup(stored.rootId);
         succeeded = true;
+        options.onSessionDistilled?.(sessionID);
       }
     } catch (error) {
       lastError = errmsg(error);
