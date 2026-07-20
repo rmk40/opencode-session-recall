@@ -507,8 +507,15 @@ describe("nl_summary consumption", () => {
   });
 
   it("joins the embedding text projection", () => {
-    const card = fullCard("c1", { nlSummary: "Wired up the kumquat sync pipeline." });
+    // A realistic inventory clears embeddingTextOf's substantive floor (as real
+    // cards do); the summary then leads the projection.
+    const card = fullCard("c1", {
+      nlSummary: "Wired up the kumquat sync pipeline.",
+      inventory:
+        "reticulate splines calibrate manifold turbine gasket flange bearing sprocket lattice quiver zephyr",
+    });
     const text = embeddingTextOf(card);
+    expect(text).not.toBeNull();
     expect(text).toContain("summary:");
     expect(text).toContain("kumquat");
   });

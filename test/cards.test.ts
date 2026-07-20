@@ -69,6 +69,13 @@ const storeSource = (store: Store) => ({
   revision: () => store.getMeta("cards_rev"),
 });
 
+// 12 distinct meaningful (≥4-char, non-stopword, non-identity) tokens, so a card
+// carrying them clears embeddingTextOf's substantive-content floor and earns a
+// vector. Appended to the semantic-test cards, whose short inventories would
+// otherwise be treated as content-free.
+const SUBST =
+  "reticulate splines calibrate manifold turbine gasket flange bearing sprocket lattice quiver zephyr";
+
 const ids = (hits: { sessionId: string }[]): string[] => hits.map((h) => h.sessionId);
 
 describe("cards tier-1 rank", () => {
@@ -191,8 +198,8 @@ describe("cards tier-1 rank", () => {
     };
     const { db, store } = await freshStore();
     // Neither card shares a content word with the query.
-    store.upsertCard(makeCard("s-close", { inventory: "actualyze walkthrough pages" }));
-    store.upsertCard(makeCard("s-far", { inventory: "postgres migration ledger" }));
+    store.upsertCard(makeCard("s-close", { inventory: `actualyze walkthrough pages ${SUBST}` }));
+    store.upsertCard(makeCard("s-far", { inventory: `postgres migration ledger ${SUBST}` }));
     const runtime = createCardsRuntime({
       source: storeSource(store),
       embedder,
@@ -238,7 +245,7 @@ describe("cards semantic persistence", () => {
     );
     const embedder = { ready: true, embed };
     const { db, store } = await freshStore();
-    store.upsertCard(makeCard("s1", { inventory: "alpha topic" }));
+    store.upsertCard(makeCard("s1", { inventory: `alpha topic ${SUBST}` }));
     store.setMeta("cards_rev", "1");
 
     // First runtime computes the vector and persists it under the model stamp.
@@ -274,7 +281,7 @@ describe("cards semantic persistence", () => {
     const embed = vi.fn(() => Float32Array.from([1, 0]));
     const embedder = { ready: true, embed };
     const { db, store } = await freshStore();
-    store.upsertCard(makeCard("s1", { inventory: "alpha topic" }));
+    store.upsertCard(makeCard("s1", { inventory: `alpha topic ${SUBST}` }));
     store.setMeta("cards_rev", "1");
 
     // Seed the store as if an OLDER model had persisted a vector + stamp.
@@ -307,8 +314,8 @@ describe("cards semantic persistence", () => {
     );
     const embedder = { ready: true, embed };
     const { db, store } = await freshStore();
-    store.upsertCard(makeCard("s1", { inventory: "alpha one" }));
-    store.upsertCard(makeCard("s2", { inventory: "alpha two" }));
+    store.upsertCard(makeCard("s1", { inventory: `alpha one ${SUBST}` }));
+    store.upsertCard(makeCard("s2", { inventory: `alpha two ${SUBST}` }));
     store.setMeta("cards_rev", "1");
 
     createCardsRuntime({
@@ -321,7 +328,7 @@ describe("cards semantic persistence", () => {
 
     // Simulate a re-distill of s1: its content changed and the distiller upserted
     // it with embedding=null (the append-path clear). cards_rev bumps.
-    store.upsertCard(makeCard("s1", { inventory: "gamma changed", embedding: null }));
+    store.upsertCard(makeCard("s1", { inventory: `gamma changed ${SUBST}`, embedding: null }));
     store.setMeta("cards_rev", "2");
 
     embed.mockClear();
@@ -343,7 +350,7 @@ describe("cards semantic persistence", () => {
 
   it("clears an old-model vector the new model cannot embed (no stale reuse under the new stamp)", async () => {
     const { db, store } = await freshStore();
-    store.upsertCard(makeCard("s1", { inventory: "alpha topic" }));
+    store.upsertCard(makeCard("s1", { inventory: `alpha topic ${SUBST}` }));
     store.setMeta("cards_rev", "1");
 
     // An older model persisted a vector for s1 under its stamp.
@@ -390,7 +397,7 @@ describe("cards semantic persistence", () => {
       embed,
     };
     const { db, store } = await freshStore();
-    store.upsertCard(makeCard("s1", { inventory: "alpha topic" }));
+    store.upsertCard(makeCard("s1", { inventory: `alpha topic ${SUBST}` }));
     store.setMeta("cards_rev", "1"); // warm store; no further distillation follows
 
     const runtime = createCardsRuntime({

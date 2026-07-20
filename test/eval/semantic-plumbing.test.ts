@@ -90,7 +90,8 @@ function makeSoupCorpus(now = Date.now()): EvalCorpus {
           "ts-1p",
           TARGET,
           "ts-1",
-          "Implement the quaxel floremel plaxin morbex module for the internal build subsystem.",
+          "Implement the quaxel floremel plaxin morbex module for the internal build subsystem, " +
+            "wiring the reticulate splines calibrate manifold turbine gasket.",
         ),
       ]),
       bundle(assistantMessage("ts-2", TARGET, now - 500_050), [
@@ -107,7 +108,38 @@ function makeSoupCorpus(now = Date.now()): EvalCorpus {
     ],
   };
 
-  const sessions = [target];
+  // Round-6 pollution shape: a content-free "Getting Started" card whose TITLE
+  // carries a concept trigger (quaxel → the "terminal" axis the queries hit).
+  // Pre-fix, title words entered the projection, so this card embedded to a
+  // strong concept vector despite having no substantive content and got rescued
+  // onto project-adjacent queries. Post-fix, the substantive floor denies it a
+  // vector entirely (its only content is a greeting), so it can never rescue.
+  // Older than every filler (recency must not surface it either — this case
+  // isolates the semantic path; a newest-card GS would leak in via the recency
+  // near-miss fallback and muddy the assertion).
+  const GS = "gs-empty";
+  const gettingStarted = session(
+    GS,
+    "Getting Started quaxel onboarding",
+    PROJECT_DIR,
+    now - 400_000,
+  );
+  messagesBySession[GS] = [
+    bundle(userMessage(`${GS}-1`, GS, now - 400_010), [
+      // Greeting text deliberately avoids every token the paraphrase queries
+      // tokenize into (incl. "on"/"to" from "add-on end to end"): in this tiny
+      // corpus such words would be unique to this card and thus high-IDF
+      // anchors, inverting their real-corpus (stopword-frequency) behavior.
+      textPart(
+        `${GS}-1p`,
+        GS,
+        `${GS}-1`,
+        "Welcome! Which task shall we begin, opencode-ghostauth?",
+      ),
+    ]),
+  ];
+
+  const sessions = [target, gettingStarted];
   for (let i = 0; i < FILLERS.length; i++) {
     const id = `d-${i}`;
     // Newer than the target so the recency near-miss never picks it.
@@ -187,6 +219,27 @@ describe("semantic plumbing eval (fake concept embedder, default gate)", () => {
       expect(
         (hit!.matchReasons ?? []).some((r) => /semantic/i.test(r)),
         `[${query}] target result is labeled semantic (matchReasons: ${JSON.stringify(hit!.matchReasons)})`,
+      ).toBe(true);
+    }
+  });
+
+  it("denies content-free identity cards a vector: no Getting-Started pollution", async () => {
+    // The gs-empty card's title carries the same concept trigger the queries hit;
+    // only the substantive floor keeps it out. Exactly one card (the target) may
+    // hold a vector, and gs-empty must never appear — while the target still does.
+    for (const query of PARAPHRASES) {
+      const out = await run(tool, query);
+      expect(
+        out.coverage?.semantic?.cardsWithVectors,
+        `[${query}] only the substantive target embeds`,
+      ).toBe(1);
+      expect(
+        out.results.some((r) => r.sessionID === "gs-empty"),
+        `[${query}] content-free identity card must not surface`,
+      ).toBe(false);
+      expect(
+        out.results.some((r) => r.sessionID === TARGET),
+        `[${query}] the substantive target still surfaces`,
       ).toBe(true);
     }
   });
