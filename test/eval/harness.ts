@@ -147,8 +147,9 @@ export async function makeEvalSearch(
     source: {
       getCards: (opts) => store.allCards(opts),
       revision: () => store.getMeta("cards_rev"),
+      vectorsRevision: () => store.getMeta("vectors_rev"),
       semanticModel: () => store.getMeta("semantic_model"),
-      writeEmbeddings: (model, rows) => store.writeCardEmbeddings(model, rows),
+      writeEmbeddings: (model, gen, rows) => store.writeCardEmbeddings(model, gen, rows),
     },
     embedder: semantic?.embedder,
     semanticWeight: semantic?.weight,

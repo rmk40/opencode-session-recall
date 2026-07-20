@@ -171,6 +171,7 @@ function makeSyntheticCard(i: number): Card {
     distillState: "full",
     distilledThrough: `msg-${i}`,
     embedding: null,
+    embeddingGen: null,
     nlSummary: "",
     summaryHash: "",
   };

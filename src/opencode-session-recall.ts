@@ -10,7 +10,16 @@ import { autoRecall } from "./hooks/auto-recall.js";
 import { compactionRecall } from "./hooks/compaction-recall.js";
 import { createFetchGate } from "./fetch-gate.js";
 import { openSqlite } from "./sqlite.js";
-import { openStore, defaultStorePath, SEMANTIC_MODEL_KEY, type Store, type Card } from "./store.js";
+import {
+  openStore,
+  defaultStorePath,
+  SCHEMA_VERSION,
+  SEMANTIC_MODEL_KEY,
+  VECTORS_REV_KEY,
+  type Store,
+  type Card,
+} from "./store.js";
+import { EMBED_REPRESENTATION } from "./embedding-text.js";
 import { createCardsRuntime, cardsLiteFromSessions, type CardSource } from "./cards.js";
 import { createDrill } from "./drill.js";
 import { createDistiller } from "./distill.js";
@@ -34,6 +43,23 @@ const DEFAULT_SEMANTIC_MODEL = "minishlab/potion-base-8M";
 const DEFAULT_SEMANTIC_WEIGHT = 0.35;
 const MIN_SEMANTIC_WEIGHT = 0.05;
 const MAX_SEMANTIC_WEIGHT = 0.95;
+
+/**
+ * Plugin build tag — recorded in the distill lease and surfaced in
+ * `coverage.semantic.pluginVersion`, so a store shared by mixed-version processes
+ * can be diagnosed from one lease read / one tool response.
+ *
+ * DEVIATION (see the plan's build-tag decision): this is NOT the package.json
+ * semver. `src/` cannot read package.json cleanly — `tsconfig` sets `rootDir` to
+ * `./src` and leaves `resolveJsonModule` off, so importing `../package.json` fails
+ * `tsc`, and a hand-copied version const would drift silently on release (the
+ * `npm version` flow only touches package.json). The tag is instead derived from
+ * the two constants that actually gate mixed-version safety — the schema version
+ * and the embedding representation generation — so it never lies about the fence
+ * dimensions and needs no release-step upkeep. Swap in a real version here if one
+ * can ever be sourced without a Node import.
+ */
+const PLUGIN_BUILD = `schema${SCHEMA_VERSION}.gen${EMBED_REPRESENTATION}`;
 
 type Options = {
   primary?: boolean;
@@ -182,8 +208,9 @@ const server: Plugin = async (ctx, options) => {
     ? {
         getCards: (embOpts) => store.allCards(embOpts),
         revision: () => store.getMeta("cards_rev"),
+        vectorsRevision: () => store.getMeta(VECTORS_REV_KEY),
         semanticModel: () => store.getMeta(SEMANTIC_MODEL_KEY),
-        writeEmbeddings: (model, rows) => store.writeCardEmbeddings(model, rows),
+        writeEmbeddings: (model, gen, rows) => store.writeCardEmbeddings(model, gen, rows),
       }
     : { getCards: () => liteCards, revision: () => undefined, degraded: true };
   if (!store) {
@@ -206,6 +233,7 @@ const server: Plugin = async (ctx, options) => {
     semanticWeight: semantic?.weight,
     semanticModel,
     semanticReady,
+    pluginVersion: PLUGIN_BUILD,
   });
   const drill = createDrill({ client, gate, limits });
 
@@ -223,6 +251,8 @@ const server: Plugin = async (ctx, options) => {
     gate,
     limits,
     instanceId,
+    build: PLUGIN_BUILD,
+    gen: EMBED_REPRESENTATION,
     discover,
     onColdPassDone: () => {
       void summarizer?.runColdPass();

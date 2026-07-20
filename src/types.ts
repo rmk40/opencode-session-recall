@@ -154,13 +154,18 @@ export type SearchCoverage = {
    *  embedder load state, `model` the configured model id, `weight` the blend
    *  weight, `cardsWithVectors` how many cards carry a vector, and `contributed`
    *  how many of THIS query's returned results the semantic tier surfaced
-   *  (reserved-slot inclusions plus zero-lexical-hit rescues). */
+   *  (reserved-slot inclusions plus zero-lexical-hit rescues). `representation`
+   *  (the embedding generation) and `pluginVersion` (this process's build tag,
+   *  the same one the distill lease records) make mixed-version confusion visible
+   *  in tool output. */
   semantic?: {
     ready: boolean;
     model?: string;
     weight: number;
     cardsWithVectors: number;
     contributed: number;
+    representation: number;
+    pluginVersion?: string;
   };
   /** Present only for a deep sweep: how much of the scoped session set the sweep
    *  actually covered. `sessionsCovered` were fully swept, `sessionsPartial`

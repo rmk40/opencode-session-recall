@@ -192,6 +192,7 @@ function fullCard(id: string, timeUpdated: number): Card {
     distillState: "full",
     distilledThrough: "seed",
     embedding: null,
+    embeddingGen: null,
     nlSummary: "",
     summaryHash: "",
   };
@@ -721,7 +722,7 @@ describe("cold pass", () => {
 
     // A prior semantic run persisted the root's card vector.
     const vec = new Uint8Array([7, 7, 7, 7]);
-    store.writeCardEmbeddings("model-x", [
+    store.writeCardEmbeddings("model-x", 4, [
       { sessionId: "R", embedding: vec, expectedSummaryHash: "" },
     ]);
     expect(store.getCard("R")!.embedding).toEqual(vec);
@@ -859,7 +860,7 @@ describe("lease", () => {
     };
     const { client, sdk } = makeDistillFake(graph);
     const { db, store } = await freshStore();
-    expect(store.acquireLease("other", 30_000)).toBe(true); // someone else holds it
+    expect(store.acquireLease("other", 30_000, "otherbuild", 4)).toBe(true); // someone else holds it
     const { gate } = makeSpyGate();
     const distiller = createDistiller({
       client,
@@ -893,7 +894,7 @@ describe("lease", () => {
     };
     const { client } = makeDistillFake(graph);
     const { db, store } = await freshStore(() => clock);
-    expect(store.acquireLease("A", 30_000)).toBe(true); // A holds it, then "dies" (no heartbeat)
+    expect(store.acquireLease("A", 30_000, "buildA", 4)).toBe(true); // A holds it, then "dies" (no heartbeat)
     const { gate } = makeSpyGate();
     const distiller = createDistiller({
       client,
@@ -1078,7 +1079,7 @@ describe("incremental", () => {
     // whether to carry it forward (stale) or clear it. It must clear it — the
     // append changed the inventory/heads the vector is derived from — matching a
     // full re-distill, which stores a null embedding.
-    store.writeCardEmbeddings("model-x", [
+    store.writeCardEmbeddings("model-x", 4, [
       { sessionId: "s1", embedding: new Uint8Array([9, 9, 9, 9]), expectedSummaryHash: "" },
     ]);
     expect(store.getCard("s1")!.embedding).not.toBeNull();

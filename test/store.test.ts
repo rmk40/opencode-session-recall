@@ -53,6 +53,7 @@ function makeCard(sessionId: string, over: Partial<Card> = {}): Card {
     distillState: "metadata",
     distilledThrough: null,
     embedding: null,
+    embeddingGen: null,
     nlSummary: "",
     summaryHash: "",
     ...over,
@@ -110,9 +111,9 @@ describe("sqlite adapter", () => {
 });
 
 describe("store migration", () => {
-  it("creates schema v2 on a fresh db", async () => {
+  it("creates schema v3 on a fresh db", async () => {
     const { db, store } = await fresh();
-    expect(store.getMeta("schema_version")).toBe("2");
+    expect(store.getMeta("schema_version")).toBe("3");
     expect(store.allCards()).toEqual([]);
     db.close();
   });
@@ -132,13 +133,13 @@ describe("store migration", () => {
     if (!db2) throw new Error("reopen failed");
     const store2 = openStore(db2);
     if (!store2) throw new Error("reopen store failed");
-    expect(store2.getMeta("schema_version")).toBe("2");
+    expect(store2.getMeta("schema_version")).toBe("3");
     expect(store2.allCards()).toEqual([]);
     expect(db2.get("SELECT name FROM sqlite_master WHERE name='junk'")).toBeUndefined();
     db2.close();
   });
 
-  it("upgrades a populated v1 store to v2 in place, preserving cards/FTS/vectors", async () => {
+  it("chains a populated v1 store additively to v3, preserving cards/FTS/vectors/stamps", async () => {
     const path = freshDbPath();
     // Build a v1-shaped store by hand (the v1 card table has no summary columns),
     // populated with a card, its slim-index/FTS rows, a persisted vector, and the
@@ -201,13 +202,14 @@ describe("store migration", () => {
     ]);
     db1.close();
 
-    // Reopen with the current (v2) code: additive upgrade, no rebuild.
+    // Reopen with the current (v3) code: additive upgrade chaining v1->v2->v3, no
+    // rebuild.
     const db2 = await openSqlite(path);
     if (!db2) throw new Error("reopen failed");
     const store2 = openStore(db2);
     if (!store2) throw new Error("reopen store failed");
 
-    expect(store2.getMeta("schema_version")).toBe("2");
+    expect(store2.getMeta("schema_version")).toBe("3");
     // Everything survived: card, its vector, the semantic stamp, cards_rev.
     expect(store2.getMeta("semantic_model")).toBe("model-x:rep2");
     expect(store2.getMeta("cards_rev")).toBe("7");
@@ -215,15 +217,118 @@ describe("store migration", () => {
     expect(card?.sessionId).toBe("s-v1");
     expect(card?.inventory).toBe("widget parser");
     expect(card?.embedding).not.toBeNull();
-    // The new columns exist and default empty; writeSummary lands.
+    // The v2 summary columns default empty; the v3 generation column reads NULL
+    // for the pre-existing row (unknown/legacy generation).
     expect(card?.nlSummary).toBe("");
     expect(card?.summaryHash).toBe("");
+    expect(card?.embeddingGen).toBeNull();
     // The FTS index survived the migration.
     expect(store2.ftsSearch({ strong: ["florplaxle"], weak: [] }).length).toBeGreaterThan(0);
     store2.writeSummary("s-v1", "Did widget parser work.", "hash1");
     const after = store2.getCard("s-v1");
     expect(after?.nlSummary).toBe("Did widget parser work.");
     expect(after?.summaryHash).toBe("hash1");
+    // A vector write at the current generation lands and stamps embedding_gen.
+    store2.writeCardEmbeddings("model-x:rep2", 4, [
+      { sessionId: "s-v1", embedding: new Uint8Array([5, 6, 7, 8]), expectedSummaryHash: "hash1" },
+    ]);
+    expect(store2.getCard("s-v1")?.embeddingGen).toBe(4);
+    db2.close();
+  });
+
+  it("upgrades a populated v2 store additively to v3, preserving cards/FTS/vectors/summaries", async () => {
+    const path = freshDbPath();
+    // Build a v2-shaped store by hand: the v2 card table HAS the summary columns
+    // but NOT embedding_gen. Populate it as a real install would be.
+    const db1 = await openSqlite(path);
+    if (!db1) throw new Error("open failed");
+    db1.exec("PRAGMA journal_mode=WAL;");
+    db1.exec(`
+      CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL) WITHOUT ROWID;
+      CREATE TABLE card (
+        session_id TEXT PRIMARY KEY, parent_id TEXT, root_id TEXT NOT NULL,
+        title TEXT NOT NULL DEFAULT '', slug TEXT NOT NULL DEFAULT '',
+        directory TEXT NOT NULL DEFAULT '', project_id TEXT NOT NULL DEFAULT '',
+        agent TEXT, model TEXT,
+        time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL,
+        part_count INTEGER NOT NULL DEFAULT 0, retained_chars INTEGER NOT NULL DEFAULT 0,
+        summary_head TEXT NOT NULL DEFAULT '', outcome_head TEXT NOT NULL DEFAULT '',
+        inventory TEXT NOT NULL DEFAULT '',
+        files TEXT NOT NULL DEFAULT '[]', tools TEXT NOT NULL DEFAULT '[]',
+        errors TEXT NOT NULL DEFAULT '[]', family_rollup TEXT NOT NULL DEFAULT '[]',
+        distill_state TEXT NOT NULL DEFAULT 'metadata',
+        distilled_through TEXT,
+        embedding BLOB,
+        nl_summary TEXT NOT NULL DEFAULT '',
+        summary_hash TEXT NOT NULL DEFAULT ''
+      );
+      CREATE TABLE part_text (
+        id INTEGER PRIMARY KEY, session_id TEXT NOT NULL, part_id TEXT NOT NULL,
+        message_id TEXT NOT NULL, prev_message_id TEXT, next_message_id TEXT,
+        class TEXT NOT NULL, time_created INTEGER NOT NULL,
+        raw TEXT NOT NULL, norm TEXT NOT NULL
+      );
+      CREATE VIRTUAL TABLE part_fts USING fts5(
+        raw, norm, content='part_text', content_rowid='id',
+        tokenize="unicode61 tokenchars '_-./'"
+      );
+    `);
+    db1.run("INSERT INTO meta(key, value) VALUES(?, ?)", ["schema_version", "2"]);
+    db1.run("INSERT INTO meta(key, value) VALUES(?, ?)", ["semantic_model", "model-x:rep3"]);
+    db1.run("INSERT INTO meta(key, value) VALUES(?, ?)", ["cards_rev", "9"]);
+    const vector = new Uint8Array([1, 2, 3, 4]);
+    db1.run(
+      "INSERT INTO card(session_id, root_id, title, time_created, time_updated, distill_state, inventory, embedding, nl_summary, summary_hash) VALUES(?, ?, ?, ?, ?, 'full', ?, ?, ?, ?)",
+      [
+        "s-v2",
+        "s-v2",
+        "V2 session",
+        1000,
+        2000,
+        "gadget indexer",
+        vector,
+        "Built the indexer.",
+        "h9",
+      ],
+    );
+    db1.run(
+      "INSERT INTO part_text(session_id, part_id, message_id, class, time_created, raw, norm) VALUES(?, ?, ?, ?, ?, ?, ?)",
+      [
+        "s-v2",
+        "p1",
+        "m1",
+        "human-text",
+        1000,
+        "gadget indexer quibblefax",
+        "gadget indexer quibblefax",
+      ],
+    );
+    db1.run("INSERT INTO part_fts(rowid, raw, norm) VALUES(?, ?, ?)", [
+      1,
+      "gadget indexer quibblefax",
+      "gadget indexer quibblefax",
+    ]);
+    db1.close();
+
+    // Reopen with the current (v3) code: single additive v2->v3 step.
+    const db2 = await openSqlite(path);
+    if (!db2) throw new Error("reopen failed");
+    const store2 = openStore(db2);
+    if (!store2) throw new Error("reopen store failed");
+
+    expect(store2.getMeta("schema_version")).toBe("3");
+    // Card, vector, summary, stamp, and cards_rev all survived.
+    expect(store2.getMeta("semantic_model")).toBe("model-x:rep3");
+    expect(store2.getMeta("cards_rev")).toBe("9");
+    const card = store2.allCards({ withEmbeddings: true })[0];
+    expect(card?.sessionId).toBe("s-v2");
+    expect(card?.embedding).not.toBeNull();
+    expect(card?.nlSummary).toBe("Built the indexer.");
+    expect(card?.summaryHash).toBe("h9");
+    // The pre-existing row reads the new column as NULL (unknown generation).
+    expect(card?.embeddingGen).toBeNull();
+    // The FTS index survived.
+    expect(store2.ftsSearch({ strong: ["quibblefax"], weak: [] }).length).toBeGreaterThan(0);
     db2.close();
   });
 
@@ -300,30 +405,34 @@ describe("cards CRUD", () => {
     db.close();
   });
 
-  it("writeCardEmbeddings stamps the model, sets blobs in one pass, and skips cards_rev", async () => {
+  it("writeCardEmbeddings stamps model+generation, sets blobs, bumps vectors_rev, skips cards_rev", async () => {
     const { db, store } = await fresh();
     store.upsertCard(makeCard("s1"));
     store.upsertCard(makeCard("s2"));
 
     const vec = new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]);
-    store.writeCardEmbeddings("minishlab/potion-base-8M", [
+    store.writeCardEmbeddings("minishlab/potion-base-8M", 4, [
       { sessionId: "s1", embedding: vec, expectedSummaryHash: "" },
     ]);
 
     expect(store.getMeta("semantic_model")).toBe("minishlab/potion-base-8M");
     const withEmb = store.allCards({ withEmbeddings: true });
     expect(withEmb.find((c) => c.sessionId === "s1")?.embedding).toEqual(vec);
+    expect(withEmb.find((c) => c.sessionId === "s1")?.embeddingGen).toBe(4); // generation stamped
     expect(withEmb.find((c) => c.sessionId === "s2")?.embedding).toBeNull(); // untouched
-    // Vectors are invisible to the lexical layer, so no reader-reload trigger.
+    // Vectors are invisible to the lexical layer (no cards_rev bump), but
+    // vectors_rev advances so another process's snapshot reloads.
     expect(store.getMeta("cards_rev")).toBeUndefined();
+    expect(store.getMeta("vectors_rev")).toBe("1");
 
     // An unknown session id updates nothing and does not throw.
     expect(() =>
-      store.writeCardEmbeddings("minishlab/potion-base-8M", [
+      store.writeCardEmbeddings("minishlab/potion-base-8M", 4, [
         { sessionId: "ghost", embedding: vec, expectedSummaryHash: "" },
       ]),
     ).not.toThrow();
     expect(store.getCard("ghost")).toBeUndefined();
+    expect(store.getMeta("vectors_rev")).toBe("2"); // every write bumps it
     db.close();
   });
 
@@ -335,16 +444,62 @@ describe("cards CRUD", () => {
     // the cleared vector with the stale, summary-less one.
     store.writeSummary("s1", "the new summary", "h2");
     const stale = new Uint8Array([1, 2, 3, 4]);
-    store.writeCardEmbeddings("m", [
+    store.writeCardEmbeddings("m", 4, [
       { sessionId: "s1", embedding: stale, expectedSummaryHash: "" },
     ]);
     expect(store.getCard("s1")?.embedding).toBeNull(); // race lost, vector stays cleared
 
     // A write-back carrying the current hash lands normally.
-    store.writeCardEmbeddings("m", [
+    store.writeCardEmbeddings("m", 4, [
       { sessionId: "s1", embedding: stale, expectedSummaryHash: "h2" },
     ]);
     expect(store.allCards({ withEmbeddings: true })[0]?.embedding).toEqual(stale);
+    db.close();
+  });
+
+  it("rejects a lower-generation write wholesale even under a different model stamp (no clear-all bypass)", async () => {
+    const { db, store } = await fresh();
+    store.upsertCard(makeCard("s1"));
+    const hi = new Uint8Array([9, 9, 9, 9]);
+    const lo = new Uint8Array([1, 1, 1, 1]);
+
+    // A generation-5 writer establishes a vector under ITS OWN stamp (the
+    // generation folds into the stamp, so a different generation always means a
+    // different stamp — the branch the old same-stamp test never exercised).
+    store.writeCardEmbeddings("model-a:5", 5, [
+      { sessionId: "s1", embedding: hi, expectedSummaryHash: "" },
+    ]);
+    expect(store.getCard("s1")?.embeddingGen).toBe(5);
+    expect(store.getMeta("semantic_model")).toBe("model-a:5");
+    const revAfterHi = store.getMeta("vectors_rev");
+
+    // A lagging generation-4 writer arrives with a DIFFERENT stamp. Its
+    // stamp-mismatch clear-all would null the gen-5 row's generation and let the
+    // per-row guard pass — so it must be refused WHOLESALE: no clear, no stamp
+    // change, no row write, no vectors_rev bump. The returned rev is unchanged.
+    const rejectedRev = store.writeCardEmbeddings("model-b:4", 4, [
+      { sessionId: "s1", embedding: lo, expectedSummaryHash: "" },
+    ]);
+    expect(store.allCards({ withEmbeddings: true })[0]?.embedding).toEqual(hi); // unchanged
+    expect(store.getCard("s1")?.embeddingGen).toBe(5); // still gen 5
+    expect(store.getMeta("semantic_model")).toBe("model-a:5"); // stamp NOT advanced
+    expect(store.getMeta("vectors_rev")).toBe(revAfterHi); // no bump
+    expect(rejectedRev.committed).toBe(false); // reported as not-committed
+    expect(String(rejectedRev.revision)).toBe(revAfterHi); // returns the unchanged revision
+
+    // Same generation may rewrite under its own stamp (equal passes the check)...
+    store.writeCardEmbeddings("model-a:5", 5, [
+      { sessionId: "s1", embedding: lo, expectedSummaryHash: "" },
+    ]);
+    expect(store.allCards({ withEmbeddings: true })[0]?.embedding).toEqual(lo);
+
+    // ...and a HIGHER generation upgrades it, its clear-all allowed.
+    store.writeCardEmbeddings("model-c:6", 6, [
+      { sessionId: "s1", embedding: hi, expectedSummaryHash: "" },
+    ]);
+    expect(store.allCards({ withEmbeddings: true })[0]?.embedding).toEqual(hi);
+    expect(store.getCard("s1")?.embeddingGen).toBe(6);
+    expect(store.getMeta("semantic_model")).toBe("model-c:6");
     db.close();
   });
 });
@@ -582,33 +737,40 @@ describe("meta and lease", () => {
     const ttl = 5_000;
     const { db, store } = await fresh(() => clock);
 
-    // Fresh acquire, and idempotent re-acquire by the same holder.
-    expect(store.acquireLease("A", ttl)).toBe(true);
-    expect(store.acquireLease("A", ttl)).toBe(true);
+    // Fresh acquire, and idempotent re-acquire by the same holder. The build tag
+    // and generation ride the lease value for cross-process diagnosis.
+    expect(store.acquireLease("A", ttl, "schema3.gen4", 4)).toBe(true);
+    expect(store.acquireLease("A", ttl, "schema3.gen4", 4)).toBe(true);
+    expect(store.leaseStatus()).toMatchObject({ holder: "A", build: "schema3.gen4", gen: 4 });
 
     // A second holder is refused while A's lease is fresh.
     clock = 1_000_100;
-    expect(store.acquireLease("B", ttl)).toBe(false);
+    expect(store.acquireLease("B", ttl, "schema3.gen4", 4)).toBe(false);
 
-    // A heartbeat (only the holder's own) extends the lease.
+    // A heartbeat (only the holder's own) extends the lease and preserves build/gen.
     expect(store.heartbeatLease("A")).toBe(true);
     expect(store.heartbeatLease("B")).toBe(false);
+    expect(store.leaseStatus()).toMatchObject({ holder: "A", build: "schema3.gen4", gen: 4 });
 
     // Past the ORIGINAL acquire + ttl but within heartbeat + ttl: still A's.
     clock = 1_005_050;
-    expect(store.acquireLease("B", ttl)).toBe(false);
+    expect(store.acquireLease("B", ttl, "schema3.gen4", 4)).toBe(false);
 
-    // Past heartbeat + ttl: B takes over the expired lease.
+    // Past heartbeat + ttl: B, a DIFFERENT build, takes over the expired lease —
+    // and leaseStatus now names it (the mixed-version diagnosis path).
     clock = 1_005_101;
-    expect(store.acquireLease("B", ttl)).toBe(true);
+    expect(store.acquireLease("B", ttl, "schema9.gen7", 7)).toBe(true);
+    expect(store.leaseStatus()).toMatchObject({ holder: "B", build: "schema9.gen7", gen: 7 });
 
     // A no longer holds it, so A cannot release; B can.
     expect(store.releaseLease("A")).toBe(false);
     expect(store.releaseLease("B")).toBe(true);
+    // A released lease has no holder (the sentinel); build/gen fall away.
+    expect(store.leaseStatus()?.holder).toBe("");
 
     // A released lease is immediately acquirable by anyone.
     clock = 1_005_102;
-    expect(store.acquireLease("A", ttl)).toBe(true);
+    expect(store.acquireLease("A", ttl, "schema3.gen4", 4)).toBe(true);
     db.close();
   });
 
@@ -621,14 +783,14 @@ describe("meta and lease", () => {
     if (!dbA || !storeA || !dbB || !storeB) throw new Error("two-handle open failed");
 
     // Two separate connections race for the same fresh lease row.
-    const a = storeA.acquireLease("A", 30_000);
-    const b = storeB.acquireLease("B", 30_000);
+    const a = storeA.acquireLease("A", 30_000, "buildA", 4);
+    const b = storeB.acquireLease("B", 30_000, "buildB", 4);
     expect([a, b].filter(Boolean)).toHaveLength(1); // exactly one winner
 
     // The loser cannot then take a fresh lease while the winner's is live — the
     // conditional UPDATE's changes count refuses it, not an app-level re-check.
     const loser = a ? { store: storeB, id: "B" } : { store: storeA, id: "A" };
-    expect(loser.store.acquireLease(loser.id, 30_000)).toBe(false);
+    expect(loser.store.acquireLease(loser.id, 30_000, "buildX", 4)).toBe(false);
     dbA.close();
     dbB.close();
   });

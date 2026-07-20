@@ -1,8 +1,8 @@
 import MiniSearch from "minisearch";
-import type { Card } from "./store.js";
+import type { Card, CardEmbeddingWrite } from "./store.js";
 import type { ParsedQuery } from "./query.js";
 import { normalize, tokenizeAll } from "./normalize.js";
-import { embeddingTextOf, cardVectorStamp } from "./embedding-text.js";
+import { embeddingTextOf, cardVectorStamp, EMBED_REPRESENTATION } from "./embedding-text.js";
 import { isSummarizerTitle } from "./extract.js";
 import { clamp01, recencyMultiplier } from "./bm25.js";
 import { cosineSimilarity } from "./semantic/similarity.js";
@@ -121,6 +121,13 @@ export type SemanticStatus = {
   weight: number;
   /** How many loaded cards currently have a computed vector. */
   cardsWithVectors: number;
+  /** Representation generation this process embeds at
+   *  ({@link EMBED_REPRESENTATION}). Surfaces in `coverage.semantic` so a
+   *  mixed-version store is visible in tool output. */
+  representation: number;
+  /** Plugin build tag of this process (from {@link CardsRuntimeDeps.pluginVersion}),
+   *  the same tag the distill lease records. Undefined when not configured. */
+  pluginVersion?: string;
 };
 
 export type CardSource = {
@@ -130,19 +137,29 @@ export type CardSource = {
   getCards: (opts?: { withEmbeddings?: boolean }) => Card[];
   /** Monotonic write revision (`cards_rev`); undefined for static/degraded. */
   revision: () => string | undefined;
+  /** Monotonic vector-write revision (`meta.vectors_rev`); undefined for
+   *  static/degraded or a store with no vector writes yet. Watched separately from
+   *  `revision` because vector writes deliberately do not bump `cards_rev`; a
+   *  change here means another process wrote/cleared vectors, so the in-memory
+   *  snapshot must reload. */
+  vectorsRevision?: () => string | undefined;
   /** True when cards are metadata-only (degraded, no store). */
   degraded?: boolean;
   /** The store's persisted semantic-model stamp (`meta.semantic_model`), or
    *  undefined with no store / no stamp yet. Gates card-vector reuse. */
   semanticModel?: () => string | undefined;
-  /** Persist newly computed card vectors plus the model stamp. Absent in
-   *  degraded mode (no store to write to). Each row carries the summary hash the
-   *  vector was embedded from so the store can skip a row a concurrent summary
-   *  write has since changed (see {@link import("./store.js").Store.writeCardEmbeddings}). */
+  /** Persist newly computed card vectors at representation generation `gen`, plus
+   *  the model stamp. Absent in degraded mode (no store to write to). Each row
+   *  carries the summary hash the vector was embedded from so the store can skip a
+   *  row a concurrent summary write has since changed. Returns `{ revision,
+   *  committed }` — the `vectors_rev` value after the call and whether it actually
+   *  wrote — so the runtime can distinguish its own committed write from a foreign
+   *  interleave (see {@link import("./store.js").Store.writeCardEmbeddings}). */
   writeEmbeddings?: (
     model: string,
+    gen: number,
     rows: Array<{ sessionId: string; embedding: Uint8Array; expectedSummaryHash: string }>,
-  ) => void;
+  ) => CardEmbeddingWrite;
 };
 
 export type CardsRuntimeDeps = {
@@ -153,6 +170,9 @@ export type CardsRuntimeDeps = {
   /** Model id stamped on persisted card vectors. When it matches the store's
    *  stamp, vectors are reused across process starts instead of recomputed. */
   semanticModel?: string;
+  /** Plugin build tag of this process, surfaced in `coverage.semantic.pluginVersion`
+   *  (the same tag the distill lease records). Purely diagnostic. */
+  pluginVersion?: string;
   /** Resolves when the embedder finishes loading (the embedder's init promise).
    *  Lets the runtime run one embed pass the moment the model is ready, so
    *  semantic activates on a warm store without waiting for a distill
@@ -286,6 +306,7 @@ export function cardsLiteFromSessions(
     distillState: "metadata",
     distilledThrough: null,
     embedding: null,
+    embeddingGen: null,
     nlSummary: "",
     summaryHash: "",
   }));
@@ -308,6 +329,25 @@ function blobToVector(blob: Uint8Array): Float32Array {
   return new Float32Array(copy.buffer, 0, Math.floor(copy.byteLength / F32_BYTES));
 }
 
+/**
+ * The `vectors_rev` value to cache after an embed pass, given the value sampled
+ * BEFORE the snapshot load (`rev0`) and the store's write result (`write`, or
+ * `undefined` when we did not call the write API). Trust the returned revision only
+ * when the call actually COMMITTED and it is exactly `rev0 + 1` — proof that our
+ * own write, and no foreign one, advanced the counter. A rejected write reports
+ * `committed:false`, and its unchanged revision may coincide with a foreign
+ * higher-gen write that already advanced `rev0` to `rev0 + 1`; keeping `rev0` in
+ * that case forces the next refresh to reload and drop the stale snapshot.
+ */
+function ownWriteRevision(
+  rev0: string | undefined,
+  write: CardEmbeddingWrite | undefined,
+): string | undefined {
+  return write?.committed && write.revision === Number(rev0 ?? "0") + 1
+    ? String(write.revision)
+    : rev0;
+}
+
 export function createCardsRuntime(deps: CardsRuntimeDeps): CardsRuntime {
   const now = deps.now ?? Date.now;
   const refreshIntervalMs = deps.refreshIntervalMs ?? REFRESH_INTERVAL_MS;
@@ -324,14 +364,18 @@ export function createCardsRuntime(deps: CardsRuntimeDeps): CardsRuntime {
   let cardVectors: Map<string, Float32Array> | undefined;
   let lastLoad = -Infinity;
   let lastRevision: string | undefined;
+  let lastVectorsRevision: string | undefined;
   let loaded = false;
 
-  function embedCards(): void {
+  /** Recompute/reuse card vectors and persist newly computed ones. Returns the
+   *  store's `{ revision, committed }` result for the caller's own-write accounting,
+   *  or `undefined` when it did not call the write API at all. */
+  function embedCards(): CardEmbeddingWrite | undefined {
     if (!embedder || semanticWeight <= 0 || !embedder.ready) {
       // Semantic off, or the model is still warming (the query path also stays
       // lexical until the embedder is ready). Nothing to compute or persist.
       cardVectors = embedder && semanticWeight > 0 ? new Map() : undefined;
-      return;
+      return undefined;
     }
 
     // Reuse persisted vectors when the store's stamp matches this model. A card
@@ -351,7 +395,13 @@ export function createCardsRuntime(deps: CardsRuntimeDeps): CardsRuntime {
       // Never embed a stray summarizer worker card (a crash can leave one in the
       // store); it is excluded from every result anyway.
       if (isSummarizerTitle(card.title)) continue;
-      if (stampMatches && card.embedding) {
+      // Reuse a persisted vector only when the model stamp matches AND the row was
+      // embedded at THIS process's generation. A null- or lower-generation row
+      // (legacy, or written by an older build) is treated as absent and falls
+      // through to recompute; the write guard then refuses to downgrade a higher-
+      // generation row on disk, so a lagging process recomputes in memory without
+      // clobbering the newer vector.
+      if (stampMatches && card.embedding && card.embeddingGen === EMBED_REPRESENTATION) {
         vectors.set(card.sessionId, blobToVector(card.embedding));
         continue;
       }
@@ -381,8 +431,9 @@ export function createCardsRuntime(deps: CardsRuntimeDeps): CardsRuntime {
       deps.source.writeEmbeddings &&
       (toWrite.length > 0 || !stampMatches)
     ) {
-      deps.source.writeEmbeddings(configuredModel, toWrite);
+      return deps.source.writeEmbeddings(configuredModel, EMBED_REPRESENTATION, toWrite);
     }
+    return undefined;
   }
 
   function rebuild(): void {
@@ -391,6 +442,14 @@ export function createCardsRuntime(deps: CardsRuntimeDeps): CardsRuntime {
     // stale, so the next refresh reloads and picks the summary up. Sampling it
     // after embedding could swallow that bump and serve a summary-less snapshot.
     const revision = deps.source.revision();
+    // Sample vectors_rev BEFORE the snapshot load too. embedCards returns the
+    // store's { revision, committed } result; ownWriteRevision trusts it only when
+    // the write COMMITTED and is exactly rev0+1 — i.e. our own write, with no
+    // foreign vector write interleaved between this load and it. Otherwise it keeps
+    // rev0, so the next refresh reloads and picks up the foreign write instead of
+    // silently absorbing it (a rejected lower-gen write is committed:false, so its
+    // unchanged revision can never masquerade as our own bump).
+    const vectorsRev0 = deps.source.vectorsRevision?.();
     const wantEmbeddings = embedder != null && semanticWeight > 0;
     cards = wantEmbeddings
       ? deps.source.getCards({ withEmbeddings: true })
@@ -402,9 +461,10 @@ export function createCardsRuntime(deps: CardsRuntimeDeps): CardsRuntime {
     });
     index.addAll(cards.map(toDoc));
     mini = index;
-    embedCards();
+    const write = embedCards();
     lastLoad = now();
     lastRevision = revision;
+    lastVectorsRevision = ownWriteRevision(vectorsRev0, write);
     loaded = true;
   }
 
@@ -415,7 +475,11 @@ export function createCardsRuntime(deps: CardsRuntimeDeps): CardsRuntime {
     }
     if (now() - lastLoad < refreshIntervalMs) return;
     const revision = deps.source.revision();
-    if (revision !== lastRevision) rebuild();
+    // Either a lexical write (cards_rev, from distill/summary) or a cross-process
+    // vector write (vectors_rev) invalidates the snapshot. The latter is the fix
+    // for silently-stale vector snapshots across processes sharing one store.
+    const vectorsRevision = deps.source.vectorsRevision?.();
+    if (revision !== lastRevision || vectorsRevision !== lastVectorsRevision) rebuild();
     else lastLoad = now(); // nothing changed; defer the next revision check
   }
 
@@ -481,6 +545,10 @@ export function createCardsRuntime(deps: CardsRuntimeDeps): CardsRuntime {
     void deps.semanticReady.then(() => {
       if (!embedder.ready || !loaded) return;
       if (cardVectors && cardVectors.size > 0) return;
+      // Deliberately leave lastVectorsRevision untouched: this pass writes vectors
+      // (bumping vectors_rev past the cached value), so the next refresh reloads
+      // once and reconciles through rebuild()'s accounting. Caching a value here
+      // could absorb a foreign write that landed since the last snapshot.
       embedCards();
     });
   }
@@ -588,6 +656,8 @@ export function createCardsRuntime(deps: CardsRuntimeDeps): CardsRuntime {
         ...(semanticModelId != null && { model: semanticModelId }),
         weight: semanticWeight,
         cardsWithVectors: cardVectors?.size ?? 0,
+        representation: EMBED_REPRESENTATION,
+        ...(deps.pluginVersion != null && { pluginVersion: deps.pluginVersion }),
       };
     },
 

@@ -47,20 +47,31 @@ const REP_MAX_CHARS = 2_000;
 const SUBSTANTIVE_FLOOR = 12;
 
 /**
- * Representation version. The embedding INPUT (this projection) is part of what
- * a persisted card vector means, so persisted vectors must recompute when it
- * changes. {@link cardVectorStamp} folds this into the stored model stamp so a
- * bump here makes every existing vector recompute exactly once (stamp mismatch),
- * without touching the schema version or forcing a store rebuild.
+ * Representation generation — a MONOTONIC INTEGER (was the string "rep4"; rep4 is
+ * generation 4). The embedding INPUT (this projection) is part of what a persisted
+ * card vector means, so persisted vectors must recompute when it changes.
+ * {@link cardVectorStamp} folds this into the stored model stamp so a bump here
+ * makes every existing vector recompute once (stamp mismatch). It is ALSO written
+ * per row as `card.embedding_gen`: reads accept only rows at the current
+ * generation, and a lower-generation writer can never downgrade a higher one (see
+ * {@link import("./store.js").Store.writeCardEmbeddings}).
  *
- * rep4 (round-6): identity de-weighting + the substantive-content floor changed
- * the input (and drop vectors for content-free cards). Bumped unconditionally so
- * the one-time recompute is simple and correct.
+ * RULE (this incident's root cause): any change to representation SEMANTICS — the
+ * projection {@link embeddingTextOf} builds, the embedding model, or how vectors
+ * are compared — MUST ride a SCHEMA bump (`SCHEMA_VERSION` in store.ts), bumped in
+ * the same change. rep4 changed the input without a schema bump, so it slipped
+ * past the store's mixed-version fence: rep3- and rep4-era processes shared one
+ * store and raced the global `semantic_model` stamp, each clearing and rewriting
+ * every vector to its own representation. The schema bump fences older builds out
+ * of writes and the lease entirely; the per-row generation is the belt for any
+ * future SAME-schema drift. Bump this generation and the schema together.
  */
-export const EMBED_REPRESENTATION = "rep4";
+export const EMBED_REPRESENTATION = 4;
 
-/** Stamp persisted alongside card vectors: the embedding model plus the
- *  representation version, so a change to EITHER recomputes the vectors. */
+/** Stamp persisted alongside card vectors (meta `semantic_model`): the embedding
+ *  model plus the representation generation, so a change to EITHER recomputes the
+ *  vectors. Still a string (`"model:4"`); the generation folds in as its decimal
+ *  form. */
 export function cardVectorStamp(model: string): string {
   return `${model}:${EMBED_REPRESENTATION}`;
 }

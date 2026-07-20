@@ -1,6 +1,6 @@
 import type { OpencodeClient, Event, Message, Part, Session } from "@opencode-ai/sdk/v2";
 import { errmsg, DISCOVERY_LIMIT, type Limits } from "./types.js";
-import type { Card, FamilyRollup, PartTextRow, Store } from "./store.js";
+import type { Card, FamilyRollup, LeaseInfo, PartTextRow, Store } from "./store.js";
 import type { FetchGate } from "./fetch-gate.js";
 import { isSelfTool, toolNameMatches, pruned, isSummarizerTitle } from "./extract.js";
 import { tokenize } from "./normalize.js";
@@ -92,6 +92,10 @@ export type DistillStatus = {
   distilledCount: number;
   knownCount: number;
   lastError?: string;
+  /** Current distill-lease holder info (this process or whichever build holds it),
+   *  from {@link Store.leaseStatus}. Undefined with no store or no lease row yet —
+   *  the one-query answer to "who holds the lease" in a mixed-version store. */
+  lease?: LeaseInfo;
 };
 
 export type Distiller = {
@@ -114,6 +118,12 @@ export type DistillerOptions = {
    *  global-vs-scoped variant. Returns raw session rows (mapped to card metadata
    *  internally); the distiller still routes the call through the fetch gate. */
   discover?: () => Promise<Session[]>;
+  /** Plugin build tag recorded in the distill-lease value for cross-process
+   *  diagnosis (see the plugin entry). Defaults to `"unknown"`. */
+  build?: string;
+  /** Representation generation recorded in the distill-lease value
+   *  ({@link import("./embedding-text.js").EMBED_REPRESENTATION}). Defaults to 0. */
+  gen?: number;
   // ── Test affordances: default to the spec values above ──
   /** Messages per page fetch (spec: 50). */
   pageMessages?: number;
@@ -504,6 +514,7 @@ export function deriveCard(input: DeriveCardInput): DerivedCard {
     distillState: "full",
     distilledThrough: walk.newestMessageId,
     embedding: null,
+    embeddingGen: null,
     // Summaries are owned by the summarizer's separate write path; these
     // defaults apply only on a brand-new insert (the card upsert preserves any
     // existing summary across re-distills).
@@ -603,6 +614,9 @@ export function createDistiller(options: DistillerOptions): Distiller {
   const idleDebounceMs = options.idleDebounceMs ?? DEFAULT_IDLE_DEBOUNCE_MS;
   const leaseRetryMs = options.leaseRetryMs ?? DEFAULT_LEASE_RETRY_MS;
   const coldPassRetryMs = options.coldPassRetryMs ?? DEFAULT_COLD_PASS_RETRY_MS;
+  // Recorded in the lease value for cross-process diagnosis; no behavioral effect.
+  const build = options.build ?? "unknown";
+  const gen = options.gen ?? 0;
   const caps = {
     ftsRowsPerSession: limits.ftsRowsPerSession,
     inventoryTokens: limits.inventoryTokens,
@@ -849,6 +863,7 @@ export function createDistiller(options: DistillerOptions): Distiller {
         // stale. Null forces the semantic layer to recompute on the next load,
         // matching a full re-distill (deriveCard also stores a null embedding).
         embedding: null,
+        embeddingGen: null,
         // Preserved by the store's card upsert (excluded from its UPDATE SET);
         // these values apply only to a first insert.
         nlSummary: "",
@@ -1056,8 +1071,15 @@ export function createDistiller(options: DistillerOptions): Distiller {
       if (store.heartbeatLease(instanceId)) scheduleHeartbeat();
       else {
         // Lost the lease (taken over): stop acting as holder and try to regain.
+        // Log who took it (build/gen) — the incident was an old build holding the
+        // lease forever, invisible until someone hunted processes.
         leaseHeld = false;
-        logMsg("lease lost");
+        const taker = store.leaseStatus();
+        logMsg(
+          taker && taker.holder && taker.holder !== instanceId
+            ? `lease lost to ${taker.holder} (build ${taker.build || "?"}, gen ${taker.gen})`
+            : "lease lost",
+        );
         scheduleLeaseRetry();
       }
     }, HEARTBEAT_MS);
@@ -1070,9 +1092,9 @@ export function createDistiller(options: DistillerOptions): Distiller {
 
   function acquire(): void {
     if (stopped) return;
-    if (store.acquireLease(instanceId, LEASE_TTL_MS)) {
+    if (store.acquireLease(instanceId, LEASE_TTL_MS, build, gen)) {
       leaseHeld = true;
-      logMsg("lease acquired");
+      logMsg(`lease acquired (build ${build}, gen ${gen})`);
       scheduleHeartbeat();
       if (limits.coldPass && coldPassState === "idle") void runColdPass();
     } else {
@@ -1134,12 +1156,14 @@ export function createDistiller(options: DistillerOptions): Distiller {
     },
 
     status(): DistillStatus {
+      const lease = store.leaseStatus();
       return {
         leaseHeld,
         coldPass: coldPassState,
         distilledCount,
         knownCount,
         ...(lastError !== undefined ? { lastError } : {}),
+        ...(lease ? { lease } : {}),
       };
     },
   };

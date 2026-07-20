@@ -4,10 +4,15 @@ import { loadFs, loadPath, loadOs } from "./node-import.js";
 /**
  * Card + slim-part-index store over a {@link SqliteDb}.
  *
- * The schema is versioned and self-healing: an absent stamp builds v1, an older
- * stamp drops everything and rebuilds, a newer stamp makes {@link openStore}
- * return `null` so the caller degrades to ephemeral mode. All of that runs under
- * one `BEGIN IMMEDIATE` so concurrent opencode processes cannot race a rebuild.
+ * The schema is versioned and self-healing: an absent (or pre-v1) stamp drops
+ * everything and rebuilds at the current version, a v1 or v2 stamp is upgraded
+ * additively in place (chaining v1->v2->v3, preserving all data), a newer stamp
+ * makes {@link openStore} return `null` so the caller degrades to ephemeral mode.
+ * All of that runs under one `BEGIN IMMEDIATE` so concurrent opencode processes
+ * cannot race a rebuild. The newer-stamp refusal is the mixed-version fence: once
+ * a store is bumped to v3, older plugin builds sharing the file degrade to
+ * read-only ephemeral mode (no writes, no distill lease) rather than corrupting a
+ * format they do not understand.
  *
  * Per-session writes are transactional delete-and-insert with an explicit FTS
  * mirror (the `part_fts` table is external-content, so deleting `part_text` rows
@@ -15,7 +20,7 @@ import { loadFs, loadPath, loadOs } from "./node-import.js";
  * never observe half a replaced session.
  */
 
-export const SCHEMA_VERSION = 2;
+export const SCHEMA_VERSION = 3;
 
 const SCHEMA_VERSION_KEY = "schema_version";
 const LEASE_KEY = "distill_lease";
@@ -23,6 +28,13 @@ const LEASE_KEY = "distill_lease";
  *  vectors. The card runtime reuses vectors only when this matches its
  *  configured model (see {@link Store.writeCardEmbeddings}). */
 export const SEMANTIC_MODEL_KEY = "semantic_model";
+/** Meta counter bumped by every {@link Store.writeCardEmbeddings} (which is the
+ *  only vector writer, and covers its own model-change clear-all). Vector writes
+ *  deliberately do NOT bump `cards_rev` — vectors are invisible to the lexical
+ *  layer — so this separate counter is how a cross-process vector change becomes
+ *  visible to another process's in-memory card snapshot (the runtime reloads when
+ *  it advances). Fixes the mixed-version incident's silently-stale snapshots. */
+export const VECTORS_REV_KEY = "vectors_rev";
 /** Meta stamp recording the summarizer prompt-template version the persisted
  *  `nl_summary` values were produced under (see {@link Store.writeSummary}). */
 export const SUMMARY_REV_KEY = "summary_rev";
@@ -38,9 +50,10 @@ const EXPIRED_SENTINEL = JSON.stringify({
 
 const PRAGMAS = "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=5000;";
 
-// DDL v1, verbatim from the implementation spec. No `prefix=` index: anchors are
-// matched as exact quoted phrases, so prefix indexes would be write/disk cost
-// with no query to serve them.
+// Current-version (v3) DDL for a fresh store; older stores reach the same shape
+// through the additive migrations below. No `prefix=` index: anchors are matched
+// as exact quoted phrases, so prefix indexes would be write/disk cost with no
+// query to serve them.
 const DDL = `
 CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL) WITHOUT ROWID;
 
@@ -58,6 +71,7 @@ CREATE TABLE card (
   distill_state TEXT NOT NULL DEFAULT 'metadata',
   distilled_through TEXT,
   embedding BLOB,
+  embedding_gen INTEGER,
   nl_summary TEXT NOT NULL DEFAULT '',
   summary_hash TEXT NOT NULL DEFAULT ''
 );
@@ -117,6 +131,16 @@ export type Card = {
   distillState: "metadata" | "full";
   distilledThrough: string | null;
   embedding: Uint8Array | null;
+  /** Representation generation the persisted {@link embedding} was produced under
+   *  ({@link import("./embedding-text.js").EMBED_REPRESENTATION}), or `null` for a
+   *  legacy/unknown-generation row (existing rows after the additive v3 migration,
+   *  or a card the distiller cleared). The card runtime treats a null- or
+   *  lower-generation vector as absent (recompute path) and never lets a
+   *  lower-generation writer overwrite a higher one — a per-row belt on top of the
+   *  schema fence for future same-schema representation drift. Written only by
+   *  {@link Store.writeCardEmbeddings} (and cleared alongside `embedding` on
+   *  re-distill / model change). */
+  embeddingGen: number | null;
   /** LLM-written natural-language summary (Path B), or "" when none. Preserved
    *  across re-distills (the distiller's card upsert never overwrites it — only
    *  {@link Store.writeSummary} does), joins the lexical index and the embedding
@@ -162,30 +186,50 @@ export type Store = {
   getCard(sessionId: string): Card | undefined;
   allCards(opts?: { withEmbeddings?: boolean }): Card[];
   /**
-   * Persist card vectors from a semantic embed pass and stamp the model that
-   * produced them ({@link SEMANTIC_MODEL_KEY}). One transaction: on a model
-   * change it first clears every existing vector (so no old-model BLOB survives
-   * under the new stamp), then sets the stamp and updates each listed row's
-   * `embedding` blob. Rows whose session id is unknown update nothing.
+   * Persist card vectors from a semantic embed pass at representation generation
+   * `gen`, stamping the model that produced them ({@link SEMANTIC_MODEL_KEY}). One
+   * transaction: on a model change it first clears every existing vector AND its
+   * generation (so no old-model BLOB survives under the new stamp), sets the
+   * stamp, updates each listed row's `embedding` blob and `embedding_gen`, then
+   * bumps {@link VECTORS_REV_KEY}. Rows whose session id is unknown update nothing.
    *
-   * Each row's write is CONDITIONAL on `expectedSummaryHash`: it lands only when
-   * the card's `summary_hash` still matches what the snapshot was embedded from.
-   * A concurrent {@link Store.writeSummary} changes the hash and nulls the vector
-   * to force a re-embed with the summary text; the guard makes the older,
-   * summary-less vector from a snapshot-in-flight lose that race instead of
-   * clobbering the cleared vector back to stale.
+   * A write whose `gen` is LOWER than the store's current maximum `embedding_gen`
+   * is rejected WHOLESALE before the stamp or any row changes — the model-change
+   * clear-all would otherwise wipe the newer rows' generation and let the per-row
+   * guard pass, a silent downgrade. Only a same-or-higher generation advances the
+   * stamp, clears, or writes.
    *
-   * Deliberately does NOT bump `cards_rev` — vectors are invisible to the
-   * lexical layer, so a bump would only trigger a needless reader reload (and a
-   * rebuild/embed/write loop). Callers write from the query path without the
-   * distill lease: a write may lose to a concurrent cross-process re-distill
-   * that cleared the row's embedding, and self-heals on that card's next
-   * re-distill.
+   * Each surviving row's write still carries TWO guards:
+   * - `expectedSummaryHash`: it lands only when the card's `summary_hash` still
+   *   matches what the snapshot was embedded from. A concurrent
+   *   {@link Store.writeSummary} changes the hash and nulls the vector to force a
+   *   re-embed with the summary text; the guard makes the older, summary-less
+   *   vector from a snapshot-in-flight lose that race instead of clobbering the
+   *   cleared vector back to stale.
+   * - generation: `embedding_gen IS NULL OR embedding_gen <= gen`, the per-row belt
+   *   behind the wholesale check above.
+   *
+   * Deliberately does NOT bump `cards_rev` — vectors are invisible to the lexical
+   * layer, so it would trigger a needless lexical reload (and a rebuild/embed/write
+   * loop). It bumps `vectors_rev` instead, which the card runtime watches
+   * separately so a cross-process vector change still invalidates a stale in-memory
+   * snapshot. Callers write from the query path without the distill lease: a write
+   * may lose to a concurrent cross-process re-distill that cleared the row's
+   * embedding, and self-heals on that card's next re-distill.
+   *
+   * Returns `{ revision, committed }`: `revision` is the `vectors_rev` value AFTER
+   * the call (the bumped value on a write, the unchanged value on a rejection) and
+   * `committed` is true only when this call actually wrote. The card runtime trusts
+   * `revision === rev0 + 1` as its own write ONLY when `committed` — a rejected
+   * write's unchanged `revision` can coincide with a foreign higher-gen write that
+   * advanced `vectors_rev` inside the snapshot window, and treating that as its own
+   * bump would strand the stale snapshot.
    */
   writeCardEmbeddings(
     model: string,
+    gen: number,
     rows: Array<{ sessionId: string; embedding: Uint8Array; expectedSummaryHash: string }>,
-  ): void;
+  ): CardEmbeddingWrite;
   /**
    * Persist a card's LLM summary and the change-detection hash it was produced
    * from ({@link Card.nlSummary}/{@link Card.summaryHash}). Owns those two
@@ -224,9 +268,42 @@ export type Store = {
   ftsSearch(input: { strong: string[]; weak: string[]; limit?: number }): FtsHit[];
   getMeta(key: string): string | undefined;
   setMeta(key: string, value: string): void;
-  acquireLease(holder: string, ttlMs: number): boolean;
+  /**
+   * Acquire or take over the distill lease, recording the holder plus the
+   * acquiring build's `build` tag and representation `gen` in the lease value.
+   * The conditional-write SEMANTICS are unchanged (absent / same-holder / expired
+   * wins); the extra fields are pure observability so a mixed-version store can be
+   * diagnosed with one {@link Store.leaseStatus} read instead of a process hunt.
+   */
+  acquireLease(holder: string, ttlMs: number, build: string, gen: number): boolean;
   heartbeatLease(holder: string): boolean;
   releaseLease(holder: string): boolean;
+  /** Current lease holder info parsed from the lease row, or `undefined` when no
+   *  lease row exists. `holder` is `""` for an expired/released sentinel (nobody
+   *  holds it); `build`/`gen` are `""`/`0` for a legacy lease written before this
+   *  field existed. Read-only; never mutates. */
+  leaseStatus(): LeaseInfo | undefined;
+};
+
+/** Result of {@link Store.writeCardEmbeddings}: the `vectors_rev` value after the
+ *  call, and whether this call actually committed a write (`false` when a
+ *  lower-generation write was rejected wholesale). The card runtime needs BOTH to
+ *  tell its own committed write from a foreign write whose bumped revision it
+ *  merely observed on a rejection. */
+export type CardEmbeddingWrite = { revision: number; committed: boolean };
+
+/** Distill-lease holder info surfaced by {@link Store.leaseStatus}. */
+export type LeaseInfo = {
+  holder: string;
+  /** Plugin build tag of the holder (see the plugin entry's build tag). */
+  build: string;
+  /** Representation generation the holder runs
+   *  ({@link import("./embedding-text.js").EMBED_REPRESENTATION}). */
+  gen: number;
+  /** Holder's last heartbeat (ms epoch, from the holder's clock). */
+  heartbeat: number;
+  /** Lease TTL the holder set (ms). */
+  ttl: number;
 };
 
 // ── Column layout (single source of truth for card CRUD) ────────────────────
@@ -255,6 +332,7 @@ const CARD_COLUMNS = [
   "distill_state",
   "distilled_through",
   "embedding",
+  "embedding_gen",
   "nl_summary",
   "summary_hash",
 ] as const;
@@ -289,6 +367,15 @@ function asNumber(value: SqlValue | undefined, fallback = 0): number {
   if (typeof value === "number") return value;
   if (typeof value === "bigint") return Number(value);
   return fallback;
+}
+
+/** A nullable INTEGER column (e.g. `embedding_gen`): a real number when present,
+ *  `null` for SQL NULL or any non-numeric value. Distinct from {@link asNumber},
+ *  which floors an absent value to 0 — here `null` must survive as "unknown". */
+function asNullableNumber(value: SqlValue | undefined): number | null {
+  if (typeof value === "number") return value;
+  if (typeof value === "bigint") return Number(value);
+  return null;
 }
 
 function parseStringArray(value: SqlValue | undefined): string[] {
@@ -348,6 +435,7 @@ function rowToCard(row: Row): Card {
     distillState: row.distill_state === "full" ? "full" : "metadata",
     distilledThrough: asNullableString(row.distilled_through),
     embedding: row.embedding instanceof Uint8Array ? row.embedding : null,
+    embeddingGen: asNullableNumber(row.embedding_gen),
     nlSummary: asString(row.nl_summary),
     summaryHash: asString(row.summary_hash),
   };
@@ -378,6 +466,7 @@ function cardValues(card: Card): SqlValue[] {
     card.distillState,
     card.distilledThrough,
     card.embedding,
+    card.embeddingGen,
     card.nlSummary,
     card.summaryHash,
   ];
@@ -437,20 +526,39 @@ function rebuild(db: SqliteDb): void {
   db.run("INSERT INTO meta(key, value) VALUES(?, ?)", [SCHEMA_VERSION_KEY, String(SCHEMA_VERSION)]);
 }
 
+/** Stamp the schema-version meta row to `version` (upsert). Shared by the
+ *  additive migrations so each records the version it actually reached. */
+function stampVersion(db: SqliteDb, version: number): void {
+  db.run(
+    "INSERT INTO meta(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+    [SCHEMA_VERSION_KEY, String(version)],
+  );
+}
+
 /**
  * Additive v1 -> v2 upgrade: add the Path B summary columns in place, preserving
  * every existing card row, slim-index row, FTS entry, and persisted vector. No
  * rebuild, no re-distill. The columns carry a DEFAULT so existing rows read as
- * unsummarized. Idempotent within its own transaction (only runs when the stamp
- * is exactly 1).
+ * unsummarized. Stamps v2; a v1 store chains straight on into {@link migrateV2ToV3}.
  */
 function migrateV1ToV2(db: SqliteDb): void {
   db.exec("ALTER TABLE card ADD COLUMN nl_summary TEXT NOT NULL DEFAULT ''");
   db.exec("ALTER TABLE card ADD COLUMN summary_hash TEXT NOT NULL DEFAULT ''");
-  db.run(
-    "INSERT INTO meta(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-    [SCHEMA_VERSION_KEY, String(SCHEMA_VERSION)],
-  );
+  stampVersion(db, 2);
+}
+
+/**
+ * Additive v2 -> v3 upgrade: add the per-row representation generation column in
+ * place, preserving every card / slim-index / FTS / vector / summary row and the
+ * meta stamps. The column is nullable with NO default, so existing rows read as
+ * `NULL` — an "unknown/legacy generation" the card runtime treats as absent and
+ * any writer may overwrite. Stamps the LITERAL destination version 3 (not
+ * `SCHEMA_VERSION`): a future v4 bump must add its own v3->v4 step, and a v2 store
+ * running that build must land on 3 here first so the ladder then applies v3->v4.
+ */
+function migrateV2ToV3(db: SqliteDb): void {
+  db.exec("ALTER TABLE card ADD COLUMN embedding_gen INTEGER");
+  stampVersion(db, 3);
 }
 
 /**
@@ -468,10 +576,17 @@ export function openStore(db: SqliteDb, opts?: StoreOptions): Store | null {
       // Newer than this build understands: refuse (degrade), never misread it.
       if (current !== null && current > SCHEMA_VERSION) return "newer";
       if (current === SCHEMA_VERSION) return "ok";
-      // Exactly v1: additive in-place upgrade, keeping all data. Anything else
-      // older (absent stamp or a foreign layout) is dropped and rebuilt fresh.
-      if (current === 1) migrateV1ToV2(db);
-      else rebuild(db);
+      // v1 and v2 upgrade additively in place, keeping all data; v1 chains through
+      // both migrations. Anything else older (absent stamp or a foreign layout) is
+      // dropped and rebuilt fresh.
+      if (current === 1) {
+        migrateV1ToV2(db);
+        migrateV2ToV3(db);
+      } else if (current === 2) {
+        migrateV2ToV3(db);
+      } else {
+        rebuild(db);
+      }
       return "ok";
     });
     if (outcome === "newer") return null;
@@ -506,28 +621,74 @@ class SqliteStore implements Store {
 
   writeCardEmbeddings(
     model: string,
+    gen: number,
     rows: Array<{ sessionId: string; embedding: Uint8Array; expectedSummaryHash: string }>,
-  ): void {
-    this.db.tx(() => {
-      // On a model change, drop every existing vector before writing the new
-      // ones: a card the new model cannot embed (embed returned undefined, so it
-      // is absent from `rows`) would otherwise keep an old-model BLOB that the
-      // next load reuses as current under the new stamp.
+  ): CardEmbeddingWrite {
+    return this.db.tx((): CardEmbeddingWrite => {
+      // FIRST, before touching the stamp or any row: reject a lower-generation
+      // write WHOLESALE. Because the generation folds into the model stamp
+      // (`model:gen`), a lagging writer always has a different stamp than a newer
+      // one, so it would take the clear-all branch below, NULL the newer rows'
+      // generation, and then its per-row guard would pass — a silent downgrade.
+      // The up-front check closes that: only a same-or-higher generation writer
+      // may advance the stamp, clear rows, or write. (MAX over an all-NULL/empty
+      // column is NULL — an unestablished store any generation may seed.)
+      const maxGen = this.currentMaxGen();
+      if (maxGen !== null && gen < maxGen) {
+        // No-op: unchanged vectors_rev, and committed:false. The unchanged rev may
+        // COINCIDE with a foreign higher-gen write that advanced it inside the
+        // caller's snapshot window, so the caller must NOT treat it as its own
+        // bump — the `committed` flag is what keeps that stale snapshot reloading.
+        return { revision: this.currentVectorsRev(), committed: false };
+      }
+      // On a model change, drop every existing vector AND its generation before
+      // writing the new ones: a card the new model cannot embed (embed returned
+      // undefined, so it is absent from `rows`) would otherwise keep an old-model
+      // BLOB that the next load reuses as current under the new stamp.
       if (this.getMeta(SEMANTIC_MODEL_KEY) !== model) {
-        this.db.run("UPDATE card SET embedding=NULL WHERE embedding IS NOT NULL");
+        this.db.run(
+          "UPDATE card SET embedding=NULL, embedding_gen=NULL WHERE embedding IS NOT NULL",
+        );
       }
       this.setMeta(SEMANTIC_MODEL_KEY, model);
       for (const row of rows) {
-        // Conditional on the summary hash: skip when a summary landed since the
-        // snapshot was embedded (writeSummary changed the hash and cleared the
-        // vector), so this stale, summary-less vector never wins that race.
-        this.db.run("UPDATE card SET embedding=? WHERE session_id=? AND summary_hash=?", [
-          row.embedding,
-          row.sessionId,
-          row.expectedSummaryHash,
-        ]);
+        // Two guards (see the interface doc): the summary hash makes a stale,
+        // summary-less vector lose to a concurrent writeSummary; the generation
+        // guard (`embedding_gen IS NULL OR embedding_gen <= ?`) is the per-row belt
+        // behind the wholesale up-front check above (always satisfied here, since
+        // gen >= maxGen >= every row's generation).
+        this.db.run(
+          "UPDATE card SET embedding=?, embedding_gen=? WHERE session_id=? AND summary_hash=? AND (embedding_gen IS NULL OR embedding_gen <= ?)",
+          [row.embedding, gen, row.sessionId, row.expectedSummaryHash, gen],
+        );
       }
+      // Vectors are invisible to cards_rev by design, so bump vectors_rev instead
+      // — the one signal that makes this change (including the clear-all above)
+      // visible to another process's in-memory card snapshot. committed:true plus
+      // the bumped value lets the card runtime confirm THIS call's own write
+      // (exactly rev0+1 AND committed means no foreign write interleaved).
+      return { revision: this.bumpVectorsRev(), committed: true };
     });
+  }
+
+  /** The highest `embedding_gen` currently stored, or `null` when no row carries a
+   *  generation (an empty/all-legacy store any generation may seed). */
+  private currentMaxGen(): number | null {
+    const row = this.db.get("SELECT MAX(embedding_gen) AS m FROM card");
+    return asNullableNumber(row?.m);
+  }
+
+  /** The current vectors-revision counter as a number (0 when unset). */
+  private currentVectorsRev(): number {
+    return Number(this.getMeta(VECTORS_REV_KEY)) || 0;
+  }
+
+  /** Increment the vectors-revision counter (see {@link VECTORS_REV_KEY}) and
+   *  return the new value. Caller supplies the transaction. */
+  private bumpVectorsRev(): number {
+    const next = this.currentVectorsRev() + 1;
+    this.setMeta(VECTORS_REV_KEY, String(next));
+    return next;
   }
 
   writeSummary(sessionId: string, summary: string, hash: string): void {
@@ -699,10 +860,13 @@ class SqliteStore implements Store {
    * read-check-write. Succeeds when the row is absent, already held by this
    * holder, or expired (heartbeat older than `ttlMs` ago).
    */
-  acquireLease(holder: string, ttlMs: number): boolean {
+  acquireLease(holder: string, ttlMs: number, build: string, gen: number): boolean {
     const now = this.now();
     const cutoff = now - ttlMs;
-    const value = JSON.stringify({ holder, heartbeat: now, ttl: ttlMs });
+    // `build`/`gen` ride the value for diagnosis only; the WHERE clause below is
+    // unchanged, so acquire semantics (absent / same-holder / expired) are too.
+    // A heartbeat updates only `$.heartbeat` (json_set), so they survive renewals.
+    const value = JSON.stringify({ holder, heartbeat: now, ttl: ttlMs, build, gen });
     return this.db.tx(() => {
       this.db.run("INSERT OR IGNORE INTO meta(key, value) VALUES(?, ?)", [
         LEASE_KEY,
@@ -730,6 +894,26 @@ class SqliteStore implements Store {
       [EXPIRED_SENTINEL, LEASE_KEY, holder],
     );
     return res.changes > 0;
+  }
+
+  leaseStatus(): LeaseInfo | undefined {
+    const raw = this.getMeta(LEASE_KEY);
+    if (raw === undefined) return undefined;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      return undefined;
+    }
+    if (!parsed || typeof parsed !== "object") return undefined;
+    const record = parsed as Record<string, unknown>;
+    return {
+      holder: typeof record.holder === "string" ? record.holder : "",
+      build: typeof record.build === "string" ? record.build : "",
+      gen: typeof record.gen === "number" ? record.gen : 0,
+      heartbeat: typeof record.heartbeat === "number" ? record.heartbeat : 0,
+      ttl: typeof record.ttl === "number" ? record.ttl : 0,
+    };
   }
 }
 

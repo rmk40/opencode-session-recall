@@ -10,7 +10,7 @@ import {
   exclusionFamilyFromCards,
   type CardSource,
 } from "../src/cards.js";
-import { cardVectorStamp } from "../src/embedding-text.js";
+import { cardVectorStamp, EMBED_REPRESENTATION } from "../src/embedding-text.js";
 import { exclusionFamily } from "../src/search.js";
 import { parseQuery } from "../src/query.js";
 import { makeEvalCorpus } from "./eval/corpus.js";
@@ -58,6 +58,7 @@ function makeCard(sessionId: string, over: Partial<Card> = {}): Card {
     distillState: "full",
     distilledThrough: "m1",
     embedding: null,
+    embeddingGen: null,
     nlSummary: "",
     summaryHash: "",
     ...over,
@@ -235,8 +236,9 @@ describe("cards semantic persistence", () => {
   const persistentSource = (store: Store): CardSource => ({
     getCards: (opts) => store.allCards(opts),
     revision: () => store.getMeta("cards_rev"),
+    vectorsRevision: () => store.getMeta("vectors_rev"),
     semanticModel: () => store.getMeta("semantic_model"),
-    writeEmbeddings: (model, rows) => store.writeCardEmbeddings(model, rows),
+    writeEmbeddings: (model, gen, rows) => store.writeCardEmbeddings(model, gen, rows),
   });
 
   it("reuses persisted card vectors on a matching model stamp (no re-embed on reload)", async () => {
@@ -424,6 +426,208 @@ describe("cards semantic persistence", () => {
     // A subsequent semantic rank now uses the vectors.
     expect(ids(runtime.rank(parseQuery("alpha"), {}))).toContain("s1");
     db.close();
+  });
+
+  it("reloads on a cross-process vectors_rev bump, but not on its own vector write", async () => {
+    // Two handles on one store file (mixed-version skew): the runtime reads
+    // through storeB; storeA stands in for another process. Vector writes do NOT
+    // bump cards_rev, so vectors_rev is the ONLY signal that invalidates the
+    // runtime's in-memory snapshot across processes.
+    const path = freshDbPath();
+    const dbA = await openSqlite(path);
+    const dbB = await openSqlite(path);
+    const storeA = dbA && openStore(dbA);
+    const storeB = dbB && openStore(dbB);
+    if (!dbA || !storeA || !dbB || !storeB) throw new Error("two-handle open failed");
+
+    storeA.upsertCard(makeCard("s1", { inventory: `alpha topic ${SUBST}` }));
+    storeA.setMeta("cards_rev", "1");
+
+    const embed = vi.fn((text: string) =>
+      Float32Array.from(text.includes("alpha") ? [1, 0] : [0, 1]),
+    );
+    const embedder = { ready: true, embed };
+    let clock = 1_000_000;
+    const refreshIntervalMs = 5_000;
+    // Count reloads via the getCards spy: one call per rebuild.
+    const getCards = vi.fn((opts?: { withEmbeddings?: boolean }) => storeB.allCards(opts));
+    const runtime = createCardsRuntime({
+      source: {
+        getCards,
+        revision: () => storeB.getMeta("cards_rev"),
+        vectorsRevision: () => storeB.getMeta("vectors_rev"),
+        semanticModel: () => storeB.getMeta("semantic_model"),
+        writeEmbeddings: (model, gen, rows) => storeB.writeCardEmbeddings(model, gen, rows),
+      },
+      embedder,
+      semanticWeight: 0.5,
+      semanticModel: "model-x",
+      now: () => clock,
+      refreshIntervalMs,
+    });
+
+    // First rank: one load + one embed pass. The pass persists a vector via
+    // storeB, bumping vectors_rev to 1; the runtime caches that POST-write value.
+    runtime.rank(parseQuery("alpha"), {});
+    expect(getCards).toHaveBeenCalledTimes(1);
+    expect(storeB.getMeta("vectors_rev")).toBe("1");
+
+    // Past the interval, its OWN vector write must not trigger a self-reload
+    // (the no-loop property; pinned so a future change can't reintroduce a loop).
+    clock += refreshIntervalMs + 1;
+    runtime.rank(parseQuery("alpha"), {});
+    expect(getCards).toHaveBeenCalledTimes(1);
+
+    // Another process writes a vector, bumping vectors_rev to 2 WITHOUT touching
+    // cards_rev — the exact cross-process change that used to go unseen.
+    storeA.writeCardEmbeddings(cardVectorStamp("model-x"), EMBED_REPRESENTATION, [
+      { sessionId: "s1", embedding: new Uint8Array([2, 2, 2, 2]), expectedSummaryHash: "" },
+    ]);
+    expect(storeB.getMeta("vectors_rev")).toBe("2");
+
+    // Past the interval, the runtime now reloads to pick up the foreign change.
+    clock += refreshIntervalMs + 1;
+    runtime.rank(parseQuery("alpha"), {});
+    expect(getCards).toHaveBeenCalledTimes(2);
+
+    dbA.close();
+    dbB.close();
+  });
+
+  it("reloads when a foreign vector write interleaves inside the snapshot window", async () => {
+    // The race finding 2 fixes: a foreign write that lands AFTER the runtime reads
+    // its snapshot but BEFORE its own write. Sampling vectors_rev only after the
+    // write would absorb it and serve the stale snapshot forever.
+    const path = freshDbPath();
+    const dbA = await openSqlite(path);
+    const dbB = await openSqlite(path);
+    const storeA = dbA && openStore(dbA);
+    const storeB = dbB && openStore(dbB);
+    if (!dbA || !storeA || !dbB || !storeB) throw new Error("two-handle open failed");
+
+    storeA.upsertCard(makeCard("s1", { inventory: `alpha topic ${SUBST}` }));
+    storeA.upsertCard(makeCard("s2", { inventory: `beta topic ${SUBST}` }));
+    storeA.setMeta("cards_rev", "1");
+
+    const embed = vi.fn((text: string) =>
+      Float32Array.from(text.includes("alpha") ? [1, 0] : [0, 1]),
+    );
+    const embedder = { ready: true, embed };
+    let clock = 1_000_000;
+    const refreshIntervalMs = 5_000;
+
+    // Inject a foreign vector write DURING the first snapshot load: the getCards
+    // seam reads the rows, then a second process writes a vector (bumping
+    // vectors_rev) before returning — so the snapshot misses it and the runtime's
+    // own write lands one revision later than a clean rev0+1.
+    let injected = false;
+    const getCards = vi.fn((opts?: { withEmbeddings?: boolean }) => {
+      const snapshot = storeB.allCards(opts);
+      if (!injected) {
+        injected = true;
+        storeA.writeCardEmbeddings(cardVectorStamp("model-x"), EMBED_REPRESENTATION, [
+          { sessionId: "s2", embedding: new Uint8Array([3, 3, 3, 3]), expectedSummaryHash: "" },
+        ]);
+      }
+      return snapshot;
+    });
+    const runtime = createCardsRuntime({
+      source: {
+        getCards,
+        revision: () => storeB.getMeta("cards_rev"),
+        vectorsRevision: () => storeB.getMeta("vectors_rev"),
+        semanticModel: () => storeB.getMeta("semantic_model"),
+        writeEmbeddings: (model, gen, rows) => storeB.writeCardEmbeddings(model, gen, rows),
+      },
+      embedder,
+      semanticWeight: 0.5,
+      semanticModel: "model-x",
+      now: () => clock,
+      refreshIntervalMs,
+    });
+
+    // First rank: rebuild samples rev0, loads the snapshot (foreign write injected
+    // mid-load), then its own write lands at rev0+2 — the interleave signature.
+    runtime.rank(parseQuery("alpha"), {});
+    expect(getCards).toHaveBeenCalledTimes(1);
+
+    // Past the interval: because the own write was NOT a clean rev0+1, the cached
+    // revision stayed at rev0, so the store's higher vectors_rev forces a reload.
+    clock += refreshIntervalMs + 1;
+    runtime.rank(parseQuery("alpha"), {});
+    expect(getCards).toHaveBeenCalledTimes(2); // interleave detected, not absorbed
+
+    dbA.close();
+    dbB.close();
+  });
+
+  it("reloads when a foreign HIGHER-generation write interleaves and rejects its own write", async () => {
+    // The compose bug: a foreign generation-5 write lands inside the snapshot
+    // window, advancing vectors_rev to exactly rev0+1. The runtime's own
+    // generation-4 write is then REJECTED wholesale (committed:false). Its
+    // unchanged returned revision equals rev0+1, so without the committed flag it
+    // would masquerade as this runtime's own bump and strand the stale gen-4
+    // snapshot forever.
+    const path = freshDbPath();
+    const dbA = await openSqlite(path);
+    const dbB = await openSqlite(path);
+    const storeA = dbA && openStore(dbA);
+    const storeB = dbB && openStore(dbB);
+    if (!dbA || !storeA || !dbB || !storeB) throw new Error("two-handle open failed");
+
+    storeA.upsertCard(makeCard("s1", { inventory: `alpha topic ${SUBST}` }));
+    storeA.setMeta("cards_rev", "1");
+
+    const embed = vi.fn((text: string) =>
+      Float32Array.from(text.includes("alpha") ? [1, 0] : [0, 1]),
+    );
+    const embedder = { ready: true, embed };
+    let clock = 1_000_000;
+    const refreshIntervalMs = 5_000;
+
+    // A NEWER (generation 5) process writes inside the snapshot window: it advances
+    // vectors_rev by exactly one AND establishes a higher generation, so this
+    // runtime's own generation-4 write will be refused.
+    let injected = false;
+    const getCards = vi.fn((opts?: { withEmbeddings?: boolean }) => {
+      const snapshot = storeB.allCards(opts);
+      if (!injected) {
+        injected = true;
+        storeA.writeCardEmbeddings("model-x:5", 5, [
+          { sessionId: "s1", embedding: new Uint8Array([5, 5, 5, 5]), expectedSummaryHash: "" },
+        ]);
+      }
+      return snapshot;
+    });
+    const runtime = createCardsRuntime({
+      source: {
+        getCards,
+        revision: () => storeB.getMeta("cards_rev"),
+        vectorsRevision: () => storeB.getMeta("vectors_rev"),
+        semanticModel: () => storeB.getMeta("semantic_model"),
+        writeEmbeddings: (model, gen, rows) => storeB.writeCardEmbeddings(model, gen, rows),
+      },
+      embedder,
+      semanticWeight: 0.5,
+      semanticModel: "model-x", // → generation EMBED_REPRESENTATION (4)
+      now: () => clock,
+      refreshIntervalMs,
+    });
+
+    // First rank: rev0 is undefined; the foreign gen-5 write bumps it to 1 mid-load;
+    // the runtime's gen-4 write is rejected (committed:false), so the cache stays at
+    // rev0 rather than the coincident rev0+1.
+    runtime.rank(parseQuery("alpha"), {});
+    expect(getCards).toHaveBeenCalledTimes(1);
+
+    // Past the interval: the store's vectors_rev (1) exceeds the cached rev0, so the
+    // runtime reloads and drops its stale gen-4 snapshot.
+    clock += refreshIntervalMs + 1;
+    runtime.rank(parseQuery("alpha"), {});
+    expect(getCards).toHaveBeenCalledTimes(2); // rejection not mistaken for own bump
+
+    dbA.close();
+    dbB.close();
   });
 });
 

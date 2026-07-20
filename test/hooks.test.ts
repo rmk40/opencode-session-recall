@@ -53,6 +53,7 @@ function makeCard(over: Partial<Card> = {}): Card {
     distillState: "full",
     distilledThrough: "m-last",
     embedding: null,
+    embeddingGen: null,
     nlSummary: "",
     summaryHash: "",
     ...over,

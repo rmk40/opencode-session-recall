@@ -75,6 +75,7 @@ function fullCard(sessionId: string, over: Partial<Card> = {}): Card {
     distillState: "full",
     distilledThrough: "m1",
     embedding: null,
+    embeddingGen: null,
     nlSummary: "",
     summaryHash: "",
     ...over,
