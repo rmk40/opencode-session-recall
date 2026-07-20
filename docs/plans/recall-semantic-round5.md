@@ -114,6 +114,15 @@ B, and record ranks in this doc.
   (config is set; the pass starts on the next restart of the lease-holding
   instance).
 
+- 2026-07-20, post mixed-version fix, live: store and coverage agree (4,590 rep4
+  vectors / 4,724 cards; representation 4, pluginVersion schema3.gen4);
+  Getting-Started pollution gone; exact Ghostauth/Tuistory retrieval improved
+  rank 3 to rank 1. Path B still unstarted (0 summaries): an already-running old
+  process reclaimed the lease in the legacy untagged format — pre-migration open
+  handles bypass the schema-open fence, the documented out-of-scope limitation.
+  All existing opencode processes must restart once before B and the
+  post-restart mixed-version guarantees can be evaluated.
+
 ## Out of scope
 
 Embedding-model upgrades, upstream completion-endpoint requests, summarizing with the
