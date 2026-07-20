@@ -100,6 +100,20 @@ content-hash skip. Existing 17-case lexical baseline stays at 1.0. Live: rerun t
 four failing paraphrase queries on the real store with semantic on, before and after
 B, and record ranks in this doc.
 
+## Live results (running record)
+
+- 2026-07-20, Path A only (rep4 with identity de-weighting + substantive floor;
+  summaries not yet populated because the distill lease was held by an instance
+  started before the summaries config landed): cardsWithVectors 4,590 of 4,724
+  (the floor correctly denies ~130 content-free cards). "pseudo-terminal testing
+  real host" now surfaces the implementation at rank 7 in user-visible results
+  (previously absent; hybrid card rank 136). The three hardest paraphrases ("PTY
+  harness inside interactive host", "test plugin interactively", "how did we
+  test the plugin interactively") remain absent, as predicted: that residual is
+  Path B's load. Re-measure all four after the summary pass populates
+  (config is set; the pass starts on the next restart of the lease-holding
+  instance).
+
 ## Out of scope
 
 Embedding-model upgrades, upstream completion-endpoint requests, summarizing with the
