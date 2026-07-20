@@ -141,20 +141,63 @@ see the current numbers.
 ## The derived store rebuilds itself; don't hand-migrate it
 
 The card + slim-FTS store lives at `~/.cache/opencode-session-recall/store-v1.db`
-(override with `storePath`). It is derived state, never authoritative: safe to
-delete at any time, and it rebuilds in the background on the next run. `store.ts`
-stamps `schema_version` (currently `SCHEMA_VERSION = 1`); an older stamp drops
-everything and rebuilds, a newer stamp makes `openStore` return null so the plugin
-degrades rather than misreading a format it doesn't understand. So the migration
-story for a schema change is: bump `SCHEMA_VERSION`, ship, let old stores rebuild.
+(the filename is fixed at `store-v1.db` regardless of schema; `storePath` overrides
+the whole path). It is derived state, never authoritative: safe to delete at any
+time, and it rebuilds in the background on the next run. `store.ts` stamps
+`schema_version` in the `meta` table (currently `SCHEMA_VERSION = 3`). On open: a
+matching stamp is used as-is; a v1 or v2 stamp is migrated **additively in place**
+(`migrateV1ToV2` adds the summary columns, `migrateV2ToV3` adds `embedding_gen`, with no data loss and no
+re-distill); an absent stamp or a foreign layout is dropped and
+rebuilt; a **newer** stamp makes `openStore` return null so the plugin degrades to
+cards-lite rather than misreading a format it doesn't understand. So the migration
+story for a schema change is: add a `v(N-1)→vN` additive step when you can, bump
+`SCHEMA_VERSION`, and ship. Old in-place stores upgrade, foreign ones rebuild.
+
 Several opencode processes run one plugin instance each and share the file,
-coordinated by a single `distill_lease` row in the `meta` table (holder, heartbeat,
-30s TTL); only the lease holder writes, stale leases are taken over on expiry, and
-per-session writes are transactional so readers never see half a session. The
-tier-1 card runtime reloads lazily off a `cards_rev` counter the distiller bumps
-after every write. Bumping it is how a store change becomes visible to a live
-query; forget the bump and the reader serves a stale snapshot until its time-gated
-refresh fires.
+coordinated by a single `distill_lease` row in `meta` (holder, heartbeat, 30s TTL,
+plus the writer's build/gen for diagnosis); only the lease holder writes, stale
+leases are taken over on expiry, and per-session writes are transactional so readers
+never see half a session. Two revision counters drive lazy reader reloads and they
+are NOT interchangeable: the distiller bumps `cards_rev` after every lexical write
+(the tier-1 runtime watches it), while `writeCardEmbeddings` bumps `vectors_rev`
+instead, because vectors are invisible to the lexical index, so bumping `cards_rev` for
+them would churn every reader for nothing. Forget the right bump and the reader
+serves a stale snapshot until its time-gated refresh fires.
+
+## Embedding representation changes MUST ride a schema bump
+
+`EMBED_REPRESENTATION` in `embedding-text.ts` is a monotonic integer stamping what a
+persisted card vector _means_: the projection `embeddingTextOf` builds, the model,
+and how vectors are compared. It folds into the vector stamp (`meta.semantic_model`
+= `model:gen`) and into each row's `embedding_gen`. **Any change to representation
+semantics must bump `SCHEMA_VERSION` (store.ts) in the same change-set.** This is a
+scar, not a style preference: `rep4` changed the projection without a schema bump, so
+it slipped past the store's version fence. A rep3 build and a rep4 build shared one
+store, raced the global `semantic_model` stamp, and each cleared and rewrote every
+vector to its own representation on a loop. The schema bump fences the older build out
+of the lease and all writes (a newer stamp makes its `openStore` return null, so that
+process degrades to cards-lite); the per-row `embedding_gen` guard
+(`embedding_gen IS NULL OR embedding_gen <= gen`, plus a wholesale reject of any
+lower-`gen` write, so an old build can never downgrade a newer vector) is the belt
+for same-schema drift. Bump both together.
+
+Mixed builds are diagnosable, not silent: the lease and every `coverage.semantic`
+carry a `pluginVersion` build tag (`schema{N}.gen{M}`, derived from `SCHEMA_VERSION`
+and `EMBED_REPRESENTATION`), so one lease read or one tool response shows which build
+wrote what.
+
+## The summarizer only runs while holding the distill lease
+
+Path B summaries (`summarize.ts`) are not an independent loop. The distiller drives
+them. `onColdPassDone` kicks the first pass and `onSessionDistilled` queues cards,
+both only while this process holds the lease, and every persisted summary write checks
+`leaseHeld()` first. All summary work drains through one serialized queue (at most one
+prompt in flight). So if the lease moves to another process, summaries move with it: a
+non-holder queues nothing and writes nothing. The throwaway worker sessions it prompts
+are titled `[recall-summarizer]` (the `SUMMARIZER_SENTINEL`) and are excluded from
+every recall path by `isSummarizerTitle`; a crashed holder's orphaned workers are
+swept best-effort on the next holder's startup, never adopted. If you add a summary
+write path, gate it on the lease or two processes will double-write.
 
 ## `session.messages` without a `limit` is the incident path
 

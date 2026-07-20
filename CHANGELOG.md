@@ -4,140 +4,139 @@ All notable changes to this project are documented here. This project follows
 [Conventional Commits](https://www.conventionalcommits.org/) and
 [Semantic Versioning](https://semver.org/).
 
-## Unreleased
+## 2.0.0 (unreleased)
 
-Round-2 dogfooding fixes (see `docs/plans/recall-dogfooding-round2-fixes.md`):
-
-- **Full-history discovery.** The opencode server defaults session lists to
-  100 rows; recall now always requests an explicit discovery limit (10,000),
-  so "all history" searches actually sweep all history instead of the 100
-  most-recently-updated sessions. Filling the window reports
-  `limitedBy: providerLimit` plus a warning. Prewarm warms the same window.
-- **Delegation-tree exclusion.** `excludeCurrentSession` now excludes the
-  current session's whole subagent family (ancestors, siblings, and
-  transitive children via `parentID`), so evaluation subagents that restate
-  the query can no longer take over the top ranks.
-- **Expansion input cap.** Tool inputs inside `expand` output are budgeted
-  (2,000 serialized chars per part, charged against the part budget);
-  oversized inputs truncate with the standard marker instead of leaking
-  50 KB file writes past every budget. Self-tool redaction drops inputs too.
-- **`web-fetch` evidence class.** Output-side matches on fetch-shaped tools
-  (`webfetch`/`fetch`/`scrape`/`crawl`/`search`/`extract`, suffix-matched)
-  classify as fetched reference material: ×0.85 ranking multiplier and a
-  2-hit cap in the top slice. Input-side matches on the same tools remain
-  `tool-input` — asking to scrape a URL is the recorded action.
-- **Code-token boundaries.** The code-token regex is boundary-anchored, so
-  "OpenCode" no longer yields a literal-search suggestion for "penCode".
-- **Representative tolerance** loosened 0.85 → 0.7 so the evidence-class
-  utility ordering can act when `topEvidence` holds stronger material.
-- **`recall_sessions` digests.** Sessions warm in the corpus cache include a
-  content-derived `digest` (best-effort; the browse tool never fetches), so
-  a misleading title is no longer the only signal.
-
-This release is about retrieval efficiency: making one or two `recall` calls
-sufficient for "how did we do X before" queries instead of seven progressively
-narrower ones. Search is now complete over the eligible scope (an in-memory
-corpus cache replaces the per-query candidate budgets that silently dropped
-old sessions), the asker's own conversation and generated reference material
-stop crowding out real history, and grouped results expose the evidence that
-made a session useful. One release note is breaking: the search output shape
-was consolidated.
+This is the architecture rewrite. Through 0.12.x, `recall` answered a query by
+fetching session history over the SDK into process memory and scanning it there.
+That search was complete, but its cost scaled with the size of your history: on a
+real store (about 4,700 sessions, 2.76GB of parts) a broad "how did we do X
+before" query climbed into multiple gigabytes of memory and ran for minutes, and
+two such queries became live incidents. 2.0 inverts the model. A background
+distiller builds a small derived index (per-session cards, a slim full-text index
+over the human layer, optional semantic vectors and LLM summaries) in a local
+SQLite file; a query ranks cards in milliseconds, checks the index for an exact
+identifier, then drills only the top handful of sessions through bounded paginated
+fetches. The retrieval contract changed with it, from exhaustive scanning to
+bounded precision-first retrieval with honest coverage reporting, so several tool
+signatures and the search output shape changed. The store is derived and safe to
+delete; opencode's database stays the sole source of truth, reached only through
+the SDK.
 
 ### Breaking
 
-- **Global- and project-scope searches exclude the current session by
-  default.** Broad "how did we do this before" queries used to be won by the
-  conversation that asked them — it repeats the query terms verbatim and gets
-  the recency boost. Callers who want in-session hits pass
-  `excludeCurrentSession: false` (or `scope: "session"`, which always searches
-  it); the default never applies when a specific `sessionID` is targeted, and
-  a new `excludeSessionID` parameter excludes any one session by ID. Zero-result
-  responses name the exclusion in their suggestions so the lever is
-  discoverable.
-- **Search output shape consolidated.** The consumer is a model reading JSON;
-  redundant fields cost tokens on every response. Top-level `scanned` is
-  removed (use `coverage.sessionsSearched`); top-level `loadErrorCount` /
-  `loadErrors` are folded into `coverage.loadErrors: { count, samples }`;
-  result-level `directoryRelevance` now lives only under `why`; and
-  `degradeKind: "budget"` is gone (unreachable now that candidate budgets no
-  longer exist). Nothing else about `results` entries changed.
-- **Coverage counts are content-honest.** `messagesSearched` / `partsSearched`
-  now count messages/parts with searchable content that passed the filters,
-  instead of everything scanned before text extraction (which inflated
-  `partsSearched` with unsearchable parts).
+- **`recall_messages` is cursor-paginated.** The `offset`, `reverse`, and `total`
+  fields are gone. Pass `cursor` from a prior page's `nextCursor` to walk further
+  back; the response carries `pagination: { limit, returned, hasMore, nextCursor }`.
+  Every page is a bounded newest-first fetch, so browsing a huge session no longer
+  reads it whole.
+- **The `sessions` recall argument is renamed `sessionLimit`.** The numeric cap on
+  how many sessions a query drills into is now `sessionLimit` (still bounded by the
+  `maxSessions` option). `sessions` is repurposed as an explicit session-id array:
+  without `deep`, drill exactly those; with `deep`, the sweep scope.
+- **Regular search no longer sweeps tool outputs across all history.** Outputs are
+  searched inside the sessions a query drills into; a global output sweep is now an
+  explicit, scope-required `deep: true` mode (see Added). Conversation text,
+  reasoning, tool-input commands, and titles are still searched across all history.
+- **Global- and project-scope searches exclude the current session by default,**
+  along with its subagent family. The asking conversation repeats the query terms
+  and used to win its own "how did we do this before" search. Pass
+  `excludeCurrentSession: false` (or `scope: "session"`) to include it;
+  `excludeSessionID` excludes any one session by id.
+- **Search output shape.** Coverage gained `cards`, `semantic`, and `deep` blocks
+  and a top-level `nextCursor` for deep continuation. The earlier consolidation
+  still holds: top-level `scanned` / `loadErrorCount` / `loadErrors` are folded into
+  `coverage` (`sessionsSearched`, `loadErrors: { count, samples }`), result-level
+  `directoryRelevance` lives only under `why`, and `degradeKind: "budget"` is gone.
 
 ### Added
 
-- **Incremental in-memory corpus cache.** Each session's searchable text is
-  built once per session version (keyed by update time) instead of re-fetched
-  and re-tokenized on every query. OpenCode's database stays the sole source
-  of truth; the cache is LRU-bounded by the new `cacheMaxChars` option
-  (default 50 million chars), and eviction only ever costs latency, never
-  results. This removes the per-query candidate budgets and their scan-order
-  truncation — a rare term in the oldest session is now found regardless of
-  history size. A new `prewarm` option (default off) syncs the cache at plugin
-  startup so the first search starts warm.
-- **Evidence classes.** Every hit is classified deterministically
-  (`human-text`, `tool-input`, `tool-output`, `reasoning`, `file-read`,
-  `skill-definition`, `session-title`) and the class is reported in
-  `why.evidenceClass`. Ranking boosts concrete actions (tool inputs) and
-  penalizes generated reference material (skill payloads, file reads), so a
-  60-char command line beats a 20,000-char skill body that mentions the same
-  terms. Final part-mode slices cap reference material (one skill-definition,
-  two file-read) and guarantee a tool-input hit for command-like queries.
-- **Grouped results carry their evidence.** Session-grouped results include
-  `evidenceKinds` (the classes seen in that session) and up to two
-  `topEvidence` snippets of other classes, and the representative hit is
-  chosen by class priority among near-best scores — a workflow session is
-  represented by its commands, not by the skill payload that happened to
-  score highest.
-- **Two-stage session-first search.** Smart/fuzzy queries shortlist sessions
-  whose title, directory, or digest overlaps the query, then re-rank the
-  shortlist's content with its own BM25 index (shortlist-local IDF), merged
-  with the broad pass. Code-like tokens (`deploy.yaml`, `launchTerminal`,
-  `GHOSTAUTH_LIVE_TUI`) are extracted from the query and boosted on verbatim
-  match. With `explain: true`, a new `queryPlan` field records which
-  strategies ran.
-- **Session digests.** At cache fill, each session gets a content-derived
-  digest: the head of its first user message plus its most characteristic
-  action vocabulary, built only from statements and commands — file reads and
-  skill payloads earn no credit. The digest is indexed alongside title and
-  directory, so ranking can find the right session even when its title is
-  misleading.
-- **Opt-in local semantic layer.** With `semantic: true`, smart/fuzzy ranking
-  blends in cosine similarity from local static embeddings
-  (`minishlab/potion-base-8M` by default, ~30 MB, downloaded once to
-  `~/.cache/opencode-session-recall/models/` on first use). Searches stay
-  lexical-only until the model warms, and any failure degrades to
-  lexical-only. Off by default; nothing is downloaded unless enabled. New
-  options: `semantic`, `semanticWeight`, `semanticModel`.
-- **Composition-aware suggestions.** Guidance now reacts to what came back:
-  top hits dominated by the current session, or by generated reference
-  material, shortlisted-but-unranked sessions, exact code tokens under a
-  ranked search, and high-`hitCount` grouped results each get a concrete
-  next call.
+- **Distill-then-search pipeline and derived store.** A background distiller reads
+  history once through the SDK and writes a versioned SQLite store
+  (`~/.cache/opencode-session-recall/store-v1.db`): one card per session plus a slim
+  FTS index over the human layer (conversation, reasoning, tool-input commands,
+  titles). The first cold pass walks every session and checkpoints as it goes;
+  opencode's idle events drive incremental updates after that. The store uses the
+  runtime's built-in SQLite (`bun:sqlite`, `node:sqlite` for tests), so it adds no
+  npm dependency, and degrades to in-memory metadata cards when no driver is present.
+- **Deep mode.** `deep: true` sweeps every part of a scoped session set, tool
+  outputs included, for a needle no card or slim-index row points at. It requires
+  scope (a `sessions` list, or a lower time bound plus a project/directory filter); a
+  global unscoped deep is rejected. It runs under char and wall-clock budgets and
+  returns a `nextCursor` you pass back as `deepCursor` to resume where coverage
+  stopped. `coverage.deep` reports sessions covered, partial, and remaining.
+- **`project` filter.** `recall`'s new `project` argument scopes to the current
+  project (`true`) or to a named project directory (a path), alongside the existing
+  `directory` filter.
+- **`recall_sessions` enrichment.** When a distilled card exists for a listed
+  session, its entry gains a content `digest`, its top `files` and `tools`, and a
+  `family` rollup (child count) for root sessions. New `since` / `until` arguments
+  filter by last-updated time, resolved from the recency-complete cards when a store
+  is present.
+- **Opt-in local semantic layer.** `semantic: true` blends cosine similarity from
+  local static embeddings into card ranking. Vectors embed a natural-language
+  projection of each card (identifiers split into words), persist lazily with a
+  representation generation, reserve `semanticSlots` (default 2) drill slots for the
+  top pure-semantic cards, and rescue a semantically-surfaced session that yields no
+  lexical hit. A substantive-content floor denies a vector to content-free cards so
+  they cannot become project-identity attractors. `coverage.semantic` reports
+  readiness, model, weight, vector count, contribution, and the `representation` /
+  `pluginVersion` diagnostics. Options: `semantic`, `semanticWeight`,
+  `semanticModel`, `semanticSlots`.
+- **Opt-in LLM card summaries.** A new `summaries` option runs your own cheap model
+  over card fields to write a short summary per session, then folds it into the
+  lexical card index, the semantic embedding text, the `recall_sessions` digest, and
+  the proactive-hook payloads. It spends your tokens and is off by default; configure
+  it as `{ enabled, model, agent?, maxPromptsPerPass? }`. Cost is bounded by
+  construction: a throwaway worker session per batch, one prompt in flight, a
+  content-hash skip, a per-pass prompt budget, a per-prompt timeout, and a
+  consecutive-failure latch. Point `agent` at a deny-all opencode agent for an
+  enforced tool block.
+- **Multi-process safety.** Several opencode processes share one store safely. A
+  schema stamp fences out a build that would misread the format (a newer schema makes
+  the plugin degrade rather than misread); persisted vectors carry a write generation
+  so an older build cannot downgrade a newer one; and a single-writer lease
+  (`distill_lease`, 30s TTL, heartbeated) keeps exactly one distiller writing while
+  readers reload off revision counters.
+- **New options.** `storePath`, `coldPass`, `drillSessions`, `drillPageMessages`,
+  `drillCharsPerSession`, `drillCharsPerQuery`, `deepCharsPerQuery`,
+  `distillConcurrency`, `distillDelayMs`, `ftsRowsPerSession`, `inventoryTokens`,
+  `semanticSlots`, and the `semantic` / `summaries` families above. `cacheMaxChars`
+  is retained but repurposed (see Changed).
+- **Evidence classes and grouped-result evidence.** Every hit is classified
+  (`human-text`, `tool-input`, `tool-output`, `reasoning`, `file-read`, `web-fetch`,
+  `skill-definition`, `session-title`) and reported in `why.evidenceClass`. Ranking
+  prefers concrete actions over generated reference material, and session-grouped
+  results carry `evidenceKinds` and up to two `topEvidence` snippets of other classes.
+- **Composition-aware suggestions.** Guidance reacts to what came back: hits
+  dominated by the current session or by generated reference material,
+  shortlisted-but-unranked sessions, exact code tokens under a ranked search, and
+  high-`hitCount` grouped results each get a concrete next call.
 
 ### Changed
 
-- **Expansion budgets are allocated per part.** One oversized tool dump can no
-  longer eat the whole expansion budget: each part is capped at 6,000 chars
-  within the total, and when the matched part itself is truncated, the region
-  around the match is preserved instead of head-slicing it away.
-- **Expansion fetches on demand.** Expanded sessions' messages are fetched
-  only when expansion runs, instead of riding on a bulk load of everything
-  searched.
-- Auto-recall's own injected `<recall-auto>` blocks are no longer searchable,
-  so a prior injection can't be found by later searches.
+- **Proactive hooks are card-based.** `autoRecall` and `compactionRecall` query the
+  card tier directly and make zero message fetches, so they add no measurable
+  latency. `autoRecall` injects the top cited cards on a cue-matching message;
+  `compactionRecall` preserves the session's own card (focus, outcome, errors,
+  identifiers, files) into the compaction summary.
+- **`recall_context` and inline expansion are bounded.** A context window is
+  assembled from bounded newest-first pages, never a whole-session load, and reports
+  `hasMoreBefore` / `hasMoreAfter` at boundaries. Expansion is budgeted per part
+  (6,000 chars each) and keeps the region around a truncated match.
+- **`cacheMaxChars` is repurposed** as the drilled-session LRU budget (default 24
+  million chars) that keeps repeat and refined queries warm, no longer a full-corpus
+  cache.
+- **`prewarm` is a no-op.** The card store persists across processes, so there is
+  nothing to prewarm. The option is retained so existing configs do not error.
 
 ### Removed
 
-- The auto-recall 200-session scan cap. The hook now searches the full scope
-  through the shared corpus cache; its 1.5-second wall-clock timeout remains
-  the safety valve.
-- The per-query candidate budgets (`maxCandidatesTotal`,
-  `maxCandidatesPerSession`, `maxCharsTotal`, `maxMessagesPerSession`,
-  `maxPartsPerSession`) and their scan-order truncation. `cacheMaxChars` and
-  the per-candidate 20,000-char cap are the remaining size controls.
+- The fetch-and-scan corpus model and its per-query candidate budgets
+  (`maxCandidatesTotal`, `maxCandidatesPerSession`, `maxCharsTotal`,
+  `maxMessagesPerSession`, `maxPartsPerSession`). Selection is now card ranking plus
+  the slim index, and drilling is bounded and paginated.
+- `recall_messages` `offset` / `reverse` / `total`, and the numeric `recall`
+  `sessions` argument (renamed `sessionLimit`). See Breaking.
 
 ## 0.12.1
 
