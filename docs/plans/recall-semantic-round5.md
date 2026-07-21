@@ -123,6 +123,26 @@ B, and record ranks in this doc.
   All existing opencode processes must restart once before B and the
   post-restart mixed-version guarantees can be evaluated.
 
+- 2026-07-21, Path B live (final measurement): after restart-all, the lease moved
+  to a 2.0 build and the Haiku pass summarized 4,349 of 4,737 cards in one
+  budgeted run (~315 prompts, foreground queries observably pausing it);
+  summaries are genuinely descriptive prose; vectors recomputed to the
+  summary-led projection (4,626 live). The four hard paraphrases, measured:
+  (1) "pseudo-terminal testing real host" rank 7 with a related probe at rank 2;
+  (2) "PTY harness inside interactive host" absent, top-12 now dominated by
+  other projects' genuine PTY sessions; (3) "test plugin interactively" absent,
+  top-12 plugin test/review sessions; (4) "how did we test the plugin
+  interactively" absent, top-12 all ghostauth TUI planning/test sessions.
+  Conclusion: summaries raised the whole corpus's semantic signal, so
+  near-misses became relevant neighbors instead of noise, but the three
+  remaining misses are genuinely ambiguous queries at 4,700-session scale
+  (their top results are legitimate matches for the words used), and the 8M
+  static embedder cannot do the last pty-to-tuistory bridging. The workflow
+  answer stands: one broad query to find the neighborhood, one narrowed query
+  (add the project or tool word) to pin the session; adding "ghostauth" or
+  "tuistory" ranks the implementation first. Future lever if wanted: a larger
+  embedding model via semanticModel, config-only.
+
 ## Out of scope
 
 Embedding-model upgrades, upstream completion-endpoint requests, summarizing with the
