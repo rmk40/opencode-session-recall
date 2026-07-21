@@ -1,31 +1,29 @@
-import type { Hooks, ToolContext, ToolDefinition } from "@opencode-ai/plugin";
-import type { OpencodeClient, Part } from "@opencode-ai/sdk/v2";
-import type { Limits, SearchOutput, SearchResult } from "../types.js";
-import { search } from "../search.js";
+import type { Hooks } from "@opencode-ai/plugin";
+import type { Part } from "@opencode-ai/sdk/v2";
+import type { SearchDeps } from "../search.js";
+import { cardRecall, type CardRecallHit } from "./card-recall.js";
 import { partId } from "./part-id.js";
 
 /**
  * R1b — gated automatic recall on `chat.message`.
  *
  * On each user message, a cheap trigger check decides whether to run a bounded
- * recall. If it fires and finds high-confidence hits, a compact cited synthetic
- * text part is appended to the message parts so the model sees the lead inline
- * (verified injection shape from opencode core: session/prompt.ts uses
+ * recall. Round 4 makes this a pure CARD-TIER query (see {@link cardRecall}):
+ * no drill, no `session.messages` fetch. If the gate fires and cards match, a
+ * compact cited synthetic text part is appended so the model sees the lead
+ * inline (verified injection shape from opencode core: session/prompt.ts uses
  * `{ type: "text", synthetic: true, text }`).
  *
- * Opt-in (default off) because it adds latency on the message critical path and
- * injects content into context. Everything here is defensive: it never throws,
- * and it does nothing when the gate does not fire or the search is empty.
+ * Opt-in (default off) because it injects content into context. Everything here
+ * is defensive: it never throws, and it does nothing when the gate does not fire
+ * or the cards yield nothing.
  */
 
 const MAX_AUTO_HITS = 3;
 const MAX_AUTO_BLOCK_CHARS = 900;
 const MAX_QUERY_CHARS = 120;
 const MIN_MESSAGE_CHARS = 12;
-/** Hard wall-clock cap on the inline auto-recall search (critical path). */
-const SEARCH_TIMEOUT_MS = 1500;
-/** Bound how many sessions auto-recall will scan (history default is unbounded). */
-const AUTO_SESSION_CAP = 200;
+const SUMMARY_SLICE_CHARS = 140;
 
 /**
  * Deictic / history cues. Word-boundary, case-insensitive. Tight on purpose so
@@ -113,22 +111,41 @@ function relativeDate(time: number): string {
   return months === 1 ? "1 month ago" : `${months} months ago`;
 }
 
-/** Format the cited synthetic block. Bounded by hit count and total chars. */
-export function formatAutoRecallBlock(results: SearchResult[]): string | undefined {
-  const hits = results.slice(0, MAX_AUTO_HITS);
-  if (hits.length === 0) return undefined;
+function dirTail(directory: string): string {
+  const trimmed = directory.replace(/[/\\]+$/, "");
+  const slash = Math.max(trimmed.lastIndexOf("/"), trimmed.lastIndexOf("\\"));
+  return slash >= 0 ? trimmed.slice(slash + 1) : trimmed;
+}
+
+/**
+ * Format the cited synthetic block from card hits. Each line carries the card's
+ * title, age, session id, a summary-head slice, and any matched anchors —
+ * everything the card already holds, no fetch. Bounded by hit count and chars.
+ */
+export function formatAutoRecallBlock(hits: CardRecallHit[]): string | undefined {
+  const top = hits.slice(0, MAX_AUTO_HITS);
+  if (top.length === 0) return undefined;
 
   const lines = [
     "<recall-auto>",
-    "Possibly relevant prior history (auto-recall; verify before relying on it):",
+    "Possibly relevant prior sessions (auto-recall; verify before relying on it):",
   ];
-  for (const r of hits) {
-    const title = r.sessionTitle?.trim() || "(untitled session)";
-    const id8 = r.sessionID.slice(0, 8);
-    const snippet = (r.snippet ?? "").replace(/\s+/g, " ").trim();
-    lines.push(`- [${title} · ${relativeDate(r.time)} · session ${id8}] ${snippet}`);
+  for (const { card, anchors } of top) {
+    const title = card.title.trim() || "(untitled session)";
+    const id8 = card.sessionId.slice(0, 8);
+    const dir = dirTail(card.directory);
+    // Prefer the LLM summary (Path B) over the mechanical summary head.
+    const summary = (card.nlSummary || card.summaryHead)
+      .replace(/\s+/g, " ")
+      .trim()
+      .slice(0, SUMMARY_SLICE_CHARS);
+    const anchorNote = anchors.length > 0 ? ` (anchors: ${anchors.join(", ")})` : "";
+    const dirNote = dir ? ` [${dir}]` : "";
+    lines.push(
+      `- [${title} · ${relativeDate(card.timeUpdated)} · session ${id8}]${dirNote} ${summary}${anchorNote}`,
+    );
   }
-  lines.push("Use recall_get / recall_context for full detail.");
+  lines.push("Use recall / recall_get for full detail.");
   lines.push("</recall-auto>");
 
   let block = lines.join("\n");
@@ -139,83 +156,20 @@ export function formatAutoRecallBlock(results: SearchResult[]): string | undefin
   return block;
 }
 
-/**
- * Run the recall search tool with conservative auto-recall parameters and a
- * wall-clock bound. `chat.message` is awaited inline before the model runs, so
- * an unbounded search would stall every user turn.
- *
- * `Promise.race` against the timeout means the hook resolves promptly once
- * control returns to the event loop after ~SEARCH_TIMEOUT_MS — it cannot
- * preempt synchronous work that is currently blocking the loop. The aborted
- * controller stops the search's own work at the next checkpoint: between async
- * session-load batches, and between sessions during synchronous candidate
- * building (smartScan also checks the wall-clock deadline there). A single
- * in-flight synchronous BM25 exec can't be interrupted, but the candidate/char
- * budgets bound it. We also cap the session scan (history default is unbounded).
- */
-async function runAutoSearch(
-  searchTool: ToolDefinition,
-  query: string,
-  input: { sessionID: string },
-): Promise<SearchResult[]> {
-  const controller = new AbortController();
-  const ctx = {
-    sessionID: input.sessionID,
-    messageID: "auto-recall",
-    agent: "auto-recall",
-    abort: controller.signal,
-    metadata: () => {},
-    ask: async () => undefined,
-  } as unknown as ToolContext;
-
-  // One timer both aborts the scan and resolves the race, cleared in finally.
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  const timeout = new Promise<undefined>((resolve) => {
-    timer = setTimeout(() => {
-      controller.abort();
-      resolve(undefined);
-    }, SEARCH_TIMEOUT_MS);
-  });
-  try {
-    const exec = searchTool.execute(
-      {
-        query,
-        match: "smart",
-        group: "session",
-        scope: "global",
-        results: MAX_AUTO_HITS,
-        sessions: AUTO_SESSION_CAP,
-      } as Parameters<typeof searchTool.execute>[0],
-      ctx,
-    );
-    const raw = await Promise.race([exec, timeout]);
-    if (raw === undefined) return [];
-    const parsed = JSON.parse(raw) as SearchOutput | { ok: false };
-    if (!("ok" in parsed) || !parsed.ok) return [];
-    return parsed.results ?? [];
-  } finally {
-    if (timer) clearTimeout(timer);
-  }
-}
-
-export function autoRecall(
-  client: OpencodeClient,
-  unscoped: OpencodeClient,
-  global: boolean,
-  limits: Limits,
-): NonNullable<Hooks["chat.message"]> {
-  const searchTool = search(client, unscoped, global, limits);
-
+export function autoRecall(deps: SearchDeps): NonNullable<Hooks["chat.message"]> {
   return async (input, output) => {
     try {
       const parts = (output.parts ?? []) as TextLikePart[];
       const decision = shouldAutoRecall(parts);
       if (!decision.run) return;
 
-      const results = await runAutoSearch(searchTool, decision.query, {
-        sessionID: input.sessionID,
+      // Pure card-tier query — no drill, no message fetch. The current session
+      // and its family are excluded so auto-recall never cites the live turn.
+      const hits = cardRecall(deps, decision.query, {
+        limit: MAX_AUTO_HITS,
+        filters: { excludeFamilyOf: input.sessionID },
       });
-      const block = formatAutoRecallBlock(results);
+      const block = formatAutoRecallBlock(hits);
       if (!block) return;
 
       // The hook fires after core's assign() has filled ids on the original

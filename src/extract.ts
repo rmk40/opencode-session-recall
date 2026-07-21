@@ -5,30 +5,94 @@ import type {
   AssistantMessage,
   UserMessage,
 } from "@opencode-ai/sdk/v2";
-import { TOOLS, type PartOutput, type MessageItem, type ResultWhy } from "./types.js";
+import {
+  TOOLS,
+  type EvidenceClass,
+  type PartOutput,
+  type MessageItem,
+  type ResultWhy,
+} from "./types.js";
 
 const INPUT_SEARCH_LIMIT = 10_000;
-const SELF = new Set<string>(TOOLS);
 /** Separators a host may use when namespacing a tool (e.g. `mcp__server__recall`,
  *  `opencode-session-recall_recall`, `provider.recall`). */
 const SELF_BOUNDARY = /[._/-]$/;
 export type SearchableField = { field: ResultWhy["matchedFields"][number]; text: string };
 
 /**
+ * Whether a tool name is `base` or a host-namespaced variant of it (e.g.
+ * `mcp__server__read`, `provider.read`). Requires a separator before the
+ * suffix so an unrelated name such as `myread` does not match.
+ */
+export function toolNameMatches(toolName: string, base: string): boolean {
+  if (toolName === base) return true;
+  if (!toolName.endsWith(base)) return false;
+  const prefix = toolName.slice(0, toolName.length - base.length);
+  return prefix.length > 0 && SELF_BOUNDARY.test(prefix);
+}
+
+/**
  * Whether a tool-part's tool name is one of OUR recall tools, so its output is
  * never searchable by recall (prevents recall from finding prior recall
- * results). Matches the bare registered name and host-namespaced variants like
- * `mcp__opencode-session-recall__recall` — but requires a separator before the
- * suffix so an unrelated tool such as `myrecall` is not excluded.
+ * results). Matches the bare registered name and host-namespaced variants.
  */
 export function isSelfTool(toolName: string): boolean {
-  if (SELF.has(toolName)) return true;
-  for (const self of TOOLS) {
-    if (!toolName.endsWith(self)) continue;
-    const prefix = toolName.slice(0, toolName.length - self.length);
-    if (prefix.length > 0 && SELF_BOUNDARY.test(prefix)) return true;
+  return TOOLS.some((self) => toolNameMatches(toolName, self));
+}
+
+/** Title sentinel marking the Path B summarizer's worker session. Bracketed so
+ *  it is distinctive and unlikely to collide with a real session title. */
+export const SUMMARIZER_SENTINEL = "[recall-summarizer]";
+
+/**
+ * Whether a session title identifies our summarizer worker session, so it is
+ * never distilled, carded, searched, or listed (its prompts embed card digests —
+ * recall must not surface them). Substring match, mirroring the self-tool
+ * suffix-matching discipline: a host that prefixes/suffixes the title (e.g.
+ * `provider: [recall-summarizer] #3`) is still excluded.
+ */
+export function isSummarizerTitle(title: string | undefined | null): boolean {
+  return typeof title === "string" && title.includes(SUMMARIZER_SENTINEL);
+}
+
+const TOOL_INPUT_FIELDS = new Set<ResultWhy["matchedFields"][number]>([
+  "command",
+  "cwd",
+  "toolName",
+]);
+
+/** Fetch-shaped tool bases (suffix-matched): their OUTPUT is fetched
+ *  reference material. Order matters — the tool-input check runs first, so
+ *  an input-only match on a fetch/search tool still counts as the action it
+ *  records; toolInputTexts files the whole JSON input under the command
+ *  field, so a before-input check would swallow every fetch part. */
+const WEB_FETCH_BASES = ["webfetch", "fetch", "scrape", "crawl", "search", "extract"] as const;
+
+/**
+ * Deterministic evidence classification for a hit. Note the `command` scope:
+ * toolInputTexts() files the whole JSON input under the `command` matched
+ * field in addition to the specific command/cwd strings, so a tool part whose
+ * only match is inside its JSON input classifies as tool-input regardless of
+ * tool. That is intended — "matched in what was asked of the tool" — and it
+ * makes non-bash tool invocations count as actions.
+ */
+export function evidenceClassFor(
+  partType: string,
+  toolName: string | undefined,
+  matchedFields: ResultWhy["matchedFields"],
+): EvidenceClass {
+  if (partType === "title") return "session-title";
+  if (partType === "reasoning") return "reasoning";
+  if (partType !== "tool") return "human-text";
+  if (toolName && toolNameMatches(toolName, "skill")) return "skill-definition";
+  if (toolName && toolNameMatches(toolName, "read")) return "file-read";
+  if (matchedFields.length > 0 && matchedFields.every((field) => TOOL_INPUT_FIELDS.has(field))) {
+    return "tool-input";
   }
-  return false;
+  if (toolName && WEB_FETCH_BASES.some((base) => toolNameMatches(toolName, base))) {
+    return "web-fetch";
+  }
+  return "tool-output";
 }
 
 function input(val: unknown): string {
@@ -64,6 +128,16 @@ export function searchableFields(part: Part): SearchableField[] {
   if (part.type === "tool" && isSelfTool(part.tool)) return [];
   switch (part.type) {
     case "text":
+      // Auto-recall injects synthetic <recall-auto> text parts that restate
+      // query-like terms; indexing them would let recall find its own prior
+      // injections. Only our sentinel is excluded — other synthetic parts
+      // (e.g. host-injected context) stay searchable.
+      if (
+        (part as { synthetic?: boolean }).synthetic === true &&
+        part.text?.startsWith("<recall-auto>")
+      ) {
+        return [];
+      }
       return part.text ? [{ field: "text", text: part.text }] : [];
     case "reasoning":
       return part.text ? [{ field: "reasoning", text: part.text }] : [];

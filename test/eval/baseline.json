@@ -1,5 +1,5 @@
 {
   "mrr": 1.0,
   "recallAt5": 1.0,
-  "_note": "Recorded from the BM25 (MiniSearch) ranker. The prior Fuse.js ranker scored MRR 0.5 / recall@5 0.5 on these cases. New ranking engines must meet or beat these numbers. Update only intentionally, explaining why in the change-set."
+  "_note": "Recorded from the distill-then-search ranker over 17 rank-scored cases (8 original + 5 field-report + 4 round-4 tier probes: tier-1 inventory needle, tier-1.5 FTS needle, and since/until temporal filters). All 17 hit rank 1, so the aggregate stays MRR 1.0 / recall@5 1.0. The output-only honest-miss/deep-hit pair and the virgin degraded-mode case are asserted directly in relevance.test.ts (negative/degraded, not rank-scored). The prior Fuse.js ranker scored MRR 0.5 / recall@5 0.5 on the original 8. New ranking engines must meet or beat these numbers. Update only intentionally, explaining why in the change-set."
 }

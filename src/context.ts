@@ -9,8 +9,14 @@ import {
   type Limits,
 } from "./types.js";
 import { formatMsg } from "./extract.js";
+import { fetchMessageWindow } from "./fetch-window.js";
+import type { FetchGate } from "./fetch-gate.js";
 
-export function context(client: OpencodeClient, limits: Limits): ToolDefinition {
+/** Never fetch more than this many messages while locating a context window —
+ *  the safety valve that keeps an old target in a giant session bounded. */
+const MAX_CONTEXT_FETCH = 200;
+
+export function context(client: OpencodeClient, gate: FetchGate, limits: Limits): ToolDefinition {
   return tool({
     description: `Get messages around a recall hit to see what was asked before, what happened after, and whether the approach worked. Use recall_get for only the single message.
 
@@ -53,33 +59,39 @@ If memory exists, store only durable findings surfaced here; skip ephemeral deta
       const na = args.after == null ? window : coerceInt(args.after, window, 0, limits.maxWindow);
 
       try {
-        const resp = await client.session.messages({
-          sessionID: sessionID,
-        });
-        if (resp.error) {
-          const err: ErrorOutput = { ok: false, error: errmsg(resp.error) };
+        // Bounded newest-first pagination — never an unpaginated whole-session
+        // fetch. Page size covers the requested window in one page for ordinary
+        // sessions; the cap bounds the worst case.
+        const pageMessages = Math.min(
+          limits.maxMessages,
+          Math.max(nb + na + 1, Math.min(25, limits.maxMessages)),
+        );
+        const window = await fetchMessageWindow(
+          client,
+          {
+            sessionID,
+            messageID,
+            before: nb,
+            after: na,
+            pageMessages,
+            maxMessages: MAX_CONTEXT_FETCH,
+          },
+          (fn) => gate.runQuery(fn),
+        );
+        if (window.loadError) {
+          const err: ErrorOutput = { ok: false, error: window.loadError };
           return JSON.stringify(err);
         }
-        if (!resp.data) {
+        if (window.fetched === 0) {
           const err: ErrorOutput = { ok: false, error: "No messages returned" };
           return JSON.stringify(err);
         }
-
-        const msgs = resp.data;
-        const idx = msgs.findIndex((m) => m.info.id === messageID);
-        if (idx === -1) {
-          const err: ErrorOutput = {
-            ok: false,
-            error: `Message not found: ${messageID}`,
-          };
+        if (window.centerIndex === -1) {
+          const err: ErrorOutput = { ok: false, error: `Message not found: ${messageID}` };
           return JSON.stringify(err);
         }
 
-        const start = Math.max(0, idx - nb);
-        const end = Math.min(msgs.length, idx + na + 1);
-        const slice = msgs.slice(start, end);
-
-        const items = slice.map((m) => {
+        const items = window.messages.map((m) => {
           const item = formatMsg(m);
           return { ...item, center: m.info.id === messageID };
         });
@@ -87,7 +99,7 @@ If memory exists, store only durable findings surfaced here; skip ephemeral deta
         let title: string | undefined;
         let directory: string | undefined;
         try {
-          const sess = await client.session.get({ sessionID: sessionID });
+          const sess = await gate.runQuery(() => client.session.get({ sessionID: sessionID }));
           if (sess.data) {
             title = sess.data.title;
             directory = sess.data.directory;
@@ -104,8 +116,8 @@ If memory exists, store only durable findings surfaced here; skip ephemeral deta
           ok: true,
           messages: items,
           context: { sessionTitle: title, directory },
-          hasMoreBefore: start > 0,
-          hasMoreAfter: end < msgs.length,
+          hasMoreBefore: window.hasMoreBefore,
+          hasMoreAfter: window.hasMoreAfter,
         };
         return JSON.stringify(out);
       } catch (e) {

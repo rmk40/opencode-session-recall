@@ -1,9 +1,32 @@
 import { describe, expect, it } from "vitest";
-import { buildCandidates, populateNormalized, type Candidate } from "../src/candidates.js";
-import { format, formatMsg, isSelfTool, pruned, searchable, snippet } from "../src/extract.js";
+import {
+  buildCandidates,
+  candidateEligible,
+  populateNormalized,
+  type Candidate,
+} from "../src/candidates.js";
+import {
+  evidenceClassFor,
+  format,
+  formatMsg,
+  isSelfTool,
+  pruned,
+  searchable,
+  snippet,
+  toolNameMatches,
+} from "../src/extract.js";
 import { parseQuery } from "../src/query.js";
 import { bm25Search } from "../src/bm25.js";
-import { smartSnippet } from "../src/snippet.js";
+import {
+  capAndSlice,
+  groupBySession,
+  truncateExpandedPart,
+  type ExpansionBudget,
+} from "../src/search.js";
+import type { PartOutput } from "../src/types.js";
+import { mergeShortlistHits, SHORTLIST_MULT } from "../src/rerank.js";
+import type { EvidenceClass, SearchResult } from "../src/types.js";
+import { smartSnippet, truncatePreservingMatch } from "../src/snippet.js";
 import { errmsg, optionalString } from "../src/types.js";
 import { normalize, splitCamelCase, tokenize } from "../src/normalize.js";
 import type { Part } from "@opencode-ai/sdk/v2";
@@ -66,6 +89,7 @@ describe("string and error helpers", () => {
       lower: 'find "exact phrase" exact "" phrase',
       tokens: ["exact", "phrase", "find"],
       phrases: ["exact phrase"],
+      codeTokens: [],
     });
   });
 });
@@ -272,6 +296,628 @@ function indexed(overrides: Partial<Candidate> & { rawText: string }): Candidate
   return c;
 }
 
+describe("evidence classification", () => {
+  it("maps part types, tool names, and matched fields to evidence classes", () => {
+    const rows: Array<{
+      partType: string;
+      toolName?: string;
+      fields: Parameters<typeof evidenceClassFor>[2];
+      expected: string;
+    }> = [
+      { partType: "title", fields: ["title"], expected: "session-title" },
+      { partType: "reasoning", fields: ["reasoning"], expected: "reasoning" },
+      { partType: "text", fields: ["text"], expected: "human-text" },
+      { partType: "subtask", fields: ["text"], expected: "human-text" },
+      { partType: "tool", toolName: "skill", fields: ["stdout"], expected: "skill-definition" },
+      // Host-namespaced variants classify the same way.
+      {
+        partType: "tool",
+        toolName: "mcp__server__read",
+        fields: ["stdout"],
+        expected: "file-read",
+      },
+      {
+        partType: "tool",
+        toolName: "provider.skill",
+        fields: ["stdout"],
+        expected: "skill-definition",
+      },
+      // Suffix without a separator is a different tool, not a match.
+      { partType: "tool", toolName: "myskill", fields: ["stdout"], expected: "tool-output" },
+      // Matched only in what was asked of the tool (incl. JSON input under
+      // the command field) => tool-input, regardless of tool.
+      { partType: "tool", toolName: "bash", fields: ["command"], expected: "tool-input" },
+      { partType: "tool", toolName: "bash", fields: ["command", "cwd"], expected: "tool-input" },
+      {
+        partType: "tool",
+        toolName: "custom-mcp-tool",
+        fields: ["command"],
+        expected: "tool-input",
+      },
+      // Fetch-shaped tools: OUTPUT matches are fetched reference material;
+      // input-only matches stay the action they record (ordering is
+      // load-bearing — the whole JSON input files under "command").
+      { partType: "tool", toolName: "webfetch", fields: ["stdout"], expected: "web-fetch" },
+      {
+        partType: "tool",
+        toolName: "mcp__firecrawl__firecrawl_scrape",
+        fields: ["stdout"],
+        expected: "web-fetch",
+      },
+      { partType: "tool", toolName: "web_search", fields: ["stdout"], expected: "web-fetch" },
+      { partType: "tool", toolName: "code_search", fields: ["command"], expected: "tool-input" },
+      {
+        partType: "tool",
+        toolName: "archive_extract",
+        fields: ["command"],
+        expected: "tool-input",
+      },
+      { partType: "tool", toolName: "research", fields: ["stdout"], expected: "tool-output" },
+      // Any output-side match makes it tool-output.
+      {
+        partType: "tool",
+        toolName: "bash",
+        fields: ["stdout", "command"],
+        expected: "tool-output",
+      },
+      { partType: "tool", toolName: "bash", fields: ["stderr"], expected: "tool-output" },
+      { partType: "tool", toolName: "bash", fields: [], expected: "tool-output" },
+    ];
+    for (const row of rows) {
+      expect(
+        evidenceClassFor(row.partType, row.toolName, row.fields),
+        `${row.partType}/${row.toolName ?? "-"}/${row.fields.join("+")}`,
+      ).toBe(row.expected);
+    }
+  });
+
+  it("toolNameMatches requires a separator boundary", () => {
+    expect(toolNameMatches("read", "read")).toBe(true);
+    expect(toolNameMatches("mcp__server__read", "read")).toBe(true);
+    expect(toolNameMatches("provider.read", "read")).toBe(true);
+    expect(toolNameMatches("myread", "read")).toBe(false);
+    expect(toolNameMatches("reader", "read")).toBe(false);
+  });
+
+  it("excludes synthetic <recall-auto> parts from search but keeps other synthetic text", () => {
+    const auto = {
+      id: "p1",
+      sessionID: "s",
+      messageID: "m",
+      type: "text",
+      text: "<recall-auto>\nPossibly relevant prior history\n</recall-auto>",
+      synthetic: true,
+    } as unknown as Part;
+    expect(searchable(auto)).toEqual([]);
+
+    const otherSynthetic = {
+      id: "p2",
+      sessionID: "s",
+      messageID: "m",
+      type: "text",
+      text: "host-injected context block",
+      synthetic: true,
+    } as unknown as Part;
+    expect(searchable(otherSynthetic)).toEqual(["host-injected context block"]);
+
+    const plain = {
+      id: "p3",
+      sessionID: "s",
+      messageID: "m",
+      type: "text",
+      text: "<recall-auto> quoted in ordinary user text",
+    } as unknown as Part;
+    expect(searchable(plain)).toHaveLength(1);
+  });
+});
+
+describe("query plan (codeTokens, shortlist, merge)", () => {
+  it("extracts code-like compound tokens verbatim", () => {
+    const rows: Array<[string, string[]]> = [
+      ["how did we test ghostauth", []],
+      ["find GHOSTAUTH_LIVE_TUI usage", ["GHOSTAUTH_LIVE_TUI"]],
+      ["call launchTerminal from the api", ["launchTerminal"]],
+      ["open deploy.yaml and opencode-multikey", ["deploy.yaml", "opencode-multikey"]],
+      ["path src/hooks/auto-recall.ts", ["src/hooks/auto-recall.ts"]],
+      ["abc a_b", []], // below the 4-char minimum
+      ["use OpenCode here", []], // PascalCase prose naming is not an anchor
+      ["deploy myVarName now", ["myVarName"]],
+      // Lookbehind blocks a match STARTING mid-word; a legitimate
+      // lowercase-led camelCase token still matches whole.
+      ["xOpenCode", ["xOpenCode"]],
+    ];
+    for (const [query, expected] of rows) {
+      expect(parseQuery(query).codeTokens, query).toEqual(expected);
+    }
+    expect(parseQuery("xOpenCode").codeTokens).not.toContain("penCode");
+  });
+
+  it("boosts verbatim code tokens over split-token equivalents", () => {
+    const candidates = [
+      indexed({ rawText: "note the ghostauth live tui lane here" }),
+      indexed({ rawText: "note the GHOSTAUTH_LIVE_TUI lane here" }),
+    ];
+    const ranked = bm25Search(candidates, parseQuery("GHOSTAUTH_LIVE_TUI"), "smart", true);
+    expect(ranked[0]?.candidate.rawText).toContain("GHOSTAUTH_LIVE_TUI");
+    expect(ranked[0]?.matchReasons.join(" ")).toContain("Exact code token");
+  });
+
+  it("treats bare acronyms as code tokens and dedupes repeats", () => {
+    expect(parseQuery("parse the JSON body").codeTokens).toEqual(["JSON"]);
+    expect(parseQuery("deploy.yaml then deploy.yaml again").codeTokens).toEqual(["deploy.yaml"]);
+  });
+
+  // (metadataShortlist / SHORTLIST_MAX tests removed: the tier-1 session
+  //  shortlist is now `cards.rank`, covered by test/cards.test.ts. The
+  //  shortlist-local-IDF deep-pass merge below still lives in rerank.ts.)
+
+  it("deep pass uses shortlist-local IDF (fails on a filter-only implementation)", () => {
+    // "needle" is common in the broad corpus (low IDF) but rare inside the
+    // shortlisted session s1. A second, shortlist-only index must score s1's
+    // needle doc higher relative to its own corpus than the broad pass did.
+    const shortlistDoc = indexed({
+      rawText: "needle appears here amid unique session context words",
+      sessionID: "s1",
+      partID: "s1-needle",
+    });
+    const shortlistOther = indexed({
+      rawText: "unique session context words about other matters entirely",
+      sessionID: "s1",
+      partID: "s1-other",
+    });
+    const broadNoise = Array.from({ length: 8 }, (_, i) =>
+      indexed({ rawText: `needle needle filler ${i}`, sessionID: `noise-${i}`, partID: `n-${i}` }),
+    );
+    const pool = [shortlistDoc, shortlistOther, ...broadNoise];
+    const query = parseQuery("needle context");
+
+    const broad = bm25Search(pool, query, "smart", false);
+    const deep = bm25Search([shortlistDoc, shortlistOther], query, "smart", false);
+    const broadRank = broad.findIndex((h) => h.candidate.partID === "s1-needle");
+    const deepRank = deep.findIndex((h) => h.candidate.partID === "s1-needle");
+    expect(deepRank).toBe(0);
+    // Merged list must respect the deep pass's local ordering for s1 parts.
+    const merged = mergeShortlistHits(broad, deep, false);
+    const mergedS1 = merged.filter((h) => h.candidate.sessionID === "s1");
+    expect(mergedS1[0]?.candidate.partID).toBe("s1-needle");
+    expect(broadRank).toBeGreaterThanOrEqual(0);
+  });
+
+  it("anchors deep scores to the broad ceiling and applies the multiplier once", () => {
+    const broad = [
+      {
+        candidate: candidate({ rawText: "a", partID: "pa", sessionID: "s1" }),
+        score: 0.4,
+        matchedTerms: [],
+        matchedFields: [],
+        evidenceClass: "human-text",
+        matchReasons: [],
+      },
+      {
+        candidate: candidate({ rawText: "b", partID: "pb", sessionID: "s2" }),
+        score: 1.0,
+        matchedTerms: [],
+        matchedFields: [],
+        evidenceClass: "human-text",
+        matchReasons: [],
+      },
+    ] as never[];
+    const deep = [
+      {
+        candidate: candidate({ rawText: "a", partID: "pa", sessionID: "s1" }),
+        score: 1.0,
+        matchedTerms: [],
+        matchedFields: [],
+        evidenceClass: "human-text",
+        matchReasons: [],
+      },
+    ] as never[];
+    const merged = mergeShortlistHits(broad as never, deep as never, false);
+    const pa = merged.find((h) => h.candidate.partID === "pa")!;
+    // Deep 1.0 anchored to the shortlist's broad ceiling (0.4) × 1.1 = 0.44,
+    // NOT 1.0 — a weak neighborhood cannot rocket to the global top.
+    expect(pa.score).toBeCloseTo(0.4 * SHORTLIST_MULT, 5);
+    const pb = merged.find((h) => h.candidate.partID === "pb")!;
+    expect(pb.score).toBe(1.0);
+  });
+
+  it("re-enters counterpart-less shortlist sessions at the relative floor", () => {
+    // s1's content was dropped from the broad list by MIN_RELATIVE_SCORE; the
+    // deep pass must bring it back anchored at floor level, not discard it
+    // and not let it rocket to the top.
+    const broad = [
+      {
+        candidate: candidate({ rawText: "b", partID: "pb", sessionID: "s2" }),
+        score: 1.0,
+        matchedTerms: [],
+        matchedFields: [],
+        evidenceClass: "human-text",
+        matchReasons: [],
+      },
+    ] as never[];
+    const deep = [
+      {
+        candidate: candidate({ rawText: "a", partID: "pa", sessionID: "s1" }),
+        score: 1.0,
+        matchedTerms: [],
+        matchedFields: [],
+        evidenceClass: "human-text",
+        matchReasons: [],
+      },
+    ] as never[];
+    const merged = mergeShortlistHits(broad as never, deep as never, false);
+    const pa = merged.find((h) => h.candidate.partID === "pa")!;
+    expect(pa.score).toBeCloseTo(1.0 * 0.1 * SHORTLIST_MULT, 5);
+    expect(merged[0]?.candidate.partID).toBe("pb");
+  });
+
+  it("anchors each shortlisted session to its own broad ceiling", () => {
+    const mk = (partID: string, sessionID: string, score: number) =>
+      ({
+        candidate: candidate({ rawText: partID, partID, sessionID }),
+        score,
+        matchedTerms: [],
+        matchedFields: [],
+        evidenceClass: "human-text",
+        matchReasons: [],
+      }) as never;
+    const broad = [mk("strong-1", "s-strong", 1.0), mk("weak-1", "s-weak", 0.2)];
+    const deep = [mk("strong-1", "s-strong", 1.0), mk("weak-1", "s-weak", 1.0)];
+    const merged = mergeShortlistHits(broad as never, deep as never, false);
+    const weak = merged.find((h) => h.candidate.partID === "weak-1")!;
+    // The weak session borrows nothing from the strong one: 1.0 × 0.2 × 1.1.
+    expect(weak.score).toBeCloseTo(0.2 * SHORTLIST_MULT, 5);
+  });
+
+  it("normalizes deep scores per session, not against the global deep top", () => {
+    const mk = (partID: string, sessionID: string, score: number) =>
+      ({
+        candidate: candidate({ rawText: partID, partID, sessionID }),
+        score,
+        matchedTerms: [],
+        matchedFields: [],
+        evidenceClass: "human-text",
+        matchReasons: [],
+      }) as never;
+    // s-b's boosted deep top (0.5) is below s-a's (2.0). Each session's best
+    // must still land at exactly its OWN ceiling × 1.1 — global normalization
+    // would leave s-b at (0.5/2.0) × 0.4 × 1.1 and deny it the lift.
+    const broad = [mk("a1", "s-a", 1.0), mk("b1", "s-b", 0.4)];
+    const deep = [mk("a1", "s-a", 2.0), mk("b1", "s-b", 0.5)];
+    const merged = mergeShortlistHits(broad as never, deep as never, false);
+    expect(merged.find((h) => h.candidate.partID === "a1")!.score).toBeCloseTo(
+      1.0 * SHORTLIST_MULT,
+      5,
+    );
+    expect(merged.find((h) => h.candidate.partID === "b1")!.score).toBeCloseTo(
+      0.4 * SHORTLIST_MULT,
+      5,
+    );
+  });
+
+  it("returns deep hits sorted and unscaled when the broad pass is empty", () => {
+    const mk = (partID: string, score: number) =>
+      ({
+        candidate: candidate({ rawText: partID, partID, sessionID: "s1" }),
+        score,
+        matchedTerms: [],
+        matchedFields: [],
+        evidenceClass: "human-text",
+        matchReasons: [],
+      }) as never;
+    const merged = mergeShortlistHits([], [mk("pa", 0.4), mk("pb", 0.9)] as never, false);
+    // No broad ceiling exists: no shortlist multiplier, standard hit ordering.
+    expect(merged.map((h) => h.candidate.partID)).toEqual(["pb", "pa"]);
+    expect(merged.map((h) => h.score)).toEqual([0.9, 0.4]);
+  });
+
+  it("keeps the broad hit when it outscores its scaled deep counterpart", () => {
+    const mk = (partID: string, score: number) =>
+      ({
+        candidate: candidate({ rawText: partID, partID, sessionID: "s1" }),
+        score,
+        matchedTerms: [],
+        matchedFields: [],
+        evidenceClass: "human-text",
+        matchReasons: [],
+      }) as never;
+    const broad = [mk("p-top", 1.0), mk("p-low", 0.9)];
+    const deep = [mk("p-top", 1.0), mk("p-low", 0.3)];
+    const merged = mergeShortlistHits(broad as never, deep as never, true);
+    const low = merged.find((h) => h.candidate.partID === "p-low")!;
+    // p-low's deep rank scales to (0.3 / 1.0) × ceiling 1.0 × 1.1 = 0.33,
+    // below its broad score of 0.9: the broad hit stays, with no shortlist
+    // reason attached.
+    expect(low.score).toBe(0.9);
+    expect(low.matchReasons.some((r) => r.includes("Title-shortlist"))).toBe(false);
+  });
+});
+
+describe("truncateExpandedPart budgets", () => {
+  function toolPart(fields: Partial<PartOutput>): PartOutput {
+    return { id: "p1", type: "tool", pruned: false, toolName: "bash", ...fields };
+  }
+
+  it("caps a multi-field part at the part budget and leaves the rest for siblings", () => {
+    const budget: ExpansionBudget = { remaining: 30_000, truncated: false };
+    const out = truncateExpandedPart(
+      toolPart({
+        content: "c".repeat(5_000),
+        output: "o".repeat(5_000),
+        error: "e".repeat(5_000),
+      }),
+      budget,
+    );
+    // Part consumed exactly the 6k part cap, not 12k+.
+    expect(30_000 - budget.remaining).toBe(6_000);
+    expect(budget.partCapped).toBe(true);
+    expect(budget.truncated).toBe(true);
+    // Fields degrade in order: content gets the field cap, output the rest.
+    expect(out.content?.length).toBeLessThanOrEqual(4_000);
+    expect(out.output?.length).toBeLessThanOrEqual(2_000);
+    expect(out.error).toBeUndefined();
+  });
+
+  it("does not report the part cap for a single field cut by the field cap", () => {
+    const budget: ExpansionBudget = { remaining: 30_000, truncated: false };
+    truncateExpandedPart(toolPart({ output: "o".repeat(10_000) }), budget);
+    expect(30_000 - budget.remaining).toBe(4_000);
+    expect(budget.partCapped).toBeUndefined();
+    expect(budget.truncated).toBe(true);
+  });
+
+  it("caps oversized tool inputs and preserves small ones by identity", () => {
+    const budget: ExpansionBudget = { remaining: 30_000, truncated: false };
+    const smallInput = { command: "npm test" };
+    const small = truncateExpandedPart(toolPart({ input: smallInput }), budget);
+    expect(small.input).toBe(smallInput);
+
+    const big = truncateExpandedPart(
+      toolPart({ input: { filePath: "/x", content: "y".repeat(50_000) } }),
+      budget,
+    );
+    expect(typeof big.input).toBe("string");
+    expect((big.input as string).length).toBeLessThanOrEqual(2_000);
+    expect(big.input as string).toContain("[truncated by recall expansion]");
+    expect(budget.truncated).toBe(true);
+  });
+
+  it("charges input length against the part budget", () => {
+    const budget: ExpansionBudget = { remaining: 30_000, truncated: false };
+    truncateExpandedPart(
+      toolPart({ input: { content: "z".repeat(5_000) }, output: "o".repeat(10_000) }),
+      budget,
+    );
+    // Input consumed 2k of the 6k part budget; output gets the remaining 4k.
+    expect(30_000 - budget.remaining).toBe(6_000);
+  });
+
+  it("omits unserializable inputs instead of throwing", () => {
+    const budget: ExpansionBudget = { remaining: 30_000, truncated: false };
+    const circular: Record<string, unknown> = {};
+    circular.self = circular;
+    const out = truncateExpandedPart(toolPart({ input: circular }), budget);
+    expect(out.input).toBeUndefined();
+
+    const fn = truncateExpandedPart(toolPart({ input: (() => {}) as never }), budget);
+    expect(fn.input).toBeUndefined();
+  });
+
+  it("attributes cuts to the global budget when it is smaller than the part cap", () => {
+    const budget: ExpansionBudget = { remaining: 1_000, truncated: false };
+    truncateExpandedPart(toolPart({ output: "o".repeat(5_000) }), budget);
+    expect(budget.remaining).toBe(0);
+    expect(budget.partCapped).toBeUndefined();
+    expect(budget.truncated).toBe(true);
+  });
+});
+
+describe("truncatePreservingMatch", () => {
+  const text = `HEAD:${"a".repeat(5_000)}NEEDLE${"b".repeat(5_000)}`;
+
+  it("returns short text unchanged and respects the cap", () => {
+    expect(truncatePreservingMatch("short", 2, 100)).toBe("short");
+    const out = truncatePreservingMatch(text, text.indexOf("NEEDLE"), 1_000);
+    expect(out.length).toBeLessThanOrEqual(1_000);
+  });
+
+  it("keeps the head and a window around a deep match with an omission marker", () => {
+    const out = truncatePreservingMatch(text, text.indexOf("NEEDLE"), 1_000);
+    expect(out.startsWith("HEAD:")).toBe(true);
+    expect(out).toContain("NEEDLE");
+    expect(out).toContain("chars omitted");
+  });
+
+  it("falls back to a head slice when the match is inside the kept head", () => {
+    const out = truncatePreservingMatch(text, 2, 1_000);
+    expect(out).toBe(text.slice(0, 1_000));
+  });
+
+  it("falls back to a head slice for missing matches and handles a match near the end", () => {
+    expect(truncatePreservingMatch(text, -1, 500)).toBe(text.slice(0, 500));
+    const nearEnd = truncatePreservingMatch(text, text.length - 3, 800);
+    expect(nearEnd.length).toBeLessThanOrEqual(800);
+    expect(nearEnd.endsWith(text.slice(-1))).toBe(true);
+  });
+
+  it("degrades to a head slice when the cap leaves no useful window", () => {
+    const out = truncatePreservingMatch(text, text.indexOf("NEEDLE"), 80);
+    expect(out).toBe(text.slice(0, 80));
+  });
+});
+
+describe("capAndSlice class caps", () => {
+  function hit(partID: string, evidenceClass: EvidenceClass): SearchResult {
+    return {
+      sessionID: "s1",
+      sessionTitle: "S",
+      directory: PROJECT_DIR,
+      messageID: `m-${partID}`,
+      role: "assistant",
+      time: 1_000,
+      partID,
+      partType: "tool",
+      pruned: false,
+      snippet: "snip",
+      why: { matchedFields: [], evidenceClass },
+    };
+  }
+
+  it("caps skill-definition to one and file-read to two within the slice", () => {
+    const ordered = [
+      hit("p1", "skill-definition"),
+      hit("p2", "skill-definition"),
+      hit("p3", "file-read"),
+      hit("p4", "file-read"),
+      hit("p5", "file-read"),
+      hit("p6", "tool-output"),
+      hit("p7", "human-text"),
+    ];
+    const final = capAndSlice(ordered, 5, false);
+    expect(final.map((h) => h.partID)).toEqual(["p1", "p3", "p4", "p6", "p7"]);
+  });
+
+  it("caps web-fetch to two within the slice", () => {
+    const ordered = [
+      hit("w1", "web-fetch"),
+      hit("w2", "web-fetch"),
+      hit("w3", "web-fetch"),
+      hit("t1", "tool-output"),
+      hit("h1", "human-text"),
+    ];
+    const final = capAndSlice(ordered, 4, false);
+    expect(final.map((h) => h.partID)).toEqual(["w1", "w2", "t1", "h1"]);
+  });
+
+  it("backfills held-back hits when caps starve the fill", () => {
+    const ordered = [
+      hit("p1", "skill-definition"),
+      hit("p2", "skill-definition"),
+      hit("p3", "skill-definition"),
+    ];
+    const final = capAndSlice(ordered, 3, false);
+    expect(final.map((h) => h.partID)).toEqual(["p1", "p2", "p3"]);
+  });
+
+  it("promotes a held-back tool-input hit for command-like queries only", () => {
+    const ordered = [hit("p1", "human-text"), hit("p2", "tool-output"), hit("p3", "tool-input")];
+    const commandLike = capAndSlice(ordered, 2, true);
+    expect(commandLike.map((h) => h.partID)).toEqual(["p1", "p3"]);
+
+    const plain = capAndSlice(ordered, 2, false);
+    expect(plain.map((h) => h.partID)).toEqual(["p1", "p2"]);
+
+    // No swap when a tool-input hit is already present.
+    const present = capAndSlice([hit("p0", "tool-input"), ...ordered], 2, true);
+    expect(present.map((h) => h.partID)).toEqual(["p0", "p1"]);
+  });
+});
+
+describe("groupBySession representative selection", () => {
+  function hit(over: Partial<SearchResult> & { evidenceClass?: EvidenceClass }): SearchResult {
+    const { evidenceClass, ...rest } = over;
+    return {
+      sessionID: "s1",
+      sessionTitle: "Session One",
+      directory: PROJECT_DIR,
+      messageID: rest.partID ? `m-${rest.partID}` : "m1",
+      role: "assistant",
+      time: 1_000,
+      partID: "p1",
+      partType: "text",
+      pruned: false,
+      snippet: "snippet text",
+      why: { matchedFields: ["text"], evidenceClass },
+      ...rest,
+    };
+  }
+
+  it("prefers a better evidence class within the score tolerance", () => {
+    const grouped = groupBySession([
+      hit({ partID: "pa", score: 1.0, evidenceClass: "skill-definition", partType: "tool" }),
+      hit({ partID: "pb", score: 0.9, evidenceClass: "tool-input", partType: "tool" }),
+      hit({ partID: "pc", score: 0.87, evidenceClass: "human-text" }),
+    ]);
+    expect(grouped).toHaveLength(1);
+    expect(grouped[0]!.partID).toBe("pc");
+    expect(grouped[0]!.hitCount).toBe(3);
+    expect(grouped[0]!.evidenceKinds).toEqual(
+      expect.arrayContaining(["skill-definition", "tool-input", "human-text"]),
+    );
+    // Secondary evidence: classes different from the representative's, max 2.
+    expect(grouped[0]!.topEvidence).toHaveLength(2);
+    expect(grouped[0]!.topEvidence!.map((e) => e.evidenceClass)).toEqual([
+      "skill-definition",
+      "tool-input",
+    ]);
+  });
+
+  it("keeps a dominant hit as representative when others fall outside tolerance", () => {
+    const grouped = groupBySession([
+      hit({ partID: "pa", score: 1.0, evidenceClass: "skill-definition", partType: "tool" }),
+      hit({ partID: "pb", score: 0.5, evidenceClass: "human-text" }),
+    ]);
+    expect(grouped[0]!.partID).toBe("pa");
+    expect(grouped[0]!.topEvidence?.map((e) => e.evidenceClass)).toEqual(["human-text"]);
+  });
+
+  it("uses class priority for unscored (literal) hits with recency as tiebreak", () => {
+    const grouped = groupBySession([
+      hit({ partID: "pa", time: 3_000, evidenceClass: "file-read", partType: "tool" }),
+      hit({ partID: "pb", time: 2_000, evidenceClass: "tool-input", partType: "tool" }),
+      hit({ partID: "pc", time: 1_000, evidenceClass: "tool-input", partType: "tool" }),
+    ]);
+    // tool-input beats file-read despite being older; newer tool-input wins the tie.
+    expect(grouped[0]!.partID).toBe("pb");
+  });
+
+  it("uses a title hit only for title-only sessions and truncates topEvidence snippets", () => {
+    const titleOnly = groupBySession([
+      hit({
+        partID: "s1:title",
+        partType: "title",
+        source: "title",
+        evidenceClass: "session-title",
+      }),
+    ]);
+    expect(titleOnly[0]!.partType).toBe("title");
+
+    const withContent = groupBySession([
+      hit({
+        partID: "s1:title",
+        partType: "title",
+        source: "title",
+        evidenceClass: "session-title",
+      }),
+      hit({
+        partID: "pb",
+        evidenceClass: "tool-output",
+        partType: "tool",
+        snippet: "x".repeat(300),
+      }),
+    ]);
+    expect(withContent[0]!.partID).toBe("pb");
+    expect(withContent[0]!.hitCount).toBe(2);
+    // Title hits are not secondary evidence (never tracked as content).
+    expect(withContent[0]!.topEvidence).toBeUndefined();
+  });
+
+  it("tracks at most four hits and caps topEvidence at two", () => {
+    const grouped = groupBySession([
+      hit({ partID: "pa", score: 1.0, evidenceClass: "human-text" }),
+      hit({ partID: "pb", score: 0.99, evidenceClass: "tool-input", partType: "tool" }),
+      hit({ partID: "pc", score: 0.98, evidenceClass: "tool-output", partType: "tool" }),
+      hit({ partID: "pd", score: 0.97, evidenceClass: "reasoning", partType: "reasoning" }),
+      hit({ partID: "pe", score: 0.96, evidenceClass: "file-read", partType: "tool" }),
+    ]);
+    expect(grouped[0]!.partID).toBe("pa");
+    expect(grouped[0]!.hitCount).toBe(5);
+    expect(grouped[0]!.topEvidence).toHaveLength(2);
+    // file-read (5th) was never tracked; kinds still record every class seen.
+    expect(grouped[0]!.evidenceKinds).toContain("file-read");
+  });
+});
+
 describe("search ranking helpers", () => {
   it("ranks BM25 matches with explainable structural boosts", () => {
     const query = parseQuery('"rate limit" cache missing');
@@ -295,11 +941,82 @@ describe("search ranking helpers", () => {
     expect(
       ranked.find((r) => r.candidate.partType === "reasoning")?.matchReasons.join(" "),
     ).toContain("Reasoning part");
-    // Every returned score stays within 0..1.
+    // Internal ranking scores are unclamped so boosts can beat the relative
+    // top; the output layer clamps to 0..1 (asserted in recall.test.ts).
     for (const r of ranked) {
       expect(r.score).toBeGreaterThanOrEqual(0);
-      expect(r.score).toBeLessThanOrEqual(1);
     }
+  });
+
+  it("prefers a concrete tool input over a long skill payload with the same terms", () => {
+    const skillBody =
+      "tuistory skill reference. tuistory launch wait type press snapshot close. " +
+      "Run tuistory sessions for agents. ".repeat(30);
+    const candidates = [
+      indexed({
+        rawText: skillBody,
+        partType: "tool",
+        toolName: "skill",
+        time: 2_000,
+      }),
+      indexed({
+        rawText: 'npx tuistory launch "opencode" -s t1 --background\n\nbash',
+        partType: "tool",
+        toolName: "bash",
+        time: 1_000,
+        fieldTexts: [
+          { field: "command", text: 'npx tuistory launch "opencode" -s t1 --background' },
+        ],
+      }),
+    ];
+    const ranked = bm25Search(candidates, parseQuery("tuistory launch"), "smart", true);
+    expect(ranked[0]?.candidate.toolName).toBe("bash");
+    expect(ranked[0]?.evidenceClass).toBe("tool-input");
+    expect(ranked[1]?.evidenceClass).toBe("skill-definition");
+    expect(ranked[0]?.matchReasons.join(" ")).toContain("Tool input");
+    expect(ranked[1]?.matchReasons.join(" ")).toContain("Skill definition");
+  });
+
+  it("boosts hits whose session digest covers at least half the query tokens", () => {
+    const query = parseQuery("checkout throttle keeper widget"); // 4 tokens
+    const covered = indexed({
+      rawText: "checkout throttle notes",
+      partID: "p-covered",
+      digestText: normalize("checkout throttle"), // 2 of 4: exactly the boundary
+    });
+    const uncovered = indexed({
+      rawText: "checkout throttle notes",
+      partID: "p-uncovered",
+      digestText: normalize("checkout"), // 1 of 4: below half
+    });
+    const ranked = bm25Search([uncovered, covered], query, "smart", true);
+    const coveredHit = ranked.find((h) => h.candidate.partID === "p-covered")!;
+    const uncoveredHit = ranked.find((h) => h.candidate.partID === "p-uncovered")!;
+    expect(coveredHit.matchReasons.join(" ")).toContain("Session digest match");
+    expect(uncoveredHit.matchReasons.join(" ")).not.toContain("Session digest match");
+    expect(ranked[0]!.candidate.partID).toBe("p-covered");
+  });
+
+  it("ranks a command input above an equally-matching fetched page", () => {
+    const candidates = [
+      indexed({
+        rawText: "zephyrite calibration handbook page content " + "filler words ".repeat(20),
+        partType: "tool",
+        toolName: "mcp__firecrawl__firecrawl_scrape",
+        time: 2_000,
+      }),
+      indexed({
+        rawText: "zephyrite calibration probe --run\n\nbash",
+        partType: "tool",
+        toolName: "bash",
+        time: 1_000,
+        fieldTexts: [{ field: "command", text: "zephyrite calibration probe --run" }],
+      }),
+    ];
+    const ranked = bm25Search(candidates, parseQuery("zephyrite calibration"), "smart", true);
+    expect(ranked[0]?.candidate.toolName).toBe("bash");
+    expect(ranked[1]?.evidenceClass).toBe("web-fetch");
+    expect(ranked[1]?.matchReasons.join(" ")).toContain("Web fetch");
   });
 
   it("rewards term rarity (IDF) over boilerplate", () => {
@@ -357,7 +1074,7 @@ describe("search ranking helpers", () => {
     expect(smartSnippet("aaa rate bbb limit ccc", parseQuery("rate limit"), 12)).toContain("rate");
   });
 
-  it("builds candidates with role/type/time filters", () => {
+  it("builds unfiltered candidates; query filters apply via candidateEligible", () => {
     const messages = [
       {
         info: userMessage("u", "s", 100),
@@ -369,28 +1086,37 @@ describe("search ranking helpers", () => {
       },
     ];
 
-    const built = buildCandidates(
-      messages,
-      { id: "s", title: "Session", directory: PROJECT_DIR },
-      {
-        maxMessagesPerSession: 10,
-        maxPartsPerSession: 10,
-        maxCharsPerCandidate: 100,
-        maxCharsTotal: 1000,
-        maxCandidatesPerSession: 10,
-        maxCandidatesTotal: 10,
-      },
-      "tool",
-      "assistant",
-      300,
-      100,
-    );
-
-    expect(built.candidates).toHaveLength(1);
+    // Cache-fill build: everything searchable, newest message first.
+    const built = buildCandidates(messages, { id: "s", title: "Session", directory: PROJECT_DIR });
+    expect(built.candidates).toHaveLength(2);
+    expect(built.candidates.map((c) => c.partType)).toEqual(["tool", "text"]);
     expect(built.candidates[0]).toMatchObject({
       partType: "tool",
       role: "assistant",
       rawText: "tool text\n\nbash\n\n{}",
     });
+
+    // Query-time filters reproduce the old build-time filtering exactly.
+    const filters = { type: "tool", role: "assistant", before: 300, after: 100 };
+    const eligible = built.candidates.filter((c) => candidateEligible(c, filters));
+    expect(eligible).toHaveLength(1);
+    expect(eligible[0]).toMatchObject({ partType: "tool", role: "assistant" });
+
+    // Boundary semantics: before excludes >= boundary, after excludes <= boundary.
+    expect(
+      built.candidates.filter((c) =>
+        candidateEligible(c, { type: "all", role: "all", before: 200 }),
+      ),
+    ).toHaveLength(1);
+    expect(
+      built.candidates.filter((c) =>
+        candidateEligible(c, { type: "all", role: "all", after: 200 }),
+      ),
+    ).toHaveLength(0);
+    expect(
+      built.candidates.filter((c) =>
+        candidateEligible(c, { type: "text", role: "all", toolName: "bash" }),
+      ),
+    ).toHaveLength(1);
   });
 });

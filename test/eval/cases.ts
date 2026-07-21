@@ -1,3 +1,4 @@
+import { GHOST_DIR } from "../helpers.js";
 import type { EvalCase } from "./harness.js";
 
 /**
@@ -88,5 +89,140 @@ export const EVAL_CASES: EvalCase[] = [
       scope: "global",
     },
     relevantSessionIDs: ["e-auth"],
+  },
+  {
+    // Field report: historical-workflow discovery. The current conversation
+    // (e-cur) parrots the whole query; default current-session exclusion must
+    // keep it out so the real workflow session (e-flow, misleading title in
+    // the ghostauth directory) can surface.
+    name: "field-report: prior ghostauth/tuistory workflow excludes current session",
+    args: {
+      query: "ghostauth tuistory test opencode plugin auth login debug workflow",
+      match: "smart",
+      group: "session",
+      scope: "global",
+    },
+    ctxSessionID: "e-cur",
+    relevantSessionIDs: ["e-flow"],
+    expect: {
+      notInResults: ["e-cur", "e-cur-sub"],
+      // The grouped representative must be conversational or action evidence,
+      // never the skill payload that happens to score well lexically.
+      classInTop3: ["human-text", "tool-input"],
+      maxClassInTop5: { "skill-definition": 0 },
+    },
+  },
+  {
+    // Field report: an exact tool query must surface concrete actions (bash
+    // tool inputs), not the skill payload that mentions the tool everywhere.
+    name: "field-report: exact tool query prefers tool-input evidence",
+    args: {
+      query: "tuistory",
+      match: "smart",
+      group: "part",
+      scope: "global",
+      directory: GHOST_DIR,
+    },
+    relevantSessionIDs: ["e-flow"],
+    expect: { classInTop3: ["tool-input"], maxClassInTop5: { "skill-definition": 1 } },
+  },
+  {
+    // Field report: a literal scan floods with skill payloads by scan order
+    // alone (three skill parts across e-flow/e-docs); the class-cap pass must
+    // keep the top five diverse regardless of ranking.
+    name: "field-report: literal tuistory flood capped to one skill hit",
+    args: {
+      query: "tuistory",
+      match: "literal",
+      group: "part",
+      scope: "global",
+      directory: GHOST_DIR,
+    },
+    relevantSessionIDs: ["e-flow"],
+    expect: { maxClassInTop5: { "skill-definition": 1 } },
+  },
+  {
+    // Field report: authored usage of an API outranks the generic skill body
+    // that also contains the literal.
+    name: "field-report: authored launchTerminal usage outranks skill body",
+    args: {
+      query: "launchTerminal",
+      match: "smart",
+      group: "part",
+      scope: "global",
+    },
+    relevantSessionIDs: ["e-flow"],
+    expect: { classInTop3: ["human-text"] },
+  },
+  {
+    // Field report: title/content bridge — deferred from the two-stage-search
+    // phase to the session-digest phase. Both sessions' strongest lexical hits
+    // are file reads; only the content-derived digest (built from statements
+    // and commands, never reads) can order the DOING session above the
+    // READING session.
+    name: "field-report: ghostauth live test bridges metadata and content",
+    args: {
+      query: "ghostauth live test",
+      match: "smart",
+      group: "session",
+      scope: "global",
+    },
+    relevantSessionIDs: ["e-flow"],
+  },
+
+  // ── Round-4 distill-then-search tier probes ──────────────────────────
+  {
+    // Tier-1 card inventory: a distinctive token that lands in the card
+    // inventory via a tool INPUT (never the title) is found by card ranking.
+    name: "tier-1 inventory needle: QUAXFLINT_CALIB",
+    args: {
+      query: "QUAXFLINT_CALIB",
+      match: "smart",
+      group: "session",
+      scope: "global",
+    },
+    relevantSessionIDs: ["e-inv"],
+  },
+  {
+    // Tier-1.5 FTS needle: "florplaxle" lives only in a reasoning part, so the
+    // card carries nothing the query matches and e-fts is one of the three
+    // oldest sessions the tier-1 recency near-miss drops. Only the FTS tier can
+    // surface it into the shortlist — the needle-backbone the plan relies on.
+    name: "tier-1.5 fts needle: florplaxle (absent from cards)",
+    args: {
+      query: "florplaxle",
+      match: "smart",
+      group: "session",
+      scope: "global",
+    },
+    relevantSessionIDs: ["e-fts"],
+  },
+  {
+    // Temporal `since`: e-temp-old (10d) and e-temp-new (2h) both match
+    // "sprocketwidget"; a 2d lower bound must exclude the older one.
+    name: "temporal since: excludes the older match",
+    args: {
+      query: "sprocketwidget",
+      match: "smart",
+      group: "session",
+      scope: "global",
+      since: "2d",
+    },
+    relevantSessionIDs: ["e-temp-new"],
+    expect: { notInResults: ["e-temp-old"] },
+  },
+  {
+    // Temporal `until`: the symmetric case — a 2d upper bound excludes the
+    // newer match, leaving only the older session.
+    name: "temporal until: excludes the newer match",
+    args: {
+      query: "sprocketwidget",
+      match: "smart",
+      group: "session",
+      scope: "global",
+      until: "2d",
+    },
+    relevantSessionIDs: ["e-temp-old"],
+    expect: { notInResults: ["e-temp-new"] },
   },
 ];

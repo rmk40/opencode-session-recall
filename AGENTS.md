@@ -59,6 +59,17 @@ Corollary on `npm run compile`: it runs `tsup` (bundles the JS) **then**
 and emit a working `dist/.js`** while `tsc` fails afterward — easy to miss. Don't
 trust a green bundle; check the whole `compile` step.
 
+## SQLite drivers: keep `bun:sqlite` in the tsup external list
+
+The derived store opens SQLite through a runtime-detected driver (`src/sqlite.ts`):
+`bun:sqlite` when the `Bun` global exists (opencode's runtime), else `node:sqlite`
+(Node >= 22.5, which the tests run on), else null (degraded, in-memory cards). `node:`
+specifiers are auto-external in tsup, but `bun:sqlite` is **not**, so it MUST stay in
+the `compile` script's `--external bun:sqlite`. Drop it and tsup tries to bundle a
+module that only exists inside Bun, and the build breaks. As everywhere in `src/`, the
+adapter is the one place a Bun/Node global may appear; nothing else in `src/` may
+import `bun:*` or `node:*` directly.
+
 ## How the plugin is loaded (why a rebuild is needed to test live)
 
 - The global opencode config (`~/.config/opencode/opencode.json`) loads this
@@ -116,11 +127,104 @@ wrong path. The live tool output is ground truth; the transcript is not.
 
 ## Relevance is gated — don't change ranking blind
 
-`test/eval/` is a labeled relevance harness (corpus + cases + `baseline.json`
-locked at MRR/recall@5 = 1.0) wired into `npm run check`. **Any ranking change
-must meet or beat the baseline**, or the build fails. If you intend to move the
-baseline, do it deliberately in the same change-set and say why. Before tuning
-`bm25.ts` constants, run the eval to see the current numbers.
+`test/eval/` is a labeled relevance harness wired into `npm run check`.
+`baseline.json` locks MRR/recall@5 = 1.0 over 17 rank-scored cases. On top of
+those, `relevance.test.ts` adds two behavioral assertions: an output-only needle
+that must be an honest miss without `deep` and a hit with a scoped deep sweep,
+and a virgin degraded-mode query that must return metadata-quality results with
+`coverage.cards.degraded` set. **Any ranking change must meet or beat the
+baseline**, or the build fails. If you intend to move the baseline, do it
+deliberately in the same change-set and say why. Before tuning ranking constants
+(`bm25.ts` for the drilled rerank, `cards.ts` for the card tier), run the eval to
+see the current numbers.
+
+## The derived store rebuilds itself; don't hand-migrate it
+
+The card + slim-FTS store lives at `~/.cache/opencode-session-recall/store-v1.db`
+(the filename is fixed at `store-v1.db` regardless of schema; `storePath` overrides
+the whole path). It is derived state, never authoritative: safe to delete at any
+time, and it rebuilds in the background on the next run. `store.ts` stamps
+`schema_version` in the `meta` table (currently `SCHEMA_VERSION = 3`). On open: a
+matching stamp is used as-is; a v1 or v2 stamp is migrated **additively in place**
+(`migrateV1ToV2` adds the summary columns, `migrateV2ToV3` adds `embedding_gen`, with no data loss and no
+re-distill); an absent stamp or a foreign layout is dropped and
+rebuilt; a **newer** stamp makes `openStore` return null so the plugin degrades to
+cards-lite rather than misreading a format it doesn't understand. So the migration
+story for a schema change is: add a `v(N-1)→vN` additive step when you can, bump
+`SCHEMA_VERSION`, and ship. Old in-place stores upgrade, foreign ones rebuild.
+
+Several opencode processes run one plugin instance each and share the file,
+coordinated by a single `distill_lease` row in `meta` (holder, heartbeat, 30s TTL,
+plus the writer's build/gen for diagnosis); only the lease holder writes, stale
+leases are taken over on expiry, and per-session writes are transactional so readers
+never see half a session. Two revision counters drive lazy reader reloads and they
+are NOT interchangeable: the distiller bumps `cards_rev` after every lexical write
+(the tier-1 runtime watches it), while `writeCardEmbeddings` bumps `vectors_rev`
+instead, because vectors are invisible to the lexical index, so bumping `cards_rev` for
+them would churn every reader for nothing. Forget the right bump and the reader
+serves a stale snapshot until its time-gated refresh fires.
+
+## Embedding representation changes MUST ride a schema bump
+
+`EMBED_REPRESENTATION` in `embedding-text.ts` is a monotonic integer stamping what a
+persisted card vector _means_: the projection `embeddingTextOf` builds, the model,
+and how vectors are compared. It folds into the vector stamp (`meta.semantic_model`
+= `model:gen`) and into each row's `embedding_gen`. **Any change to representation
+semantics must bump `SCHEMA_VERSION` (store.ts) in the same change-set.** This is a
+scar, not a style preference: `rep4` changed the projection without a schema bump, so
+it slipped past the store's version fence. A rep3 build and a rep4 build shared one
+store, raced the global `semantic_model` stamp, and each cleared and rewrote every
+vector to its own representation on a loop. The schema bump fences the older build out
+of the lease and all writes (a newer stamp makes its `openStore` return null, so that
+process degrades to cards-lite); the per-row `embedding_gen` guard
+(`embedding_gen IS NULL OR embedding_gen <= gen`, plus a wholesale reject of any
+lower-`gen` write, so an old build can never downgrade a newer vector) is the belt
+for same-schema drift. Bump both together.
+
+Mixed builds are diagnosable, not silent: the lease and every `coverage.semantic`
+carry a `pluginVersion` build tag (`schema{N}.gen{M}`, derived from `SCHEMA_VERSION`
+and `EMBED_REPRESENTATION`), so one lease read or one tool response shows which build
+wrote what.
+
+## The summarizer only runs while holding the distill lease
+
+Path B summaries (`summarize.ts`) are not an independent loop. The distiller drives
+them. `onColdPassDone` kicks the first pass and `onSessionDistilled` queues cards,
+both only while this process holds the lease, and every persisted summary write checks
+`leaseHeld()` first. All summary work drains through one serialized queue (at most one
+prompt in flight). So if the lease moves to another process, summaries move with it: a
+non-holder queues nothing and writes nothing. The throwaway worker sessions it prompts
+are titled `[recall-summarizer]` (the `SUMMARIZER_SENTINEL`) and are excluded from
+every recall path by `isSummarizerTitle`; a crashed holder's orphaned workers are
+swept best-effort on the next holder's startup, never adopted. If you add a summary
+write path, gate it on the lease or two processes will double-write.
+
+## `session.messages` without a `limit` is the incident path
+
+The two original live incidents were an unpaginated `session.messages({ sessionID })`
+that pulled a whole (up to 77MB) session into memory. That is the legacy
+full-session fetch, and it must never run. The single allowed entry point is
+`fetchMessagePage()` in `src/distill.ts` (re-exported by `fetch-window.ts`), which
+ALWAYS sends a `limit` and reads the next-page cursor from the `X-Next-Cursor`
+header. Drill, deep, the browse/context tools, and the distiller all page through
+it. Tests enforce this: the fake client throws `UNBOUNDED_MESSAGES_ERROR` on any
+no-limit call when strict mode is on (`setStrictNoLimitMessages(true)` in
+`test/helpers.ts`), and the `runTool` helpers hard-fail if a tool swallows that
+throw into an error output. Suites that intentionally exercise the legacy
+full-return path (some distiller fixtures) opt out by leaving strict mode off. If
+you add a new fetch site, route it through `fetchMessagePage` and cover it under a
+strict-mode suite.
+
+## Perf gates are behind `RECALL_PERF=1`
+
+`test/perf.test.ts` is `describe.skipIf`'d off by default because it measures
+machine-dependent wall-clock time. Run it deliberately:
+`RECALL_PERF=1 npx vitest run test/perf.test.ts`. The budgets it defends: tier-1
+card rank p95 under 50ms over 20 queries on ~4,700 cards; single-session
+distill+replace p50 under 150ms; `ftsSearch` over ~50k slim-index rows under
+100ms; a drilled smart query end-to-end under 1.5s on a ~100-session store; and
+heap under 150MB after those runs. If a change makes the store or the query path
+heavier, run these before assuming it's fine.
 
 ## Tokenizer split is load-bearing
 

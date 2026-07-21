@@ -14,6 +14,35 @@ export type Limits = {
   maxMessages: number;
   maxWindow: number;
   defaultWidth: number;
+  /** Raw-text budget for the tier-2 drilled-session LRU (repurposed from the
+   *  deleted full-corpus cache). */
+  cacheMaxChars: number;
+  /** Sessions the distiller keeps in flight during the cold pass. */
+  distillConcurrency: number;
+  /** Politeness delay (ms) between a session's page fetches in the cold pass. */
+  distillDelayMs: number;
+  /** Per-session slim-index row cap; giants keep their newest rows. */
+  ftsRowsPerSession: number;
+  /** Card inventory token cap (code anchors + digest tokens, combined). */
+  inventoryTokens: number;
+  /** Whether the distiller runs its background cold pass at all. */
+  coldPass: boolean;
+  /** Tier-2 drill fan-out: how many shortlisted sessions to drill per query. */
+  drillSessions: number;
+  /** Of `drillSessions`, how many slots to reserve for the top pure-semantic
+   *  cards not already shortlisted (semantic on + ready only). Clamped; 0
+   *  disables the reservation. */
+  semanticSlots: number;
+  /** Messages per untargeted drill page fetch (newest-first). */
+  drillPageMessages: number;
+  /** Per-session retained-chars budget for an untargeted drill. */
+  drillCharsPerSession: number;
+  /** Per-query retained-chars budget shared across all drilled sessions. */
+  drillCharsPerQuery: number;
+  /** Per-query retained-chars budget for a deep (exhaustive, output-inclusive)
+   *  sweep. Much larger than the normal drill budget because deep exists to
+   *  cover the 2.4GB tool-output tier within an explicit scope. */
+  deepCharsPerQuery: number;
 };
 
 export const DEFAULTS: Limits = {
@@ -24,13 +53,51 @@ export const DEFAULTS: Limits = {
   maxMessages: 50,
   maxWindow: 10,
   defaultWidth: 200,
+  // Repurposed as the drilled-session LRU budget (no longer the full-corpus cache).
+  cacheMaxChars: 24_000_000,
+  distillConcurrency: 2,
+  distillDelayMs: 25,
+  ftsRowsPerSession: 5000,
+  inventoryTokens: 200,
+  coldPass: true,
+  drillSessions: 12,
+  semanticSlots: 2,
+  drillPageMessages: 25,
+  drillCharsPerSession: 1_500_000,
+  drillCharsPerQuery: 20_000_000,
+  deepCharsPerQuery: 30_000_000,
 };
 
+/** Explicit discovery limit for "all history" requests: the opencode server
+ *  defaults to 100 rows when no limit is sent (silently hiding older sessions),
+ *  and it applies caller limits unclamped. Lives here (not in `search.ts`) so
+ *  the distiller can share it without importing the search module, which would
+ *  cycle once search wires the distiller in. `search.ts` re-exports it for
+ *  existing importers. */
+export const DISCOVERY_LIMIT = 10_000;
+
 export type MatchMode = "literal" | "smart" | "fuzzy" | "regex";
-export type DegradeKind = "none" | "time" | "budget" | "fallback";
+export type DegradeKind = "none" | "time" | "fallback";
 export type GroupMode = "part" | "session";
 export type ResultSource = "message" | "title" | "tool" | "reasoning";
 export type DirectoryRelevance = "exact" | "project" | "global" | "unknown";
+
+/**
+ * What kind of evidence a hit is, derived deterministically from part type,
+ * tool name, and which fields matched. Generated reference material
+ * (skill-definition, file-read) is distinguished from concrete actions
+ * (tool-input) and conversational statements (human-text) so ranking and
+ * grouping can prefer the latter for "what did we do before" queries.
+ */
+export type EvidenceClass =
+  | "human-text" // text part, user or assistant
+  | "reasoning"
+  | "tool-input" // hit matched in command/cwd/toolName fields (incl. JSON input)
+  | "tool-output"
+  | "file-read" // tool name suffix-matches "read"
+  | "web-fetch" // output-side match on a fetch-shaped tool (webfetch/scrape/…)
+  | "skill-definition" // tool name suffix-matches "skill"
+  | "session-title";
 
 export type SearchSuggestion = {
   reason: string;
@@ -65,11 +132,52 @@ export type SearchCoverage = {
     | "sessionsLimit"
     | "maxSessions"
     | "providerLimit"
+    | "excludedSession"
     | "loadError"
     | "rankingBudget"
     | "timeBudget"
     | "abortSignal"
   >;
+  /** Present when some sessions failed to load; samples are capped. */
+  loadErrors?: { count: number; samples: string[] };
+  /** Tier-0 card-store state: how many sessions are distilled and how fresh the
+   *  store is. `total` counts every known card, `full` those distilled to
+   *  content (the rest are metadata-only), `storeRecency` is the newest card's
+   *  `timeUpdated` (ms, 0 when none), `degraded` is true in cards-lite mode. */
+  cards?: {
+    total: number;
+    full: number;
+    storeRecency: number;
+    degraded: boolean;
+  };
+  /** Present only when the semantic layer is configured on. `ready` is the
+   *  embedder load state, `model` the configured model id, `weight` the blend
+   *  weight, `cardsWithVectors` how many cards carry a vector, and `contributed`
+   *  how many of THIS query's returned results the semantic tier surfaced
+   *  (reserved-slot inclusions plus zero-lexical-hit rescues). `representation`
+   *  (the embedding generation) and `pluginVersion` (this process's build tag,
+   *  the same one the distill lease records) make mixed-version confusion visible
+   *  in tool output. */
+  semantic?: {
+    ready: boolean;
+    model?: string;
+    weight: number;
+    cardsWithVectors: number;
+    contributed: number;
+    representation: number;
+    pluginVersion?: string;
+  };
+  /** Present only for a deep sweep: how much of the scoped session set the sweep
+   *  actually covered. `sessionsCovered` were fully swept, `sessionsPartial`
+   *  stopped mid-session on a budget, `sessionsRemaining` were never reached,
+   *  and `exhaustedBudget` is true when a char/time budget stopped the sweep
+   *  (in which case `nextCursor` on the output continues it). */
+  deep?: {
+    sessionsCovered: number;
+    sessionsPartial: number;
+    sessionsRemaining: number;
+    exhaustedBudget: boolean;
+  };
 };
 
 export type ResultWhy = {
@@ -80,6 +188,11 @@ export type ResultWhy = {
   directoryRelevance?: DirectoryRelevance;
   recency?: "recent" | "older" | "unknown";
   confidence?: "high" | "medium" | "low";
+  evidenceClass?: EvidenceClass;
+  /** Semantic (cosine-derived, 0..1) similarity behind this result. Present for
+   *  a zero-lexical-hit semantic rescue (its whole basis), and for any result
+   *  under explain:true when the semantic layer scored its session. */
+  semanticSimilarity?: number;
 };
 
 export type NearMiss = {
@@ -88,6 +201,14 @@ export type NearMiss = {
   directory?: string;
   reason: string;
   terms?: string[];
+};
+
+/** Compact secondary evidence attached to grouped session results. */
+export type TopEvidence = {
+  messageID: string;
+  partID: string;
+  evidenceClass: EvidenceClass;
+  snippet: string;
 };
 
 export type SearchResult = {
@@ -112,9 +233,12 @@ export type SearchResult = {
   matchReasons?: string[];
   /** Present when group:"session" — number of part-level hits in this session */
   hitCount?: number;
+  /** Present when group:"session" — unique evidence classes among the session's hits */
+  evidenceKinds?: EvidenceClass[];
+  /** Present when group:"session" — up to two hits of other evidence classes */
+  topEvidence?: TopEvidence[];
   source?: ResultSource;
   why?: ResultWhy;
-  directoryRelevance?: DirectoryRelevance;
   titleMatch?: {
     title: string;
     matchedTerms?: string[];
@@ -125,18 +249,13 @@ export type SearchOutput = {
   ok: true;
   results: SearchResult[];
   expanded?: ExpandedResult[];
-  scanned: number;
   total: number;
   truncated: boolean;
-  /** Number of sessions whose messages could not be loaded */
-  loadErrorCount?: number;
-  /** Sample message-load failures; omitted when all scanned sessions loaded */
-  loadErrors?: string[];
   /** Which strategy produced the returned results */
   matchMode?: MatchMode;
-  /** Ranking/coverage flag: "fallback" (smart→literal), "budget" (candidate cap
-   *  hit), "time" (search exceeded the time budget — a latency flag, results are
-   *  still BM25-ranked), or "none". */
+  /** Ranking/coverage flag: "fallback" (smart→literal), "time" (search
+   *  exceeded the time budget — a latency flag, results are still
+   *  BM25-ranked), or "none". */
   degradeKind?: DegradeKind;
   /** Which grouping was applied */
   group?: GroupMode;
@@ -144,6 +263,12 @@ export type SearchOutput = {
   suggestions?: SearchSuggestion[];
   coverage?: SearchCoverage;
   nearMisses?: NearMiss[];
+  /** Present when explain:true — which query-plan variants exist and ran. */
+  queryPlan?: { variants: string[]; selected: string[] };
+  /** Present only for a deep sweep that stopped on a budget: an opaque
+   *  continuation token; pass it back as `deepCursor` to resume exactly where
+   *  coverage stopped. */
+  nextCursor?: string;
 };
 
 export type ExpandedResult = {
@@ -215,11 +340,15 @@ export type MessagesOutput = {
     sessionTitle?: string;
     directory?: string;
   };
+  /** Cursor-based pagination over one bounded newest-first page. `nextCursor`
+   *  (opaque) continues from where this page stopped; absent means the last
+   *  page. `returned` counts messages after role/query filtering within the
+   *  page, so it can be less than `limit`. */
   pagination: {
-    offset: number;
+    limit: number;
     returned: number;
-    total: number;
     hasMore: boolean;
+    nextCursor?: string;
   };
 };
 
@@ -230,6 +359,17 @@ export type SessionItem = {
   project?: { name?: string; worktree: string };
   time: { created: number; updated: number };
   archived: boolean;
+  /** Content-derived digest (the card's summary head), present only when a
+   *  distilled card exists for the session (best-effort; recall_sessions never
+   *  fetches). */
+  digest?: string;
+  /** Up to the top files the session touched (from the card, when one exists). */
+  files?: string[];
+  /** Up to the top tools the session used (from the card, when one exists). */
+  tools?: string[];
+  /** Family rollup for a root session: its id and how many descendant sessions
+   *  the card store knows about. Present only for a root that has children. */
+  family?: { rootId: string; childCount: number };
 };
 
 export type SessionsOutput = {
@@ -237,6 +377,10 @@ export type SessionsOutput = {
   sessions: SessionItem[];
   returned: number;
   scope: string;
+  /** Explains a caveat in how the listing was produced — e.g. a since/until
+   *  filter that could only be applied within the newest-limit window because no
+   *  card store was available to resolve older sessions authoritatively. */
+  note?: string;
 };
 
 export type ErrorOutput = {
@@ -258,8 +402,11 @@ export function errmsg(e: unknown): string {
   }
 }
 
-export function optionalString(value: string | undefined): string | undefined {
-  const trimmed = value?.trim();
+export function optionalString(value: unknown): string | undefined {
+  // Defensive against the host-bypass path: a raw non-string (number, object)
+  // must coerce to "unset", not throw on .trim().
+  if (typeof value !== "string") return undefined;
+  const trimmed = value.trim();
   return trimmed ? trimmed : undefined;
 }
 

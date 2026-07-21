@@ -51,6 +51,39 @@ function findAllPositions(haystack: string, needle: string): number[] {
   return positions;
 }
 
+function omissionMarker(omitted: number): string {
+  return `\n[… ${omitted} chars omitted; use recall_get for the full message]\n`;
+}
+
+/**
+ * Truncate `text` to at most `cap` chars while preserving both the head and a
+ * window around `matchIndex`. Head-only truncation would slice off the matched
+ * region whenever it sits deep inside a large part; this keeps the beginning
+ * (context) plus the region that actually matched, joined by an omission
+ * marker. Falls back to a plain head slice when the match is absent, invalid,
+ * or already inside the kept head.
+ */
+export function truncatePreservingMatch(text: string, matchIndex: number, cap: number): string {
+  if (cap <= 0) return "";
+  if (text.length <= cap) return text;
+
+  const headLength = Math.floor(cap * 0.4);
+  if (!(matchIndex > 0) || matchIndex < headLength) return text.slice(0, cap);
+
+  // Reserve marker space using the worst-case omitted count (full length).
+  const markerReserve = omissionMarker(text.length).length;
+  const windowLength = cap - headLength - markerReserve;
+  if (windowLength < 20) return text.slice(0, cap);
+
+  let start = Math.max(headLength, matchIndex - Math.floor(windowLength / 2));
+  const end = Math.min(text.length, start + windowLength);
+  start = Math.max(headLength, end - windowLength);
+  const omitted = start - headLength;
+  if (omitted <= 0) return text.slice(0, cap);
+
+  return text.slice(0, headLength) + omissionMarker(omitted) + text.slice(start, end);
+}
+
 /**
  * Select the best snippet window from raw text based on query token density.
  * For smart/fuzzy mode: finds the window with the most query token matches.

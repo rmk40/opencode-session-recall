@@ -3,7 +3,8 @@ import { distance } from "fastest-levenshtein";
 import type { Candidate } from "./candidates.js";
 import type { ParsedQuery } from "./query.js";
 import { tokenize, tokenizeAll } from "./normalize.js";
-import type { ResultWhy } from "./types.js";
+import { evidenceClassFor } from "./extract.js";
+import type { EvidenceClass, ResultWhy } from "./types.js";
 
 /**
  * BM25 relevance ranking via an in-memory MiniSearch index built per query.
@@ -15,18 +16,23 @@ import type { ResultWhy } from "./types.js";
  * phrase, coverage) are layered on as multiplicative document boosts so they
  * ride on a calibrated relevance score rather than an uncalibrated fuzzy distance.
  *
- * The index is rebuilt every call. This is intentional and cheap: histories load
- * fast and there is no persistent cache (by design).
+ * The index is rebuilt per query over candidates served from the shared
+ * corpus cache (src/corpus.ts), which already amortizes fetching, extraction,
+ * tokenization, and normalization per session version — rebuilding the
+ * MiniSearch index itself is the cheap part.
  */
 
 export type Bm25Mode = "smart" | "fuzzy";
 
 export type Bm25Hit = {
   candidate: Candidate;
-  /** Final score in 0..1 (BM25 relative score × structural multiplier). */
+  /** BM25 relative score × structural multipliers. UNCLAMPED: boosts can push
+   *  it above 1 so they can break ties at the relative top; the output layer
+   *  (rankedToSearchResults) clamps to 0..1 for the public shape. */
   score: number;
   matchedTerms: string[];
   matchedFields: ResultWhy["matchedFields"];
+  evidenceClass: EvidenceClass;
   matchReasons: string[];
 };
 
@@ -42,6 +48,28 @@ const RECENCY_MULT_MAX = 1.05; // was +0.05 at max
 const WEAK_FUZZY_MULT = 0.9; // was −0.10
 const POOR_COVERAGE_MULT = 0.92; // was −0.08
 
+// ── Evidence-class multipliers ────────────────────────────────────────
+// Concrete actions (tool inputs) beat generated reference material (skill
+// payloads, file reads) for "what did we do before" queries. Plain tool
+// output is deliberately NOT penalized: error/stdout evidence is often the
+// only record of what happened. Tuned against test/eval/.
+const TOOL_INPUT_MULT = 1.1;
+const SKILL_DEFINITION_MULT = 0.85;
+const FILE_READ_MULT = 0.9;
+/** Fetched web content is reference material, same tier as skill payloads —
+ *  exactly the class round-2 dogfooding saw dominating workflow queries. */
+const WEB_FETCH_MULT = 0.85;
+
+/** Verbatim presence of a code-like compound query token (tokenization splits
+ *  them, so BM25 alone cannot tell `GHOSTAUTH_LIVE_TUI` from the loose words). */
+const EXACT_TOKEN_MULT = 1.12;
+
+/** Session-identity boost: at least half the query tokens appear in the
+ *  candidate's session digest (built from the session's own statements and
+ *  commands, never from reads). A session that SAID or DID the query's terms
+ *  outranks one that merely read about them at equal lexical strength. */
+const DIGEST_MATCH_MULT = 1.15;
+
 const RECENCY_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
 const WEAK_FUZZY_THRESHOLD = 0.7;
 
@@ -50,8 +78,12 @@ const WEAK_FUZZY_THRESHOLD = 0.7;
  * MiniSearch combines terms with OR, so a single weakly-matched term can surface
  * an otherwise-irrelevant document. This floor drops that noise. It is a relative
  * floor: scores are normalized to the top hit, so the best match always survives.
+ * (Applied to the unclamped boosted score; multipliers shift hits across the
+ * floor slightly, which is intended — penalized classes may drop below it.)
+ * Exported for the shortlist merge, which uses it as the re-entry ceiling for
+ * deep hits whose broad counterparts this floor removed.
  */
-const MIN_RELATIVE_SCORE = 0.1;
+export const MIN_RELATIVE_SCORE = 0.1;
 
 const ERROR_PATTERNS = ["error", "failed", "exception"];
 
@@ -73,19 +105,34 @@ function maxEditDistance(term: string, mode: Bm25Mode): number {
   return Math.min(MAX_FUZZY, Math.round(term.length * fuzzyFor(mode)));
 }
 
-function containsErrorPattern(text: string): boolean {
+/** Whether text carries an error signature (`error`/`failed`/`exception`).
+ *  Exported so the distiller mines the same error vocabulary from tool outputs
+ *  when building a card's error-signature list. */
+export function containsErrorPattern(text: string): boolean {
   const lower = text.toLowerCase();
   return ERROR_PATTERNS.some((p) => lower.includes(p));
 }
 
-function recencyMultiplier(time: number): number {
+/** Recency prior: linearly decays from {@link RECENCY_MULT_MAX} at now to 1.0 at
+ *  {@link RECENCY_WINDOW_MS} old, then flat. Exported so tier-1 card ranking
+ *  applies the same recency shape as part-level scoring. */
+export function recencyMultiplier(time: number): number {
   const ageMs = Date.now() - time;
   const factor = Math.max(0, 1 - ageMs / RECENCY_WINDOW_MS);
   return 1 + factor * (RECENCY_MULT_MAX - 1);
 }
 
-function clamp01(value: number): number {
+export function clamp01(value: number): number {
   return Math.max(0, Math.min(1, value));
+}
+
+/** Deterministic hit ordering: score, then recency, then partID. */
+export function compareHits(a: Bm25Hit, b: Bm25Hit): number {
+  const diff = b.score - a.score;
+  if (diff !== 0) return diff;
+  const timeDiff = b.candidate.time - a.candidate.time;
+  if (timeDiff !== 0) return timeDiff;
+  return a.candidate.partID.localeCompare(b.candidate.partID);
 }
 
 /**
@@ -156,16 +203,21 @@ type IndexedDoc = {
   secondaryText: string;
   titleText: string;
   hintText: string;
+  digestText: string;
 };
 
-const FIELDS = ["primaryText", "secondaryText", "titleText", "hintText"] as const;
+const FIELDS = ["primaryText", "secondaryText", "titleText", "hintText", "digestText"] as const;
 
-/** Field boosts mirror the old Fuse key weights (primary dominates). */
+/** Field boosts mirror the old Fuse key weights (primary dominates). The
+ *  digest sits between directory (0.6) and title (0.3): content-derived
+ *  session identity outranks naming metadata but never body text. The main
+ *  digest ranking signal is DIGEST_MATCH_MULT below, not this field boost. */
 const FIELD_BOOST: Record<(typeof FIELDS)[number], number> = {
   primaryText: 2,
   secondaryText: 0.6,
   titleText: 0.3,
   hintText: 0.15,
+  digestText: 0.4,
 };
 
 /**
@@ -186,6 +238,7 @@ export function bm25Search(
     secondaryText: c.secondaryText ?? "",
     titleText: c.titleText ?? "",
     hintText: c.hintText ?? "",
+    digestText: c.digestText ?? "",
   }));
 
   const mini = new MiniSearch<IndexedDoc>({
@@ -216,6 +269,9 @@ export function bm25Search(
   // Normalize BM25 scores to a 0..1 relative scale using the top score.
   const maxScore = rawHits[0]!.score || 1;
 
+  // Digest strings repeat across a session's candidates; tokenize each once.
+  const digestTokenCache = new Map<string, Set<string>>();
+
   const hits: Bm25Hit[] = [];
   for (const hit of rawHits) {
     const candidate = candidates[hit.id as number]!;
@@ -232,8 +288,46 @@ export function bm25Search(
       if (explain) reasons.push(`Exact phrase: ×${EXACT_PHRASE_MULT}`);
     }
 
+    // Session-identity: the session's own statements/actions cover the query.
+    if (candidate.digestText && query.tokens.length > 0) {
+      let digestTokens = digestTokenCache.get(candidate.digestText);
+      if (!digestTokens) {
+        digestTokens = new Set(tokenize(candidate.digestText));
+        digestTokenCache.set(candidate.digestText, digestTokens);
+      }
+      const covered = query.tokens.filter((token) => digestTokens!.has(token)).length;
+      if (covered * 2 >= query.tokens.length) {
+        mult *= DIGEST_MATCH_MULT;
+        if (explain) reasons.push(`Session digest match: ×${DIGEST_MATCH_MULT}`);
+      }
+    }
+
+    // Verbatim code-like compound token (case-insensitive).
+    if (
+      query.codeTokens.length > 0 &&
+      query.codeTokens.some((token) => rawLower.includes(token.toLowerCase()))
+    ) {
+      mult *= EXACT_TOKEN_MULT;
+      if (explain) reasons.push(`Exact code token: ×${EXACT_TOKEN_MULT}`);
+    }
+
     const matchedTerms = findMatchedTerms(query.tokens, indexedTokenPool(candidate), mode);
     const matchedFields = findMatchedFields(query, candidate, mode);
+    const evidenceClass = evidenceClassFor(candidate.partType, candidate.toolName, matchedFields);
+    if (evidenceClass === "tool-input") {
+      mult *= TOOL_INPUT_MULT;
+      if (explain) reasons.push(`Tool input: ×${TOOL_INPUT_MULT}`);
+    } else if (evidenceClass === "skill-definition") {
+      mult *= SKILL_DEFINITION_MULT;
+      if (explain) reasons.push(`Skill definition: ×${SKILL_DEFINITION_MULT}`);
+    } else if (evidenceClass === "file-read") {
+      mult *= FILE_READ_MULT;
+      if (explain) reasons.push(`File read: ×${FILE_READ_MULT}`);
+    } else if (evidenceClass === "web-fetch") {
+      mult *= WEB_FETCH_MULT;
+      if (explain) reasons.push(`Web fetch: ×${WEB_FETCH_MULT}`);
+    }
+    if (explain) reasons.push(`Evidence class: ${evidenceClass}`);
     const allTokens = query.tokens.length > 0 && matchedTerms.length === query.tokens.length;
     if (allTokens) {
       mult *= ALL_TOKENS_MULT;
@@ -273,24 +367,23 @@ export function bm25Search(
 
     hits.push({
       candidate,
-      score: clamp01(base * mult),
+      // Deliberately unclamped: clamping here would erase positive boosts at
+      // the relative top (1.0 × 1.12 → 1.0), reducing them to tie-breaks.
+      score: base * mult,
       matchedTerms,
       matchedFields,
+      evidenceClass,
       matchReasons: explain ? reasons : [],
     });
   }
 
-  hits.sort((a, b) => {
-    const diff = b.score - a.score;
-    if (diff !== 0) return diff;
-    const timeDiff = b.candidate.time - a.candidate.time;
-    if (timeDiff !== 0) return timeDiff;
-    // Final deterministic tie-breaker so ordering is stable across runs.
-    return a.candidate.partID.localeCompare(b.candidate.partID);
-  });
+  hits.sort(compareHits);
 
   // Drop trailing noise from OR-combined weak single-term matches, but never
-  // drop the only/best hit (the floor is relative to the top score).
+  // drop the only/best hit. The floor is relative to the BOOSTED top score:
+  // internal scores are unclamped, so a fixed threshold would stop being
+  // relative whenever multipliers push the top above 1.
   if (hits.length <= 1) return hits;
-  return hits.filter((h) => h.score >= MIN_RELATIVE_SCORE);
+  const floor = hits[0]!.score * MIN_RELATIVE_SCORE;
+  return hits.filter((h) => h.score >= floor);
 }

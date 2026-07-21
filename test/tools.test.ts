@@ -1,9 +1,10 @@
-import { describe, expect, it } from "vitest";
+import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { context as contextTool } from "../src/context.js";
 import { get as getTool } from "../src/get.js";
 import { messages as messagesTool } from "../src/messages.js";
 import { search } from "../src/search.js";
 import { sessions as sessionsTool } from "../src/sessions.js";
+import { createFetchGate, type FetchGate } from "../src/fetch-gate.js";
 import type {
   ContextOutput,
   ErrorOutput,
@@ -12,7 +13,43 @@ import type {
   SearchOutput,
   SessionsOutput,
 } from "../src/types.js";
-import { TEST_LIMITS, makeContext, makeFakeHarness, runTool, runToolRaw } from "./helpers.js";
+import {
+  PROJECT_DIR,
+  TEST_LIMITS,
+  bundle,
+  globalSessionFrom,
+  makeContext,
+  makeFakeHarness,
+  makeRecallDeps,
+  runTool,
+  runToolRaw,
+  session,
+  setStrictNoLimitMessages,
+  textPart,
+  userMessage,
+} from "./helpers.js";
+
+// Every browse/search tool must fetch bounded pages, never a whole session.
+beforeAll(() => setStrictNoLimitMessages(true));
+afterAll(() => setStrictNoLimitMessages(false));
+
+// Shared gate for the browse tools (they must not fetch outside the concurrency
+// budget). `gate` is a plain gate for behavior tests; `makeSpyGate` counts
+// `runQuery` calls so a test can assert the fetch went through the gate.
+const gate: FetchGate = createFetchGate({ concurrency: 4 });
+function makeSpyGate(): { gate: FetchGate; queries: () => number } {
+  const real = createFetchGate({ concurrency: 4 });
+  let queryCount = 0;
+  const spy: FetchGate = {
+    runQuery: (fn) => {
+      queryCount++;
+      return real.runQuery(fn);
+    },
+    runBackground: (fn) => real.runBackground(fn),
+    activeQueries: () => real.activeQueries(),
+  };
+  return { gate: spy, queries: () => queryCount };
+}
 
 describe("recall_sessions", () => {
   it("lists project sessions with schema defaults", async () => {
@@ -66,52 +103,52 @@ describe("recall_sessions", () => {
 });
 
 describe("recall_messages", () => {
-  it("browses current-session messages chronologically with pagination", async () => {
+  it("returns one bounded newest-first page with a continuation cursor", async () => {
     const h = makeFakeHarness();
-    const out = await runTool<MessagesOutput>(messagesTool(h.client, TEST_LIMITS), {
-      limit: 2,
-    });
+    const tool = messagesTool(h.client, gate, TEST_LIMITS);
+    const out = await runTool<MessagesOutput>(tool, { limit: 2 });
 
-    expect(out.messages.map((m) => m.message.id)).toEqual(["m-current-1", "m-current-2"]);
-    expect(out.pagination).toEqual({
-      offset: 0,
-      returned: 2,
-      total: 6,
-      hasMore: true,
-    });
+    // Newest-first, always with an explicit limit (never a whole-session fetch).
+    expect(out.messages.map((m) => m.message.id)).toEqual(["m-current-6", "m-current-5"]);
+    expect(out.pagination.limit).toBe(2);
+    expect(out.pagination.returned).toBe(2);
+    expect(out.pagination.hasMore).toBe(true);
+    expect(out.pagination.nextCursor).toBeDefined();
+    expect(h.calls.messages.every((c) => c.limit != null)).toBe(true);
     expect(out.context.sessionTitle).toBe("Current Debugging Session");
+
+    // The cursor continues to the next page.
+    const next = await runTool<MessagesOutput>(tool, {
+      limit: 2,
+      cursor: out.pagination.nextCursor,
+    });
+    expect(next.messages.map((m) => m.message.id)).toEqual(["m-current-4", "m-current-3"]);
   });
 
-  it("supports reverse offset semantics and role/query filters", async () => {
+  it("filters the returned page by role and query", async () => {
     const h = makeFakeHarness();
-    const tool = messagesTool(h.client, TEST_LIMITS);
-
-    const reverse = await runTool<MessagesOutput>(tool, {
-      reverse: true,
-      offset: 1,
-      limit: 1,
-    });
-    expect(reverse.messages.map((m) => m.message.id)).toEqual(["m-current-5"]);
-
-    const filtered = await runTool<MessagesOutput>(tool, {
+    // A page large enough to cover the small session, then filter within it.
+    const filtered = await runTool<MessagesOutput>(messagesTool(h.client, gate, TEST_LIMITS), {
       role: "user",
       query: "checkout",
-      limit: 10,
+      limit: 50,
     });
     expect(filtered.messages.map((m) => m.message.id)).toEqual(["m-current-1"]);
-    expect(filtered.pagination.total).toBe(1);
+    expect(filtered.pagination.returned).toBe(1);
+    expect(filtered.pagination.hasMore).toBe(false);
+    expect(filtered.pagination.nextCursor).toBeUndefined();
   });
 
-  it("normalizes blank query and handles missing/error/no-data sessions", async () => {
+  it("normalizes blank query and handles missing/error/empty sessions", async () => {
     const blank = makeFakeHarness();
-    const blankOut = await runTool<MessagesOutput>(messagesTool(blank.client, TEST_LIMITS), {
+    const blankOut = await runTool<MessagesOutput>(messagesTool(blank.client, gate, TEST_LIMITS), {
       query: "   ",
       limit: 50,
     });
-    expect(blankOut.pagination.total).toBe(6);
+    expect(blankOut.pagination.returned).toBe(6);
 
     const missing = await runTool<ErrorOutput>(
-      messagesTool(blank.client, TEST_LIMITS),
+      messagesTool(blank.client, gate, TEST_LIMITS),
       {},
       makeContext({ sessionID: "" }).ctx,
     );
@@ -120,34 +157,62 @@ describe("recall_messages", () => {
     const errored = makeFakeHarness({
       messageErrors: { "s-current": "Unauthorized" },
     });
-    const errorOut = await runTool<ErrorOutput>(messagesTool(errored.client, TEST_LIMITS), {});
+    const errorOut = await runTool<ErrorOutput>(
+      messagesTool(errored.client, gate, TEST_LIMITS),
+      {},
+    );
     expect(errorOut.error).toContain("Unauthorized");
 
+    // A session with no data now returns an empty page rather than an error.
     const noData = makeFakeHarness({ noMessageData: new Set(["s-current"]) });
-    const noDataOut = await runTool<ErrorOutput>(messagesTool(noData.client, TEST_LIMITS), {});
-    expect(noDataOut.error).toBe("No messages returned");
+    const noDataOut = await runTool<MessagesOutput>(
+      messagesTool(noData.client, gate, TEST_LIMITS),
+      {},
+    );
+    expect(noDataOut.ok).toBe(true);
+    expect(noDataOut.pagination.returned).toBe(0);
   });
 
-  it("survives raw MCP-bypass args (undefined role/limit/offset/reverse must not filter everything)", async () => {
+  it("survives raw MCP-bypass args (undefined role/limit must not filter everything)", async () => {
     // The live MCP host can forward args that skip Zod defaults. With role
     // undefined, the old code did `role !== "all"` → true → filtered everything
-    // out, returning total:0 on a non-empty session. Coercion must restore the
-    // defaults. runToolRaw bypasses Zod exactly like the MCP host.
+    // out. Coercion restores the defaults AND still passes a limit under strict.
     const h = makeFakeHarness();
-    const out = await runToolRaw<MessagesOutput>(messagesTool(h.client, TEST_LIMITS), {
+    const out = await runToolRaw<MessagesOutput>(messagesTool(h.client, gate, TEST_LIMITS), {
       sessionID: "s-current",
     });
     expect(out.ok).toBe(true);
-    expect(out.pagination.total).toBe(6);
     expect(out.pagination.returned).toBeGreaterThan(0);
-    expect(out.pagination.offset).toBe(0);
+    expect(h.calls.messages.every((c) => c.limit != null)).toBe(true);
+  });
+
+  it("survives a raw non-string cursor (host path): treats it as the first page", async () => {
+    // A Zod-bypassed non-string cursor must coerce to undefined (first page),
+    // never reach the SDK as a bad `before`, and never throw.
+    const h = makeFakeHarness();
+    const out = await runToolRaw<MessagesOutput>(messagesTool(h.client, gate, TEST_LIMITS), {
+      sessionID: "s-current",
+      cursor: 123,
+    });
+    expect(out.ok).toBe(true);
+    expect(out.pagination.returned).toBeGreaterThan(0);
+    // No stray cursor was forwarded to the SDK as `before`.
+    expect(h.calls.messages.every((c) => c.before === undefined)).toBe(true);
+  });
+
+  it("routes its fetches through the shared gate", async () => {
+    const h = makeFakeHarness();
+    const { gate: spy, queries } = makeSpyGate();
+    await runTool<MessagesOutput>(messagesTool(h.client, spy, TEST_LIMITS), { limit: 2 });
+    // The page fetch (and the session.get) must go through gate.runQuery.
+    expect(queries()).toBeGreaterThan(0);
   });
 });
 
 describe("recall_get", () => {
   it("returns formatted full messages with model, pruned, and tool-state details", async () => {
     const h = makeFakeHarness();
-    const tool = getTool(h.client);
+    const tool = getTool(h.client, gate);
 
     const user = await runTool<MessageOutput>(tool, {
       sessionID: "s-current",
@@ -192,7 +257,7 @@ describe("recall_get", () => {
 
   it("handles not-found, returned errors, and context lookup failures", async () => {
     const h = makeFakeHarness();
-    const notFound = await runTool<ErrorOutput>(getTool(h.client), {
+    const notFound = await runTool<ErrorOutput>(getTool(h.client, gate), {
       sessionID: "s-current",
       messageID: "missing",
     });
@@ -201,7 +266,7 @@ describe("recall_get", () => {
     const noData = makeFakeHarness({
       noSingleMessageData: new Set(["s-current:m-current-1"]),
     });
-    const noDataOut = await runTool<ErrorOutput>(getTool(noData.client), {
+    const noDataOut = await runTool<ErrorOutput>(getTool(noData.client, gate), {
       sessionID: "s-current",
       messageID: "m-current-1",
     });
@@ -210,14 +275,14 @@ describe("recall_get", () => {
     const errored = makeFakeHarness({
       messageLookupErrors: { "s-current:m-current-1": "message API failed" },
     });
-    const errorOut = await runTool<ErrorOutput>(getTool(errored.client), {
+    const errorOut = await runTool<ErrorOutput>(getTool(errored.client, gate), {
       sessionID: "s-current",
       messageID: "m-current-1",
     });
     expect(errorOut.error).toContain("message API failed");
 
     const noContext = makeFakeHarness({ getThrows: new Set(["s-current"]) });
-    const ok = await runTool<MessageOutput>(getTool(noContext.client), {
+    const ok = await runTool<MessageOutput>(getTool(noContext.client, gate), {
       sessionID: "s-current",
       messageID: "m-current-1",
     });
@@ -225,12 +290,23 @@ describe("recall_get", () => {
     expect(ok.context.sessionTitle).toBeUndefined();
     expect(ok.context.directory).toBeUndefined();
   });
+
+  it("routes its fetches through the shared gate", async () => {
+    const h = makeFakeHarness();
+    const { gate: spy, queries } = makeSpyGate();
+    await runTool<MessageOutput>(getTool(h.client, spy), {
+      sessionID: "s-current",
+      messageID: "m-current-1",
+    });
+    // The message fetch (and the session.get) must go through gate.runQuery.
+    expect(queries()).toBeGreaterThan(0);
+  });
 });
 
 describe("recall_context", () => {
   it("returns centered windows, window:0, and asymmetric before/after slices", async () => {
     const h = makeFakeHarness();
-    const tool = contextTool(h.client, TEST_LIMITS);
+    const tool = contextTool(h.client, gate, TEST_LIMITS);
 
     const around = await runTool<ContextOutput>(tool, {
       sessionID: "s-current",
@@ -264,7 +340,7 @@ describe("recall_context", () => {
 
   it("sets boundary hasMore flags at the first and last message", async () => {
     const h = makeFakeHarness();
-    const tool = contextTool(h.client, TEST_LIMITS);
+    const tool = contextTool(h.client, gate, TEST_LIMITS);
 
     const first = await runTool<ContextOutput>(tool, {
       sessionID: "s-current",
@@ -287,7 +363,7 @@ describe("recall_context", () => {
 
   it("handles message-not-found, returned errors, and no-data errors", async () => {
     const h = makeFakeHarness();
-    const notFound = await runTool<ErrorOutput>(contextTool(h.client, TEST_LIMITS), {
+    const notFound = await runTool<ErrorOutput>(contextTool(h.client, gate, TEST_LIMITS), {
       sessionID: "s-current",
       messageID: "missing",
     });
@@ -296,14 +372,14 @@ describe("recall_context", () => {
     const errored = makeFakeHarness({
       messageErrors: { "s-current": "Unauthorized" },
     });
-    const errorOut = await runTool<ErrorOutput>(contextTool(errored.client, TEST_LIMITS), {
+    const errorOut = await runTool<ErrorOutput>(contextTool(errored.client, gate, TEST_LIMITS), {
       sessionID: "s-current",
       messageID: "m-current-1",
     });
     expect(errorOut.error).toContain("Unauthorized");
 
     const noData = makeFakeHarness({ noMessageData: new Set(["s-current"]) });
-    const noDataOut = await runTool<ErrorOutput>(contextTool(noData.client, TEST_LIMITS), {
+    const noDataOut = await runTool<ErrorOutput>(contextTool(noData.client, gate, TEST_LIMITS), {
       sessionID: "s-current",
       messageID: "m-current-1",
     });
@@ -312,13 +388,52 @@ describe("recall_context", () => {
 
   it("survives raw MCP-bypass args (undefined window must not break slice bounds)", async () => {
     const h = makeFakeHarness();
-    const out = await runToolRaw<ContextOutput>(contextTool(h.client, TEST_LIMITS), {
+    const out = await runToolRaw<ContextOutput>(contextTool(h.client, gate, TEST_LIMITS), {
       sessionID: "s-current",
       messageID: "m-current-3",
     });
     expect(out.ok).toBe(true);
     expect(out.messages.length).toBeGreaterThan(0);
     expect(out.messages.some((m) => m.center)).toBe(true);
+  });
+
+  it("fetches only bounded pages, never the whole session", async () => {
+    // A 60-message session: a small window around a recent message must be
+    // served by bounded newest-first pages, never an unpaginated whole-session
+    // pull (the incident path).
+    const h = makeFakeHarness();
+    h.messagesBySession["s-big"] = Array.from({ length: 60 }, (_, i) =>
+      bundle(userMessage(`mb-${i}`, "s-big", 1_000 + i), [
+        textPart(`pb-${i}`, "s-big", `mb-${i}`, `context line ${i}`),
+      ]),
+    );
+
+    const out = await runTool<ContextOutput>(contextTool(h.client, gate, TEST_LIMITS), {
+      sessionID: "s-big",
+      messageID: "mb-59",
+      window: 1,
+    });
+    expect(out.ok).toBe(true);
+    expect(out.messages.some((m) => m.center && m.message.id === "mb-59")).toBe(true);
+    // Every fetch carried an explicit, capped limit …
+    expect(
+      h.calls.messages.every((c) => c.limit != null && c.limit <= TEST_LIMITS.maxMessages),
+    ).toBe(true);
+    // … and the total fetched stayed well under the whole 60-message session.
+    const totalFetched = h.calls.messages.reduce((sum, c) => sum + (c.limit ?? 0), 0);
+    expect(totalFetched).toBeLessThan(60);
+  });
+
+  it("routes its fetches through the shared gate", async () => {
+    const h = makeFakeHarness();
+    const { gate: spy, queries } = makeSpyGate();
+    await runTool<ContextOutput>(contextTool(h.client, spy, TEST_LIMITS), {
+      sessionID: "s-current",
+      messageID: "m-current-3",
+      window: 1,
+    });
+    // The window page fetch (and the session.get) must go through gate.runQuery.
+    expect(queries()).toBeGreaterThan(0);
   });
 });
 
@@ -333,19 +448,140 @@ describe("recall_sessions defensive args", () => {
     expect(out.scope).toBe("project");
     expect(Array.isArray(out.sessions)).toBe(true);
   });
+
+  it("survives raw non-string since/until (host path): ignores the filters", async () => {
+    // The since/until time bounds can arrive with the wrong type from the live
+    // MCP host. optionalString() must drop them (no .trim() on a non-string) so
+    // the listing succeeds unfiltered rather than throwing.
+    const h = makeFakeHarness();
+    const out = await runToolRaw<SessionsOutput>(
+      sessionsTool(h.client, h.unscoped, true, TEST_LIMITS),
+      { scope: "global", since: 42, until: {} },
+    );
+    expect(out.ok).toBe(true);
+    // Non-string bounds were ignored, so every listed session came through.
+    expect(out.sessions.length).toBeGreaterThan(0);
+  });
+});
+
+describe("recall_sessions enrichment", () => {
+  it("attaches card-store digest, files, tools, and family from the card store", async () => {
+    const h = makeFakeHarness();
+
+    // No enrichment source (no store wired) → bare listings, ever.
+    const cold = await runTool<SessionsOutput>(
+      sessionsTool(h.client, h.unscoped, true, TEST_LIMITS),
+      { scope: "global" },
+    );
+    expect(cold.sessions.every((s) => s.digest === undefined)).toBe(true);
+    expect(cold.sessions.every((s) => s.files === undefined && s.tools === undefined)).toBe(true);
+
+    // With a seeded card store, sessions carry their card's summary head, top
+    // files/tools, and a family rollup for roots — served from the card store,
+    // no message fetch.
+    const { store, cleanup } = await makeRecallDeps(h);
+    try {
+      const enrichment = { cards: () => store.allCards() };
+      const warm = await runTool<SessionsOutput>(
+        sessionsTool(h.client, h.unscoped, true, TEST_LIMITS, enrichment),
+        { scope: "global" },
+      );
+      const current = warm.sessions.find((s) => s.id === "s-current");
+      expect(current?.digest).toBeDefined();
+      expect(current!.digest!.length).toBeLessThanOrEqual(160);
+      // s-project-2 touched the checkout cache via a bash tool → tools present.
+      const projectTwo = warm.sessions.find((s) => s.id === "s-project-2");
+      expect(projectTwo?.tools).toContain("bash");
+      // No message fetch happened for enrichment.
+      expect(h.calls.messages).toHaveLength(0);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("filters by since/until on time.updated", async () => {
+    const h = makeFakeHarness();
+    const { store, cleanup } = await makeRecallDeps(h);
+    try {
+      const enrichment = { cards: () => store.allCards() };
+      // s-other is the newest global session (updated now-500); a tight `since`
+      // keeps only the freshest, an `until` in the future keeps all.
+      const recent = await runTool<SessionsOutput>(
+        sessionsTool(h.client, h.unscoped, true, TEST_LIMITS, enrichment),
+        { scope: "global", since: "1h" },
+      );
+      // All fixture sessions are within the last hour, so since:1h keeps them.
+      expect(recent.sessions.length).toBeGreaterThan(0);
+
+      // A future-only lower bound (very small window) drops everything.
+      const none = await runTool<SessionsOutput>(
+        sessionsTool(h.client, h.unscoped, true, TEST_LIMITS, enrichment),
+        { scope: "global", until: "10w" },
+      );
+      // until:10w = updated <= now-10w → all fixture sessions are newer → none.
+      expect(none.sessions).toHaveLength(0);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("returns older matches beyond the newest page when a card store is present", async () => {
+    // The defect: session.list returns only the newest `limit` rows, so
+    // post-filtering an until bound there drops older matches. With the card
+    // store, the time-filtered set is resolved authoritatively in memory.
+    const now = Date.now();
+    const h = makeFakeHarness();
+    const old = session("s-old", "Old cache investigation", PROJECT_DIR, now - 40 * 24 * 3600_000);
+    h.sessions.push(old);
+    h.globalSessions.push(globalSessionFrom(old));
+    h.messagesBySession[old.id] = [
+      bundle(userMessage("m-old-1", old.id, now - 40 * 24 * 3600_000 - 500), [
+        textPart("p-old-1", old.id, "m-old-1", "old cache investigation notes"),
+      ]),
+    ];
+    const { store, cleanup } = await makeRecallDeps(h);
+    try {
+      const enrichment = { cards: () => store.allCards() };
+      // until:30d excludes every newest fixture session; only s-old (40d) matches.
+      // A tiny limit means the list path would return only the (excluded) newest
+      // page — the card path still surfaces the older match.
+      const out = await runTool<SessionsOutput>(
+        sessionsTool(h.client, h.unscoped, true, TEST_LIMITS, enrichment),
+        { scope: "global", until: "30d", limit: 2 },
+      );
+      expect(out.sessions.map((s) => s.id)).toContain("s-old");
+      expect(h.calls.messages).toHaveLength(0);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("notes the newest-window caveat when filtering without a card store (degraded)", async () => {
+    const h = makeFakeHarness();
+    // No enrichment → the time filter can only apply within the list's page.
+    const out = await runTool<SessionsOutput>(
+      sessionsTool(h.client, h.unscoped, true, TEST_LIMITS),
+      { scope: "global", since: "7d" },
+    );
+    expect(out.ok).toBe(true);
+    expect(out.note).toBeDefined();
+    expect(out.note).toMatch(/newest/i);
+  });
 });
 
 describe("LLM-facing schemas", () => {
   it("reject invalid enum and capped numeric args before execute", async () => {
     const h = makeFakeHarness();
-    const recall = search(h.client, h.unscoped, true, {
-      ...TEST_LIMITS,
-      maxResults: 2,
-    });
-
-    await expect(
-      runTool<SearchOutput>(recall, { query: "rate", scope: "everywhere" }),
-    ).rejects.toThrow();
-    await expect(runTool<SearchOutput>(recall, { query: "rate", results: 3 })).rejects.toThrow();
+    const limits = { ...TEST_LIMITS, maxResults: 2 };
+    const { deps, cleanup } = await makeRecallDeps(h, limits);
+    try {
+      const recall = search(h.client, h.unscoped, true, limits, deps);
+      await expect(
+        runTool<SearchOutput>(recall, { query: "rate", scope: "everywhere" }),
+      ).rejects.toThrow();
+      await expect(runTool<SearchOutput>(recall, { query: "rate", results: 3 })).rejects.toThrow();
+    } finally {
+      cleanup();
+    }
   });
 });
