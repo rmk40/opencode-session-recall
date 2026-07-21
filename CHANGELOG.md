@@ -4,7 +4,7 @@ All notable changes to this project are documented here. This project follows
 [Conventional Commits](https://www.conventionalcommits.org/) and
 [Semantic Versioning](https://semver.org/).
 
-## 2.0.0 (unreleased)
+## 2.0.0
 
 This is the architecture rewrite. Through 0.12.x, `recall` answered a query by
 fetching session history over the SDK into process memory and scanning it there.
