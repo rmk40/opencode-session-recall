@@ -179,19 +179,17 @@ The retrieval contract changed with the architecture. 1.x promised exhaustive sc
 
 The store is derived and disposable. Delete the file and the distiller rebuilds it in the background; nothing you can lose lives only there. opencode's own database stays the sole source of truth, reached only through the SDK, never by a direct query. Several opencode processes can run against one store at once without corrupting it: a schema stamp fences out any build that would misread the format, persisted vectors carry a write generation so an older build cannot downgrade a newer one, and a single-writer lease keeps exactly one distiller writing at a time.
 
----
-
 The rest of this document is reference material. The agent gets the full parameter and response schema from each tool's own description at runtime, so you don't need to read it to use the plugin.
 
 ## Tools
 
 Five tools, designed around how agents navigate conversation history.
 
-### `recall` — Search
+### `recall` (search)
 
 The primary tool. Full-text search across session titles, messages, tool outputs, tool-input commands and `cwd` values, reasoning, and subtask descriptions. Searches globally by default, or narrowed to the current project or session.
 
-Project- and global-scope searches exclude the current session — and its whole delegation tree of subagent sessions, which restate the query and findings — by default, so "how did we do X before" queries return history instead of the conversation that just asked. Pass `excludeCurrentSession: false` to include them (session scope always searches the current session), or `excludeSessionID` to exclude one specific session.
+Project- and global-scope searches exclude the current session by default, along with its whole delegation tree of subagent sessions (they restate the query and findings), so "how did we do X before" queries return history instead of the conversation that just asked. Pass `excludeCurrentSession: false` to include them (session scope always searches the current session), or `excludeSessionID` to exclude one specific session.
 
 It supports four [match modes](#match-modes), session vs. part grouping, time filters (`since`/`until`/`last`/`from`/`to`/`before`/`after`), directory and project filters, and optional inline expansion of the top hits. Ranked results (`smart` and `fuzzy`) carry a relevance `score` and the matched terms; every result carries a short explanation of why it matched (`why`), including an `evidenceClass` that says what kind of evidence the hit is: something a person said (`human-text`), a command that ran (`tool-input`), its output (`tool-output`), reasoning, a session title, or generated reference material (`file-read`, `web-fetch` for fetched web content, `skill-definition`). Session-grouped results additionally carry `evidenceKinds` (the classes seen in that session) and up to two `topEvidence` snippets of other classes, so a session's hit is legible without a follow-up part-level search. The response includes coverage metadata describing what was searched, suggestions that react to the result composition (all hits from the current session, all generated reference material, shortlisted-but-unranked sessions), and, with `explain: true`, a `queryPlan` naming which search strategies ran. The agent receives the complete parameter list and response shape in the tool description; the short version:
 
@@ -212,7 +210,7 @@ Optional filters are forgiving: blank values are ignored, and malformed time fil
 
 Output-shape note for anyone parsing responses across versions: the top-level `scanned`, `loadErrorCount`, and `loadErrors` fields are gone (use `coverage.sessionsSearched` and `coverage.loadErrors`), `directoryRelevance` lives only under `why`, and `degradeKind: "budget"` no longer exists. Coverage now also carries a `cards` block (store totals and freshness) and, for a deep sweep, a `deep` block (sessions covered, partial, remaining) alongside the top-level `nextCursor`. See the [changelog](CHANGELOG.md) for the full list.
 
-### `recall_get` — Retrieve
+### `recall_get` (retrieve)
 
 Get the full content of a specific message, including all parts. Tool outputs are returned in their original form, even if they were pruned from context. Use after `recall` finds something interesting.
 
@@ -220,7 +218,7 @@ Get the full content of a specific message, including all parts. Tool outputs ar
 recall_get({ sessionID: "ses_abc", messageID: "msg_def" })
 ```
 
-### `recall_context` — Expand
+### `recall_context` (expand)
 
 Get a window of messages around a specific message. After `recall` finds a match, see what was asked before it and what happened after. Supports symmetric and asymmetric windows, and reports `hasMoreBefore`/`hasMoreAfter` at boundaries. The window is assembled from bounded newest-first pages, never a whole-session load, so it stays cheap even on a huge session.
 
@@ -229,7 +227,7 @@ recall_context({ sessionID: "ses_abc", messageID: "msg_def", window: 3 })
 recall_context({ sessionID: "ses_abc", messageID: "msg_def", before: 1, after: 5 })
 ```
 
-### `recall_messages` — Browse
+### `recall_messages` (browse)
 
 One bounded page of a session's messages, newest first. Pass `cursor` from a prior page's `nextCursor` to walk further back; `limit` sets the page size. Optional `role` and `query` filter within the returned page. Defaults to the current session.
 
@@ -239,7 +237,7 @@ recall_messages({ sessionID: "ses_abc", limit: 10, cursor: "..." })
 recall_messages({ query: "npm", role: "user" })
 ```
 
-### `recall_sessions` — Discover
+### `recall_sessions` (discover)
 
 List sessions by title, for lightweight recent-session browsing or recency checks. When a distilled card exists for a session, its entry is enriched from the card: a content `digest`, the top `files` and `tools` it touched, and, for a root session, a `family` rollup with its child count. `since`/`until` filter by last-updated time. For topical discovery, prefer `recall`; it searches titles and content together and labels title-only hits.
 
