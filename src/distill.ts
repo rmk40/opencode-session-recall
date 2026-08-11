@@ -44,10 +44,20 @@ const DEFAULT_LEASE_RETRY_MS = 60_000;
 const DEFAULT_COLD_PASS_RETRY_MS = 60_000;
 const LEASE_TTL_MS = 30_000;
 const HEARTBEAT_MS = 10_000;
+/** Bound process-lifetime state retained for malformed legacy sessions. */
+const MAX_QUARANTINED_SESSIONS = 1_000;
 
 // ── Shared shapes ────────────────────────────────────────────────────────────
 
 type MsgWithParts = { info: Message; parts: Part[] };
+
+class MalformedSessionError extends Error {
+  override name = "MalformedSessionError";
+}
+
+class SessionMetadataTransportError extends Error {
+  override name = "SessionMetadataTransportError";
+}
 
 /** Human-layer field extracted from one part; the FTS `norm` column and the
  *  per-row ids are added when this becomes a {@link PartTextRow}. */
@@ -100,7 +110,12 @@ export type DistillStatus = {
 
 export type Distiller = {
   start(): void;
-  stop(): void;
+  /** Stop accepting or scheduling work immediately, but keep renewing an
+   *  already-held lease until {@link stop} finalizes the handoff. */
+  quiesce(): void;
+  /** Whether this instance still owns a live lease, verified against the store. */
+  ownsLease(): boolean;
+  stop(): Promise<void>;
   onEvent(event: Event): void;
   status(): DistillStatus;
 };
@@ -562,7 +577,10 @@ export async function fetchMessagePage(
       : { sessionID: opts.sessionID, limit: opts.limit };
   const resp = await client.session.messages(params);
   if (resp.error) throw new Error(errmsg(resp.error));
-  const items = Array.isArray(resp.data) ? (resp.data as MsgWithParts[]) : [];
+  if (!Array.isArray(resp.data)) {
+    throw new MalformedSessionError("successful message response was not an array");
+  }
+  const items = resp.data as MsgWithParts[];
   return { items, nextCursor: readNextCursor(resp.response) };
 }
 
@@ -603,7 +621,14 @@ export function createDistiller(options: DistillerOptions): Distiller {
 
   // Store unavailable (degraded mode): every method is a clean no-op.
   if (!options.store) {
-    return { start() {}, stop() {}, onEvent() {}, status: noopStatus };
+    return {
+      start() {},
+      quiesce() {},
+      ownsLease: () => false,
+      async stop() {},
+      onEvent() {},
+      status: noopStatus,
+    };
   }
   const store: Store = options.store;
 
@@ -628,6 +653,7 @@ export function createDistiller(options: DistillerOptions): Distiller {
   type Timer = ReturnType<typeof setTimeout>;
 
   let stopped = false;
+  let finalized = false;
   let leaseHeld = false;
   let coldPassState: DistillStatus["coldPass"] = "idle";
   let lastError: string | undefined;
@@ -638,8 +664,11 @@ export function createDistiller(options: DistillerOptions): Distiller {
   let leaseRetryTimer: Timer | undefined;
   let coldPassRetryTimer: Timer | undefined;
   const debounceTimers = new Map<string, Timer>();
-  const inFlight = new Set<string>();
+  let coldPassPromise: Promise<void> | undefined;
+  const inFlight = new Map<string, Promise<void>>();
   const pendingRerun = new Set<string>();
+  const quarantined = new Map<string, number>();
+  let stopPromise: Promise<void> | undefined;
   /** Sessions that saw a removal-shaped event since their last full distill, so
    *  the next re-distill takes the full path rather than appending. */
   const removalSince = new Set<string>();
@@ -665,15 +694,30 @@ export function createDistiller(options: DistillerOptions): Distiller {
   // ── Fetch primitives (all through the gate at background priority) ──
 
   async function discoverSessions(): Promise<DistillSessionMeta[]> {
-    const sessions = await gate.runBackground(() => discover());
+    const sessions = await gate.runBackground(() => {
+      if (stopped || !leaseHeld) return Promise.resolve([]);
+      return discover();
+    });
     // Never distill the summarizer's worker session — its prompts embed card
     // digests, which recall must not surface (see isSummarizerTitle).
     return sessions.map(toMeta).filter((meta) => !isSummarizerTitle(meta.title));
   }
 
   async function fetchSessionMeta(sessionID: string): Promise<DistillSessionMeta | null> {
-    const resp = await gate.runBackground(() => client.session.get({ sessionID }));
-    if (resp.error || !resp.data || typeof resp.data !== "object") return null;
+    const resp = await gate.runBackground(() => {
+      if (stopped || !leaseHeld) return Promise.resolve(null);
+      return client.session.get({ sessionID });
+    });
+    if (!resp) return null;
+    if (resp.error) {
+      throw new SessionMetadataTransportError(
+        `session ${sessionID} metadata fetch failed: ${errmsg(resp.error)}`,
+      );
+    }
+    if (resp.data == null) return null;
+    if (typeof resp.data !== "object") {
+      throw new MalformedSessionError(`session ${sessionID} metadata response was not an object`);
+    }
     return toMeta(resp.data as Session);
   }
 
@@ -686,15 +730,24 @@ export function createDistiller(options: DistillerOptions): Distiller {
     let rowCount = 0;
     let first = true;
     do {
-      if (!first && limits.distillDelayMs > 0) await sleep(limits.distillDelayMs);
+      if (stopped || !leaseHeld) return all;
+      if (!first && limits.distillDelayMs > 0) {
+        await sleep(limits.distillDelayMs);
+        if (stopped || !leaseHeld) return all;
+      }
       first = false;
       const before = cursor;
-      const page = await gate.runBackground(() =>
-        fetchMessagePage(client, { sessionID, limit: pageMessages, before }),
-      );
-      for (const msg of page.items) {
-        all.push(msg);
-        for (const part of msg.parts) rowCount += distillFields(part).length;
+      const page = await gate.runBackground(() => {
+        if (stopped || !leaseHeld) return Promise.resolve({ items: [], nextCursor: null });
+        return fetchMessagePage(client, { sessionID, limit: pageMessages, before });
+      });
+      try {
+        for (const msg of page.items) {
+          all.push(msg);
+          for (const part of msg.parts) rowCount += distillFields(part).length;
+        }
+      } catch (error) {
+        throw new MalformedSessionError(errmsg(error));
       }
       cursor = page.nextCursor ?? undefined;
     } while (cursor && rowCount < maxRows);
@@ -715,12 +768,17 @@ export function createDistiller(options: DistillerOptions): Distiller {
     let first = true;
     let reached = false;
     do {
-      if (!first && limits.distillDelayMs > 0) await sleep(limits.distillDelayMs);
+      if (stopped || !leaseHeld) return { messages: collected, reached: false };
+      if (!first && limits.distillDelayMs > 0) {
+        await sleep(limits.distillDelayMs);
+        if (stopped || !leaseHeld) return { messages: collected, reached: false };
+      }
       first = false;
       const before = cursor;
-      const page = await gate.runBackground(() =>
-        fetchMessagePage(client, { sessionID, limit: pageMessages, before }),
-      );
+      const page = await gate.runBackground(() => {
+        if (stopped || !leaseHeld) return Promise.resolve({ items: [], nextCursor: null });
+        return fetchMessagePage(client, { sessionID, limit: pageMessages, before });
+      });
       for (const msg of page.items) {
         if (msg.info.id === checkpoint) {
           reached = true;
@@ -805,6 +863,7 @@ export function createDistiller(options: DistillerOptions): Distiller {
       parentById: parentChainOf(session),
       caps,
     });
+    if (stopped || !leaseHeld) return;
     store.replaceSessionParts(session.id, rows, card);
     bumpCardsRev();
   }
@@ -816,6 +875,7 @@ export function createDistiller(options: DistillerOptions): Distiller {
       return;
     }
     const { messages: newMessages, reached } = await fetchNewMessages(session.id, checkpoint);
+    if (stopped || !leaseHeld) return;
     // If the checkpoint message was never found, the newest pages are NOT a clean
     // append tail (they'd re-insert already-stored parts and hit a UNIQUE
     // violation, wedging the session). Fall back to a full re-distill.
@@ -907,6 +967,12 @@ export function createDistiller(options: DistillerOptions): Distiller {
     try {
       const discovered = await discoverSessions();
       knownCount = discovered.length;
+      const liveUpdates = new Map(discovered.map((session) => [session.id, session.timeUpdated]));
+      for (const [sessionId, timeUpdated] of quarantined) {
+        // Deletions and updates both invalidate quarantine. An updated session is
+        // retried below; a deleted one no longer consumes retained state.
+        if (liveUpdates.get(sessionId) !== timeUpdated) quarantined.delete(sessionId);
+      }
       const parentById = new Map(discovered.map((s) => [s.id, s.parentId] as const));
       const sorted = [...discovered].sort(
         (a, b) => b.timeUpdated - a.timeUpdated || a.id.localeCompare(b.id),
@@ -924,12 +990,33 @@ export function createDistiller(options: DistillerOptions): Distiller {
         const upToDate =
           existing?.distillState === "full" && existing.timeUpdated === session.timeUpdated;
         if (!upToDate) {
-          const { card, rows } = deriveCard({
-            session,
-            messages: await fetchSessionMessages(session.id, caps.ftsRowsPerSession),
-            parentById,
-            caps,
-          });
+          if (quarantined.get(session.id) === session.timeUpdated) {
+            examined++;
+            recordProgress(session.timeUpdated);
+            return;
+          }
+
+          let messages: MsgWithParts[];
+          try {
+            messages = await fetchSessionMessages(session.id, caps.ftsRowsPerSession);
+          } catch (error) {
+            if (!(error instanceof MalformedSessionError)) throw error;
+            quarantine(session, error);
+            examined++;
+            recordProgress(session.timeUpdated);
+            return;
+          }
+
+          let card: Card;
+          let rows: PartTextRow[];
+          try {
+            ({ card, rows } = deriveCard({ session, messages, parentById, caps }));
+          } catch (error) {
+            quarantine(session, error);
+            examined++;
+            recordProgress(session.timeUpdated);
+            return;
+          }
           // The lease can drop (heartbeat takeover) during the fetch above; a
           // non-holder must never write. Re-check right before the write and
           // skip it, counting the session as not distilled.
@@ -966,11 +1053,37 @@ export function createDistiller(options: DistillerOptions): Distiller {
     }
   }
 
+  function quarantine(session: DistillSessionMeta, error: unknown): void {
+    // Reinsertion keeps FIFO eviction aligned with the latest failure.
+    quarantined.delete(session.id);
+    quarantined.set(session.id, session.timeUpdated);
+    while (quarantined.size > MAX_QUARANTINED_SESSIONS) {
+      const oldest = quarantined.keys().next().value;
+      if (oldest === undefined) break;
+      quarantined.delete(oldest);
+    }
+    logMsg(
+      `session ${session.id} quarantined at timeUpdated ${session.timeUpdated}: ${errmsg(error)}`,
+    );
+  }
+
+  function startColdPass(): Promise<void> {
+    if (stopped || !leaseHeld) return Promise.resolve();
+    if (coldPassPromise) return coldPassPromise;
+    const running = runColdPass().finally(() => {
+      if (coldPassPromise === running) coldPassPromise = undefined;
+    });
+    coldPassPromise = running;
+    return running;
+  }
+
   function scheduleColdPassRetry(): void {
+    if (stopped || !leaseHeld) return;
     clearTimer(coldPassRetryTimer);
     coldPassRetryTimer = setTimeout(() => {
+      coldPassRetryTimer = undefined;
       if (stopped || !leaseHeld) return;
-      if (coldPassState === "idle" && lastError !== undefined) void runColdPass();
+      if (coldPassState === "idle" && lastError !== undefined) void startColdPass();
     }, coldPassRetryMs);
   }
 
@@ -979,6 +1092,7 @@ export function createDistiller(options: DistillerOptions): Distiller {
   // (Stage 3). Resume correctness comes from the per-card skip above.
   let progressFloor: number | undefined;
   function recordProgress(timeUpdated: number): void {
+    if (stopped || !leaseHeld) return;
     if (progressFloor == null || timeUpdated < progressFloor) {
       progressFloor = timeUpdated;
       store.setMeta("coldpass_cursor", String(timeUpdated));
@@ -994,18 +1108,25 @@ export function createDistiller(options: DistillerOptions): Distiller {
       sessionID,
       setTimeout(() => {
         debounceTimers.delete(sessionID);
-        void runReDistill(sessionID);
+        startReDistill(sessionID);
       }, idleDebounceMs),
     );
   }
 
-  async function runReDistill(sessionID: string): Promise<void> {
+  function startReDistill(sessionID: string): void {
     if (stopped || !leaseHeld) return; // non-holders and stopped instances write nothing
     if (inFlight.has(sessionID)) {
       pendingRerun.add(sessionID); // coalesce: run once more after the in-flight pass
       return;
     }
-    inFlight.add(sessionID);
+    const running = runReDistill(sessionID).finally(() => {
+      inFlight.delete(sessionID);
+      if (!stopped && pendingRerun.delete(sessionID)) scheduleReDistill(sessionID);
+    });
+    inFlight.set(sessionID, running);
+  }
+
+  async function runReDistill(sessionID: string): Promise<void> {
     // Snapshot-and-clear the removal flag BEFORE any await: a removal event that
     // arrives mid-distill re-adds it independently, so the coalesced rerun still
     // forces a full re-distill instead of appending onto a compacted transcript.
@@ -1025,6 +1146,7 @@ export function createDistiller(options: DistillerOptions): Distiller {
           !hadRemoval;
         if (canAppend && existing) await distillAppend(session, existing);
         else await distillFull(session);
+        if (stopped || !leaseHeld) return;
         // Keep the root's family highlights current with its live children.
         const stored = store.getCard(sessionID);
         if (stored && stored.rootId !== sessionID) recomputeRootRollup(stored.rootId);
@@ -1033,14 +1155,10 @@ export function createDistiller(options: DistillerOptions): Distiller {
       }
     } catch (error) {
       lastError = errmsg(error);
+      logMsg(`session ${sessionID} re-distill failed: ${lastError}`);
     } finally {
       // If the distill did not land, preserve the removal signal for the retry.
       if (!succeeded && hadRemoval) removalSince.add(sessionID);
-      inFlight.delete(sessionID);
-      if (pendingRerun.has(sessionID)) {
-        pendingRerun.delete(sessionID);
-        scheduleReDistill(sessionID);
-      }
     }
   }
 
@@ -1055,6 +1173,7 @@ export function createDistiller(options: DistillerOptions): Distiller {
       debounceTimers.delete(sessionID);
     }
     removalSince.delete(sessionID);
+    quarantined.delete(sessionID);
     if (rootId && rootId !== sessionID) recomputeRootRollup(rootId);
   }
 
@@ -1067,7 +1186,8 @@ export function createDistiller(options: DistillerOptions): Distiller {
   function scheduleHeartbeat(): void {
     clearTimer(heartbeatTimer);
     heartbeatTimer = setTimeout(() => {
-      if (stopped || !leaseHeld) return;
+      heartbeatTimer = undefined;
+      if (finalized || !leaseHeld) return;
       if (store.heartbeatLease(instanceId)) scheduleHeartbeat();
       else {
         // Lost the lease (taken over): stop acting as holder and try to regain.
@@ -1080,14 +1200,18 @@ export function createDistiller(options: DistillerOptions): Distiller {
             ? `lease lost to ${taker.holder} (build ${taker.build || "?"}, gen ${taker.gen})`
             : "lease lost",
         );
-        scheduleLeaseRetry();
+        if (!stopped) scheduleLeaseRetry();
       }
     }, HEARTBEAT_MS);
   }
 
   function scheduleLeaseRetry(): void {
+    if (stopped || finalized) return;
     clearTimer(leaseRetryTimer);
-    leaseRetryTimer = setTimeout(acquire, leaseRetryMs);
+    leaseRetryTimer = setTimeout(() => {
+      leaseRetryTimer = undefined;
+      acquire();
+    }, leaseRetryMs);
   }
 
   function acquire(): void {
@@ -1096,11 +1220,39 @@ export function createDistiller(options: DistillerOptions): Distiller {
       leaseHeld = true;
       logMsg(`lease acquired (build ${build}, gen ${gen})`);
       scheduleHeartbeat();
-      if (limits.coldPass && coldPassState === "idle") void runColdPass();
+      if (limits.coldPass && coldPassState === "idle") void startColdPass();
     } else {
       leaseHeld = false;
       scheduleLeaseRetry();
     }
+  }
+
+  function ownsLease(): boolean {
+    if (!leaseHeld || finalized) return false;
+    const current = store.leaseStatus();
+    const owned = current?.holder === instanceId && current.heartbeat + current.ttl > now();
+    if (!owned) {
+      leaseHeld = false;
+      clearTimer(heartbeatTimer);
+      heartbeatTimer = undefined;
+      if (!stopped) scheduleLeaseRetry();
+    }
+    return owned;
+  }
+
+  function quiesce(): void {
+    if (stopped) return;
+    stopped = true;
+    clearTimer(leaseRetryTimer);
+    clearTimer(coldPassRetryTimer);
+    leaseRetryTimer = undefined;
+    coldPassRetryTimer = undefined;
+    for (const timer of debounceTimers.values()) clearTimeout(timer);
+    debounceTimers.clear();
+    pendingRerun.clear();
+    // Deliberately retain heartbeatTimer: summary worker cleanup is lease-owned
+    // and plugin disposal finalizes this distiller only after that cleanup has
+    // settled or reached its shutdown bound.
   }
 
   return {
@@ -1109,16 +1261,20 @@ export function createDistiller(options: DistillerOptions): Distiller {
       acquire();
     },
 
-    stop(): void {
-      stopped = true;
+    quiesce,
+
+    ownsLease,
+
+    stop(): Promise<void> {
+      if (stopPromise) return stopPromise;
+      quiesce();
+      finalized = true;
       clearTimer(heartbeatTimer);
       clearTimer(leaseRetryTimer);
       clearTimer(coldPassRetryTimer);
       heartbeatTimer = undefined;
       leaseRetryTimer = undefined;
       coldPassRetryTimer = undefined;
-      for (const timer of debounceTimers.values()) clearTimeout(timer);
-      debounceTimers.clear();
       if (leaseHeld) {
         try {
           store.releaseLease(instanceId);
@@ -1127,6 +1283,11 @@ export function createDistiller(options: DistillerOptions): Distiller {
         }
       }
       leaseHeld = false;
+      const running = [coldPassPromise, ...inFlight.values()].filter(
+        (promise): promise is Promise<void> => promise !== undefined,
+      );
+      stopPromise = Promise.allSettled(running).then(() => {});
+      return stopPromise;
     },
 
     onEvent(event: Event): void {
@@ -1158,7 +1319,7 @@ export function createDistiller(options: DistillerOptions): Distiller {
     status(): DistillStatus {
       const lease = store.leaseStatus();
       return {
-        leaseHeld,
+        leaseHeld: ownsLease(),
         coldPass: coldPassState,
         distilledCount,
         knownCount,

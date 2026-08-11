@@ -1,4 +1,4 @@
-import type { Plugin } from "@opencode-ai/plugin";
+import type { Plugin, ToolDefinition } from "@opencode-ai/plugin";
 import { createOpencodeClient, type Session } from "@opencode-ai/sdk/v2";
 import { sessions, type SessionEnrichment } from "./sessions.js";
 import { search, DISCOVERY_LIMIT, type SearchDeps, type SemanticSearchConfig } from "./search.js";
@@ -9,7 +9,7 @@ import { systemNudge } from "./hooks/system-nudge.js";
 import { autoRecall } from "./hooks/auto-recall.js";
 import { compactionRecall } from "./hooks/compaction-recall.js";
 import { createFetchGate } from "./fetch-gate.js";
-import { openSqlite } from "./sqlite.js";
+import { openSqlite, type SqliteDb } from "./sqlite.js";
 import {
   openStore,
   defaultStorePath,
@@ -25,6 +25,15 @@ import { createDrill } from "./drill.js";
 import { createDistiller } from "./distill.js";
 import { createSummarizer, parseModelId, type Summarizer } from "./summarize.js";
 import { TOOLS, DEFAULTS, optionalString, errmsg, type Limits } from "./types.js";
+
+// `dispose` was added to the host/plugin contract in @opencode-ai/plugin 1.15.11.
+// Keep the source compatible with this repository's older tool-result typings
+// while declaring the exact minimum-host hook that the package engine requires.
+declare module "@opencode-ai/plugin" {
+  interface Hooks {
+    dispose?: () => Promise<void>;
+  }
+}
 
 /** Guarded, Node-free logger: `console` is a std global, but `src/` declares no
  *  types, so reach it defensively. */
@@ -95,6 +104,18 @@ const server: Plugin = async (ctx, options) => {
   const nudge = opts.nudge !== false;
   const autoRecallEnabled = opts.autoRecall === true;
   const compactionRecallEnabled = opts.compactionRecall === true;
+  let disposed = false;
+  let disposePromise: Promise<void> | undefined;
+  const operations = new Set<Promise<unknown>>();
+
+  const track = <T>(operation: Promise<T>): Promise<T> => {
+    operations.add(operation);
+    void operation.then(
+      () => operations.delete(operation),
+      () => operations.delete(operation),
+    );
+    return operation;
+  };
 
   const clamp = (val: number | undefined, fallback: number, min = 1) =>
     Math.max(min, Math.floor(val ?? fallback));
@@ -196,8 +217,9 @@ const server: Plugin = async (ctx, options) => {
   // cards-lite built from the session list.
   const storePath = optionalString(opts.storePath) ?? (await defaultStorePath());
   let store: Store | null = null;
+  let db: SqliteDb | null = null;
   if (storePath) {
-    const db = await openSqlite(storePath);
+    db = await openSqlite(storePath);
     if (db) store = openStore(db);
   }
 
@@ -214,13 +236,16 @@ const server: Plugin = async (ctx, options) => {
       }
     : { getCards: () => liteCards, revision: () => undefined, degraded: true };
   if (!store) {
-    void discover()
-      .then((list) => {
-        liteCards = cardsLiteFromSessions(list as Parameters<typeof cardsLiteFromSessions>[0]);
-      })
-      .catch(() => {
-        // Best-effort; a failed list just leaves cards-lite empty until retried.
-      });
+    void track(
+      discover()
+        .then((list) => {
+          if (!disposed)
+            liteCards = cardsLiteFromSessions(list as Parameters<typeof cardsLiteFromSessions>[0]);
+        })
+        .catch(() => {
+          // Best-effort; a failed list just leaves cards-lite empty until retried.
+        }),
+    );
   }
 
   // One shared fetch gate gates every SDK call in the query/distill paths so the
@@ -255,9 +280,18 @@ const server: Plugin = async (ctx, options) => {
     gen: EMBED_REPRESENTATION,
     discover,
     onColdPassDone: () => {
-      void summarizer?.runColdPass();
+      if (!disposed && summarizer) {
+        // Summarizer.stop() owns the bounded shutdown of this drain. Do not add
+        // it to the plugin's general operation set, which is intentionally
+        // unbounded for DB-capable hooks and distiller work.
+        void summarizer
+          .runColdPass()
+          .catch((error) => pluginLog(`summarizer cold pass failed: ${errmsg(error)}`));
+      }
     },
-    onSessionDistilled: (sessionId) => summarizer?.queue(sessionId),
+    onSessionDistilled: (sessionId) => {
+      if (!disposed) summarizer?.queue(sessionId);
+    },
   });
   if (store && opts.summaries?.enabled === true) {
     const model = optionalString(opts.summaries.model);
@@ -279,7 +313,8 @@ const server: Plugin = async (ctx, options) => {
           ...(agent != null && { agent }),
           ...(maxPromptsPerPass != null && { maxPromptsPerPass }),
         },
-        leaseHeld: () => distiller.status().leaseHeld,
+        ownerToken: instanceId,
+        leaseHeld: () => distiller.ownsLease(),
         log: pluginLog,
       });
     } else {
@@ -298,32 +333,57 @@ const server: Plugin = async (ctx, options) => {
     ? { cards: () => store.allCards() }
     : undefined;
 
+  const guardTool = (definition: ToolDefinition): ToolDefinition => ({
+    ...definition,
+    execute: (args, context) => {
+      if (disposed) {
+        return Promise.reject(new Error("opencode-session-recall: plugin has been disposed"));
+      }
+      return track(definition.execute(args, context));
+    },
+  });
+
+  const guardHook =
+    <TArgs extends unknown[]>(
+      hook: (...args: TArgs) => Promise<void>,
+    ): ((...args: TArgs) => Promise<void>) =>
+    async (...args) => {
+      if (disposed) return;
+      await track(hook(...args));
+    };
+
+  const nudgeHook = nudge ? systemNudge() : undefined;
+  const autoRecallHook = autoRecallEnabled ? autoRecall(deps) : undefined;
+  const compactionHook = compactionRecallEnabled ? compactionRecall(deps) : undefined;
+
   return {
     tool: {
-      recall_sessions: sessions(client, unscoped, global, limits, enrichment),
-      recall: search(client, unscoped, global, limits, deps),
-      recall_get: get(client, gate),
-      recall_context: context(client, gate, limits),
-      recall_messages: messages(client, gate, limits),
+      recall_sessions: guardTool(sessions(client, unscoped, global, limits, enrichment)),
+      recall: guardTool(search(client, unscoped, global, limits, deps)),
+      recall_get: guardTool(get(client, gate)),
+      recall_context: guardTool(context(client, gate, limits)),
+      recall_messages: guardTool(messages(client, gate, limits)),
     },
     event: async ({ event }) => {
+      if (disposed) return;
       // The plugin `event` hook is typed against the default SDK vintage; the
       // distiller compiles against the v2 event union the live bus actually
       // delivers. Bridge the vintage gap at this one boundary.
       distiller.onEvent(event as unknown as Parameters<typeof distiller.onEvent>[0]);
     },
-    ...(nudge && {
-      "experimental.chat.system.transform": systemNudge(),
+    ...(nudgeHook && {
+      "experimental.chat.system.transform": guardHook(nudgeHook),
     }),
-    ...(autoRecallEnabled && {
-      "chat.message": autoRecall(deps),
+    ...(autoRecallHook && {
+      "chat.message": guardHook(autoRecallHook),
     }),
-    ...(compactionRecallEnabled && {
-      "experimental.session.compacting": compactionRecall(deps),
+    ...(compactionHook && {
+      "experimental.session.compacting": guardHook(compactionHook),
     }),
     ...(primary && {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any -- opencode config type not exported
       config: async (c: any) => {
+        if (disposed) return;
         c.experimental ??= {};
         const existing: string[] = c.experimental.primary_tools ?? [];
         const deduped = new Set(existing);
@@ -331,6 +391,26 @@ const server: Plugin = async (ctx, options) => {
         c.experimental.primary_tools = [...deduped];
       },
     }),
+    dispose: () => {
+      if (disposePromise) return disposePromise;
+      disposed = true;
+      // Phase 1 is synchronous: no distill/retry/incremental work can start
+      // after dispose() returns its promise. The heartbeat deliberately remains
+      // active so lease-owned summarizer cleanup can finish safely.
+      distiller.quiesce();
+      cards.dispose();
+      disposePromise = (async () => {
+        // Summarizer.stop() is bounded. Its late SDK promises are detached and
+        // ownership/lease guarded, so phase 2 may safely release the lease once
+        // this settles even when an SDK request itself never does.
+        if (summarizer) await Promise.allSettled([summarizer.stop()]);
+        await distiller.stop();
+        await Promise.allSettled([...operations]);
+        db?.close();
+        db = null;
+      })();
+      return disposePromise;
+    },
   };
 };
 

@@ -1,11 +1,46 @@
-import { beforeEach, describe, expect, it, vi } from "vitest";
-import { tool, type PluginInput, type ToolDefinition } from "@opencode-ai/plugin";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { tool, type Hooks, type PluginInput, type ToolDefinition } from "@opencode-ai/plugin";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { TOOLS } from "../src/types.js";
-import { PROJECT_DIR } from "./helpers.js";
+import { openSqlite } from "../src/sqlite.js";
+import { openStore } from "../src/store.js";
+import { bundle, PROJECT_DIR, textPart, userMessage } from "./helpers.js";
 
 const createOpencodeClient = vi.hoisted(() => vi.fn((options: unknown) => options));
+const sqliteLifecycle = vi.hoisted(() => ({ closes: 0, postCloseCalls: 0 }));
 
 vi.mock("@opencode-ai/sdk/v2", () => ({ createOpencodeClient }));
+
+vi.mock("../src/sqlite.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../src/sqlite.js")>();
+  return {
+    ...actual,
+    openSqlite: async (...args: Parameters<typeof actual.openSqlite>) => {
+      const db = await actual.openSqlite(...args);
+      if (!db) return db;
+      let closed = false;
+      return new Proxy(db, {
+        get(target, property, receiver) {
+          const value = Reflect.get(target, property, receiver);
+          if (typeof value !== "function") return value;
+          if (property === "close") {
+            return () => {
+              sqliteLifecycle.closes++;
+              closed = true;
+              return value.call(target);
+            };
+          }
+          return (...methodArgs: unknown[]) => {
+            if (closed) sqliteLifecycle.postCloseCalls++;
+            return value.apply(target, methodArgs);
+          };
+        },
+      });
+    },
+  };
+});
 
 // Mock the semantic embedder so the wiring test never downloads a model or
 // touches the network: init resolves immediately and the model stays unready.
@@ -22,12 +57,19 @@ vi.mock("../src/semantic/embedder.js", () => ({
 }));
 
 const plugin = await import("../src/opencode-session-recall.js");
+const activeHooks: Hooks[] = [];
 
 // Every entry call opens a card store and (with coldPass) starts a background
 // distiller. Default tests use an in-memory store with the cold pass off so they
 // exercise only wiring, with no filesystem side effect or leaked timers.
-function server(input: PluginInput, opts: Record<string, unknown> = {}) {
-  return plugin.default.server(input, { storePath: ":memory:", coldPass: false, ...opts });
+async function server(input: PluginInput, opts: Record<string, unknown> = {}) {
+  const hooks = await plugin.default.server(input, {
+    storePath: ":memory:",
+    coldPass: false,
+    ...opts,
+  });
+  activeHooks.push(hooks);
+  return hooks;
 }
 
 function mustTool(definition: ToolDefinition | undefined): ToolDefinition {
@@ -66,6 +108,12 @@ function ctx(config: {
 describe("plugin entry", () => {
   beforeEach(() => {
     createOpencodeClient.mockClear();
+    sqliteLifecycle.closes = 0;
+    sqliteLifecycle.postCloseCalls = 0;
+  });
+
+  afterEach(async () => {
+    await Promise.all(activeHooks.splice(0).map((hooks) => hooks.dispose?.()));
   });
 
   it("registers all tools and strips project scoping only from the unscoped client", async () => {
@@ -212,6 +260,281 @@ describe("plugin entry", () => {
     const sessionsArgs = tool.schema.object(mustTool(hooks.tool?.recall_sessions).args);
     expect(() => sessionsArgs.parse({ limit: 4 })).not.toThrow();
     expect(() => sessionsArgs.parse({ limit: 5 })).toThrow();
+  });
+
+  it("waits for an in-flight cold-pass fetch before closing SQLite", async () => {
+    let resolveMessages: ((value: { data: [] }) => void) | undefined;
+    const messages = vi.fn(
+      () =>
+        new Promise<{ data: [] }>((resolve) => {
+          resolveMessages = resolve;
+        }),
+    );
+    createOpencodeClient
+      .mockImplementationOnce((options: unknown) => ({
+        ...(options as object),
+        session: { messages, list: vi.fn(async () => ({ data: [] })) },
+      }))
+      .mockImplementationOnce((options: unknown) => ({
+        ...(options as object),
+        experimental: {
+          session: {
+            list: vi.fn(async () => ({
+              data: [
+                {
+                  id: "s1",
+                  title: "T",
+                  directory: PROJECT_DIR,
+                  time: { created: 1, updated: 2 },
+                },
+              ],
+            })),
+          },
+        },
+      }));
+    const hooks = await server(ctx({ fetch: vi.fn() }), { coldPass: true });
+    await vi.waitFor(() => expect(messages).toHaveBeenCalled());
+
+    let disposed = false;
+    const stopping = hooks.dispose?.().then(() => {
+      disposed = true;
+    });
+    await Promise.resolve();
+    expect(disposed).toBe(false);
+    expect(sqliteLifecycle.closes).toBe(0);
+
+    resolveMessages?.({ data: [] });
+    await stopping;
+    expect(sqliteLifecycle.closes).toBe(1);
+    expect(sqliteLifecycle.postCloseCalls).toBe(0);
+  });
+
+  it("disposes idempotently and rejects tools without touching SQLite afterwards", async () => {
+    const hooks = await server(ctx({ fetch: vi.fn() }), {});
+
+    const first = hooks.dispose?.();
+    const second = hooks.dispose?.();
+    expect(second).toBe(first);
+    await first;
+    expect(sqliteLifecycle.closes).toBe(1);
+
+    await hooks.event?.({
+      event: { type: "session.idle", properties: { sessionID: "s" } },
+    } as never);
+    await expect(mustTool(hooks.tool?.recall_sessions).execute({}, {} as never)).rejects.toThrow(
+      "opencode-session-recall: plugin has been disposed",
+    );
+    expect(sqliteLifecycle.closes).toBe(1);
+    expect(sqliteLifecycle.postCloseCalls).toBe(0);
+  });
+
+  it("cancels scheduler timers before closing SQLite", async () => {
+    vi.useFakeTimers();
+    try {
+      createOpencodeClient
+        .mockImplementationOnce((options: unknown) => ({
+          ...(options as object),
+          session: { messages: vi.fn(async () => ({ data: [] })) },
+        }))
+        .mockImplementationOnce((options: unknown) => ({
+          ...(options as object),
+          experimental: { session: { list: vi.fn(async () => ({ data: [] })) } },
+        }));
+      const hooks = await server(ctx({ fetch: vi.fn() }), { coldPass: true });
+
+      await hooks.dispose?.();
+      expect(sqliteLifecycle.closes).toBe(1);
+      await vi.advanceTimersByTimeAsync(20_000);
+
+      expect(sqliteLifecycle.closes).toBe(1);
+      expect(sqliteLifecycle.postCloseCalls).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("holds the distill lease until active summarizer cleanup finishes", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "recall-plugin-handoff-"));
+    const storePath = join(dir, "recall.sqlite");
+    let resolvePrompt: ((value: unknown) => void) | undefined;
+    const prompt = vi.fn(
+      () =>
+        new Promise<unknown>((resolve) => {
+          resolvePrompt = resolve;
+        }),
+    );
+    const deleteWorker = vi.fn(async () => ({ data: true }));
+    const messages = vi.fn(async () => ({
+      data: [
+        bundle(userMessage("m1", "s1", 1), [
+          textPart("p1", "s1", "m1", "Summarize this lease handoff session."),
+        ]),
+      ],
+    }));
+    createOpencodeClient
+      .mockImplementationOnce((options: unknown) => ({
+        ...(options as object),
+        session: {
+          messages,
+          list: vi.fn(async () => ({ data: [] })),
+          create: vi.fn(async () => ({ data: { id: "worker-1" } })),
+          prompt,
+          delete: deleteWorker,
+          abort: vi.fn(async () => ({ data: true })),
+        },
+      }))
+      .mockImplementationOnce((options: unknown) => ({
+        ...(options as object),
+        experimental: {
+          session: {
+            list: vi.fn(async () => ({
+              data: [
+                {
+                  id: "s1",
+                  title: "Lease handoff",
+                  directory: PROJECT_DIR,
+                  time: { created: 1, updated: 2 },
+                },
+              ],
+            })),
+          },
+        },
+      }));
+
+    let rivalDb: Awaited<ReturnType<typeof openSqlite>> = null;
+    try {
+      const hooks = await server(ctx({ fetch: vi.fn() }), {
+        storePath,
+        coldPass: true,
+        summaries: { enabled: true, model: "test/cheap" },
+      });
+      await vi.waitFor(() => expect(prompt).toHaveBeenCalledOnce());
+
+      const stopping = hooks.dispose?.();
+      await Promise.resolve();
+      rivalDb = await openSqlite(storePath);
+      if (!rivalDb) throw new Error("failed to open rival store");
+      const rival = openStore(rivalDb);
+      if (!rival) throw new Error("failed to initialize rival store");
+      expect(rival.acquireLease("rival", 60_000, "test", 1)).toBe(false);
+
+      resolvePrompt?.({ data: { info: {}, parts: [{ type: "text", text: "[]" }] } });
+      await stopping;
+      expect(deleteWorker).toHaveBeenCalledWith({ sessionID: "worker-1" });
+      expect(rival.acquireLease("rival", 60_000, "test", 1)).toBe(true);
+    } finally {
+      rivalDb?.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("quiesces immediately but renews the lease only until blocked cleanup times out", async () => {
+    vi.useFakeTimers({ now: 1_000_000 });
+    const dir = mkdtempSync(join(tmpdir(), "recall-plugin-bounded-cleanup-"));
+    const storePath = join(dir, "recall.db");
+    let resolveDelete: ((value: { data: true }) => void) | undefined;
+    try {
+      const coldSession = {
+        id: "s1",
+        title: "Cold session",
+        slug: "cold-session",
+        directory: PROJECT_DIR,
+        projectID: "p",
+        time: { created: 1000, updated: 2000 },
+      };
+      const getSession = vi.fn(async () => ({ data: coldSession }));
+      const messages = vi.fn(async () => ({
+        data: [
+          bundle(userMessage("m1", "s1", 1100), [
+            textPart("p1", "s1", "m1", "bounded cleanup source"),
+          ]),
+        ],
+      }));
+      const deleteWorker = vi.fn(
+        () =>
+          new Promise<{ data: true }>((resolve) => {
+            resolveDelete = resolve;
+          }),
+      );
+      const scopedClient = {
+        session: {
+          get: getSession,
+          messages,
+          list: vi.fn(async () => ({ data: [] })),
+          create: vi.fn(async () => ({ data: { id: "blocked-worker" } })),
+          prompt: vi.fn(async () => ({
+            data: {
+              info: { role: "assistant" },
+              parts: [{ type: "text", text: "[]" }],
+            },
+          })),
+          delete: deleteWorker,
+          abort: vi.fn(async () => ({ data: true })),
+        },
+      };
+      const discover = vi.fn(async () => ({ data: [coldSession] }));
+      const unscopedClient = { experimental: { session: { list: discover } } };
+      createOpencodeClient.mockReturnValueOnce(scopedClient).mockReturnValueOnce(unscopedClient);
+
+      const hooks = await server(ctx({ fetch: vi.fn() }), {
+        storePath,
+        coldPass: true,
+        summaries: { enabled: true, model: "test/cheap" },
+      });
+      for (let i = 0; i < 100 && deleteWorker.mock.calls.length === 0; i++) {
+        await Promise.resolve();
+      }
+      expect(deleteWorker).toHaveBeenCalledWith({ sessionID: "blocked-worker" });
+
+      // Queue incremental work immediately before disposal. Quiescence must
+      // cancel it synchronously even though summarizer cleanup is still blocked.
+      await hooks.event?.({
+        event: { type: "session.idle", properties: { sessionID: "s1" } },
+      } as Parameters<NonNullable<Hooks["event"]>>[0]);
+      let disposed = false;
+      const stopping = hooks.dispose?.().then(() => {
+        disposed = true;
+      });
+      expect(stopping).toBeDefined();
+
+      const rivalDb = await openSqlite(storePath);
+      if (!rivalDb) throw new Error("openSqlite returned null for rival");
+      const rival = openStore(rivalDb);
+      if (!rival) throw new Error("openStore returned null for rival");
+      const initialLease = rival.leaseStatus();
+      expect(initialLease).toBeDefined();
+      expect(rival.acquireLease("rival", 60_000, "test", 1)).toBe(false);
+
+      await vi.advanceTimersByTimeAsync(10_000);
+      const renewedLease = rival.leaseStatus();
+      expect(renewedLease?.heartbeat).toBeGreaterThan(initialLease?.heartbeat ?? 0);
+      expect(disposed).toBe(false);
+      expect(rival.acquireLease("rival", 60_000, "test", 1)).toBe(false);
+      expect(discover).toHaveBeenCalledTimes(1);
+      expect(messages).toHaveBeenCalledTimes(1);
+      expect(getSession).not.toHaveBeenCalled();
+
+      // Summarizer shutdown is bounded. Once its timeout expires, distiller
+      // finalization releases the lease and disposal closes the old DB.
+      await vi.advanceTimersByTimeAsync(5_001);
+      await stopping;
+      expect(disposed).toBe(true);
+      expect(rival.acquireLease("rival", 60_000, "test", 1)).toBe(true);
+      expect(discover).toHaveBeenCalledTimes(1);
+      expect(messages).toHaveBeenCalledTimes(1);
+      expect(getSession).not.toHaveBeenCalled();
+      expect(sqliteLifecycle.postCloseCalls).toBe(0);
+
+      // The SDK promise itself cannot be cancelled. Its late settlement only
+      // releases the fetch-gate permit and cannot touch SQLite or another worker.
+      resolveDelete?.({ data: true });
+      await Promise.resolve();
+      expect(sqliteLifecycle.postCloseCalls).toBe(0);
+      rivalDb.close();
+    } finally {
+      vi.useRealTimers();
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it("fails clearly if SDK internals needed for transport extraction change", async () => {

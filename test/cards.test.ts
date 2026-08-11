@@ -428,6 +428,43 @@ describe("cards semantic persistence", () => {
     db.close();
   });
 
+  it("cancels deferred semantic warm-up when disposed", async () => {
+    let ready = false;
+    let resolveReady!: () => void;
+    const readyPromise = new Promise<void>((resolve) => {
+      resolveReady = () => {
+        ready = true;
+        resolve();
+      };
+    });
+    const embed = vi.fn(() => Float32Array.from([1, 0]));
+    const embedder = {
+      get ready() {
+        return ready;
+      },
+      embed,
+    };
+    const { db, store } = await freshStore();
+    store.upsertCard(makeCard("s1", { inventory: `alpha topic ${SUBST}` }));
+    store.setMeta("cards_rev", "1");
+    const runtime = createCardsRuntime({
+      source: persistentSource(store),
+      embedder,
+      semanticWeight: 0.5,
+      semanticModel: "model-x",
+      semanticReady: readyPromise,
+    });
+    runtime.rank(parseQuery("alpha"), {}); // load the warm store before model readiness
+
+    runtime.dispose();
+    db.close();
+    resolveReady();
+    await readyPromise;
+    await Promise.resolve();
+
+    expect(embed).not.toHaveBeenCalled();
+  });
+
   it("reloads on a cross-process vectors_rev bump, but not on its own vector write", async () => {
     // Two handles on one store file (mixed-version skew): the runtime reads
     // through storeB; storeA stands in for another process. Vector writes do NOT

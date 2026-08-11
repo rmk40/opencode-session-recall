@@ -200,6 +200,8 @@ export type CardsRuntime = {
   semanticStatus(): SemanticStatus | undefined;
   /** Force the next rank() to rebuild from the source (tests). */
   invalidate(): void;
+  /** Prevent deferred semantic warm-up from touching its source after shutdown. */
+  dispose(): void;
 };
 
 function basename(path: string): string {
@@ -366,6 +368,7 @@ export function createCardsRuntime(deps: CardsRuntimeDeps): CardsRuntime {
   let lastRevision: string | undefined;
   let lastVectorsRevision: string | undefined;
   let loaded = false;
+  let disposed = false;
 
   /** Recompute/reuse card vectors and persist newly computed ones. Returns the
    *  store's `{ revision, committed }` result for the caller's own-write accounting,
@@ -543,7 +546,7 @@ export function createCardsRuntime(deps: CardsRuntimeDeps): CardsRuntime {
   // no snapshot is loaded yet (the next query then rebuilds and embeds).
   if (embedder && semanticWeight > 0 && deps.semanticReady) {
     void deps.semanticReady.then(() => {
-      if (!embedder.ready || !loaded) return;
+      if (disposed || !embedder.ready || !loaded) return;
       if (cardVectors && cardVectors.size > 0) return;
       // Deliberately leave lastVectorsRevision untouched: this pass writes vectors
       // (bumping vectors_rev past the cached value), so the next refresh reloads
@@ -554,6 +557,10 @@ export function createCardsRuntime(deps: CardsRuntimeDeps): CardsRuntime {
   }
 
   return {
+    dispose(): void {
+      disposed = true;
+    },
+
     rank(query, filters): CardHit[] {
       refreshIfStale();
       const excluded = filters.excludeFamilyOf

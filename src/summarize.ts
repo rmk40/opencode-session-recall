@@ -36,6 +36,10 @@ const DEFAULT_BATCH_SIZE = 15;
 const DEFAULT_MAX_PROMPTS_PER_PASS = 200;
 const DEFAULT_POLITENESS_MS = 250;
 const DEFAULT_PROMPT_TIMEOUT_MS = 60_000;
+/** Disposal may detach a stuck SDK request after this bound. The request itself
+ *  cannot be cancelled by the SDK; lease/title guards make its late settlement
+ *  incapable of touching SQLite or another instance's worker. */
+const DEFAULT_SHUTDOWN_TIMEOUT_MS = 15_000;
 const DEFAULT_IDLE_DEBOUNCE_MS = 3_000;
 /** Abort a drain after this many prompts fail in a row: a misconfigured model
  *  must not burn the whole per-pass budget. Latches until the next cold pass. */
@@ -92,6 +96,9 @@ export type SummarizerDeps = {
   store: Store;
   gate: FetchGate;
   config: SummariesConfig;
+  /** Unique to this plugin instance; embedded in worker titles and used to keep
+   *  normal cleanup scoped to workers this instance created. */
+  ownerToken: string;
   /** Only the distill-lease holder writes; checked before every persisted write. */
   leaseHeld: () => boolean;
   log?: (message: string) => void;
@@ -101,6 +108,7 @@ export type SummarizerDeps = {
   batchSize?: number;
   politenessMs?: number;
   promptTimeoutMs?: number;
+  shutdownTimeoutMs?: number;
   idleDebounceMs?: number;
 };
 
@@ -111,11 +119,33 @@ export type Summarizer = {
   /** Debounced incremental re-summarize of one session (the idle-debounce path);
    *  the drain skips it when the content hash is unchanged. */
   queue(sessionId: string): void;
-  stop(): void;
+  /** Stop accepting work and settle the active serialized drain. */
+  stop(): Promise<void>;
   status(): { summarized: number; lastError?: string };
 };
 
 type Timer = ReturnType<typeof setTimeout>;
+
+type TimedResult<T> = { timedOut: false; value: T } | { timedOut: true };
+
+async function settleWithin<T>(promise: Promise<T>, timeoutMs: number): Promise<TimedResult<T>> {
+  let timer: Timer | undefined;
+  const timeout = new Promise<TimedResult<T>>((resolve) => {
+    timer = setTimeout(() => resolve({ timedOut: true }), timeoutMs);
+  });
+  try {
+    return await Promise.race([
+      promise.then((value): TimedResult<T> => ({ timedOut: false, value })),
+      timeout,
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+export function summarizerWorkerTitle(ownerToken: string): string {
+  return `${SUMMARIZER_SENTINEL} owner=${ownerToken}`;
+}
 
 // ── Text helpers ─────────────────────────────────────────────────────────────
 
@@ -235,13 +265,14 @@ function replyText(parts: Part[]): string {
 // ── Summarizer ───────────────────────────────────────────────────────────────
 
 export function createSummarizer(deps: SummarizerDeps): Summarizer {
-  const { client, store, gate, config, leaseHeld } = deps;
+  const { client, store, gate, config, leaseHeld, ownerToken } = deps;
   const now = deps.now ?? Date.now;
   const log = deps.log;
   const rev = deps.rev ?? SUMMARY_REV;
   const batchSize = Math.max(1, deps.batchSize ?? DEFAULT_BATCH_SIZE);
   const politenessMs = Math.max(0, deps.politenessMs ?? DEFAULT_POLITENESS_MS);
   const promptTimeoutMs = Math.max(1, deps.promptTimeoutMs ?? DEFAULT_PROMPT_TIMEOUT_MS);
+  const shutdownTimeoutMs = Math.max(1, deps.shutdownTimeoutMs ?? DEFAULT_SHUTDOWN_TIMEOUT_MS);
   const idleDebounceMs = Math.max(0, deps.idleDebounceMs ?? DEFAULT_IDLE_DEBOUNCE_MS);
   const maxPromptsPerPass = Math.max(1, config.maxPromptsPerPass ?? DEFAULT_MAX_PROMPTS_PER_PASS);
 
@@ -263,11 +294,35 @@ export function createSummarizer(deps: SummarizerDeps): Summarizer {
   const inFlight = new Set<string>();
   const attempts = new Map<string, number>();
   let drainPromise: Promise<void> | null = null;
+  let stopPromise: Promise<void> | undefined;
   const debounceTimers = new Map<string, Timer>();
+  const ownedWorkers = new Set<string>();
+  const workerTitle = summarizerWorkerTitle(ownerToken);
 
   // ── Worker session lifecycle ──
   // A fresh worker per batch (create, prompt once, delete): create/delete are
   // unbilled and this keeps every batch's context clean with zero accumulation.
+
+  async function leaseSdk<T>(
+    label: string,
+    allowWhileStopped: boolean,
+    operation: () => Promise<T>,
+  ): Promise<T | undefined> {
+    if ((!allowWhileStopped && stopped) || !leaseHeld()) return undefined;
+    const result = await settleWithin(
+      gate.runBackground(() => {
+        // A gate permit may arrive after shutdown or an involuntary lease loss.
+        if ((!allowWhileStopped && stopped) || !leaseHeld()) return Promise.resolve(undefined);
+        return operation();
+      }),
+      shutdownTimeoutMs,
+    );
+    if (result.timedOut) {
+      logMsg(`${label} timed out after ${shutdownTimeoutMs}ms; late SDK settlement detached`);
+      return undefined;
+    }
+    return result.value;
+  }
 
   async function createWorker(): Promise<string | null> {
     try {
@@ -275,12 +330,14 @@ export function createSummarizer(deps: SummarizerDeps): Summarizer {
       // shape, remember that and create plainly thereafter (never let a rejected
       // ruleset silently disable summaries).
       if (permissionMode !== "without") {
-        const resp = await gate.runBackground(() =>
-          client.session.create({ title: SUMMARIZER_SENTINEL, permission: DENY_ALL_PERMISSION }),
+        const resp = await leaseSdk("worker create", false, () =>
+          client.session.create({ title: workerTitle, permission: DENY_ALL_PERMISSION }),
         );
+        if (!resp) return null;
         const created = resp.data as Session | undefined;
         if (!resp.error && created?.id) {
           permissionMode = "with";
+          ownedWorkers.add(created.id);
           return created.id;
         }
         if (permissionMode === undefined) {
@@ -288,10 +345,12 @@ export function createSummarizer(deps: SummarizerDeps): Summarizer {
           logMsg("worker permission ruleset rejected; relying on tool-disable + exclusion");
         }
       }
-      const resp = await gate.runBackground(() =>
-        client.session.create({ title: SUMMARIZER_SENTINEL }),
+      const resp = await leaseSdk("worker create", false, () =>
+        client.session.create({ title: workerTitle }),
       );
+      if (!resp) return null;
       const created = resp.data as Session | undefined;
+      if (created?.id) ownedWorkers.add(created.id);
       return created?.id ?? null;
     } catch (error) {
       lastError = errmsg(error);
@@ -299,17 +358,19 @@ export function createSummarizer(deps: SummarizerDeps): Summarizer {
     }
   }
 
-  async function deleteWorker(sessionID: string): Promise<void> {
+  async function deleteOwnedWorker(sessionID: string): Promise<void> {
+    if (!ownedWorkers.has(sessionID)) return;
     try {
-      await gate.runBackground(() => client.session.delete({ sessionID }));
+      await leaseSdk("worker delete", true, () => client.session.delete({ sessionID }));
     } catch {
       // Best-effort; a lingering sentinel session is excluded everywhere.
     }
   }
 
-  async function abortWorker(sessionID: string): Promise<void> {
+  async function abortOwnedWorker(sessionID: string): Promise<void> {
+    if (!ownedWorkers.has(sessionID)) return;
     try {
-      await gate.runBackground(() => client.session.abort({ sessionID }));
+      await leaseSdk("worker abort", true, () => client.session.abort({ sessionID }));
     } catch {
       // Best-effort.
     }
@@ -319,13 +380,20 @@ export function createSummarizer(deps: SummarizerDeps): Summarizer {
    *  than adopting one whose accumulated context is unknown. Runs once. */
   async function deleteOrphans(): Promise<void> {
     try {
-      const resp = await gate.runBackground(() =>
+      const resp = await leaseSdk("worker orphan list", false, () =>
         client.session.list({ search: SUMMARIZER_SENTINEL, limit: 100 }),
       );
+      if (!resp || stopped || !leaseHeld()) return;
       const rows = Array.isArray(resp.data) ? (resp.data as Session[]) : [];
       for (const row of rows) {
+        // Ownership can change while list/delete is in flight. Re-check after
+        // every await and immediately before each destructive request.
+        if (stopped || !leaseHeld()) return;
         if (isSummarizerTitle(row.title) && typeof row.id === "string" && row.id) {
-          await deleteWorker(row.id);
+          await leaseSdk("orphan worker delete", false, () =>
+            client.session.delete({ sessionID: row.id }),
+          );
+          if (stopped || !leaseHeld()) return;
         }
       }
     } catch {
@@ -342,6 +410,7 @@ export function createSummarizer(deps: SummarizerDeps): Summarizer {
     const workerId = await createWorker();
     if (!workerId) return new Map();
     try {
+      if (stopped || !leaseHeld()) return new Map();
       const { text, keyToSession } = renderBatch(cards);
       const reply = await promptWorker(workerId, text);
       if (reply == null) return new Map();
@@ -353,17 +422,15 @@ export function createSummarizer(deps: SummarizerDeps): Summarizer {
       }
       return out;
     } finally {
-      await deleteWorker(workerId);
+      // Only ids created by this owner token enter ownedWorkers; normal cleanup
+      // can therefore never target another instance's worker.
+      await deleteOwnedWorker(workerId);
     }
   }
 
   async function promptWorker(workerId: string, text: string): Promise<string | null> {
-    let timer: Timer | undefined;
-    const timeout = new Promise<"timeout">((resolve) => {
-      timer = setTimeout(() => resolve("timeout"), promptTimeoutMs);
-    });
     try {
-      const outcome = await Promise.race([
+      const outcome = await settleWithin(
         client.session.prompt({
           sessionID: workerId,
           model: { providerID: config.providerID, modelID: config.modelID },
@@ -374,25 +441,24 @@ export function createSummarizer(deps: SummarizerDeps): Summarizer {
           tools: DISABLE_ALL_TOOLS,
           parts: [{ type: "text", text }],
         }),
-        timeout,
-      ]);
-      if (outcome === "timeout") {
+        promptTimeoutMs,
+      );
+      if (outcome.timedOut) {
         // Stop the generation so the timeout caps SPEND, not just our waiting.
-        await abortWorker(workerId);
+        await abortOwnedWorker(workerId);
         lastError = "summary prompt timed out";
         return null;
       }
-      if (outcome.error || !outcome.data) {
-        lastError = outcome.error ? errmsg(outcome.error) : "empty prompt response";
+      const response = outcome.value;
+      if (response.error || !response.data) {
+        lastError = response.error ? errmsg(response.error) : "empty prompt response";
         return null;
       }
-      const data = outcome.data as { parts?: Part[] };
+      const data = response.data as { parts?: Part[] };
       return replyText(Array.isArray(data.parts) ? data.parts : []);
     } catch (error) {
       lastError = errmsg(error);
       return null;
-    } finally {
-      if (timer) clearTimeout(timer);
     }
   }
 
@@ -443,6 +509,7 @@ export function createSummarizer(deps: SummarizerDeps): Summarizer {
     if (!cleanedOrphans) {
       cleanedOrphans = true;
       await deleteOrphans();
+      if (stopped || !leaseHeld()) return;
     }
     let prompts = 0;
     while (
@@ -478,7 +545,7 @@ export function createSummarizer(deps: SummarizerDeps): Summarizer {
 
       prompts++;
       const summaries = await promptBatchFor(cards);
-      if (!leaseHeld() || stopped) {
+      if (stopped || !leaseHeld()) {
         for (const id of batchIds) inFlight.delete(id);
         break;
       }
@@ -547,10 +614,24 @@ export function createSummarizer(deps: SummarizerDeps): Summarizer {
       );
     },
 
-    stop(): void {
+    stop(): Promise<void> {
+      if (stopPromise) return stopPromise;
       stopped = true;
       for (const timer of debounceTimers.values()) clearTimeout(timer);
       debounceTimers.clear();
+      pending.length = 0;
+      pendingSet.clear();
+      const active = drainPromise;
+      stopPromise = active
+        ? settleWithin(active, shutdownTimeoutMs).then((result) => {
+            if (result.timedOut) {
+              logMsg(
+                `shutdown timed out after ${shutdownTimeoutMs}ms; late SDK work is lease-guarded and detached`,
+              );
+            }
+          })
+        : Promise.resolve();
+      return stopPromise;
     },
 
     status() {

@@ -1,4 +1,4 @@
-import { afterAll, describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it, vi } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -16,6 +16,7 @@ import {
   createSummarizer,
   parseModelId,
   parseSummaryReply,
+  summarizerWorkerTitle,
   type Summarizer,
 } from "../src/summarize.js";
 import {
@@ -119,6 +120,7 @@ function makeSummarizer(
     store,
     gate,
     config: { providerID: "test", modelID: "cheap" },
+    ownerToken: "test-owner",
     leaseHeld: () => true,
     politenessMs: 0,
     idleDebounceMs: 0,
@@ -306,6 +308,11 @@ describe("summarizer worker lifecycle", () => {
 
     expect(client.calls.prompts.length).toBe(3);
     expect(client.calls.creates.length).toBe(3); // one worker per batch
+    expect(client.calls.creates.map((call) => call.title)).toEqual([
+      summarizerWorkerTitle("test-owner"),
+      summarizerWorkerTitle("test-owner"),
+      summarizerWorkerTitle("test-owner"),
+    ]);
     expect(client.calls.deletes.length).toBe(3); // each disposed
     expect(client.liveWorkers()).toHaveLength(0);
   });
@@ -323,6 +330,46 @@ describe("summarizer worker lifecycle", () => {
     expect(client.calls.deletes).toContain("orphan-a");
     expect(client.calls.deletes).toContain("orphan-b");
     expect(client.liveWorkers()).toHaveLength(0); // orphans + this batch's worker all gone
+  });
+
+  it("does not delete a new holder's worker when an orphan list returns after lease loss", async () => {
+    const store = await freshStore();
+    store.upsertCard(fullCard("c1"));
+    const gate = createFetchGate({ concurrency: 2 });
+    let leaseHeld = true;
+    let resolveList!: (value: { data: unknown[] }) => void;
+    const listResult = new Promise<{ data: unknown[] }>((resolve) => {
+      resolveList = resolve;
+    });
+    const deleteWorker = vi.fn(async () => ({ data: true }));
+    const createWorker = vi.fn(async () => ({ data: { id: "old-worker" } }));
+    const listWorkers = vi.fn(async () => listResult);
+    const client = {
+      session: {
+        list: listWorkers,
+        delete: deleteWorker,
+        create: createWorker,
+      },
+    } as unknown as OpencodeClient;
+    const summarizer = makeSummarizer(store, client, gate, {
+      ownerToken: "old-owner",
+      leaseHeld: () => leaseHeld,
+      shutdownTimeoutMs: 100,
+    });
+
+    const run = summarizer.runColdPass();
+    while (listWorkers.mock.calls.length === 0) {
+      await Promise.resolve();
+    }
+    leaseHeld = false;
+    resolveList({
+      data: [session("new-worker", summarizerWorkerTitle("new-owner"), PROJECT_DIR, 4000)],
+    });
+    await run;
+
+    expect(deleteWorker).not.toHaveBeenCalled();
+    expect(createWorker).not.toHaveBeenCalled();
+    await summarizer.stop();
   });
 
   it("disables tools and applies a deny-all permission on the worker prompt", async () => {
@@ -365,6 +412,28 @@ describe("summarizer worker lifecycle", () => {
 });
 
 describe("summarizer drain (budget, latch, gating)", () => {
+  it("waits for an active prompt to settle when stopped", async () => {
+    const store = await freshStore();
+    store.upsertCard(fullCard("c1"));
+    const gate = createFetchGate({ concurrency: 2 });
+    const client = makeSummarizerClient(() => ({ text: "[]", delayMs: 30 }));
+    const summarizer = makeSummarizer(store, client.client, gate);
+
+    const run = summarizer.runColdPass();
+    while (client.calls.prompts.length === 0)
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    let stopped = false;
+    const stopping = summarizer.stop().then(() => {
+      stopped = true;
+    });
+    await Promise.resolve();
+
+    expect(stopped).toBe(false);
+    await Promise.all([run, stopping]);
+    expect(stopped).toBe(true);
+    expect(store.getCard("c1")?.nlSummary).toBe("");
+  });
+
   it("summarizes every needing card, then skips them on the content-hash gate", async () => {
     const store = await freshStore();
     store.upsertCard(fullCard("c1"));

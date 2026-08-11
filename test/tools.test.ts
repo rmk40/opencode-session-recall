@@ -163,14 +163,13 @@ describe("recall_messages", () => {
     );
     expect(errorOut.error).toContain("Unauthorized");
 
-    // A session with no data now returns an empty page rather than an error.
+    // A successful response without an array body is malformed, not an empty page.
     const noData = makeFakeHarness({ noMessageData: new Set(["s-current"]) });
-    const noDataOut = await runTool<MessagesOutput>(
+    const noDataOut = await runTool<ErrorOutput>(
       messagesTool(noData.client, gate, TEST_LIMITS),
       {},
     );
-    expect(noDataOut.ok).toBe(true);
-    expect(noDataOut.pagination.returned).toBe(0);
+    expect(noDataOut.error).toBe("successful message response was not an array");
   });
 
   it("survives raw MCP-bypass args (undefined role/limit must not filter everything)", async () => {
@@ -383,7 +382,7 @@ describe("recall_context", () => {
       sessionID: "s-current",
       messageID: "m-current-1",
     });
-    expect(noDataOut.error).toBe("No messages returned");
+    expect(noDataOut.error).toBe("successful message response was not an array");
   });
 
   it("survives raw MCP-bypass args (undefined window must not break slice bounds)", async () => {

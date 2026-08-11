@@ -62,6 +62,9 @@
     "url": "https://github.com/rmk40/opencode-session-recall/issues"
   },
   "license": "MIT",
+  "engines": {
+    "opencode": ">=1.15.11"
+  },
   "peerDependencies": {
     "@opencode-ai/plugin": ">=1.2.0"
   },
