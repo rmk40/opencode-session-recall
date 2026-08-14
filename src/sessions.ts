@@ -65,12 +65,18 @@ export function sessions(
   enrichment?: SessionEnrichment,
 ): ToolDefinition {
   return tool({
-    description: `List session metadata: titles, directories, timestamps, archival state, plus (when a distilled card exists) a content digest, top files/tools, and a family rollup for roots. Use only for recent-session browsing, finding a session ID/title/timeframe, or recency checks. Not content search; for topical discovery use recall.`,
+    description: `List session metadata: titles, directories, timestamps, archival state, plus (when a distilled card exists) a content digest, top files/tools, and a family rollup for roots. Use only for recent-session browsing, finding a session ID/title/timeframe, or recency checks. Not content search; for topical discovery use recall. To recover cancelled or interrupted subagents (Task tool returned "Task cancelled" with no task_id), call this with parentID:"current" — the listing is live and does not depend on the search index.`,
     args: {
       scope: tool.schema
         .enum(["project", "global"])
         .default("project")
         .describe("project=current project, global=all projects"),
+      parentID: tool.schema
+        .string()
+        .optional()
+        .describe(
+          'Filter to child (subagent) sessions of a parent; "current" = this session. Live lookup, direct children only — works for cancelled or in-flight subagents not yet indexed.',
+        ),
       search: tool.schema.string().optional().describe("Title substring"),
       since: tool.schema
         .string()
@@ -89,7 +95,9 @@ export function sessions(
     },
     async execute(args, ctx: ToolContext): Promise<string> {
       const search = optionalString(args.search);
-      // Defensive: live MCP host can bypass Zod defaults.
+      // Defensive: live MCP host can bypass Zod defaults. A non-string parentID
+      // degrades to an ordinary listing (detectable: scope !== "children").
+      const parentID = optionalString(args.parentID);
       const scope = coerceEnum(args.scope, ["project", "global"] as const, "project");
       const limit = coerceInt(
         args.limit,
@@ -107,7 +115,10 @@ export function sessions(
           : `Listing ${scope} sessions`,
       });
 
-      if (scope === "global" && !global) {
+      // The children branch ignores `scope`, so the global-disabled early
+      // return does not apply to it (its own scope policy is decision 2's
+      // sameProject withholding for explicit foreign parents).
+      if (scope === "global" && !global && !parentID) {
         const err: ErrorOutput = {
           ok: false,
           error: "Global scope disabled via plugin option: global: false",
@@ -137,6 +148,16 @@ export function sessions(
         return true;
       };
 
+      /** Live-listing marker, applied at the call sites of the two live paths
+       *  (the children branch and the staleness fallback) — never inside
+       *  `enrich()`, which also serves the ordinary card-backed listings that
+       *  must stay byte-identical. A row with no card, or a card not distilled
+       *  to content, gets `distilled: false`; full-card rows omit the field. */
+      const markUndistilled = (item: SessionItem): SessionItem => {
+        const card = cardById?.get(item.id);
+        return card && card.distillState === "full" ? item : { ...item, distilled: false };
+      };
+
       /** Attach card-derived enrichment to a base item (digest, files, tools,
        *  family). Backward compatible: only optional fields are ever added. */
       const enrich = (item: SessionItem): SessionItem => {
@@ -158,12 +179,94 @@ export function sessions(
       };
 
       try {
+        // ── Children branch: live parent/child lookup, index-free ──
+        // Recovers subagent sessions (cancelled or in-flight) that the card
+        // index has not caught up to. Ignores `scope`; direct children only.
+        if (parentID) {
+          const currentSessionID = optionalString(ctx.sessionID);
+          // Case-insensitive sugar; no collision risk (real IDs are ses_*-prefixed).
+          const resolvedParent = parentID.toLowerCase() === "current" ? currentSessionID : parentID;
+          if (!resolvedParent) {
+            const err: ErrorOutput = {
+              ok: false,
+              error: 'parentID:"current" requires a current session, but none is available',
+            };
+            return JSON.stringify(err);
+          }
+          const result = await client.session.children({ sessionID: resolvedParent });
+          if (result.error) {
+            const err: ErrorOutput = {
+              ok: false,
+              error: `Failed to list children: ${errmsg(result.error)}`,
+            };
+            return JSON.stringify(err);
+          }
+          const searchLower = search?.toLowerCase();
+          const callerDir = normalizeDir(optionalString(ctx.directory));
+          // `global: false` withholds children in foreign projects — but only
+          // for explicit foreign parents. The caller's own children are exempt:
+          // this session spawned them (possibly in other worktrees), so the
+          // don't-leak-other-projects rationale cannot apply.
+          const scopeExempt = global || resolvedParent === currentSessionID;
+          let withheld = 0;
+          // Defensive: a divergent server payload (non-array data without an
+          // error) is treated as an empty child list, not a raw TypeError.
+          const rows = Array.isArray(result.data) ? result.data : [];
+          const selected = rows
+            .filter((row) => {
+              // Direct children only — the output contract holds even if the
+              // endpoint returns full descendants.
+              if (row.parentID !== resolvedParent) return false;
+              if (isSummarizerTitle(row.title)) return false;
+              if (searchLower && !row.title.toLowerCase().includes(searchLower)) return false;
+              if (!passesTime(row.time.updated)) return false;
+              if (!scopeExempt && !sameProject(row.directory, callerDir)) {
+                withheld++;
+                return false;
+              }
+              return true;
+            })
+            .sort((a, b) => b.time.updated - a.time.updated || a.id.localeCompare(b.id));
+          // Post-filter, pre-slice: childCount > returned means `limit` truncated.
+          const childCount = selected.length;
+          const items = selected.slice(0, limit).map((s) =>
+            markUndistilled(
+              enrich({
+                id: s.id,
+                title: s.title,
+                directory: s.directory,
+                time: { created: s.time.created, updated: s.time.updated },
+                archived: s.time.archived != null,
+              }),
+            ),
+          );
+          ctx.metadata({ title: `Found ${items.length} children of ${resolvedParent}` });
+          const out: SessionsOutput = {
+            ok: true,
+            sessions: items,
+            returned: items.length,
+            scope: "children",
+            parentID: resolvedParent,
+            childCount,
+            ...(withheld > 0
+              ? {
+                  note: `${withheld} child session${withheld === 1 ? "" : "s"} in other projects ${withheld === 1 ? "was" : "were"} withheld (plugin option global: false).`,
+                }
+              : {}),
+          };
+          return JSON.stringify(out);
+        }
+
         // ── Card-authoritative time filtering ──
         // When a card store is available and a since/until bound is set, resolve
         // the set from the in-memory cards. session.list returns only the newest
         // `limit` rows, so post-filtering it drops older matches entirely (e.g.
         // until:"30d" would return ~nothing). The cards are the recency-complete,
         // fetch-free authority, so they select; the list call is skipped.
+        // Exception: when the filter selects nothing AND the lower bound is
+        // newer than the newest in-scope card, the emptiness is index lag, not
+        // history — fall through to the live list with `staleFallback` set.
+        let staleFallback = false;
         if (allCards && hasTimeFilter) {
           const searchLower = search?.toLowerCase();
           const callerDir = normalizeDir(optionalString(ctx.directory));
@@ -189,16 +292,34 @@ export function sessions(
                 archived: false,
               }),
             );
-          ctx.metadata({
-            title: `Found ${selected.length} ${scope} sessions${search ? ` matching "${search}"` : ""}`,
-          });
-          const out: SessionsOutput = {
-            ok: true,
-            sessions: selected,
-            returned: selected.length,
-            scope,
-          };
-          return JSON.stringify(out);
+          // Staleness watermark: newest in-scope card, counting ALL cards
+          // regardless of distillState (a metadata card is sufficient coverage
+          // for a metadata listing; a full-only watermark would collapse in
+          // cards-lite mode and fire this on every since call). Only a lower
+          // bound triggers, and an inverted window (since > until) is the
+          // caller's own emptiness, not index lag.
+          if (selected.length === 0 && since != null && !(until != null && since > until)) {
+            let watermark = 0;
+            for (const card of allCards) {
+              // Summarizer workers are excluded from every listing, so a fresh
+              // worker card must not raise the watermark and mask real lag.
+              if (isSummarizerTitle(card.title)) continue;
+              if (inScope(card) && card.timeUpdated > watermark) watermark = card.timeUpdated;
+            }
+            if (since > watermark) staleFallback = true;
+          }
+          if (!staleFallback) {
+            ctx.metadata({
+              title: `Found ${selected.length} ${scope} sessions${search ? ` matching "${search}"` : ""}`,
+            });
+            const out: SessionsOutput = {
+              ok: true,
+              sessions: selected,
+              returned: selected.length,
+              scope,
+            };
+            return JSON.stringify(out);
+          }
         }
 
         const items: SessionItem[] = [];
@@ -260,11 +381,32 @@ export function sessions(
           title: `Found ${items.length} ${scope} sessions${search ? ` matching "${search}"` : ""}`,
         });
 
+        // On the staleness fallback, rows without a full card are marked
+        // distilled:false at this call site (never inside enrich()).
+        const finalItems = staleFallback ? items.map(markUndistilled) : items;
+
+        // The fallback consulted the newest `limit` live sessions — newest
+        // `limit` MATCHING sessions when a title search narrowed the list call.
+        const liveBound = `the newest ${limit}${search ? " matching" : ""} live sessions`;
+
         const out: SessionsOutput = {
           ok: true,
-          sessions: items,
-          returned: items.length,
+          sessions: finalItems,
+          returned: finalItems.length,
           scope: scope,
+          // The two note producers below cannot co-occur: the fallback requires
+          // a card store (allCards), the degraded note requires its absence.
+          // The fallback note only claims index lag when the live source
+          // actually produced in-window rows; an empty live check means the
+          // window is genuinely quiet, and the note says so instead.
+          ...(staleFallback
+            ? {
+                note:
+                  finalItems.length > 0
+                    ? `The card index had not caught up to this time window (its newest session predates \`since\`), so ${liveBound} were consulted instead. This listing is bounded by that window and may itself be incomplete.`
+                    : `No indexed session in scope is newer than \`since\`, so ${liveBound} were checked; none fell in the window either.`,
+              }
+            : {}),
           // Degraded path: no card store, so the time filter could only be applied
           // within the newest-`limit` window session.list returned. Older matches
           // beyond it are not shown — say so honestly.

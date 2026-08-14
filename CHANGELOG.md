@@ -4,6 +4,34 @@ All notable changes to this project are documented here. This project follows
 [Conventional Commits](https://www.conventionalcommits.org/) and
 [Semantic Versioning](https://semver.org/).
 
+## Unreleased
+
+### Added
+
+- **`recall_sessions` gains a `parentID` arg** for subagent recovery: a live,
+  index-free listing of a parent session's direct children, with
+  `parentID: "current"` as sugar for the calling session. Built for the
+  "Task cancelled with no task_id" workflow — cancelled or in-flight subagents
+  are listed even before the search index has seen them. The children response
+  uses `scope: "children"` (a widening of the output `scope` field's value set,
+  which previously only held `"project"`/`"global"`; discriminate on it — a
+  malformed non-string `parentID` degrades to an ordinary listing) plus a
+  `parentID` echo and a `childCount` (post-filter, pre-slice; greater than
+  `returned` means `limit` truncated). Rows not yet distilled to content carry
+  `distilled: false`.
+- **Staleness fallback in `recall_sessions`:** a `since`-filtered listing that
+  selects zero sessions while `since` is newer than the newest in-scope indexed
+  session now falls back to the live session list for that window (with a
+  disclosing `note`) instead of returning an empty card-index answer. Cost, on
+  the record: a `since`-filtered call on a quiet window now performs one live
+  `session.list` round-trip where it was previously fetch-free; all other
+  time-filtered calls stay card-only.
+- **Staleness suggestion in `recall`:** a zero-eligible search whose lower time
+  bound is newer than the index's recency now leads with a suggestion that the
+  index has not caught up (pointing at `recall_sessions` and the
+  `parentID: "current"` recovery call), instead of the misleading generic
+  broaden-your-query hints, which are suppressed in that state.
+
 ## 2.0.0
 
 This is the architecture rewrite. Through 0.12.x, `recall` answered a query by

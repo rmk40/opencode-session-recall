@@ -74,6 +74,10 @@ export type FakeCalls = {
   get: Array<{ sessionID: string }>;
   messages: Array<{ sessionID: string; limit?: number; before?: string }>;
   message: Array<{ sessionID: string; messageID: string }>;
+  /** One shared log for session.children on BOTH fake clients, tagged with the
+   *  client it went through — so the scoped-client decision is enforced by
+   *  assertion, while a client switch stays a one-line change. */
+  children: Array<{ sessionID: string; client: "scoped" | "unscoped" }>;
 };
 
 export type FakeOptions = {
@@ -86,6 +90,15 @@ export type FakeOptions = {
   messageLookupErrors?: Record<string, string>;
   noSingleMessageData?: Set<string>;
   afterMessagesCall?: (sessionID: string) => void;
+  /** Opt-in session graph for session.children: parentID → child sessions.
+   *  The default fixture stays graph-free. */
+  children?: Record<string, Session[]>;
+  /** session.children returns an SDK error with this message. */
+  childrenError?: string;
+  /** session.children rejects (thrown, not an error return). */
+  childrenThrows?: boolean;
+  /** session.children returns a divergent non-array `data` payload. */
+  childrenNonArray?: boolean;
 };
 
 export type FakeHarness = {
@@ -479,6 +492,17 @@ export function makeFakeHarness(options: FakeOptions = {}): FakeHarness {
     get: [],
     messages: [],
     message: [],
+    children: [],
+  };
+
+  const childrenFake = (tag: "scoped" | "unscoped") => {
+    return async ({ sessionID }: { sessionID: string }) => {
+      calls.children.push({ sessionID, client: tag });
+      if (options.childrenThrows) throw new Error(`children failed: ${sessionID}`);
+      if (options.childrenError) return { error: apiFailure(options.childrenError) };
+      if (options.childrenNonArray) return { data: { unexpected: true } as unknown as Session[] };
+      return { data: options.children?.[sessionID] ?? [] };
+    };
   };
 
   const client = {
@@ -531,6 +555,7 @@ export function makeFakeHarness(options: FakeOptions = {}): FakeHarness {
         const found = fixture.messagesBySession[sessionID]?.find((m) => m.info.id === messageID);
         return found ? { data: found } : { error: apiFailure(`Message not found: ${messageID}`) };
       },
+      children: childrenFake("scoped"),
     },
   };
 
@@ -548,6 +573,9 @@ export function makeFakeHarness(options: FakeOptions = {}): FakeHarness {
           };
         },
       },
+    },
+    session: {
+      children: childrenFake("unscoped"),
     },
   };
 

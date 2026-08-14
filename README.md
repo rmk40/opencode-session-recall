@@ -244,7 +244,12 @@ List sessions by title, for lightweight recent-session browsing or recency check
 ```
 recall_sessions({ scope: "project", search: "auth" })
 recall_sessions({ scope: "global", search: "deployment", since: "7d" })
+recall_sessions({ parentID: "current" })
 ```
+
+`parentID` switches the tool to a live parent/child lookup: it lists the direct children (subagent sessions) of the given parent, with `"current"` as sugar for the calling session. The listing comes straight from the server, not the search index, so it finds cancelled or in-flight subagents the index has not caught up to — the recovery path when a Task tool returns "Task cancelled" without a `task_id`. From the listed IDs, `recall_messages` reads each child's tail state. Only direct children are returned (not grandchildren), and the response uses `scope: "children"` with a `parentID` echo and a `childCount`; `childCount > returned` means the `limit` truncated the listing. A malformed (non-string) `parentID` degrades to an ordinary listing, so check `scope === "children"` to discriminate. Rows whose content is not yet distilled into the search index carry `distilled: false`; rows backed by a fully distilled card omit the field.
+
+When a `since` filter selects nothing and the lower bound is newer than the newest indexed session, the tool falls back to a live listing for that window (marked with a `note`), so index lag never silently hides brand-new sessions.
 
 ## Match modes
 
@@ -273,7 +278,7 @@ This plugin reads them back through the OpenCode SDK:
 
 - No direct database queries. All access goes through the SDK; opencode's database stays the sole source of truth.
 - One derived index, built in the background and safe to delete. There is nothing for you to set up or sync.
-- Every fetch is bounded and paginated. A search never pulls a whole session into memory, and a background distiller never competes with a live query.
+- Every message fetch is bounded and paginated. A search never pulls a whole session into memory, and a background distiller never competes with a live query. (Metadata listings, like the parent/child lookup, are single bounded-in-practice calls.)
 - Long-running work respects abort signals.
 - Cross-project search is on by default; disable it with `global: false`.
 - All four match modes work in every scope: session, project, and global.

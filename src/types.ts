@@ -370,6 +370,12 @@ export type SessionItem = {
   /** Family rollup for a root session: its id and how many descendant sessions
    *  the card store knows about. Present only for a root that has children. */
   family?: { rootId: string; childCount: number };
+  /** Emitted as `false` only, on live listings (the `parentID` children branch
+   *  and the staleness fallback), for a row with no card or one not distilled
+   *  to content (`distillState !== "full"`): its content is not searchable via
+   *  `recall` yet. Rows backed by a full card omit the field, and ordinary
+   *  card-backed listings never emit it. */
+  distilled?: boolean;
 };
 
 export type SessionsOutput = {
@@ -377,6 +383,13 @@ export type SessionsOutput = {
   sessions: SessionItem[];
   returned: number;
   scope: string;
+  /** Children branch only: echoes the resolved parent session ID. Its presence
+   *  is NOT the discrimination rule — check `scope === "children"`. */
+  parentID?: string;
+  /** Children branch only: the post-filter, pre-slice child count (withheld
+   *  foreign rows excluded). `childCount > returned` means the listing was
+   *  truncated by `limit`. */
+  childCount?: number;
   /** Explains a caveat in how the listing was produced — e.g. a since/until
    *  filter that could only be applied within the newest-limit window because no
    *  card store was available to resolve older sessions authoritatively. */
