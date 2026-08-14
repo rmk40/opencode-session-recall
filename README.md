@@ -105,7 +105,7 @@ That's the whole setup. The agent picks up the tools on the next session and use
 
 A search tool only helps if the agent reaches for it. The plugin has three features aimed at that, at increasing levels of automation. The first is on by default; the other two you turn on yourself.
 
-**System-prompt nudge (`nudge`, on by default).** The plugin adds a short line to the system prompt reminding the agent to search its history when you reference past work. This is just text, so it costs a handful of tokens per request and nothing else. The agent still decides whether and when to call `recall`.
+**System-prompt nudge (`nudge`, on by default).** The plugin adds a short line to the system prompt reminding the agent to search its history when you reference past work, and to recover cancelled subagents with `recall_sessions({ parentID: "current" })` when a Task fails before returning its `task_id`. This is just text, so it costs a handful of tokens per request and nothing else. The agent still decides whether and when to call `recall`.
 
 **Automatic recall (`autoRecall`, off by default).** When one of your messages clearly points back at earlier work ("last time", "what did we decide", "same as before", "previously"), the plugin runs a recall for you and drops the top one to three hits, with citations, into the agent's context before it answers. This runs entirely against the session cards, so it fetches no messages and adds no measurable latency to your turn, and if nothing matches it stays quiet.
 

@@ -75,6 +75,10 @@ describe("systemNudge", () => {
     expect(output.system).toHaveLength(2);
     expect(output.system[1]).toContain(NUDGE_SENTINEL);
     expect(output.system[1]).toContain("recall");
+    // The subagent-recovery hint must ride the nudge: the moment a model needs
+    // it (a cancelled Task with no task_id), tool descriptions are easy to
+    // skim past, but the system prompt is always in view.
+    expect(output.system[1]).toContain('parentID: "current"');
   });
 
   it("is idempotent (does not double-inject)", async () => {

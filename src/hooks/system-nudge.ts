@@ -17,7 +17,7 @@ import type { Hooks } from "@opencode-ai/plugin";
 export const NUDGE_SENTINEL = "[recall-nudge]";
 
 /** Kept short on purpose: it is paid on every request. */
-export const NUDGE_TEXT = `${NUDGE_SENTINEL} You have recall tools that search this and prior opencode sessions. When the user refers to earlier work, a previous session, a past decision, or uses vague back-references ("that bug", "same as before", "what did we decide", "like last time"), call recall before answering or re-deriving — the answer may already exist in history.`;
+export const NUDGE_TEXT = `${NUDGE_SENTINEL} You have recall tools that search this and prior opencode sessions. When the user refers to earlier work, a previous session, a past decision, or uses vague back-references ("that bug", "same as before", "what did we decide", "like last time"), call recall before answering or re-deriving — the answer may already exist in history. If a subagent task was cancelled or failed before returning its task_id, recover the child session with recall_sessions({ parentID: "current" }).`;
 
 export function systemNudge(): NonNullable<Hooks["experimental.chat.system.transform"]> {
   return async (_input, output) => {
