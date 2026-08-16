@@ -81,7 +81,9 @@ describe("systemNudge", () => {
     // AND its trigger condition — dropping the condition would turn a narrow
     // conditional instruction into an unconditional one.
     expect(output.system[1]).toContain('parentID: "current"');
-    expect(output.system[1]).toMatch(/cancelled or interrupted.*task_id/);
+    expect(output.system[1]).toMatch(
+      /cancelled or interrupted after starting.*returned no task_id/,
+    );
   });
 
   it("keeps the nudge text within its per-request budget", () => {

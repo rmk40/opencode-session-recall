@@ -27,10 +27,11 @@ All notable changes to this project are documented here. This project follows
   `session.list` round-trip where it was previously fetch-free; all other
   time-filtered calls stay card-only.
 - **Subagent-recovery hint in the system nudge:** the `nudge` line now also
-  tells the agent to recover a cancelled/failed subagent's session with
-  `recall_sessions({ parentID: "current" })` — the moment that hint is needed,
-  the Task error payload carries nothing and tool descriptions are easy to skim
-  past, but the system prompt is always in view. Costs ~40 tokens per request.
+  tells the agent to list a cancelled or interrupted subagent's child sessions
+  with `recall_sessions({ parentID: "current" })` when a Task returned no
+  `task_id` — the moment that hint is needed, the Task error payload carries
+  nothing and tool descriptions are easy to skim past, but the system prompt is
+  always in view. Adds ~45 tokens to the nudge (~130 total per request).
 - **Staleness suggestion in `recall`:** a zero-eligible search whose lower time
   bound is newer than the index's recency now leads with a suggestion that the
   index has not caught up (pointing at `recall_sessions` and the
