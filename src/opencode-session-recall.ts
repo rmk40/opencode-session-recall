@@ -24,16 +24,24 @@ import { createCardsRuntime, cardsLiteFromSessions, type CardSource } from "./ca
 import { createDrill } from "./drill.js";
 import { createDistiller } from "./distill.js";
 import { createSummarizer, parseModelId, type Summarizer } from "./summarize.js";
-import { TOOLS, DEFAULTS, optionalString, errmsg, type Limits } from "./types.js";
+import {
+  TOOLS,
+  DEFAULTS,
+  optionalString,
+  errmsg,
+  settleWithin,
+  type ErrorOutput,
+  type Limits,
+} from "./types.js";
 
-// `dispose` was added to the host/plugin contract in @opencode-ai/plugin 1.15.11.
-// Keep the source compatible with this repository's older tool-result typings
-// while declaring the exact minimum-host hook that the package engine requires.
-declare module "@opencode-ai/plugin" {
-  interface Hooks {
-    dispose?: () => Promise<void>;
-  }
-}
+/** Per-phase bound on dispose()'s awaited waits. The host awaits dispose as a
+ *  shutdown finalizer with no timeout of its own, so a never-settling in-flight
+ *  SDK request must not hang shutdown forever. Two bounded phases (distiller
+ *  stop, tracked operations) after the summarizer's own 15s bound keep total
+ *  dispose under ~20s worst case. Timed-out work is detached, not cancelled;
+ *  every store write path re-checks stopped/finalized/lease ownership before
+ *  writing, so closing SQLite with a detached fetch pending is safe. */
+const SHUTDOWN_TIMEOUT_MS = 2_500;
 
 /** Guarded, Node-free logger: `console` is a std global, but `src/` declares no
  *  types, so reach it defensively. */
@@ -337,7 +345,13 @@ const server: Plugin = async (ctx, options) => {
     ...definition,
     execute: (args, context) => {
       if (disposed) {
-        return Promise.reject(new Error("opencode-session-recall: plugin has been disposed"));
+        // Match every other failure in this codebase: a JSON error output, not
+        // a rejection.
+        const err: ErrorOutput = {
+          ok: false,
+          error: "opencode-session-recall: plugin has been disposed",
+        };
+        return Promise.resolve(JSON.stringify(err));
       }
       return track(definition.execute(args, context));
     },
@@ -400,12 +414,18 @@ const server: Plugin = async (ctx, options) => {
       distiller.quiesce();
       cards.dispose();
       disposePromise = (async () => {
-        // Summarizer.stop() is bounded. Its late SDK promises are detached and
-        // ownership/lease guarded, so phase 2 may safely release the lease once
-        // this settles even when an SDK request itself never does.
+        // Summarizer.stop() is internally bounded (its own 15s shutdown
+        // timeout). Its late SDK promises are detached and ownership/lease
+        // guarded, so phase 2 may safely release the lease once this settles
+        // even when an SDK request itself never does.
         if (summarizer) await Promise.allSettled([summarizer.stop()]);
-        await distiller.stop();
-        await Promise.allSettled([...operations]);
+        // Bound the remaining waits: an SDK request that never settles would
+        // otherwise hang the host's shutdown (dispose is awaited untimed).
+        // Timing out does NOT skip db.close() — every distiller write path is
+        // finalized/lease-guarded, so a detached fetch that settles later can
+        // no longer reach SQLite.
+        await settleWithin(distiller.stop(), SHUTDOWN_TIMEOUT_MS);
+        await settleWithin(Promise.allSettled([...operations]), SHUTDOWN_TIMEOUT_MS);
         db?.close();
         db = null;
       })();

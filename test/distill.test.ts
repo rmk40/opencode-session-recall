@@ -549,6 +549,24 @@ describe("fetchMessagePage", () => {
     const { client } = clientReturning(() => ({ error: apiFailure("boom") }));
     await expect(fetchMessagePage(client, { sessionID: "s", limit: 5 })).rejects.toThrow("boom");
   });
+
+  it("treats a successful non-array body as an empty page by default (query path)", async () => {
+    // Documented decision: a `{}` response (no data field) means "empty page,
+    // ok:true" for recall_messages/recall_context/recall_get/drill. Only the
+    // distiller opts into strict (below) so its quarantine can distinguish
+    // malformed from empty.
+    const { client } = clientReturning(() => ({}));
+    const page = await fetchMessagePage(client, { sessionID: "s", limit: 5 });
+    expect(page.items).toEqual([]);
+    expect(page.nextCursor).toBeNull();
+  });
+
+  it("throws MalformedSessionError on a successful non-array body under strict", async () => {
+    const { client } = clientReturning(() => ({ data: { messages: "not-an-array" } }));
+    await expect(
+      fetchMessagePage(client, { sessionID: "s", limit: 5, strict: true }),
+    ).rejects.toThrow("successful message response was not an array");
+  });
 });
 
 // ── Cold pass ────────────────────────────────────────────────────────────────
@@ -596,6 +614,102 @@ describe("cold pass", () => {
     expect(logs.some((line) => line.includes("session bad quarantined at timeUpdated 3000:"))).toBe(
       true,
     );
+    expect(distiller.status().quarantinedCount).toBe(1);
+    await distiller.stop();
+    db.close();
+  });
+
+  it("does not quarantine on a non-shape deriveCard error; the pass aborts and surfaces it", async () => {
+    // A deriveCard REGRESSION (anything that is not a data-shape failure) must
+    // not sideline healthy sessions while reporting "done". The message below
+    // passes the fetch stage untouched (fetchSessionMessages only walks parts)
+    // and then throws a plain Error inside deriveCard's walk.
+    const boobyTrapped = {
+      info: {
+        id: "m-boom",
+        role: "user",
+        get time(): { created: number } {
+          throw new Error("synthetic deriveCard regression");
+        },
+      },
+      parts: [textPart("p-boom", "boom", "m-boom", "content")],
+    } as unknown as MessageBundle;
+    const graph: Graph = {
+      sessions: [session("boom", "Boom", PROJECT_DIR, 3000)],
+      messagesBySession: { boom: [boobyTrapped] },
+    };
+    const { client } = makeDistillFake(graph);
+    const { db, store } = await freshStore();
+    const { gate } = makeSpyGate();
+    const distiller = createDistiller({
+      client,
+      store,
+      gate,
+      limits: { ...TEST_LIMITS, distillConcurrency: 1 },
+      instanceId: "regression-surface",
+      coldPassRetryMs: 60_000,
+    });
+
+    distiller.start();
+    await waitFor(() => distiller.status().lastError != null);
+
+    expect(distiller.status().lastError).toContain("synthetic deriveCard regression");
+    expect(distiller.status().quarantinedCount).toBe(0); // NOT quarantined
+    expect(distiller.status().coldPass).toBe("idle"); // aborted, not "done"
+    await distiller.stop();
+    db.close();
+  });
+
+  it("skips the write when the lease is taken over between fetch and write (stale writer)", async () => {
+    // A process suspended past the TTL can lose the lease before its heartbeat
+    // callback ever runs. The resumed fetch must not replace the new holder's
+    // rows: the write gate re-verifies ownership against the live lease row.
+    let clock = 1_000_000;
+    let resolveMessages!: (value: unknown) => void;
+    const gatePromise = new Promise<unknown>((resolve) => {
+      resolveMessages = resolve;
+    });
+    const s1 = session("s1", "Alpha", PROJECT_DIR, 3000);
+    const client = {
+      session: {
+        list: async () => ({ data: [s1] }),
+        messages: async (params: { sessionID: string; limit?: number }) => {
+          if (params.limit == null) throw new Error("unbounded fetch");
+          await gatePromise;
+          return messagesResponse(
+            [bundle(userMessage("m1", "s1", 100), [textPart("p1", "s1", "m1", "alpha")])],
+            null,
+          );
+        },
+      },
+    } as unknown as OpencodeClient;
+    const { db, store } = await freshStore(() => clock);
+    const { gate } = makeSpyGate();
+    const distiller = createDistiller({
+      client,
+      store,
+      gate,
+      limits: { ...TEST_LIMITS, distillConcurrency: 1 },
+      instanceId: "suspended",
+      now: () => clock,
+      leaseRetryMs: 600_000,
+    });
+
+    distiller.start();
+    await new Promise((r) => setTimeout(r, 10)); // fetch now blocked in flight
+
+    // Simulated suspension past the TTL: a rival takes the lease over.
+    clock += 31_000;
+    expect(store.acquireLease("rival", 30_000, "rivalbuild", 4)).toBe(true);
+
+    // status() reports the CACHED flag (side-effect-free): the heartbeat
+    // callback has not run, so this instance still believes it holds the lease.
+    expect(distiller.status().leaseHeld).toBe(true);
+
+    resolveMessages({});
+    await waitFor(() => distiller.status().coldPass !== "running");
+
+    expect(store.getCard("s1")).toBeUndefined(); // the stale write was skipped
     await distiller.stop();
     db.close();
   });
@@ -1244,6 +1358,40 @@ describe("lease", () => {
     distiller.stop();
     db.close();
   });
+
+  it("ownsLease does not self-demote on its own stale heartbeat", async () => {
+    // If the row still names THIS instance, nobody has taken over — an expired
+    // heartbeat only means someone COULD. Heartbeat freshness is the
+    // ACQUIRE-side concern of rivals; self-demoting would cost a full
+    // lease-retry stall after any >TTL event-loop hiccup.
+    let clock = 1_000_000;
+    const { client } = makeDistillFake({ sessions: [], messagesBySession: {} });
+    const { db, store } = await freshStore(() => clock);
+    const { gate } = makeSpyGate();
+    const distiller = createDistiller({
+      client,
+      store,
+      gate,
+      limits: { ...TEST_LIMITS, coldPass: false },
+      instanceId: "hiccup",
+      now: () => clock,
+    });
+
+    distiller.start();
+    expect(distiller.ownsLease()).toBe(true);
+
+    clock += 31_000; // heartbeat now looks expired, but the row still names us
+    expect(distiller.ownsLease()).toBe(true);
+    expect(distiller.status().leaseHeld).toBe(true);
+
+    // An actual takeover (someone else's name on the row) IS a loss.
+    expect(store.acquireLease("rival", 30_000, "rivalbuild", 4)).toBe(true);
+    expect(distiller.ownsLease()).toBe(false);
+    expect(distiller.status().leaseHeld).toBe(false);
+
+    await distiller.stop();
+    db.close();
+  });
 });
 
 // ── Incremental ──────────────────────────────────────────────────────────────
@@ -1589,6 +1737,7 @@ describe("null store", () => {
       coldPass: "idle",
       distilledCount: 0,
       knownCount: 0,
+      quarantinedCount: 0,
     });
   });
 });

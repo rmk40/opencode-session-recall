@@ -1,7 +1,7 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { ToolDefinition } from "@opencode-ai/plugin";
 import type { SearchOutput } from "../../src/types.js";
-import { TEST_LIMITS } from "../helpers.js";
+import { TEST_LIMITS, toolResultText } from "../helpers.js";
 import {
   PROJECT_DIR,
   assistantMessage,
@@ -178,7 +178,7 @@ async function run(
     } as Parameters<typeof tool.execute>[0],
     evalContext("plumbing-external"),
   );
-  const parsed = JSON.parse(raw) as SearchOutput | { ok: false; error: string };
+  const parsed = JSON.parse(toolResultText(raw)) as SearchOutput | { ok: false; error: string };
   if (!("ok" in parsed) || !parsed.ok) throw new Error(`query failed: ${JSON.stringify(parsed)}`);
   return parsed;
 }

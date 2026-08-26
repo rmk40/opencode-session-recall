@@ -101,6 +101,9 @@ export type DistillStatus = {
   coldPass: "idle" | "running" | "done";
   distilledCount: number;
   knownCount: number;
+  /** Sessions currently sidelined as malformed (see the quarantine mechanism);
+   *  observability for "the pass is done but N sessions were skipped". */
+  quarantinedCount: number;
   lastError?: string;
   /** Current distill-lease holder info (this process or whichever build holds it),
    *  from {@link Store.leaseStatus}. Undefined with no store or no lease row yet —
@@ -566,10 +569,16 @@ function readNextCursor(response: unknown): string | null {
  * without `limit` is a 400. The next-page cursor rides the `X-Next-Cursor`
  * header; the body is the `{ info, parts }` array. Throws on an SDK error so the
  * caller's try/catch handles fetch failures uniformly.
+ *
+ * A successful response whose body is not an array is ambiguous: the query path
+ * (browse/context/drill) treats it as a deliberate "empty page, ok:true" — a
+ * documented decision for sessions with no data — while the distiller passes
+ * `strict: true` so its quarantine can distinguish a malformed session from an
+ * empty one.
  */
 export async function fetchMessagePage(
   client: OpencodeClient,
-  opts: { sessionID: string; limit: number; before?: string },
+  opts: { sessionID: string; limit: number; before?: string; strict?: boolean },
 ): Promise<MessagePage> {
   const params =
     opts.before != null
@@ -578,7 +587,10 @@ export async function fetchMessagePage(
   const resp = await client.session.messages(params);
   if (resp.error) throw new Error(errmsg(resp.error));
   if (!Array.isArray(resp.data)) {
-    throw new MalformedSessionError("successful message response was not an array");
+    if (opts.strict) {
+      throw new MalformedSessionError("successful message response was not an array");
+    }
+    return { items: [], nextCursor: readNextCursor(resp.response) };
   }
   const items = resp.data as MsgWithParts[];
   return { items, nextCursor: readNextCursor(resp.response) };
@@ -614,6 +626,7 @@ const noopStatus = (): DistillStatus => ({
   coldPass: "idle",
   distilledCount: 0,
   knownCount: 0,
+  quarantinedCount: 0,
 });
 
 export function createDistiller(options: DistillerOptions): Distiller {
@@ -739,7 +752,7 @@ export function createDistiller(options: DistillerOptions): Distiller {
       const before = cursor;
       const page = await gate.runBackground(() => {
         if (stopped || !leaseHeld) return Promise.resolve({ items: [], nextCursor: null });
-        return fetchMessagePage(client, { sessionID, limit: pageMessages, before });
+        return fetchMessagePage(client, { sessionID, limit: pageMessages, before, strict: true });
       });
       try {
         for (const msg of page.items) {
@@ -777,14 +790,18 @@ export function createDistiller(options: DistillerOptions): Distiller {
       const before = cursor;
       const page = await gate.runBackground(() => {
         if (stopped || !leaseHeld) return Promise.resolve({ items: [], nextCursor: null });
-        return fetchMessagePage(client, { sessionID, limit: pageMessages, before });
+        return fetchMessagePage(client, { sessionID, limit: pageMessages, before, strict: true });
       });
-      for (const msg of page.items) {
-        if (msg.info.id === checkpoint) {
-          reached = true;
-          break;
+      try {
+        for (const msg of page.items) {
+          if (msg.info.id === checkpoint) {
+            reached = true;
+            break;
+          }
+          collected.push(msg);
         }
-        collected.push(msg);
+      } catch (error) {
+        throw new MalformedSessionError(errmsg(error));
       }
       cursor = reached ? undefined : (page.nextCursor ?? undefined);
     } while (cursor);
@@ -820,6 +837,10 @@ export function createDistiller(options: DistillerOptions): Distiller {
   }
 
   function recomputeRootRollup(rootId: string): void {
+    // Rollup writes replace the root card row; verify authoritative ownership
+    // once per rollup batch (callers reach here after awaited fetches, so the
+    // cached flag alone can be stale after a >TTL suspension).
+    if (!ownsLease()) return;
     const root = store.getCard(rootId);
     if (!root) return;
     const children = store
@@ -830,6 +851,10 @@ export function createDistiller(options: DistillerOptions): Distiller {
   }
 
   function recomputeAllRootRollups(): void {
+    // One authoritative ownership read for the whole rollup sweep (see
+    // recomputeRootRollup); per-row checks would multiply SQLite reads for
+    // no additional safety.
+    if (!ownsLease()) return;
     const rootCards = new Map<string, Card>();
     const childrenByRoot = new Map<string, Card[]>();
     // Load embeddings too: the rollup upsert below rewrites every card column, so
@@ -857,13 +882,21 @@ export function createDistiller(options: DistillerOptions): Distiller {
 
   async function distillFull(session: DistillSessionMeta): Promise<void> {
     const messages = await fetchSessionMessages(session.id, caps.ftsRowsPerSession);
+    // Cheap flag check before parentChainOf touches the store: a detached
+    // continuation (the fetch settled after dispose's bounded wait) must not
+    // read SQLite, which may already be closed.
+    if (stopped || !leaseHeld) return;
     const { card, rows } = deriveCard({
       session,
       messages,
       parentById: parentChainOf(session),
       caps,
     });
-    if (stopped || !leaseHeld) return;
+    // Authoritative re-check (live lease row, not the cached flag): a process
+    // suspended past the TTL can lose the lease to a rival before its heartbeat
+    // callback ever runs; the resumed fetch must not replace the new holder's
+    // rows. One leaseStatus() read per write batch.
+    if (stopped || !ownsLease()) return;
     store.replaceSessionParts(session.id, rows, card);
     bumpCardsRev();
   }
@@ -875,7 +908,9 @@ export function createDistiller(options: DistillerOptions): Distiller {
       return;
     }
     const { messages: newMessages, reached } = await fetchNewMessages(session.id, checkpoint);
-    if (stopped || !leaseHeld) return;
+    // Authoritative ownership check before the append write (see distillFull);
+    // only synchronous derivation sits between here and appendSessionParts.
+    if (stopped || !ownsLease()) return;
     // If the checkpoint message was never found, the newest pages are NOT a clean
     // append tail (they'd re-insert already-stored parts and hit a UNIQUE
     // violation, wedging the session). Fall back to a full re-distill.
@@ -1012,15 +1047,25 @@ export function createDistiller(options: DistillerOptions): Distiller {
           try {
             ({ card, rows } = deriveCard({ session, messages, parentById, caps }));
           } catch (error) {
+            // Quarantine only data-shape failures (mirroring the fetch path
+            // above): a TypeError walking malformed legacy parts is this
+            // session's problem; anything else is a deriveCard regression that
+            // must surface as a pass failure, not silently sideline sessions.
+            if (!(error instanceof MalformedSessionError) && !(error instanceof TypeError)) {
+              throw error;
+            }
             quarantine(session, error);
             examined++;
             recordProgress(session.timeUpdated);
             return;
           }
           // The lease can drop (heartbeat takeover) during the fetch above; a
-          // non-holder must never write. Re-check right before the write and
-          // skip it, counting the session as not distilled.
-          if (stopped || !leaseHeld) return;
+          // non-holder must never write. Re-check right before the write —
+          // authoritatively, against the live lease row, because a suspension
+          // past the TTL loses the lease before the heartbeat callback flips
+          // the cached flag — and skip it, counting the session as not
+          // distilled.
+          if (stopped || !ownsLease()) return;
           store.replaceSessionParts(session.id, rows, card);
           bumpCardsRev();
           distilled++;
@@ -1134,6 +1179,10 @@ export function createDistiller(options: DistillerOptions): Distiller {
     let succeeded = false;
     try {
       const session = await fetchSessionMeta(sessionID);
+      // A request already in flight at stop time settles late, past dispose's
+      // bounded wait — by then SQLite may be closed, so a detached continuation
+      // must not reach the store reads below.
+      if (stopped || !leaseHeld) return;
       // The summarizer's worker session emits idle events as it is prompted; it
       // is never distilled or carded (its prompts embed card digests).
       if (session && isSummarizerTitle(session.title)) return;
@@ -1163,7 +1212,7 @@ export function createDistiller(options: DistillerOptions): Distiller {
   }
 
   function handleDeleted(sessionID: string): void {
-    if (!leaseHeld) return;
+    if (!ownsLease()) return; // authoritative: this path deletes rows immediately
     const rootId = store.getCard(sessionID)?.rootId;
     store.deleteSession(sessionID);
     bumpCardsRev();
@@ -1229,8 +1278,14 @@ export function createDistiller(options: DistillerOptions): Distiller {
 
   function ownsLease(): boolean {
     if (!leaseHeld || finalized) return false;
+    // Authoritative check against the live lease row. Ownership is lost only
+    // when someone else's name is on the row (a takeover happened) or the row
+    // is gone — NOT when our own heartbeat merely looks stale: an expired
+    // heartbeat means a rival COULD take over, and heartbeat freshness is the
+    // ACQUIRE-side concern of that rival. Self-demoting on staleness would cost
+    // a full lease-retry stall after any >TTL event-loop hiccup.
     const current = store.leaseStatus();
-    const owned = current?.holder === instanceId && current.heartbeat + current.ttl > now();
+    const owned = current?.holder === instanceId;
     if (!owned) {
       leaseHeld = false;
       clearTimer(heartbeatTimer);
@@ -1318,11 +1373,14 @@ export function createDistiller(options: DistillerOptions): Distiller {
 
     status(): DistillStatus {
       const lease = store.leaseStatus();
+      // Report the cached flag: status() must be side-effect-free (ownsLease()
+      // mutates lease state and re-arms timers; it is for write gates only).
       return {
-        leaseHeld: ownsLease(),
+        leaseHeld,
         coldPass: coldPassState,
         distilledCount,
         knownCount,
+        quarantinedCount: quarantined.size,
         ...(lastError !== undefined ? { lastError } : {}),
         ...(lease ? { lease } : {}),
       };

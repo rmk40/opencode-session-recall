@@ -309,6 +309,62 @@ describe("plugin entry", () => {
     expect(sqliteLifecycle.postCloseCalls).toBe(0);
   });
 
+  it("dispose completes within its bound when an SDK request never settles", async () => {
+    // The host awaits dispose as a shutdown finalizer with no timeout of its
+    // own; a never-settling in-flight fetch must not hang shutdown forever.
+    // The timeout still closes SQLite: every write path is stopped/finalized-
+    // guarded, so the detached fetch can never reach the store.
+    vi.useFakeTimers();
+    try {
+      const messages = vi.fn(() => new Promise<never>(() => {}));
+      createOpencodeClient
+        .mockImplementationOnce((options: unknown) => ({
+          ...(options as object),
+          session: { messages, list: vi.fn(async () => ({ data: [] })) },
+        }))
+        .mockImplementationOnce((options: unknown) => ({
+          ...(options as object),
+          experimental: {
+            session: {
+              list: vi.fn(async () => ({
+                data: [
+                  {
+                    id: "s1",
+                    title: "T",
+                    directory: PROJECT_DIR,
+                    time: { created: 1, updated: 2 },
+                  },
+                ],
+              })),
+            },
+          },
+        }));
+      const hooks = await server(ctx({ fetch: vi.fn() }), { coldPass: true });
+      for (let i = 0; i < 100 && messages.mock.calls.length === 0; i++) {
+        await Promise.resolve();
+      }
+      expect(messages).toHaveBeenCalled();
+
+      let disposed = false;
+      const stopping = hooks.dispose?.().then(() => {
+        disposed = true;
+      });
+      await Promise.resolve();
+      expect(disposed).toBe(false);
+
+      // Total dispose stays under ~20s worst case even though the SDK request
+      // never settles; SQLite is still closed exactly once, with no post-close
+      // access from the detached fetch.
+      await vi.advanceTimersByTimeAsync(20_000);
+      await stopping;
+      expect(disposed).toBe(true);
+      expect(sqliteLifecycle.closes).toBe(1);
+      expect(sqliteLifecycle.postCloseCalls).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("disposes idempotently and rejects tools without touching SQLite afterwards", async () => {
     const hooks = await server(ctx({ fetch: vi.fn() }), {});
 
@@ -321,9 +377,13 @@ describe("plugin entry", () => {
     await hooks.event?.({
       event: { type: "session.idle", properties: { sessionID: "s" } },
     } as never);
-    await expect(mustTool(hooks.tool?.recall_sessions).execute({}, {} as never)).rejects.toThrow(
-      "opencode-session-recall: plugin has been disposed",
-    );
+    // Disposed-tool calls return the codebase's JSON error-output shape, not a
+    // rejection (every other failure path resolves `{ ok:false, error }`).
+    const out = await mustTool(hooks.tool?.recall_sessions).execute({}, {} as never);
+    expect(JSON.parse(out as string)).toEqual({
+      ok: false,
+      error: "opencode-session-recall: plugin has been disposed",
+    });
     expect(sqliteLifecycle.closes).toBe(1);
     expect(sqliteLifecycle.postCloseCalls).toBe(0);
   });

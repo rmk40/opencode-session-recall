@@ -2,7 +2,7 @@ import type { OpencodeClient, Part, PermissionRuleset, Session } from "@opencode
 import type { Card, Store } from "./store.js";
 import { SUMMARY_REV_KEY } from "./store.js";
 import type { FetchGate } from "./fetch-gate.js";
-import { errmsg } from "./types.js";
+import { errmsg, settleWithin } from "./types.js";
 import { tokenizeAll } from "./normalize.js";
 import { SUMMARIZER_SENTINEL, isSummarizerTitle } from "./extract.js";
 
@@ -125,23 +125,6 @@ export type Summarizer = {
 };
 
 type Timer = ReturnType<typeof setTimeout>;
-
-type TimedResult<T> = { timedOut: false; value: T } | { timedOut: true };
-
-async function settleWithin<T>(promise: Promise<T>, timeoutMs: number): Promise<TimedResult<T>> {
-  let timer: Timer | undefined;
-  const timeout = new Promise<TimedResult<T>>((resolve) => {
-    timer = setTimeout(() => resolve({ timedOut: true }), timeoutMs);
-  });
-  try {
-    return await Promise.race([
-      promise.then((value): TimedResult<T> => ({ timedOut: false, value })),
-      timeout,
-    ]);
-  } finally {
-    if (timer) clearTimeout(timer);
-  }
-}
 
 export function summarizerWorkerTitle(ownerToken: string): string {
   return `${SUMMARIZER_SENTINEL} owner=${ownerToken}`;
@@ -303,16 +286,12 @@ export function createSummarizer(deps: SummarizerDeps): Summarizer {
   // A fresh worker per batch (create, prompt once, delete): create/delete are
   // unbilled and this keeps every batch's context clean with zero accumulation.
 
-  async function leaseSdk<T>(
-    label: string,
-    allowWhileStopped: boolean,
-    operation: () => Promise<T>,
-  ): Promise<T | undefined> {
-    if ((!allowWhileStopped && stopped) || !leaseHeld()) return undefined;
+  async function leaseSdk<T>(label: string, operation: () => Promise<T>): Promise<T | undefined> {
+    if (stopped || !leaseHeld()) return undefined;
     const result = await settleWithin(
       gate.runBackground(() => {
         // A gate permit may arrive after shutdown or an involuntary lease loss.
-        if ((!allowWhileStopped && stopped) || !leaseHeld()) return Promise.resolve(undefined);
+        if (stopped || !leaseHeld()) return Promise.resolve(undefined);
         return operation();
       }),
       shutdownTimeoutMs,
@@ -324,13 +303,32 @@ export function createSummarizer(deps: SummarizerDeps): Summarizer {
     return result.value;
   }
 
+  /** Bounded SDK runner for destroying a worker THIS instance created. Remote
+   *  worker ownership is a separate authority from the SQLite writer lease:
+   *  losing the lease (or stopping) must never leak a worker we uniquely own,
+   *  so this deliberately checks neither `stopped` nor `leaseHeld()` — only the
+   *  caller's `ownedWorkers` membership scopes it. Returns whether the request
+   *  settled in time (a timed-out delete leaves the id owned for a later retry
+   *  by the next holder's orphan sweep). */
+  async function ownedWorkerSdk(
+    label: string,
+    operation: () => Promise<unknown>,
+  ): Promise<boolean> {
+    const result = await settleWithin(gate.runBackground(operation), shutdownTimeoutMs);
+    if (result.timedOut) {
+      logMsg(`${label} timed out after ${shutdownTimeoutMs}ms; late SDK settlement detached`);
+      return false;
+    }
+    return true;
+  }
+
   async function createWorker(): Promise<string | null> {
     try {
       // Probe the deny-all permission ruleset once; if the server rejects the
       // shape, remember that and create plainly thereafter (never let a rejected
       // ruleset silently disable summaries).
       if (permissionMode !== "without") {
-        const resp = await leaseSdk("worker create", false, () =>
+        const resp = await leaseSdk("worker create", () =>
           client.session.create({ title: workerTitle, permission: DENY_ALL_PERMISSION }),
         );
         if (!resp) return null;
@@ -345,7 +343,7 @@ export function createSummarizer(deps: SummarizerDeps): Summarizer {
           logMsg("worker permission ruleset rejected; relying on tool-disable + exclusion");
         }
       }
-      const resp = await leaseSdk("worker create", false, () =>
+      const resp = await leaseSdk("worker create", () =>
         client.session.create({ title: workerTitle }),
       );
       if (!resp) return null;
@@ -361,16 +359,26 @@ export function createSummarizer(deps: SummarizerDeps): Summarizer {
   async function deleteOwnedWorker(sessionID: string): Promise<void> {
     if (!ownedWorkers.has(sessionID)) return;
     try {
-      await leaseSdk("worker delete", true, () => client.session.delete({ sessionID }));
+      // NOT lease-gated: this instance created the worker and uniquely owns it;
+      // losing the SQLite writer lease mid-batch must not leak the session.
+      const settled = await ownedWorkerSdk("worker delete", () =>
+        client.session.delete({ sessionID }),
+      );
+      if (settled) ownedWorkers.delete(sessionID);
     } catch {
-      // Best-effort; a lingering sentinel session is excluded everywhere.
+      // Best-effort; a lingering sentinel session is excluded everywhere and
+      // swept by the next holder's orphan cleanup.
+      ownedWorkers.delete(sessionID);
     }
   }
 
   async function abortOwnedWorker(sessionID: string): Promise<void> {
     if (!ownedWorkers.has(sessionID)) return;
     try {
-      await leaseSdk("worker abort", true, () => client.session.abort({ sessionID }));
+      // NOT lease-gated, same as deleteOwnedWorker: the abort stops OUR
+      // worker's spend. It does not remove the id — the delete that follows
+      // owns the ownedWorkers cleanup.
+      await ownedWorkerSdk("worker abort", () => client.session.abort({ sessionID }));
     } catch {
       // Best-effort.
     }
@@ -380,7 +388,7 @@ export function createSummarizer(deps: SummarizerDeps): Summarizer {
    *  than adopting one whose accumulated context is unknown. Runs once. */
   async function deleteOrphans(): Promise<void> {
     try {
-      const resp = await leaseSdk("worker orphan list", false, () =>
+      const resp = await leaseSdk("worker orphan list", () =>
         client.session.list({ search: SUMMARIZER_SENTINEL, limit: 100 }),
       );
       if (!resp || stopped || !leaseHeld()) return;
@@ -390,7 +398,9 @@ export function createSummarizer(deps: SummarizerDeps): Summarizer {
         // every await and immediately before each destructive request.
         if (stopped || !leaseHeld()) return;
         if (isSummarizerTitle(row.title) && typeof row.id === "string" && row.id) {
-          await leaseSdk("orphan worker delete", false, () =>
+          // Orphan sweeps target OTHER holders' leftovers, so they stay
+          // lease-gated (unlike ownedWorkers cleanup above).
+          await leaseSdk("orphan worker delete", () =>
             client.session.delete({ sessionID: row.id }),
           );
           if (stopped || !leaseHeld()) return;

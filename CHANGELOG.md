@@ -4,6 +4,55 @@ All notable changes to this project are documented here. This project follows
 [Conventional Commits](https://www.conventionalcommits.org/) and
 [Semantic Versioning](https://semver.org/).
 
+## Unreleased
+
+Based on PR #3 by @kernel-oops with maintainer fixes.
+
+### Added
+
+- **Bounded shutdown via the optional `dispose` hook.** On hosts that call
+  `dispose` (opencode ≥ 1.15.11), the plugin now shuts down in two phases:
+  an immediate quiesce (no new distill/summary/hook work starts) followed by a
+  bounded drain of in-flight work before SQLite closes. Every wait is
+  timeout-capped — a never-settling SDK request is detached, not awaited
+  forever — so plugin disposal can never hang the host's shutdown. Detached
+  work is fenced by stop/finalize/lease guards and cannot touch the closed
+  store. There is **no new host requirement**: older hosts simply never call
+  `dispose` and the plugin behaves exactly as before (no `engines` constraint
+  was added).
+- **Cold-pass quarantine for malformed legacy sessions.** A session whose
+  message payload is structurally malformed (non-array body, unwalkable parts)
+  is sidelined for that `timeUpdated` and logged instead of aborting the whole
+  pass; it is retried automatically when the session changes and is dropped
+  from quarantine on deletion. The quarantine catches only data-shape errors —
+  a distiller regression still surfaces as a pass failure. `status()` exposes
+  `quarantinedCount`.
+- **Transport-vs-absence distinction in the incremental path.** A failed
+  session-metadata fetch is now a logged, retryable transport error rather
+  than being conflated with "session gone", so a flaky server no longer makes
+  the distiller silently skip re-distills.
+
+### Fixed
+
+- **Stale-writer window closed.** Distiller writes (full/append/cold-pass
+  replaces, rollups, deletes) now re-verify authoritative lease ownership
+  against the live lease row immediately before each write transaction, so a
+  process suspended past the lease TTL cannot clobber the new holder's rows
+  when its paused fetch resumes. The self-check demotes only when another
+  holder's name is on the row — an expired-looking own heartbeat is not a
+  loss, so a long event-loop hiccup no longer costs a lease-retry stall.
+- **Summarizer worker handoff safety.** Worker sessions are title-stamped with
+  their owner instance; normal cleanup only ever targets workers this instance
+  created, and orphan sweeps (other holders' leftovers) stay lease-gated.
+  Deleting/aborting a worker this instance owns is deliberately NOT
+  lease-gated — losing the writer lease mid-batch no longer leaks the worker
+  session. Worker ids are released from the owned set once cleanup completes.
+- **No tool-contract change:** `fetchMessagePage` stays lenient on the query
+  path — a successful response without an array body is still an empty page
+  (`ok: true`) for `recall_messages`/`recall_context`/`recall_get`/drill.
+  Only the distiller opts into strict mode (where a non-array body must be
+  distinguishable from an empty session for quarantine).
+
 ## 2.1.0
 
 ### Added

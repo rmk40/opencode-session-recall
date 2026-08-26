@@ -30,6 +30,7 @@ import {
   paginateBundles,
   session,
   textPart,
+  toolResultText,
   userMessage,
   type SummaryPromptCall,
   type SummaryPromptResult,
@@ -291,7 +292,7 @@ describe("summarizer worker-session exclusion", () => {
       { scope: "global", since: "30d" } as Parameters<typeof tool.execute>[0],
       ctx,
     );
-    const out = JSON.parse(raw) as { sessions: Array<{ id: string }> };
+    const out = JSON.parse(toolResultText(raw)) as { sessions: Array<{ id: string }> };
     const ids = out.sessions.map((s) => s.id);
     expect(ids).toContain("real");
     expect(ids).not.toContain("worker");
@@ -369,6 +370,30 @@ describe("summarizer worker lifecycle", () => {
 
     expect(deleteWorker).not.toHaveBeenCalled();
     expect(createWorker).not.toHaveBeenCalled();
+    await summarizer.stop();
+  });
+
+  it("still deletes its own worker when the lease is lost mid-batch (no leak)", async () => {
+    // Remote worker ownership is a separate authority from the SQLite writer
+    // lease: this instance created the worker and uniquely owns it, so losing
+    // the lease between create and cleanup must not leak the session.
+    const store = await freshStore();
+    store.upsertCard(fullCard("c1"));
+    const gate = createFetchGate({ concurrency: 2 });
+    let leaseHeld = true;
+    const client = makeSummarizerClient((call) => {
+      void call;
+      leaseHeld = false; // takeover lands while the prompt is in flight
+      return { text: "[]" };
+    });
+    const summarizer = makeSummarizer(store, client.client, gate, {
+      leaseHeld: () => leaseHeld,
+    });
+
+    await summarizer.runColdPass();
+
+    expect(client.calls.deletes).toEqual(["worker-1"]);
+    expect(client.liveWorkers()).toHaveLength(0);
     await summarizer.stop();
   });
 
@@ -607,7 +632,9 @@ describe("nl_summary consumption", () => {
       { scope: "global", since: "30d" } as Parameters<typeof tool.execute>[0],
       ctx,
     );
-    const out = JSON.parse(raw) as { sessions: Array<{ id: string; digest?: string }> };
+    const out = JSON.parse(toolResultText(raw)) as {
+      sessions: Array<{ id: string; digest?: string }>;
+    };
     expect(out.sessions.find((s) => s.id === "s1")?.digest).toBe("LLM summary about widgets.");
   });
 });
