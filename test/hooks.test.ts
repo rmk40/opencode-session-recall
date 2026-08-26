@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { systemNudge, NUDGE_SENTINEL } from "../src/hooks/system-nudge.js";
+import { systemNudge, NUDGE_SENTINEL, NUDGE_TEXT } from "../src/hooks/system-nudge.js";
 import { shouldAutoRecall, formatAutoRecallBlock, autoRecall } from "../src/hooks/auto-recall.js";
 import { formatPreservationBlock, compactionRecall } from "../src/hooks/compaction-recall.js";
 import { partId } from "../src/hooks/part-id.js";
@@ -75,6 +75,22 @@ describe("systemNudge", () => {
     expect(output.system).toHaveLength(2);
     expect(output.system[1]).toContain(NUDGE_SENTINEL);
     expect(output.system[1]).toContain("recall");
+    // The subagent-recovery hint must ride the nudge: the moment a model needs
+    // it (a cancelled Task with no task_id), tool descriptions are easy to
+    // skim past, but the system prompt is always in view. Pin both the call
+    // AND its trigger condition — dropping the condition would turn a narrow
+    // conditional instruction into an unconditional one.
+    expect(output.system[1]).toContain('parentID: "current"');
+    expect(output.system[1]).toMatch(
+      /cancelled or interrupted after starting.*returned no task_id/,
+    );
+  });
+
+  it("keeps the nudge text within its per-request budget", () => {
+    // Paid on every request, in every session. Raising this is a decision,
+    // not drift (same convention as the tool-description budget in
+    // plugin.test.ts).
+    expect(NUDGE_TEXT.length).toBeLessThan(600);
   });
 
   it("is idempotent (does not double-inject)", async () => {

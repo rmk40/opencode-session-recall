@@ -105,7 +105,7 @@ That's the whole setup. The agent picks up the tools on the next session and use
 
 A search tool only helps if the agent reaches for it. The plugin has three features aimed at that, at increasing levels of automation. The first is on by default; the other two you turn on yourself.
 
-**System-prompt nudge (`nudge`, on by default).** The plugin adds a short line to the system prompt reminding the agent to search its history when you reference past work. This is just text, so it costs a handful of tokens per request and nothing else. The agent still decides whether and when to call `recall`.
+**System-prompt nudge (`nudge`, on by default).** The plugin adds a short line to the system prompt reminding the agent to search its history when you reference past work, and to list this session's children with `recall_sessions({ parentID: "current" })` when a subagent Task was cancelled or interrupted after starting without returning its `task_id`. This is just text, so it costs roughly 130 tokens per request and nothing else. The agent still decides whether and when to call `recall`.
 
 **Automatic recall (`autoRecall`, off by default).** When one of your messages clearly points back at earlier work ("last time", "what did we decide", "same as before", "previously"), the plugin runs a recall for you and drops the top one to three hits, with citations, into the agent's context before it answers. This runs entirely against the session cards, so it fetches no messages and adds no measurable latency to your turn, and if nothing matches it stays quiet.
 
@@ -244,7 +244,12 @@ List sessions by title, for lightweight recent-session browsing or recency check
 ```
 recall_sessions({ scope: "project", search: "auth" })
 recall_sessions({ scope: "global", search: "deployment", since: "7d" })
+recall_sessions({ parentID: "current" })
 ```
+
+`parentID` switches the tool to a live parent/child lookup: it lists the direct children (subagent sessions) of the given parent, with `"current"` as sugar for the calling session. The listing comes straight from the server, not the search index, so it finds cancelled or in-flight subagents the index has not caught up to — the recovery path when a Task tool returns "Task cancelled" without a `task_id`. From the listed IDs, `recall_messages` reads each child's tail state. Only direct children are returned (not grandchildren), and the response uses `scope: "children"` with a `parentID` echo and a `childCount`; `childCount > returned` means the `limit` truncated the listing. A malformed (non-string) `parentID` degrades to an ordinary listing, so check `scope === "children"` to discriminate. Rows whose content is not yet distilled into the search index carry `distilled: false`; rows backed by a fully distilled card omit the field.
+
+When a `since` filter selects nothing and the lower bound is newer than the newest indexed session, the tool falls back to a live listing for that window (marked with a `note`), so index lag never silently hides brand-new sessions.
 
 ## Match modes
 
@@ -273,7 +278,7 @@ This plugin reads them back through the OpenCode SDK:
 
 - No direct database queries. All access goes through the SDK; opencode's database stays the sole source of truth.
 - One derived index, built in the background and safe to delete. There is nothing for you to set up or sync.
-- Every fetch is bounded and paginated. A search never pulls a whole session into memory, and a background distiller never competes with a live query.
+- Every message fetch is bounded and paginated. A search never pulls a whole session into memory, and a background distiller never competes with a live query. (Metadata listings, like the parent/child lookup, are single bounded-in-practice calls.)
 - Long-running work respects abort signals.
 - Cross-project search is on by default; disable it with `global: false`.
 - All four match modes work in every scope: session, project, and global.

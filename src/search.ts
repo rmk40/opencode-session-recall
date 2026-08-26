@@ -1358,7 +1358,9 @@ function capWarnings(warnings: string[]): string[] | undefined {
   return unique.length > 0 ? unique.slice(0, MAX_WARNINGS) : undefined;
 }
 
-function buildSuggestions(input: {
+// Exported for direct unit tests (the absent-`coverage.cards` guard cannot be
+// reached through the tool, which always attaches a cards block).
+export function buildSuggestions(input: {
   results: SearchResult[];
   coverage: SearchCoverage;
   directory?: string;
@@ -1374,6 +1376,8 @@ function buildSuggestions(input: {
   codeTokens: string[];
   /** Session IDs the metadata shortlist selected (smart/fuzzy only). */
   shortlistIDs: string[];
+  /** Normalized lower time bound (ms epoch), when the caller set one. */
+  after?: number;
 }): SearchSuggestion[] | undefined {
   // Suggestions are ranked before the MAX_SUGGESTIONS slice so plan-mandated
   // guidance (exact code tokens, shortlisted-but-unranked sessions) cannot be
@@ -1386,6 +1390,36 @@ function buildSuggestions(input: {
   const onlyTitleHits =
     input.results.length > 0 && input.results.every((result) => result.source === "title");
   const typeFilter = input.type && input.type !== "all" ? input.type : undefined;
+
+  // Staleness: the requested window is newer than the newest indexed session,
+  // so zero eligible sessions means the index has not caught up — not that the
+  // history is empty. Inserted FIRST among priority-0 entries so the cap
+  // (MAX_SUGGESTIONS) cannot displace it, and the two generic zero-result
+  // entries it would contradict (literal→smart, "only N sessions searched")
+  // are suppressed below. Widening the window is deliberately not offered: it
+  // only admits older indexed sessions, never unindexed ones.
+  const staleWindow =
+    input.coverage.sessionsEligible === 0 &&
+    input.after != null &&
+    input.coverage.cards != null &&
+    input.after > input.coverage.cards.storeRecency;
+  if (staleWindow) {
+    if (input.coverage.cards?.degraded) {
+      add(0, {
+        reason:
+          "No content index is available (degraded mode); recent sessions are not searchable.",
+        action:
+          "Use recall_sessions for live session metadata; recall_messages reads a known session directly.",
+      });
+    } else {
+      add(0, {
+        reason:
+          "The search index has not caught up to this time window; recent sessions may be missing.",
+        action:
+          'For cancelled-subagent recovery use recall_sessions({ parentID: "current" }); otherwise list live session metadata with recall_sessions using the same since.',
+      });
+    }
+  }
 
   // Routing hint: never override the caller, only suggest a better-fitting mode.
   const routed = classifyQuery(input.query, input.matchMode);
@@ -1425,7 +1459,9 @@ function buildSuggestions(input: {
     });
   }
 
-  if (input.results.length === 0 && input.matchMode === "literal") {
+  // Suppressed under a stale window: broadening the match cannot recover
+  // sessions the index has not seen.
+  if (input.results.length === 0 && input.matchMode === "literal" && !staleWindow) {
     add(0, {
       reason: "Literal search found no hits.",
       action: 'Try match:"smart" or match:"fuzzy" for typos and naming variants.',
@@ -1441,7 +1477,9 @@ function buildSuggestions(input: {
     });
   }
 
-  if (input.results.length === 0 && input.coverage.sessionsSearched <= 4) {
+  // Suppressed under a stale window: "remove narrowing filters" misdiagnoses
+  // an indexing gap as over-filtering.
+  if (input.results.length === 0 && input.coverage.sessionsSearched <= 4 && !staleWindow) {
     const count = input.coverage.sessionsSearched;
     const noun = count === 1 ? "session" : "sessions";
     const verb = count === 1 ? "was" : "were";
@@ -1550,6 +1588,7 @@ function attachCommonOutput<T extends SearchOutput>(
     excludeExplicitOff: boolean;
     codeTokens: string[];
     shortlistIDs: string[];
+    after?: number;
   },
 ): T {
   input.coverage.directoryBucketCounts = countDirectoryBuckets(input.final);
@@ -1569,6 +1608,7 @@ function attachCommonOutput<T extends SearchOutput>(
     excludeExplicitOff: input.excludeExplicitOff,
     codeTokens: input.codeTokens,
     shortlistIDs: input.shortlistIDs,
+    ...(input.after != null && { after: input.after }),
   });
   if (suggestions) out.suggestions = suggestions;
   const nearMisses = buildNearMisses(input.final, input.searchedSessions);
@@ -2596,6 +2636,7 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
               excludeExplicitOff: excludeExplicit === false,
               codeTokens: queryMeta.codeTokens,
               shortlistIDs,
+              ...(after != null && { after }),
             },
           );
         };

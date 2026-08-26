@@ -1,7 +1,10 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import type { ToolDefinition } from "@opencode-ai/plugin";
-import { search } from "../src/search.js";
-import type { Limits, SearchOutput, ErrorOutput } from "../src/types.js";
+import { buildSuggestions, search, type SearchDeps } from "../src/search.js";
+import { cardsLiteFromSessions, createCardsRuntime } from "../src/cards.js";
+import { createDrill } from "../src/drill.js";
+import { createFetchGate } from "../src/fetch-gate.js";
+import type { Limits, SearchCoverage, SearchOutput, ErrorOutput } from "../src/types.js";
 import {
   PROJECT_DIR,
   TEST_LIMITS,
@@ -1412,6 +1415,160 @@ describe("recall", () => {
       expect(out.results[0]?.hitCount).toBeGreaterThanOrEqual(10);
       const hint = out.suggestions?.find((s) => s.action.includes('group:"part"'));
       expect(hint?.example).toEqual({ group: "part", sessionID: dense.id });
+    });
+  });
+
+  describe("staleness suggestion", () => {
+    /** Age every fixture session so the seeded card store's recency is 3 days
+     *  old — a since:"1h" window is then provably newer than the index. */
+    function staleHarness(): FakeHarness {
+      const h = makeFakeHarness();
+      const old = Date.now() - 3 * 24 * 3600_000;
+      for (const s of [...h.sessions, ...h.globalSessions]) s.time.updated = old;
+      return h;
+    }
+
+    it("flags a stale window first and suppresses the misleading generic entries", async () => {
+      const h = staleHarness();
+      const out = await runTool<SearchOutput>(await recallTool(h), {
+        query: "fix review findings batch",
+        scope: "project",
+        since: "1h",
+      });
+
+      expect(out.results).toEqual([]);
+      expect(out.coverage?.sessionsEligible).toBe(0);
+      // The staleness entry is present and FIRST.
+      expect(out.suggestions?.[0]?.reason).toContain("has not caught up");
+      expect(out.suggestions?.[0]?.action).toContain('parentID: "current"');
+      // The two contradicted generic entries are suppressed (the pinned
+      // sessions-searched entry reads "Only N session(s) ... searched.").
+      expect(out.suggestions?.some((s) => s.reason.includes("Literal search found no hits"))).toBe(
+        false,
+      );
+      expect(
+        out.suggestions?.some((s) => /^Only \d+ sessions? (was|were) searched\.$/.test(s.reason)),
+      ).toBe(false);
+      // "Widen the window" is never offered.
+      expect(out.suggestions?.some((s) => /widen/i.test(`${s.reason} ${s.action}`))).toBe(false);
+    });
+
+    it("survives the 3-cap against a regex-shaped query with directory and type filters", async () => {
+      // Adversarial combination: the regex routing hint plus the directory and
+      // type-filter zero-result hints are all priority-0 — the staleness entry
+      // must be inserted ahead of them or the cap slices it off.
+      const h = staleHarness();
+      const out = await runTool<SearchOutput>(await recallTool(h), {
+        query: "batch[a-z]+",
+        match: "smart",
+        type: "reasoning",
+        directory: "/nonexistent/path",
+        since: "1h",
+      });
+
+      expect(out.results).toEqual([]);
+      expect(out.suggestions).toHaveLength(3);
+      expect(out.suggestions?.[0]?.reason).toContain("has not caught up");
+    });
+
+    it("uses the no-index wording in degraded mode", async () => {
+      // Virgin degraded mode: no store, cards-lite over aged sessions, so
+      // storeRecency is 0 and coverage.cards.degraded is true. The wording
+      // must say "no index", not misdiagnose the missing store as lag.
+      const h = staleHarness();
+      const gate = createFetchGate({ concurrency: TEST_LIMITS.concurrency });
+      const liteCards = cardsLiteFromSessions(h.globalSessions);
+      const cards = createCardsRuntime({
+        source: { getCards: () => liteCards, revision: () => undefined, degraded: true },
+      });
+      const drill = createDrill({ client: h.client, gate, limits: TEST_LIMITS });
+      const deps: SearchDeps = { gate, store: null, cards, drill };
+      const tool = search(h.client, h.unscoped, true, TEST_LIMITS, deps);
+
+      const out = await runTool<SearchOutput>(tool, {
+        query: "fix review findings batch",
+        scope: "project",
+        since: "1h",
+      });
+
+      expect(out.coverage?.cards?.degraded).toBe(true);
+      expect(out.suggestions?.[0]?.reason).toContain("No content index is available");
+      expect(out.suggestions?.[0]?.action).toContain("recall_sessions");
+    });
+
+    it("keeps generic suggestions unchanged for a non-stale zero result", async () => {
+      // Fresh fixture store, absent query: zero results but the window covers
+      // the index, so the staleness entry must not appear and the generic
+      // literal→smart hint stays.
+      const out = await runTool<SearchOutput>(await recallTool(makeFakeHarness()), {
+        query: "totally-absent-token",
+        scope: "project",
+        since: "1h",
+      });
+
+      expect(out.results).toEqual([]);
+      expect(out.suggestions?.some((s) => s.reason.includes("has not caught up")) ?? false).toBe(
+        false,
+      );
+      expect(out.suggestions?.some((s) => s.action.includes('match:"smart"'))).toBe(true);
+    });
+
+    it("requires zero eligible sessions: a stale-looking recency alone does not fire", () => {
+      // Degraded mode reaches this state for real: storeRecency is 0 (it counts
+      // full cards only) while sessions are still eligible and searchable.
+      // Without the sessionsEligible conjunct the no-index entry would fire on
+      // every time-bounded degraded query, results or not.
+      const coverage: SearchCoverage = {
+        totalSessionsKnown: false,
+        sessionsDiscovered: 3,
+        sessionsEligible: 3,
+        sessionsSearched: 3,
+        messagesSearched: 10,
+        partsSearched: 20,
+        sessionsSkipped: 0,
+        cards: { total: 3, full: 0, storeRecency: 0, degraded: true },
+      };
+      const suggestions = buildSuggestions({
+        results: [],
+        coverage,
+        fallback: false,
+        matchMode: "smart",
+        type: undefined,
+        query: "anything",
+        currentSessionExcluded: false,
+        excludeExplicitOff: false,
+        codeTokens: [],
+        shortlistIDs: [],
+        after: Date.now() - 3600_000,
+      });
+      const all = (suggestions ?? []).map((s) => `${s.reason} ${s.action}`).join(" | ");
+      expect(all).not.toMatch(/has not caught up|No content index is available/);
+    });
+
+    it("emits no staleness entry and does not crash when coverage.cards is absent", () => {
+      const coverage: SearchCoverage = {
+        totalSessionsKnown: false,
+        sessionsDiscovered: 0,
+        sessionsEligible: 0,
+        sessionsSearched: 0,
+        messagesSearched: 0,
+        partsSearched: 0,
+        sessionsSkipped: 0,
+      };
+      const suggestions = buildSuggestions({
+        results: [],
+        coverage,
+        fallback: false,
+        matchMode: "smart",
+        type: undefined,
+        query: "anything",
+        currentSessionExcluded: false,
+        excludeExplicitOff: false,
+        codeTokens: [],
+        shortlistIDs: [],
+        after: Date.now() - 3600_000,
+      });
+      expect(suggestions?.some((s) => s.reason.includes("has not caught up")) ?? false).toBe(false);
     });
   });
 
