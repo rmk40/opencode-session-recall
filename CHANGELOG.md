@@ -11,13 +11,16 @@ Based on PR #3 by @kernel-oops with maintainer fixes.
 ### Added
 
 - **Bounded shutdown via the optional `dispose` hook.** On hosts that call
-  `dispose` (opencode ≥ 1.15.11), the plugin now shuts down in two phases:
+  `dispose` (recent opencode versions), the plugin now shuts down in two phases:
   an immediate quiesce (no new distill/summary/hook work starts) followed by a
   bounded drain of in-flight work before SQLite closes. Every wait is
   timeout-capped — a never-settling SDK request is detached, not awaited
   forever — so plugin disposal can never hang the host's shutdown. Detached
-  work is fenced by stop/finalize/lease guards and cannot touch the closed
-  store. There is **no new host requirement**: older hosts simply never call
+  distiller work is fenced by stop/finalize/lease guards and cannot touch the
+  closed store; if a foreground tool execution has not settled within the
+  bound, the store handle is deliberately left open (the process is exiting
+  and the store is derived/rebuildable) rather than risking a use-after-close.
+  There is **no new host requirement**: older hosts simply never call
   `dispose` and the plugin behaves exactly as before (no `engines` constraint
   was added).
 - **Cold-pass quarantine for malformed legacy sessions.** A session whose
@@ -34,9 +37,10 @@ Based on PR #3 by @kernel-oops with maintainer fixes.
 
 ### Fixed
 
-- **Stale-writer window closed.** Distiller writes (full/append/cold-pass
-  replaces, rollups, deletes) now re-verify authoritative lease ownership
-  against the live lease row immediately before each write transaction, so a
+- **Stale-writer window closed.** Every distiller store write (full/append/
+  cold-pass replaces, rollups, deletes, the cold-pass progress cursor) now
+  re-verifies authoritative lease ownership against the live lease row
+  immediately before the write, so a
   process suspended past the lease TTL cannot clobber the new holder's rows
   when its paused fetch resumes. The self-check demotes only when another
   holder's name is on the row — an expired-looking own heartbeat is not a

@@ -417,17 +417,32 @@ const server: Plugin = async (ctx, options) => {
         // Summarizer.stop() is internally bounded (its own 15s shutdown
         // timeout). Its late SDK promises are detached and ownership/lease
         // guarded, so phase 2 may safely release the lease once this settles
-        // even when an SDK request itself never does.
-        if (summarizer) await Promise.allSettled([summarizer.stop()]);
+        // even when an SDK request itself never does. The catch covers the rare
+        // rejecting drain (e.g. a store write threw) — shutdown must not care.
+        if (summarizer) await summarizer.stop().catch(() => {});
         // Bound the remaining waits: an SDK request that never settles would
         // otherwise hang the host's shutdown (dispose is awaited untimed).
-        // Timing out does NOT skip db.close() — every distiller write path is
-        // finalized/lease-guarded, so a detached fetch that settles later can
-        // no longer reach SQLite.
+        //
+        // The two waits differ in what protects a detached continuation:
+        // - Distiller work is finalized/lease-guarded before every store
+        //   read/write, so a distiller fetch that settles after the timeout can
+        //   never reach SQLite. Closing after a distiller timeout is safe.
+        // - `operations` tracks FOREGROUND tool executions, which have no such
+        //   guards: a paused recall/drill fetch can resume straight into card
+        //   coverage reads. If they have not all settled, do NOT close — the
+        //   process is exiting anyway, the store is derived/rebuildable, and an
+        //   unclosed handle is harmless, whereas a use-after-close is not.
         await settleWithin(distiller.stop(), SHUTDOWN_TIMEOUT_MS);
-        await settleWithin(Promise.allSettled([...operations]), SHUTDOWN_TIMEOUT_MS);
-        db?.close();
-        db = null;
+        const ops = await settleWithin(Promise.allSettled([...operations]), SHUTDOWN_TIMEOUT_MS);
+        if (!ops.timedOut) {
+          try {
+            db?.close();
+          } catch {
+            // Best-effort: a throwing close must not reject disposePromise
+            // into the host's shutdown finalizer.
+          }
+          db = null;
+        }
       })();
       return disposePromise;
     },

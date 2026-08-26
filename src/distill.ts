@@ -686,7 +686,31 @@ export function createDistiller(options: DistillerOptions): Distiller {
    *  the next re-distill takes the full path rather than appending. */
   const removalSince = new Set<string>();
 
-  const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+  /** Cancellable inter-page politeness sleep. The timers are tracked so
+   *  quiesce() can cancel them: an untracked setTimeout with a long
+   *  distillDelayMs would otherwise keep the runtime alive past dispose. A
+   *  cancelled sleep resolves immediately; the caller's stopped/lease check
+   *  right after it does the actual bail-out. */
+  const pageDelayTimers = new Map<Timer, () => void>();
+  const sleep = (ms: number): Promise<void> =>
+    new Promise((resolve) => {
+      if (stopped) {
+        resolve();
+        return;
+      }
+      const timer = setTimeout(() => {
+        pageDelayTimers.delete(timer);
+        resolve();
+      }, ms);
+      pageDelayTimers.set(timer, resolve);
+    });
+  function cancelPageDelays(): void {
+    for (const [timer, resolve] of pageDelayTimers) {
+      clearTimeout(timer);
+      resolve();
+    }
+    pageDelayTimers.clear();
+  }
 
   const discover =
     options.discover ??
@@ -716,6 +740,25 @@ export function createDistiller(options: DistillerOptions): Distiller {
     return sessions.map(toMeta).filter((meta) => !isSummarizerTitle(meta.title));
   }
 
+  /** Whether an SDK error return means "session does not exist" (absence)
+   *  rather than a transport failure. Best-effort on both signals the SDK
+   *  exposes: the v2 error body's `_tag` discriminant (`SessionNotFoundError`)
+   *  and the fields-style `response.status` (404). Either matching → absence. */
+  function isNotFoundError(error: unknown, response: unknown): boolean {
+    if (
+      error &&
+      typeof error === "object" &&
+      (error as { _tag?: unknown })._tag === "SessionNotFoundError"
+    ) {
+      return true;
+    }
+    return (
+      response != null &&
+      typeof response === "object" &&
+      (response as { status?: unknown }).status === 404
+    );
+  }
+
   async function fetchSessionMeta(sessionID: string): Promise<DistillSessionMeta | null> {
     const resp = await gate.runBackground(() => {
       if (stopped || !leaseHeld) return Promise.resolve(null);
@@ -723,6 +766,9 @@ export function createDistiller(options: DistillerOptions): Distiller {
     });
     if (!resp) return null;
     if (resp.error) {
+      // A recognizable not-found is ABSENCE (session gone → nothing to
+      // distill), not a transport failure to retry.
+      if (isNotFoundError(resp.error, resp.response)) return null;
       throw new SessionMetadataTransportError(
         `session ${sessionID} metadata fetch failed: ${errmsg(resp.error)}`,
       );
@@ -760,6 +806,10 @@ export function createDistiller(options: DistillerOptions): Distiller {
           for (const part of msg.parts) rowCount += distillFields(part).length;
         }
       } catch (error) {
+        // Only a TypeError here is a data-shape failure (e.g. `parts` missing
+        // on a malformed legacy message); anything else is a code regression
+        // that must abort the pass, not quarantine the session.
+        if (!(error instanceof TypeError)) throw error;
         throw new MalformedSessionError(errmsg(error));
       }
       cursor = page.nextCursor ?? undefined;
@@ -801,6 +851,10 @@ export function createDistiller(options: DistillerOptions): Distiller {
           collected.push(msg);
         }
       } catch (error) {
+        // TypeError only, matching fetchSessionMessages: a data-shape failure
+        // (`info` missing on a malformed message) quarantines; anything else
+        // is a regression and must surface.
+        if (!(error instanceof TypeError)) throw error;
         throw new MalformedSessionError(errmsg(error));
       }
       cursor = reached ? undefined : (page.nextCursor ?? undefined);
@@ -1051,6 +1105,9 @@ export function createDistiller(options: DistillerOptions): Distiller {
             // above): a TypeError walking malformed legacy parts is this
             // session's problem; anything else is a deriveCard regression that
             // must surface as a pass failure, not silently sideline sessions.
+            // Accepted tradeoff: a deriveCard TypeError REGRESSION quarantines
+            // rather than aborts; quarantinedCount + the 1000-entry cap bound
+            // the damage and make it diagnosable.
             if (!(error instanceof MalformedSessionError) && !(error instanceof TypeError)) {
               throw error;
             }
@@ -1077,8 +1134,10 @@ export function createDistiller(options: DistillerOptions): Distiller {
 
       // Losing the lease (a takeover) or stopping mid-pass must NOT finish the
       // pass or recompute rollups as if complete — leave it idle so the new
-      // holder (or a restart) redoes the remainder.
-      if (stopped || !leaseHeld) {
+      // holder (or a restart) redoes the remainder. Authoritative check: a
+      // demoted instance whose rollup recompute silently no-oped must not
+      // declare "done" or kick the summarizer.
+      if (stopped || !ownsLease()) {
         coldPassState = "idle";
         return;
       }
@@ -1139,6 +1198,11 @@ export function createDistiller(options: DistillerOptions): Distiller {
   function recordProgress(timeUpdated: number): void {
     if (stopped || !leaseHeld) return;
     if (progressFloor == null || timeUpdated < progressFloor) {
+      // Authoritative ownership gate (same as every other distiller store
+      // write): this is reached from the quarantine branches and the common
+      // up-to-date skip path, all after awaited fetches. Checked only when the
+      // floor actually moves, so the hot skip path usually costs nothing extra.
+      if (!ownsLease()) return;
       progressFloor = timeUpdated;
       store.setMeta("coldpass_cursor", String(timeUpdated));
     }
@@ -1305,6 +1369,10 @@ export function createDistiller(options: DistillerOptions): Distiller {
     for (const timer of debounceTimers.values()) clearTimeout(timer);
     debounceTimers.clear();
     pendingRerun.clear();
+    // Wake any inter-page politeness sleep immediately: with a long
+    // distillDelayMs those timers would otherwise keep the runtime alive past
+    // dispose. The woken fetch loop bails on its stopped check.
+    cancelPageDelays();
     // Deliberately retain heartbeatTimer: summary worker cleanup is lease-owned
     // and plugin disposal finalizes this distiller only after that cleanup has
     // settled or reached its shutdown bound.
@@ -1373,10 +1441,13 @@ export function createDistiller(options: DistillerOptions): Distiller {
 
     status(): DistillStatus {
       const lease = store.leaseStatus();
-      // Report the cached flag: status() must be side-effect-free (ownsLease()
-      // mutates lease state and re-arms timers; it is for write gates only).
+      // Derive leaseHeld from the lease row already read for the `lease` field:
+      // authoritative AND side-effect-free (unlike ownsLease(), which mutates
+      // lease state and re-arms timers — that one is for write gates only), and
+      // no extra SQLite read. `leaseHeld &&` keeps a released/finalized
+      // instance reporting false even if the row still names it briefly.
       return {
-        leaseHeld,
+        leaseHeld: leaseHeld && lease?.holder === instanceId,
         coldPass: coldPassState,
         distilledCount,
         knownCount,

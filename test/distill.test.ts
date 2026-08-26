@@ -702,9 +702,12 @@ describe("cold pass", () => {
     clock += 31_000;
     expect(store.acquireLease("rival", 30_000, "rivalbuild", 4)).toBe(true);
 
-    // status() reports the CACHED flag (side-effect-free): the heartbeat
-    // callback has not run, so this instance still believes it holds the lease.
-    expect(distiller.status().leaseHeld).toBe(true);
+    // status() is authoritative WITHOUT side effects: it derives leaseHeld from
+    // the lease row it already reads for the `lease` field, so it reports the
+    // takeover even though the heartbeat callback has not run and the internal
+    // cached flag still says held.
+    expect(distiller.status().leaseHeld).toBe(false);
+    expect(distiller.status().lease?.holder).toBe("rival");
 
     resolveMessages({});
     await waitFor(() => distiller.status().coldPass !== "running");

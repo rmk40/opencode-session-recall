@@ -309,14 +309,22 @@ describe("plugin entry", () => {
     expect(sqliteLifecycle.postCloseCalls).toBe(0);
   });
 
-  it("dispose completes within its bound when an SDK request never settles", async () => {
+  it("dispose completes within its bound when a distiller SDK request never settles", async () => {
     // The host awaits dispose as a shutdown finalizer with no timeout of its
     // own; a never-settling in-flight fetch must not hang shutdown forever.
-    // The timeout still closes SQLite: every write path is stopped/finalized-
-    // guarded, so the detached fetch can never reach the store.
+    // A distiller timeout still closes SQLite: every distiller path is
+    // stopped/finalized-guarded, so the detached fetch can never reach the
+    // store — proven below by resolving it AFTER dispose and asserting no
+    // post-close DB access.
     vi.useFakeTimers();
     try {
-      const messages = vi.fn(() => new Promise<never>(() => {}));
+      let resolveMessages: ((value: { data: [] }) => void) | undefined;
+      const messages = vi.fn(
+        () =>
+          new Promise<{ data: [] }>((resolve) => {
+            resolveMessages = resolve;
+          }),
+      );
       createOpencodeClient
         .mockImplementationOnce((options: unknown) => ({
           ...(options as object),
@@ -353,12 +361,75 @@ describe("plugin entry", () => {
       expect(disposed).toBe(false);
 
       // Total dispose stays under ~20s worst case even though the SDK request
-      // never settles; SQLite is still closed exactly once, with no post-close
-      // access from the detached fetch.
+      // has not settled; SQLite is still closed exactly once.
       await vi.advanceTimersByTimeAsync(20_000);
       await stopping;
       expect(disposed).toBe(true);
       expect(sqliteLifecycle.closes).toBe(1);
+      expect(sqliteLifecycle.postCloseCalls).toBe(0);
+
+      // The detached fetch resolving AFTER dispose must not reach the closed
+      // store: the resumed continuation bails on its stopped/finalized guards
+      // before any store read/write.
+      resolveMessages?.({ data: [] });
+      for (let i = 0; i < 20; i++) await Promise.resolve();
+      expect(sqliteLifecycle.postCloseCalls).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("skips the DB close when a foreground tool operation outlives the dispose bound", async () => {
+    // `operations` tracks FOREGROUND tool executions, which have no
+    // finalized/lease guards: a recall paused in an SDK fetch can resume into
+    // card/store reads. When that wait times out, dispose deliberately does
+    // NOT close SQLite (the process is exiting; the derived store rebuilds) so
+    // the late resumption cannot use-after-close.
+    vi.useFakeTimers();
+    try {
+      let resolveMessages: ((value: { data: [] }) => void) | undefined;
+      const messages = vi.fn(
+        () =>
+          new Promise<{ data: [] }>((resolve) => {
+            resolveMessages = resolve;
+          }),
+      );
+      const get = vi.fn(async () => ({ data: undefined }));
+      createOpencodeClient
+        .mockImplementationOnce((options: unknown) => ({
+          ...(options as object),
+          session: { messages, get, list: vi.fn(async () => ({ data: [] })) },
+        }))
+        .mockImplementationOnce((options: unknown) => ({
+          ...(options as object),
+          experimental: { session: { list: vi.fn(async () => ({ data: [] })) } },
+        }));
+      const hooks = await server(ctx({ fetch: vi.fn() }), {});
+
+      // Start a foreground tool call that parks inside the SDK fetch.
+      const toolRun = mustTool(hooks.tool?.recall_messages).execute({ sessionID: "s-park" }, {
+        sessionID: "s-park",
+        metadata: () => {},
+      } as never);
+      for (let i = 0; i < 100 && messages.mock.calls.length === 0; i++) {
+        await Promise.resolve();
+      }
+      expect(messages).toHaveBeenCalled();
+
+      let disposed = false;
+      const stopping = hooks.dispose?.().then(() => {
+        disposed = true;
+      });
+      await vi.advanceTimersByTimeAsync(20_000);
+      await stopping;
+      expect(disposed).toBe(true);
+      // The operations wait timed out → the close was skipped.
+      expect(sqliteLifecycle.closes).toBe(0);
+
+      // The parked tool resuming afterwards must not crash or hit a closed
+      // handle (there is none to hit — the close was skipped).
+      resolveMessages?.({ data: [] });
+      await toolRun;
       expect(sqliteLifecycle.postCloseCalls).toBe(0);
     } finally {
       vi.useRealTimers();

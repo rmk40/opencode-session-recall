@@ -307,19 +307,19 @@ export function createSummarizer(deps: SummarizerDeps): Summarizer {
    *  worker ownership is a separate authority from the SQLite writer lease:
    *  losing the lease (or stopping) must never leak a worker we uniquely own,
    *  so this deliberately checks neither `stopped` nor `leaseHeld()` — only the
-   *  caller's `ownedWorkers` membership scopes it. Returns whether the request
-   *  settled in time (a timed-out delete leaves the id owned for a later retry
-   *  by the next holder's orphan sweep). */
-  async function ownedWorkerSdk(
+   *  caller's `ownedWorkers` membership scopes it. Returns the SDK response, or
+   *  undefined on timeout, so the caller can distinguish confirmed success
+   *  (`resp` without `error`) from a failed or detached request. */
+  async function ownedWorkerSdk<T>(
     label: string,
-    operation: () => Promise<unknown>,
-  ): Promise<boolean> {
+    operation: () => Promise<T>,
+  ): Promise<T | undefined> {
     const result = await settleWithin(gate.runBackground(operation), shutdownTimeoutMs);
     if (result.timedOut) {
       logMsg(`${label} timed out after ${shutdownTimeoutMs}ms; late SDK settlement detached`);
-      return false;
+      return undefined;
     }
-    return true;
+    return result.value;
   }
 
   async function createWorker(): Promise<string | null> {
@@ -361,14 +361,17 @@ export function createSummarizer(deps: SummarizerDeps): Summarizer {
     try {
       // NOT lease-gated: this instance created the worker and uniquely owns it;
       // losing the SQLite writer lease mid-batch must not leak the session.
-      const settled = await ownedWorkerSdk("worker delete", () =>
+      const resp = await ownedWorkerSdk("worker delete", () =>
         client.session.delete({ sessionID }),
       );
-      if (settled) ownedWorkers.delete(sessionID);
+      // Prune only on CONFIRMED success: an SDK error, rejection, or timeout
+      // keeps the id owned so this instance's own later cleanup can retry.
+      // (Retention only helps THIS instance — any next lease holder's orphan
+      // sweep deletes by sentinel title regardless of our bookkeeping.)
+      if (resp && !resp.error) ownedWorkers.delete(sessionID);
     } catch {
       // Best-effort; a lingering sentinel session is excluded everywhere and
       // swept by the next holder's orphan cleanup.
-      ownedWorkers.delete(sessionID);
     }
   }
 
@@ -385,7 +388,10 @@ export function createSummarizer(deps: SummarizerDeps): Summarizer {
   }
 
   /** Delete any sentinel worker sessions left by a crashed prior holder, rather
-   *  than adopting one whose accumulated context is unknown. Runs once. */
+   *  than adopting one whose accumulated context is unknown. Runs once.
+   *  Accepted race: the sweep matches by sentinel title, so a fresh lease
+   *  winner can delete a demoted loser's still-in-flight worker — benign, since
+   *  the loser's results were lease-gated out of persistence anyway. */
   async function deleteOrphans(): Promise<void> {
     try {
       const resp = await leaseSdk("worker orphan list", () =>
