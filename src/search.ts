@@ -2204,7 +2204,8 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
         const probeMeta = async (
           id: string,
         ): Promise<{ title: string; directory: string; updated: number } | undefined> => {
-          for (const c of [client, unscoped]) {
+          const probeClients = client === unscoped ? [client] : [client, unscoped];
+          for (const c of probeClients) {
             try {
               const sess = await gate.runQuery(() => c.session.get({ sessionID: id }));
               if (sess.data) {
@@ -2248,9 +2249,10 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
             for (let i = 0; i < chunk.length; i++) {
               if (resolved.length >= wanted) {
                 // Probed but over the cap: count as unprobed for the warning —
-                // it genuinely was not searched.
+                // it genuinely was not searched. (The rewind can never go
+                // negative: index === chunkStart + chunk.length here and we
+                // subtract at most chunk.length.)
                 index -= chunk.length - i;
-                index = Math.max(index, 0);
                 break;
               }
               const id = chunk[i]!;
@@ -2369,12 +2371,17 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
             // guards as a fresh uncarded shortlist — worker exclusion, live
             // metadata probe, time bounds, current-session exclusion, warning.
             // Without this split a resume would bypass every uncarded guard.
-            const explicitOnly = uncardedShortlist(kept.filter((id) => cards.get(id) == null));
+            // Snapshot carded-ness ONCE before the await: cards.get triggers
+            // refreshIfStale, so two reads straddling the probe could disagree
+            // (present→absent would drop an id with no warning — the round-1
+            // dual-source bug in miniature).
+            const cardedIds = new Set(kept.filter((id) => cards.get(id) != null));
+            const explicitOnly = uncardedShortlist(kept.filter((id) => !cardedIds.has(id)));
             const { resolved } = await resolveUncarded(explicitOnly, explicitOnly.length);
             const resolvedById = new Map(resolved.map((r) => [r.target.sessionId, r] as const));
             drillTargets = [];
             for (const id of kept) {
-              if (cards.get(id)) drillTargets.push(targetFor(id));
+              if (cardedIds.has(id)) drillTargets.push(targetFor(id));
               else {
                 const r = resolvedById.get(id);
                 if (r) drillTargets.push(r.target);
@@ -2943,7 +2950,16 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
 
         // ── Deep sweep route (exhaustive, tool-output-inclusive, budgeted) ──
         if (deepMode) {
-          const deepResume = deepCursor?.current ? { before: deepCursor.before } : undefined;
+          // The page offset belongs to ONE session (deepCursor.current). The
+          // resume rebuild can drop that session (worker/bounds/current-session
+          // guards, excludeSessionID), shifting a different session into slot 0
+          // — applying the offset there would silently skip its earlier pages
+          // and report full coverage. Only resume mid-session when slot 0 is
+          // still the session the cursor was cut in; otherwise sweep it fresh.
+          const deepResume =
+            deepCursor?.current && drillTargets[0]?.sessionId === deepCursor.current
+              ? { before: deepCursor.before }
+              : undefined;
           const deepResult = await drill.deep({
             sessions: drillTargets,
             query: queryMeta,

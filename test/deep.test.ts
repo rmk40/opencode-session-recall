@@ -256,6 +256,60 @@ describe("deep scope validation", () => {
       cleanup();
     }
   });
+
+  it("does not apply a dropped session's page offset to the next session", async () => {
+    // The cursor's `before` offset belongs to `current`. When the resume
+    // rebuild drops `current` (here: a worker excluded by its live title), the
+    // next session shifts into slot 0 — it must be swept FROM THE BEGINNING,
+    // not from a foreign mid-session offset that would silently skip its
+    // earlier messages while reporting full coverage.
+    const h = makeFakeHarness();
+    const { deps, cleanup } = await makeRecallDeps(h);
+    const worker = session(
+      "s-offset-worker",
+      "[recall-summarizer] owner=off",
+      PROJECT_DIR,
+      NOW - 1_000,
+    );
+    addSession(h, worker, [
+      bundle(userMessage("m-offset-worker-1", worker.id, NOW - 2_000), [
+        textPart("p-offset-worker-1", worker.id, "m-offset-worker-1", "glimmerquartz w"),
+      ]),
+    ]);
+    const young = session("s-offset-young", "Offset Young", PROJECT_DIR, NOW - 1_000);
+    addSession(h, young, [
+      bundle(userMessage("m-offset-young-1", young.id, NOW - 3_000), [
+        textPart("p-offset-young-1", young.id, "m-offset-young-1", "glimmerquartz needle early"),
+      ]),
+      bundle(userMessage("m-offset-young-2", young.id, NOW - 2_000), [
+        textPart("p-offset-young-2", young.id, "m-offset-young-2", "later filler text"),
+      ]),
+    ]);
+    // Cursor cut mid-sweep in the WORKER with a before-offset pointing past
+    // the young session's first (needle-bearing) message id.
+    const cursor = encodeDeepCursor({
+      v: 1,
+      remaining: ["s-offset-young"],
+      current: "s-offset-worker",
+      before: "m-offset-young-1",
+    });
+    try {
+      const recall = search(h.client, h.unscoped, true, TEST_LIMITS, deps);
+      const out = await runTool<SearchOutput>(recall, {
+        query: "glimmerquartz",
+        deepCursor: cursor,
+        sessions: ["s-offset-worker", "s-offset-young"],
+      });
+      expect(out.ok).toBe(true);
+      // Worker dropped by the guard; the young session swept fresh — the
+      // needle in its FIRST message must be reachable (a leaked offset would
+      // start the page walk before it and miss it).
+      expect(out.results.some((r) => r.sessionID === "s-offset-worker")).toBe(false);
+      expect(out.results.some((r) => r.partID === "p-offset-young-1")).toBe(true);
+    } finally {
+      cleanup();
+    }
+  });
 });
 
 // ── Output-only needle: the honest-miss pair ─────────────────────────────────
