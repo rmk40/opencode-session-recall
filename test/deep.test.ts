@@ -279,19 +279,22 @@ describe("deep scope validation", () => {
     const young = session("s-offset-young", "Offset Young", PROJECT_DIR, NOW - 1_000);
     addSession(h, young, [
       bundle(userMessage("m-offset-young-1", young.id, NOW - 3_000), [
-        textPart("p-offset-young-1", young.id, "m-offset-young-1", "glimmerquartz needle early"),
+        textPart("p-offset-young-1", young.id, "m-offset-young-1", "older filler text"),
       ]),
       bundle(userMessage("m-offset-young-2", young.id, NOW - 2_000), [
-        textPart("p-offset-young-2", young.id, "m-offset-young-2", "later filler text"),
+        textPart("p-offset-young-2", young.id, "m-offset-young-2", "glimmerquartz needle newest"),
       ]),
     ]);
-    // Cursor cut mid-sweep in the WORKER with a before-offset pointing past
-    // the young session's first (needle-bearing) message id.
+    // Cursor cut mid-sweep in the WORKER. The fake's `before` cursor is a
+    // base64url-encoded NEWEST-FIRST index (test/helpers.ts paginateBundles),
+    // not a message id: index 1 skips the young session's newest message —
+    // the needle-bearing one. If the guard leaks this offset onto the young
+    // session, the needle is unreachable and the assertion below fails.
     const cursor = encodeDeepCursor({
       v: 1,
       remaining: ["s-offset-young"],
       current: "s-offset-worker",
-      before: "m-offset-young-1",
+      before: Buffer.from("1").toString("base64url"),
     });
     try {
       const recall = search(h.client, h.unscoped, true, TEST_LIMITS, deps);
@@ -302,10 +305,10 @@ describe("deep scope validation", () => {
       });
       expect(out.ok).toBe(true);
       // Worker dropped by the guard; the young session swept fresh — the
-      // needle in its FIRST message must be reachable (a leaked offset would
-      // start the page walk before it and miss it).
+      // needle in its NEWEST message must be reachable (a leaked offset of 1
+      // would skip exactly that message in the fake's newest-first walk).
       expect(out.results.some((r) => r.sessionID === "s-offset-worker")).toBe(false);
-      expect(out.results.some((r) => r.partID === "p-offset-young-1")).toBe(true);
+      expect(out.results.some((r) => r.partID === "p-offset-young-2")).toBe(true);
     } finally {
       cleanup();
     }
