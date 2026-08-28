@@ -2,7 +2,7 @@ import type { OpencodeClient, Part, PermissionRuleset, Session } from "@opencode
 import type { Card, Store } from "./store.js";
 import { SUMMARY_REV_KEY } from "./store.js";
 import type { FetchGate } from "./fetch-gate.js";
-import { errmsg } from "./types.js";
+import { errmsg, settleWithin } from "./types.js";
 import { tokenizeAll } from "./normalize.js";
 import { SUMMARIZER_SENTINEL, isSummarizerTitle } from "./extract.js";
 
@@ -36,10 +36,22 @@ const DEFAULT_BATCH_SIZE = 15;
 const DEFAULT_MAX_PROMPTS_PER_PASS = 200;
 const DEFAULT_POLITENESS_MS = 250;
 const DEFAULT_PROMPT_TIMEOUT_MS = 60_000;
+/** Disposal may detach a stuck SDK request after this bound. The request itself
+ *  cannot be cancelled by the SDK; lease/title guards make its late settlement
+ *  incapable of touching SQLite or another instance's worker. */
+const DEFAULT_SHUTDOWN_TIMEOUT_MS = 15_000;
 const DEFAULT_IDLE_DEBOUNCE_MS = 3_000;
 /** Abort a drain after this many prompts fail in a row: a misconfigured model
  *  must not burn the whole per-pass budget. Latches until the next cold pass. */
 const MAX_CONSECUTIVE_FAILURES = 3;
+/** Leftover owned-worker deletes retried per batch (aggregate bound: without
+ *  it, persistent failures make batch k drain k-1 ids — O(n²) deletes, or
+ *  worse, serial 15s timeouts wedging the pass while holding the lease). */
+const MAX_DRAIN_PER_BATCH = 3;
+/** Failed delete attempts per owned worker before giving up on it. The next
+ *  holder's sentinel-based orphan sweep is the backstop, and sentinel-titled
+ *  sessions are excluded from every recall path, so giving up is safe. */
+const MAX_DELETE_ATTEMPTS = 2;
 const INVENTORY_TOKENS = 24;
 const FILES_SHOWN = 6;
 const TOOLS_SHOWN = 8;
@@ -92,6 +104,9 @@ export type SummarizerDeps = {
   store: Store;
   gate: FetchGate;
   config: SummariesConfig;
+  /** Unique to this plugin instance; embedded in worker titles and used to keep
+   *  normal cleanup scoped to workers this instance created. */
+  ownerToken: string;
   /** Only the distill-lease holder writes; checked before every persisted write. */
   leaseHeld: () => boolean;
   log?: (message: string) => void;
@@ -101,7 +116,11 @@ export type SummarizerDeps = {
   batchSize?: number;
   politenessMs?: number;
   promptTimeoutMs?: number;
+  shutdownTimeoutMs?: number;
   idleDebounceMs?: number;
+  /** Failed delete attempts per owned worker before the give-up drops it
+   *  (spec: MAX_DELETE_ATTEMPTS). */
+  maxDeleteAttempts?: number;
 };
 
 export type Summarizer = {
@@ -111,11 +130,16 @@ export type Summarizer = {
   /** Debounced incremental re-summarize of one session (the idle-debounce path);
    *  the drain skips it when the content hash is unchanged. */
   queue(sessionId: string): void;
-  stop(): void;
+  /** Stop accepting work and settle the active serialized drain. */
+  stop(): Promise<void>;
   status(): { summarized: number; lastError?: string };
 };
 
 type Timer = ReturnType<typeof setTimeout>;
+
+export function summarizerWorkerTitle(ownerToken: string): string {
+  return `${SUMMARIZER_SENTINEL} owner=${ownerToken}`;
+}
 
 // ── Text helpers ─────────────────────────────────────────────────────────────
 
@@ -235,13 +259,15 @@ function replyText(parts: Part[]): string {
 // ── Summarizer ───────────────────────────────────────────────────────────────
 
 export function createSummarizer(deps: SummarizerDeps): Summarizer {
-  const { client, store, gate, config, leaseHeld } = deps;
+  const { client, store, gate, config, leaseHeld, ownerToken } = deps;
   const now = deps.now ?? Date.now;
   const log = deps.log;
   const rev = deps.rev ?? SUMMARY_REV;
   const batchSize = Math.max(1, deps.batchSize ?? DEFAULT_BATCH_SIZE);
   const politenessMs = Math.max(0, deps.politenessMs ?? DEFAULT_POLITENESS_MS);
   const promptTimeoutMs = Math.max(1, deps.promptTimeoutMs ?? DEFAULT_PROMPT_TIMEOUT_MS);
+  const shutdownTimeoutMs = Math.max(1, deps.shutdownTimeoutMs ?? DEFAULT_SHUTDOWN_TIMEOUT_MS);
+  const maxDeleteAttempts = Math.max(1, deps.maxDeleteAttempts ?? MAX_DELETE_ATTEMPTS);
   const idleDebounceMs = Math.max(0, deps.idleDebounceMs ?? DEFAULT_IDLE_DEBOUNCE_MS);
   const maxPromptsPerPass = Math.max(1, config.maxPromptsPerPass ?? DEFAULT_MAX_PROMPTS_PER_PASS);
 
@@ -263,11 +289,52 @@ export function createSummarizer(deps: SummarizerDeps): Summarizer {
   const inFlight = new Set<string>();
   const attempts = new Map<string, number>();
   let drainPromise: Promise<void> | null = null;
+  let stopPromise: Promise<void> | undefined;
   const debounceTimers = new Map<string, Timer>();
+  const ownedWorkers = new Set<string>();
+  /** Failed delete attempts per owned worker id (see MAX_DELETE_ATTEMPTS). */
+  const deleteAttempts = new Map<string, number>();
+  const workerTitle = summarizerWorkerTitle(ownerToken);
 
   // ── Worker session lifecycle ──
   // A fresh worker per batch (create, prompt once, delete): create/delete are
   // unbilled and this keeps every batch's context clean with zero accumulation.
+
+  async function leaseSdk<T>(label: string, operation: () => Promise<T>): Promise<T | undefined> {
+    if (stopped || !leaseHeld()) return undefined;
+    const result = await settleWithin(
+      gate.runBackground(() => {
+        // A gate permit may arrive after shutdown or an involuntary lease loss.
+        if (stopped || !leaseHeld()) return Promise.resolve(undefined);
+        return operation();
+      }),
+      shutdownTimeoutMs,
+    );
+    if (result.timedOut) {
+      logMsg(`${label} timed out after ${shutdownTimeoutMs}ms; late SDK settlement detached`);
+      return undefined;
+    }
+    return result.value;
+  }
+
+  /** Bounded SDK runner for destroying a worker THIS instance created. Remote
+   *  worker ownership is a separate authority from the SQLite writer lease:
+   *  losing the lease (or stopping) must never leak a worker we uniquely own,
+   *  so this deliberately checks neither `stopped` nor `leaseHeld()` — only the
+   *  caller's `ownedWorkers` membership scopes it. Returns the SDK response, or
+   *  undefined on timeout, so the caller can distinguish confirmed success
+   *  (`resp` without `error`) from a failed or detached request. */
+  async function ownedWorkerSdk<T>(
+    label: string,
+    operation: () => Promise<T>,
+  ): Promise<T | undefined> {
+    const result = await settleWithin(gate.runBackground(operation), shutdownTimeoutMs);
+    if (result.timedOut) {
+      logMsg(`${label} timed out after ${shutdownTimeoutMs}ms; late SDK settlement detached`);
+      return undefined;
+    }
+    return result.value;
+  }
 
   async function createWorker(): Promise<string | null> {
     try {
@@ -275,12 +342,14 @@ export function createSummarizer(deps: SummarizerDeps): Summarizer {
       // shape, remember that and create plainly thereafter (never let a rejected
       // ruleset silently disable summaries).
       if (permissionMode !== "without") {
-        const resp = await gate.runBackground(() =>
-          client.session.create({ title: SUMMARIZER_SENTINEL, permission: DENY_ALL_PERMISSION }),
+        const resp = await leaseSdk("worker create", () =>
+          client.session.create({ title: workerTitle, permission: DENY_ALL_PERMISSION }),
         );
+        if (!resp) return null;
         const created = resp.data as Session | undefined;
         if (!resp.error && created?.id) {
           permissionMode = "with";
+          ownedWorkers.add(created.id);
           return created.id;
         }
         if (permissionMode === undefined) {
@@ -288,10 +357,12 @@ export function createSummarizer(deps: SummarizerDeps): Summarizer {
           logMsg("worker permission ruleset rejected; relying on tool-disable + exclusion");
         }
       }
-      const resp = await gate.runBackground(() =>
-        client.session.create({ title: SUMMARIZER_SENTINEL }),
+      const resp = await leaseSdk("worker create", () =>
+        client.session.create({ title: workerTitle }),
       );
+      if (!resp) return null;
       const created = resp.data as Session | undefined;
+      if (created?.id) ownedWorkers.add(created.id);
       return created?.id ?? null;
     } catch (error) {
       lastError = errmsg(error);
@@ -299,33 +370,92 @@ export function createSummarizer(deps: SummarizerDeps): Summarizer {
     }
   }
 
-  async function deleteWorker(sessionID: string): Promise<void> {
+  async function deleteOwnedWorker(sessionID: string): Promise<void> {
+    if (!ownedWorkers.has(sessionID)) return;
+    let succeeded = false;
     try {
-      await gate.runBackground(() => client.session.delete({ sessionID }));
+      // NOT lease-gated: this instance created the worker and uniquely owns it;
+      // losing the SQLite writer lease mid-batch must not leak the session.
+      const resp = await ownedWorkerSdk("worker delete", () =>
+        client.session.delete({ sessionID }),
+      );
+      // Prune only on CONFIRMED success: an SDK error, rejection, or timeout
+      // keeps the id owned so drainOwnedWorkers retries it at the start of the
+      // next batch (up to MAX_DELETE_ATTEMPTS failures).
+      succeeded = resp != null && !resp.error;
     } catch {
-      // Best-effort; a lingering sentinel session is excluded everywhere.
+      // Best-effort; a lingering sentinel session is excluded everywhere and
+      // swept by the next holder's orphan cleanup.
+    }
+    if (succeeded) {
+      ownedWorkers.delete(sessionID);
+      deleteAttempts.delete(sessionID);
+      return;
+    }
+    const attempts = (deleteAttempts.get(sessionID) ?? 0) + 1;
+    if (attempts >= maxDeleteAttempts) {
+      // Give up: drop the id so the retained set stays bounded. Safe because
+      // the next lease holder's sentinel-based orphan sweep deletes it, and
+      // sentinel-titled sessions are excluded from every recall path meanwhile.
+      ownedWorkers.delete(sessionID);
+      deleteAttempts.delete(sessionID);
+      logMsg(
+        `worker ${sessionID} delete gave up after ${attempts} attempts; orphan sweep will reap it`,
+      );
+    } else {
+      deleteAttempts.set(sessionID, attempts);
     }
   }
 
-  async function abortWorker(sessionID: string): Promise<void> {
+  /** Best-effort retry of leftover owned ids (deletes that failed or timed out
+   *  in earlier batches). Runs at the start of each batch, before creating the
+   *  new worker. Bounds: at most MAX_DRAIN_PER_BATCH deletes per batch (each
+   *  already settleWithin-capped), and each id is retried at most
+   *  MAX_DELETE_ATTEMPTS times before deleteOwnedWorker drops it — the next
+   *  holder's sentinel-based orphan sweep is the backstop for dropped ids.
+   *  Success prunes; a failure under the attempt cap keeps the id for the next
+   *  batch's drain. */
+  async function drainOwnedWorkers(): Promise<void> {
+    for (const sessionID of [...ownedWorkers].slice(0, MAX_DRAIN_PER_BATCH)) {
+      await deleteOwnedWorker(sessionID);
+    }
+  }
+
+  async function abortOwnedWorker(sessionID: string): Promise<void> {
+    if (!ownedWorkers.has(sessionID)) return;
     try {
-      await gate.runBackground(() => client.session.abort({ sessionID }));
+      // NOT lease-gated, same as deleteOwnedWorker: the abort stops OUR
+      // worker's spend. It does not remove the id — the delete that follows
+      // owns the ownedWorkers cleanup.
+      await ownedWorkerSdk("worker abort", () => client.session.abort({ sessionID }));
     } catch {
       // Best-effort.
     }
   }
 
   /** Delete any sentinel worker sessions left by a crashed prior holder, rather
-   *  than adopting one whose accumulated context is unknown. Runs once. */
+   *  than adopting one whose accumulated context is unknown. Runs once.
+   *  Accepted race: the sweep matches by sentinel title, so a fresh lease
+   *  winner can delete a demoted loser's still-in-flight worker — benign, since
+   *  the loser's results were lease-gated out of persistence anyway. */
   async function deleteOrphans(): Promise<void> {
     try {
-      const resp = await gate.runBackground(() =>
+      const resp = await leaseSdk("worker orphan list", () =>
         client.session.list({ search: SUMMARIZER_SENTINEL, limit: 100 }),
       );
+      if (!resp || stopped || !leaseHeld()) return;
       const rows = Array.isArray(resp.data) ? (resp.data as Session[]) : [];
       for (const row of rows) {
+        // Ownership can change while list/delete is in flight. Re-check after
+        // every await and immediately before each destructive request.
+        if (stopped || !leaseHeld()) return;
         if (isSummarizerTitle(row.title) && typeof row.id === "string" && row.id) {
-          await deleteWorker(row.id);
+          // Orphan sweeps target OTHER holders' leftovers, so they stay
+          // lease-gated (unlike ownedWorkers cleanup above).
+          await leaseSdk("orphan worker delete", () =>
+            client.session.delete({ sessionID: row.id }),
+          );
+          if (stopped || !leaseHeld()) return;
         }
       }
     } catch {
@@ -339,9 +469,20 @@ export function createSummarizer(deps: SummarizerDeps): Summarizer {
    *  permit that long would only starve foreground recall for no concurrency
    *  benefit. Worker create/delete/list/abort stay gated (quick server fetches). */
   async function promptBatchFor(cards: Card[]): Promise<Map<string, string>> {
+    // Retry any leftover owned workers from earlier batches before adding one.
+    await drainOwnedWorkers();
+    // Bounded-backlog policy: a still-saturated backlog after the drain means
+    // deletes are persistently failing. Skip this batch rather than creating
+    // yet another worker that will likely join the leak; the per-id give-up in
+    // deleteOwnedWorker shrinks the backlog so a later batch proceeds.
+    if (ownedWorkers.size >= MAX_DRAIN_PER_BATCH) {
+      logMsg(`skipping batch: ${ownedWorkers.size} owned workers still undeleted after drain`);
+      return new Map();
+    }
     const workerId = await createWorker();
     if (!workerId) return new Map();
     try {
+      if (stopped || !leaseHeld()) return new Map();
       const { text, keyToSession } = renderBatch(cards);
       const reply = await promptWorker(workerId, text);
       if (reply == null) return new Map();
@@ -353,17 +494,15 @@ export function createSummarizer(deps: SummarizerDeps): Summarizer {
       }
       return out;
     } finally {
-      await deleteWorker(workerId);
+      // Only ids created by this owner token enter ownedWorkers; normal cleanup
+      // can therefore never target another instance's worker.
+      await deleteOwnedWorker(workerId);
     }
   }
 
   async function promptWorker(workerId: string, text: string): Promise<string | null> {
-    let timer: Timer | undefined;
-    const timeout = new Promise<"timeout">((resolve) => {
-      timer = setTimeout(() => resolve("timeout"), promptTimeoutMs);
-    });
     try {
-      const outcome = await Promise.race([
+      const outcome = await settleWithin(
         client.session.prompt({
           sessionID: workerId,
           model: { providerID: config.providerID, modelID: config.modelID },
@@ -374,25 +513,24 @@ export function createSummarizer(deps: SummarizerDeps): Summarizer {
           tools: DISABLE_ALL_TOOLS,
           parts: [{ type: "text", text }],
         }),
-        timeout,
-      ]);
-      if (outcome === "timeout") {
+        promptTimeoutMs,
+      );
+      if (outcome.timedOut) {
         // Stop the generation so the timeout caps SPEND, not just our waiting.
-        await abortWorker(workerId);
+        await abortOwnedWorker(workerId);
         lastError = "summary prompt timed out";
         return null;
       }
-      if (outcome.error || !outcome.data) {
-        lastError = outcome.error ? errmsg(outcome.error) : "empty prompt response";
+      const response = outcome.value;
+      if (response.error || !response.data) {
+        lastError = response.error ? errmsg(response.error) : "empty prompt response";
         return null;
       }
-      const data = outcome.data as { parts?: Part[] };
+      const data = response.data as { parts?: Part[] };
       return replyText(Array.isArray(data.parts) ? data.parts : []);
     } catch (error) {
       lastError = errmsg(error);
       return null;
-    } finally {
-      if (timer) clearTimeout(timer);
     }
   }
 
@@ -443,6 +581,7 @@ export function createSummarizer(deps: SummarizerDeps): Summarizer {
     if (!cleanedOrphans) {
       cleanedOrphans = true;
       await deleteOrphans();
+      if (stopped || !leaseHeld()) return;
     }
     let prompts = 0;
     while (
@@ -478,7 +617,7 @@ export function createSummarizer(deps: SummarizerDeps): Summarizer {
 
       prompts++;
       const summaries = await promptBatchFor(cards);
-      if (!leaseHeld() || stopped) {
+      if (stopped || !leaseHeld()) {
         for (const id of batchIds) inFlight.delete(id);
         break;
       }
@@ -547,10 +686,24 @@ export function createSummarizer(deps: SummarizerDeps): Summarizer {
       );
     },
 
-    stop(): void {
+    stop(): Promise<void> {
+      if (stopPromise) return stopPromise;
       stopped = true;
       for (const timer of debounceTimers.values()) clearTimeout(timer);
       debounceTimers.clear();
+      pending.length = 0;
+      pendingSet.clear();
+      const active = drainPromise;
+      stopPromise = active
+        ? settleWithin(active, shutdownTimeoutMs).then((result) => {
+            if (result.timedOut) {
+              logMsg(
+                `shutdown timed out after ${shutdownTimeoutMs}ms; late SDK work is lease-guarded and detached`,
+              );
+            }
+          })
+        : Promise.resolve();
+      return stopPromise;
     },
 
     status() {

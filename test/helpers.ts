@@ -842,6 +842,14 @@ function guardUnbounded(parsed: { ok: boolean; error?: unknown }): void {
   }
 }
 
+/** Narrow a ToolResult to the JSON string every tool in this plugin returns.
+ *  (Since @opencode-ai/plugin 1.18 `execute` may also return a structured
+ *  object; this codebase never does.) */
+export function toolResultText(raw: unknown): string {
+  if (typeof raw !== "string") throw new Error(`tool returned a non-string result: ${typeof raw}`);
+  return raw;
+}
+
 export async function runTool<T extends { ok: boolean }>(
   definition: ToolDefinition,
   rawArgs: Record<string, unknown>,
@@ -849,7 +857,7 @@ export async function runTool<T extends { ok: boolean }>(
 ): Promise<T> {
   const parsedArgs = tool.schema.object(definition.args).parse(rawArgs);
   const raw = await definition.execute(parsedArgs, ctx);
-  const parsed = JSON.parse(raw) as T;
+  const parsed = JSON.parse(toolResultText(raw)) as T;
   expect(parsed).toHaveProperty("ok");
   guardUnbounded(parsed as { ok: boolean; error?: unknown });
   return parsed;
@@ -865,7 +873,7 @@ export async function runToolRaw<T extends { ok: boolean }>(
   ctx = makeContext().ctx,
 ): Promise<T> {
   const raw = await definition.execute(rawArgs as Parameters<typeof definition.execute>[0], ctx);
-  const parsed = JSON.parse(raw) as T;
+  const parsed = JSON.parse(toolResultText(raw)) as T;
   expect(parsed).toHaveProperty("ok");
   guardUnbounded(parsed as { ok: boolean; error?: unknown });
   return parsed;

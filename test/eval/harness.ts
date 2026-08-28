@@ -21,6 +21,7 @@ import {
   strictNoLimit,
   setStrictNoLimitMessages,
   UNBOUNDED_MESSAGES_ERROR,
+  toolResultText,
 } from "../helpers.js";
 import { openSqlite } from "../../src/sqlite.js";
 import { openStore } from "../../src/store.js";
@@ -264,7 +265,7 @@ export async function runCase(
 ): Promise<CaseResult> {
   const caseCtx = c.ctxSessionID ? evalContext(c.ctxSessionID) : (ctx ?? evalContext());
   const raw = await searchTool.execute(c.args as Parameters<typeof searchTool.execute>[0], caseCtx);
-  const parsed = JSON.parse(raw) as SearchOutput | { ok: false; error: string };
+  const parsed = JSON.parse(toolResultText(raw)) as SearchOutput | { ok: false; error: string };
 
   const returnedSessionIDs: string[] = [];
   const topClasses: (string | undefined)[] = [];

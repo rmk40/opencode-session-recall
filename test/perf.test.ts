@@ -46,6 +46,7 @@ import {
   paginateBundles,
   session,
   textPart,
+  toolResultText,
   userMessage,
 } from "./helpers.js";
 
@@ -524,7 +525,7 @@ describe.skipIf(!ENABLED)("perf: distill-then-search gates", () => {
           } as Parameters<typeof tool.execute>[0],
           perfContext(),
         );
-        return JSON.parse(raw) as SearchOutput;
+        return JSON.parse(toolResultText(raw)) as SearchOutput;
       };
 
       // Warm up (cold LRU/index), then measure a fresh drilled query.

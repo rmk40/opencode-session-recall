@@ -449,3 +449,32 @@ export function coerceInt(value: unknown, fallback: number, min: number, max: nu
   if (typeof value !== "number" || !Number.isFinite(value)) return fallback;
   return Math.min(max, Math.max(min, Math.trunc(value)));
 }
+
+/** Result of {@link settleWithin}: the settled value, or a timeout marker. */
+export type TimedResult<T> = { timedOut: false; value: T } | { timedOut: true };
+
+/**
+ * Await a promise for at most `timeoutMs`, then detach it. The promise itself
+ * is never cancelled (SDK requests cannot be); a late settlement is simply no
+ * longer awaited. Callers must ensure detached work is guarded (lease checks,
+ * finalized flags) so its late completion cannot write anywhere. Used to bound
+ * summarizer SDK calls and the plugin's dispose() so a never-settling request
+ * cannot hang the host's shutdown.
+ */
+export async function settleWithin<T>(
+  promise: Promise<T>,
+  timeoutMs: number,
+): Promise<TimedResult<T>> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<TimedResult<T>>((resolve) => {
+    timer = setTimeout(() => resolve({ timedOut: true }), timeoutMs);
+  });
+  try {
+    return await Promise.race([
+      promise.then((value): TimedResult<T> => ({ timedOut: false, value })),
+      timeout,
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}

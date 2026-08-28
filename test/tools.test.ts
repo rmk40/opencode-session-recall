@@ -165,7 +165,8 @@ describe("recall_messages", () => {
     );
     expect(errorOut.error).toContain("Unauthorized");
 
-    // A session with no data now returns an empty page rather than an error.
+    // A session with no data returns an empty page rather than an error: the
+    // query path is deliberately lenient (only the distiller opts into strict).
     const noData = makeFakeHarness({ noMessageData: new Set(["s-current"]) });
     const noDataOut = await runTool<MessagesOutput>(
       messagesTool(noData.client, gate, TEST_LIMITS),

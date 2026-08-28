@@ -11,6 +11,7 @@ import {
   globalSessionFrom,
   session,
   textPart,
+  toolResultText,
   userMessage,
 } from "../helpers.js";
 import type { EvalCorpus, MessageBundle } from "./corpus.js";
@@ -82,7 +83,7 @@ describe.skipIf(!process.env.RECALL_EVAL_SEMANTIC)(
           >[0],
           evalContext("sem-external"),
         );
-        const out = JSON.parse(raw) as SearchOutput;
+        const out = JSON.parse(toolResultText(raw)) as SearchOutput;
         const top3 = out.results.slice(0, 3).map((r) => r.sessionID);
         expect(top3, `results: ${JSON.stringify(out.results.map((r) => r.sessionID))}`).toContain(
           "sem-work",
@@ -275,7 +276,7 @@ describe.skipIf(!process.env.RECALL_EVAL_SEMANTIC)(
           } as Parameters<typeof tool.execute>[0],
           evalContext("soup-external"),
         );
-        return JSON.parse(raw) as SearchOutput;
+        return JSON.parse(toolResultText(raw)) as SearchOutput;
       };
 
       // Lexical-only baseline (no embedder) vs. the production default weight

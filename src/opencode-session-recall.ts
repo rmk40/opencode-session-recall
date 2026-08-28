@@ -1,4 +1,4 @@
-import type { Plugin } from "@opencode-ai/plugin";
+import type { Plugin, ToolDefinition } from "@opencode-ai/plugin";
 import { createOpencodeClient, type Session } from "@opencode-ai/sdk/v2";
 import { sessions, type SessionEnrichment } from "./sessions.js";
 import { search, DISCOVERY_LIMIT, type SearchDeps, type SemanticSearchConfig } from "./search.js";
@@ -9,7 +9,7 @@ import { systemNudge } from "./hooks/system-nudge.js";
 import { autoRecall } from "./hooks/auto-recall.js";
 import { compactionRecall } from "./hooks/compaction-recall.js";
 import { createFetchGate } from "./fetch-gate.js";
-import { openSqlite } from "./sqlite.js";
+import { openSqlite, type SqliteDb } from "./sqlite.js";
 import {
   openStore,
   defaultStorePath,
@@ -24,7 +24,24 @@ import { createCardsRuntime, cardsLiteFromSessions, type CardSource } from "./ca
 import { createDrill } from "./drill.js";
 import { createDistiller } from "./distill.js";
 import { createSummarizer, parseModelId, type Summarizer } from "./summarize.js";
-import { TOOLS, DEFAULTS, optionalString, errmsg, type Limits } from "./types.js";
+import {
+  TOOLS,
+  DEFAULTS,
+  optionalString,
+  errmsg,
+  settleWithin,
+  type ErrorOutput,
+  type Limits,
+} from "./types.js";
+
+/** Per-phase bound on dispose()'s awaited waits. The host awaits dispose as a
+ *  shutdown finalizer with no timeout of its own, so a never-settling in-flight
+ *  SDK request must not hang shutdown forever. Two bounded phases (distiller
+ *  stop, tracked operations) after the summarizer's own 15s bound keep total
+ *  dispose under ~20s worst case. Timed-out work is detached, not cancelled;
+ *  every store write path re-checks stopped/finalized/lease ownership before
+ *  writing, so closing SQLite with a detached fetch pending is safe. */
+const SHUTDOWN_TIMEOUT_MS = 2_500;
 
 /** Guarded, Node-free logger: `console` is a std global, but `src/` declares no
  *  types, so reach it defensively. */
@@ -95,6 +112,18 @@ const server: Plugin = async (ctx, options) => {
   const nudge = opts.nudge !== false;
   const autoRecallEnabled = opts.autoRecall === true;
   const compactionRecallEnabled = opts.compactionRecall === true;
+  let disposed = false;
+  let disposePromise: Promise<void> | undefined;
+  const operations = new Set<Promise<unknown>>();
+
+  const track = <T>(operation: Promise<T>): Promise<T> => {
+    operations.add(operation);
+    void operation.then(
+      () => operations.delete(operation),
+      () => operations.delete(operation),
+    );
+    return operation;
+  };
 
   const clamp = (val: number | undefined, fallback: number, min = 1) =>
     Math.max(min, Math.floor(val ?? fallback));
@@ -196,8 +225,9 @@ const server: Plugin = async (ctx, options) => {
   // cards-lite built from the session list.
   const storePath = optionalString(opts.storePath) ?? (await defaultStorePath());
   let store: Store | null = null;
+  let db: SqliteDb | null = null;
   if (storePath) {
-    const db = await openSqlite(storePath);
+    db = await openSqlite(storePath);
     if (db) store = openStore(db);
   }
 
@@ -214,13 +244,16 @@ const server: Plugin = async (ctx, options) => {
       }
     : { getCards: () => liteCards, revision: () => undefined, degraded: true };
   if (!store) {
-    void discover()
-      .then((list) => {
-        liteCards = cardsLiteFromSessions(list as Parameters<typeof cardsLiteFromSessions>[0]);
-      })
-      .catch(() => {
-        // Best-effort; a failed list just leaves cards-lite empty until retried.
-      });
+    void track(
+      discover()
+        .then((list) => {
+          if (!disposed)
+            liteCards = cardsLiteFromSessions(list as Parameters<typeof cardsLiteFromSessions>[0]);
+        })
+        .catch(() => {
+          // Best-effort; a failed list just leaves cards-lite empty until retried.
+        }),
+    );
   }
 
   // One shared fetch gate gates every SDK call in the query/distill paths so the
@@ -255,9 +288,18 @@ const server: Plugin = async (ctx, options) => {
     gen: EMBED_REPRESENTATION,
     discover,
     onColdPassDone: () => {
-      void summarizer?.runColdPass();
+      if (!disposed && summarizer) {
+        // Summarizer.stop() owns the bounded shutdown of this drain. Do not add
+        // it to the plugin's general operation set, which is intentionally
+        // unbounded for DB-capable hooks and distiller work.
+        void summarizer
+          .runColdPass()
+          .catch((error) => pluginLog(`summarizer cold pass failed: ${errmsg(error)}`));
+      }
     },
-    onSessionDistilled: (sessionId) => summarizer?.queue(sessionId),
+    onSessionDistilled: (sessionId) => {
+      if (!disposed) summarizer?.queue(sessionId);
+    },
   });
   if (store && opts.summaries?.enabled === true) {
     const model = optionalString(opts.summaries.model);
@@ -279,7 +321,8 @@ const server: Plugin = async (ctx, options) => {
           ...(agent != null && { agent }),
           ...(maxPromptsPerPass != null && { maxPromptsPerPass }),
         },
-        leaseHeld: () => distiller.status().leaseHeld,
+        ownerToken: instanceId,
+        leaseHeld: () => distiller.ownsLease(),
         log: pluginLog,
       });
     } else {
@@ -298,32 +341,63 @@ const server: Plugin = async (ctx, options) => {
     ? { cards: () => store.allCards() }
     : undefined;
 
+  const guardTool = (definition: ToolDefinition): ToolDefinition => ({
+    ...definition,
+    execute: (args, context) => {
+      if (disposed) {
+        // Match every other failure in this codebase: a JSON error output, not
+        // a rejection.
+        const err: ErrorOutput = {
+          ok: false,
+          error: "opencode-session-recall: plugin has been disposed",
+        };
+        return Promise.resolve(JSON.stringify(err));
+      }
+      return track(definition.execute(args, context));
+    },
+  });
+
+  const guardHook =
+    <TArgs extends unknown[]>(
+      hook: (...args: TArgs) => Promise<void>,
+    ): ((...args: TArgs) => Promise<void>) =>
+    async (...args) => {
+      if (disposed) return;
+      await track(hook(...args));
+    };
+
+  const nudgeHook = nudge ? systemNudge() : undefined;
+  const autoRecallHook = autoRecallEnabled ? autoRecall(deps) : undefined;
+  const compactionHook = compactionRecallEnabled ? compactionRecall(deps) : undefined;
+
   return {
     tool: {
-      recall_sessions: sessions(client, unscoped, global, limits, enrichment),
-      recall: search(client, unscoped, global, limits, deps),
-      recall_get: get(client, gate),
-      recall_context: context(client, gate, limits),
-      recall_messages: messages(client, gate, limits),
+      recall_sessions: guardTool(sessions(client, unscoped, global, limits, enrichment)),
+      recall: guardTool(search(client, unscoped, global, limits, deps)),
+      recall_get: guardTool(get(client, gate)),
+      recall_context: guardTool(context(client, gate, limits)),
+      recall_messages: guardTool(messages(client, gate, limits)),
     },
     event: async ({ event }) => {
+      if (disposed) return;
       // The plugin `event` hook is typed against the default SDK vintage; the
       // distiller compiles against the v2 event union the live bus actually
       // delivers. Bridge the vintage gap at this one boundary.
       distiller.onEvent(event as unknown as Parameters<typeof distiller.onEvent>[0]);
     },
-    ...(nudge && {
-      "experimental.chat.system.transform": systemNudge(),
+    ...(nudgeHook && {
+      "experimental.chat.system.transform": guardHook(nudgeHook),
     }),
-    ...(autoRecallEnabled && {
-      "chat.message": autoRecall(deps),
+    ...(autoRecallHook && {
+      "chat.message": guardHook(autoRecallHook),
     }),
-    ...(compactionRecallEnabled && {
-      "experimental.session.compacting": compactionRecall(deps),
+    ...(compactionHook && {
+      "experimental.session.compacting": guardHook(compactionHook),
     }),
     ...(primary && {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any -- opencode config type not exported
       config: async (c: any) => {
+        if (disposed) return;
         c.experimental ??= {};
         const existing: string[] = c.experimental.primary_tools ?? [];
         const deduped = new Set(existing);
@@ -331,6 +405,65 @@ const server: Plugin = async (ctx, options) => {
         c.experimental.primary_tools = [...deduped];
       },
     }),
+    dispose: () => {
+      if (disposePromise) return disposePromise;
+      disposed = true;
+      // Phase 1 is synchronous: no distill/retry/incremental work can start
+      // after dispose() returns its promise. The heartbeat deliberately remains
+      // active so lease-owned summarizer cleanup can finish safely.
+      distiller.quiesce();
+      cards.dispose();
+      disposePromise = (async () => {
+        // Summarizer.stop() is internally bounded (its own 15s shutdown
+        // timeout). Its late SDK promises are detached and ownership/lease
+        // guarded, so phase 2 may safely release the lease once this settles
+        // even when an SDK request itself never does. The catch covers the rare
+        // rejecting drain (e.g. a store write threw) — shutdown must not care.
+        if (summarizer) await summarizer.stop().catch(() => {});
+        // Bound the remaining waits: an SDK request that never settles would
+        // otherwise hang the host's shutdown (dispose is awaited untimed).
+        //
+        // The two waits differ in what protects a detached continuation:
+        // - Distiller work is finalized/lease-guarded before every store
+        //   read/write, so a distiller fetch that settles after the timeout can
+        //   never reach SQLite. Closing after a distiller timeout is safe.
+        // - `operations` tracks FOREGROUND tool executions, which have no such
+        //   guards: a paused recall/drill fetch can resume straight into card
+        //   coverage reads. If they have not all settled within the bound,
+        //   DEFER the close instead: it fires after disposePromise has resolved
+        //   (cannot hang the host), only once every straggler has settled
+        //   (never closes under a live reader), and so closes eventually — no
+        //   handle leak when opencode disposes a cached per-directory instance
+        //   without the process exiting. A straggler that truly never settles
+        //   degrades to an unclosed handle on a derived, rebuildable store —
+        //   harmless, unlike a use-after-close.
+        const closeDb = (): void => {
+          try {
+            db?.close();
+          } catch {
+            // Best-effort: a throwing close must not reject disposePromise
+            // (or escape the detached deferral) into the host.
+          }
+          db = null;
+        };
+        await settleWithin(distiller.stop(), SHUTDOWN_TIMEOUT_MS);
+        const ops = await settleWithin(Promise.allSettled([...operations]), SHUTDOWN_TIMEOUT_MS);
+        if (ops.timedOut) {
+          // Diagnosable, not silent: until the stragglers settle, the SQLite
+          // handle stays open — this line is the marker if it never closes.
+          pluginLog(
+            `dispose: ${operations.size} operation(s) outlived the ${SHUTDOWN_TIMEOUT_MS}ms bound; deferring SQLite close until they settle`,
+          );
+          void Promise.allSettled([...operations]).then(() => {
+            pluginLog("dispose: deferred SQLite close firing (stragglers settled)");
+            closeDb();
+          });
+        } else {
+          closeDb();
+        }
+      })();
+      return disposePromise;
+    },
   };
 };
 

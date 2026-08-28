@@ -3,6 +3,7 @@ import type { ToolDefinition } from "@opencode-ai/plugin";
 import type { SearchOutput } from "../../src/types.js";
 import { EVAL_CASES } from "./cases.js";
 import { evalContext, makeDegradedEvalSearch, makeEvalSearch, runEval } from "./harness.js";
+import { toolResultText } from "../helpers.js";
 import BASELINE from "./baseline.json" with { type: "json" };
 
 /** Run one recall query through a tool and parse it (throws on a non-ok body). */
@@ -11,7 +12,7 @@ async function runQuery(
   args: Record<string, unknown>,
 ): Promise<SearchOutput> {
   const raw = await tool.execute(args as Parameters<typeof tool.execute>[0], evalContext());
-  const parsed = JSON.parse(raw) as SearchOutput | { ok: false; error: string };
+  const parsed = JSON.parse(toolResultText(raw)) as SearchOutput | { ok: false; error: string };
   if (!("ok" in parsed) || !parsed.ok) {
     throw new Error(`query failed: ${JSON.stringify(parsed)}`);
   }

@@ -1,4 +1,4 @@
-import { afterAll, describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it, vi } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -16,6 +16,7 @@ import {
   createSummarizer,
   parseModelId,
   parseSummaryReply,
+  summarizerWorkerTitle,
   type Summarizer,
 } from "../src/summarize.js";
 import {
@@ -29,7 +30,9 @@ import {
   paginateBundles,
   session,
   textPart,
+  toolResultText,
   userMessage,
+  type SummarizerClient,
   type SummaryPromptCall,
   type SummaryPromptResult,
 } from "./helpers.js";
@@ -119,6 +122,7 @@ function makeSummarizer(
     store,
     gate,
     config: { providerID: "test", modelID: "cheap" },
+    ownerToken: "test-owner",
     leaseHeld: () => true,
     politenessMs: 0,
     idleDebounceMs: 0,
@@ -289,7 +293,7 @@ describe("summarizer worker-session exclusion", () => {
       { scope: "global", since: "30d" } as Parameters<typeof tool.execute>[0],
       ctx,
     );
-    const out = JSON.parse(raw) as { sessions: Array<{ id: string }> };
+    const out = JSON.parse(toolResultText(raw)) as { sessions: Array<{ id: string }> };
     const ids = out.sessions.map((s) => s.id);
     expect(ids).toContain("real");
     expect(ids).not.toContain("worker");
@@ -306,6 +310,11 @@ describe("summarizer worker lifecycle", () => {
 
     expect(client.calls.prompts.length).toBe(3);
     expect(client.calls.creates.length).toBe(3); // one worker per batch
+    expect(client.calls.creates.map((call) => call.title)).toEqual([
+      summarizerWorkerTitle("test-owner"),
+      summarizerWorkerTitle("test-owner"),
+      summarizerWorkerTitle("test-owner"),
+    ]);
     expect(client.calls.deletes.length).toBe(3); // each disposed
     expect(client.liveWorkers()).toHaveLength(0);
   });
@@ -323,6 +332,175 @@ describe("summarizer worker lifecycle", () => {
     expect(client.calls.deletes).toContain("orphan-a");
     expect(client.calls.deletes).toContain("orphan-b");
     expect(client.liveWorkers()).toHaveLength(0); // orphans + this batch's worker all gone
+  });
+
+  it("does not delete a new holder's worker when an orphan list returns after lease loss", async () => {
+    const store = await freshStore();
+    store.upsertCard(fullCard("c1"));
+    const gate = createFetchGate({ concurrency: 2 });
+    let leaseHeld = true;
+    let resolveList!: (value: { data: unknown[] }) => void;
+    const listResult = new Promise<{ data: unknown[] }>((resolve) => {
+      resolveList = resolve;
+    });
+    const deleteWorker = vi.fn(async () => ({ data: true }));
+    const createWorker = vi.fn(async () => ({ data: { id: "old-worker" } }));
+    const listWorkers = vi.fn(async () => listResult);
+    const client = {
+      session: {
+        list: listWorkers,
+        delete: deleteWorker,
+        create: createWorker,
+      },
+    } as unknown as OpencodeClient;
+    const summarizer = makeSummarizer(store, client, gate, {
+      ownerToken: "old-owner",
+      leaseHeld: () => leaseHeld,
+      shutdownTimeoutMs: 100,
+    });
+
+    const run = summarizer.runColdPass();
+    while (listWorkers.mock.calls.length === 0) {
+      await Promise.resolve();
+    }
+    leaseHeld = false;
+    resolveList({
+      data: [session("new-worker", summarizerWorkerTitle("new-owner"), PROJECT_DIR, 4000)],
+    });
+    await run;
+
+    expect(deleteWorker).not.toHaveBeenCalled();
+    expect(createWorker).not.toHaveBeenCalled();
+    await summarizer.stop();
+  });
+
+  it("still deletes its own worker when the lease is lost mid-batch (no leak)", async () => {
+    // Remote worker ownership is a separate authority from the SQLite writer
+    // lease: this instance created the worker and uniquely owns it, so losing
+    // the lease between create and cleanup must not leak the session.
+    const store = await freshStore();
+    store.upsertCard(fullCard("c1"));
+    const gate = createFetchGate({ concurrency: 2 });
+    let leaseHeld = true;
+    const client = makeSummarizerClient((call) => {
+      void call;
+      leaseHeld = false; // takeover lands while the prompt is in flight
+      return { text: "[]" };
+    });
+    const summarizer = makeSummarizer(store, client.client, gate, {
+      leaseHeld: () => leaseHeld,
+    });
+
+    await summarizer.runColdPass();
+
+    expect(client.calls.deletes).toEqual(["worker-1"]);
+    expect(client.liveWorkers()).toHaveLength(0);
+    await summarizer.stop();
+  });
+
+  it("retries a failed owned-worker delete on the next batch's drain and prunes it", async () => {
+    // A delete that fails keeps the id in ownedWorkers; the start-of-batch
+    // drain retries it before creating the next worker, and prunes on success.
+    const store = await freshStore();
+    store.upsertCard(fullCard("c1", { timeUpdated: 2000 }));
+    store.upsertCard(fullCard("c2", { timeUpdated: 3000 }));
+    const gate = createFetchGate({ concurrency: 2 });
+    const client = makeSummarizerClient(replyKeys(() => "s"));
+    const realDelete = (
+      client.client as unknown as {
+        session: { delete: (p: { sessionID: string }) => Promise<unknown> };
+      }
+    ).session.delete;
+    let failNext = true;
+    const deletes: string[] = [];
+    (
+      client.client as unknown as {
+        session: { delete: (p: { sessionID: string }) => Promise<unknown> };
+      }
+    ).session.delete = async (params) => {
+      deletes.push(params.sessionID);
+      if (failNext) {
+        failNext = false;
+        return { error: { data: { message: "delete failed" } } };
+      }
+      return realDelete(params);
+    };
+
+    const summarizer = makeSummarizer(store, client.client, gate, { batchSize: 1 });
+    await summarizer.runColdPass();
+
+    // Batch 1's delete of worker-1 failed; batch 2's drain retried worker-1
+    // (successfully) before its own worker-2 create+delete.
+    expect(deletes).toEqual(["worker-1", "worker-1", "worker-2"]);
+    expect(client.liveWorkers()).toHaveLength(0); // nothing leaked
+    await summarizer.stop();
+  });
+
+  /** Replace the fake client's delete with one that always fails, recording ids. */
+  function failAllDeletes(client: SummarizerClient): string[] {
+    const deletes: string[] = [];
+    (
+      client.client as unknown as {
+        session: { delete: (p: { sessionID: string }) => Promise<unknown> };
+      }
+    ).session.delete = async (params) => {
+      deletes.push(params.sessionID);
+      return { error: { data: { message: "delete always fails" } } };
+    };
+    return deletes;
+  }
+
+  it("gives up on a persistently failing delete after 2 attempts (set stays bounded)", async () => {
+    // Persistent delete failures must not grow ownedWorkers one id per batch
+    // (O(n^2) deletes / serial timeout wedge): each id is dropped after
+    // MAX_DELETE_ATTEMPTS (2) failures — the sentinel orphan sweep reaps it.
+    const store = await freshStore();
+    for (let i = 0; i < 4; i++) store.upsertCard(fullCard(`c${i}`, { timeUpdated: 2000 + i }));
+    const gate = createFetchGate({ concurrency: 2 });
+    const client = makeSummarizerClient(replyKeys(() => "s"));
+    const deletes = failAllDeletes(client);
+
+    const logs: string[] = [];
+    const summarizer = makeSummarizer(store, client.client, gate, {
+      batchSize: 1,
+      log: (message) => logs.push(message),
+    });
+    await summarizer.runColdPass();
+
+    // No id is delete-attempted more than twice (its own batch's finally plus
+    // at most one drain retry) before the give-up drops it.
+    const countsById = new Map<string, number>();
+    for (const id of deletes) countsById.set(id, (countsById.get(id) ?? 0) + 1);
+    for (const [id, count] of countsById) {
+      expect(count, `delete attempts for ${id}`).toBeLessThanOrEqual(2);
+    }
+    expect(logs.some((line) => line.includes("delete gave up after 2 attempts"))).toBe(true);
+    await summarizer.stop();
+  });
+
+  it("skips worker creation while the retained backlog stays saturated after a drain", async () => {
+    // Bounded-backlog policy: with the give-up delayed (high maxDeleteAttempts)
+    // the retained set grows to MAX_DRAIN_PER_BATCH (3); from then on each
+    // batch drains at most 3 and — still saturated — skips creating another
+    // worker instead of adding to the leak.
+    const store = await freshStore();
+    for (let i = 0; i < 6; i++) store.upsertCard(fullCard(`c${i}`, { timeUpdated: 2000 + i }));
+    const gate = createFetchGate({ concurrency: 2 });
+    const client = makeSummarizerClient(replyKeys(() => "s"));
+    failAllDeletes(client);
+
+    const logs: string[] = [];
+    const summarizer = makeSummarizer(store, client.client, gate, {
+      batchSize: 1,
+      maxDeleteAttempts: 100, // keep ids retained so the backlog saturates
+      log: (message) => logs.push(message),
+    });
+    await summarizer.runColdPass();
+
+    expect(logs.some((line) => line.includes("skipping batch"))).toBe(true);
+    // Only the pre-saturation batches created workers (3 = MAX_DRAIN_PER_BATCH).
+    expect(client.calls.creates.length).toBe(3);
+    await summarizer.stop();
   });
 
   it("disables tools and applies a deny-all permission on the worker prompt", async () => {
@@ -365,6 +543,28 @@ describe("summarizer worker lifecycle", () => {
 });
 
 describe("summarizer drain (budget, latch, gating)", () => {
+  it("waits for an active prompt to settle when stopped", async () => {
+    const store = await freshStore();
+    store.upsertCard(fullCard("c1"));
+    const gate = createFetchGate({ concurrency: 2 });
+    const client = makeSummarizerClient(() => ({ text: "[]", delayMs: 30 }));
+    const summarizer = makeSummarizer(store, client.client, gate);
+
+    const run = summarizer.runColdPass();
+    while (client.calls.prompts.length === 0)
+      await new Promise((resolve) => setTimeout(resolve, 1));
+    let stopped = false;
+    const stopping = summarizer.stop().then(() => {
+      stopped = true;
+    });
+    await Promise.resolve();
+
+    expect(stopped).toBe(false);
+    await Promise.all([run, stopping]);
+    expect(stopped).toBe(true);
+    expect(store.getCard("c1")?.nlSummary).toBe("");
+  });
+
   it("summarizes every needing card, then skips them on the content-hash gate", async () => {
     const store = await freshStore();
     store.upsertCard(fullCard("c1"));
@@ -538,7 +738,9 @@ describe("nl_summary consumption", () => {
       { scope: "global", since: "30d" } as Parameters<typeof tool.execute>[0],
       ctx,
     );
-    const out = JSON.parse(raw) as { sessions: Array<{ id: string; digest?: string }> };
+    const out = JSON.parse(toolResultText(raw)) as {
+      sessions: Array<{ id: string; digest?: string }>;
+    };
     expect(out.sessions.find((s) => s.id === "s1")?.digest).toBe("LLM summary about widgets.");
   });
 });

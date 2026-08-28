@@ -1,4 +1,4 @@
-import { afterAll, describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it, vi } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -66,7 +66,13 @@ type SdkCalls = {
 
 function makeDistillFake(
   graph: Graph,
-  opts: { throwOnce?: Set<string> } = {},
+  opts: {
+    throwOnce?: Set<string>;
+    nonArray?: Set<string>;
+    metadataErrorOnce?: Set<string>;
+    /** session.get returns the v2 404 body (`name: "NotFoundError"`). */
+    metadataNotFound?: Set<string>;
+  } = {},
 ): { client: OpencodeClient; sdk: SdkCalls } {
   const sdk: SdkCalls = { list: 0, get: 0, messages: [] };
   const threw = new Set<string>();
@@ -78,6 +84,16 @@ function makeDistillFake(
       },
       get: async ({ sessionID }: { sessionID: string }) => {
         sdk.get++;
+        if (opts.metadataErrorOnce?.has(sessionID) && !threw.has(`meta:${sessionID}`)) {
+          threw.add(`meta:${sessionID}`);
+          return { error: apiFailure(`metadata transport failed: ${sessionID}`) };
+        }
+        if (opts.metadataNotFound?.has(sessionID)) {
+          // The real SessionGetErrors[404] shape from the v2 typings.
+          return {
+            error: { name: "NotFoundError", data: { message: `session not found: ${sessionID}` } },
+          };
+        }
         const found = graph.sessions.find((s) => s.id === sessionID);
         return found ? { data: found } : { error: apiFailure(`not found: ${sessionID}`) };
       },
@@ -90,6 +106,9 @@ function makeDistillFake(
         if (opts.throwOnce?.has(params.sessionID) && !threw.has(params.sessionID)) {
           threw.add(params.sessionID);
           throw new Error(`throw once: ${params.sessionID}`);
+        }
+        if (opts.nonArray?.has(params.sessionID)) {
+          return { data: { messages: "not-an-array" } };
         }
         const data = graph.messagesBySession[params.sessionID] ?? [];
         const { items, nextCursor } = paginateBundles(
@@ -538,11 +557,444 @@ describe("fetchMessagePage", () => {
     const { client } = clientReturning(() => ({ error: apiFailure("boom") }));
     await expect(fetchMessagePage(client, { sessionID: "s", limit: 5 })).rejects.toThrow("boom");
   });
+
+  it("treats a successful non-array body as an empty page by default (query path)", async () => {
+    // Documented decision: a `{}` response (no data field) means "empty page,
+    // ok:true" for recall_messages/recall_context/recall_get/drill. Only the
+    // distiller opts into strict (below) so its quarantine can distinguish
+    // malformed from empty.
+    const { client } = clientReturning(() => ({}));
+    const page = await fetchMessagePage(client, { sessionID: "s", limit: 5 });
+    expect(page.items).toEqual([]);
+    expect(page.nextCursor).toBeNull();
+  });
+
+  it("throws MalformedSessionError on a successful non-array body under strict", async () => {
+    const { client } = clientReturning(() => ({ data: { messages: "not-an-array" } }));
+    await expect(
+      fetchMessagePage(client, { sessionID: "s", limit: 5, strict: true }),
+    ).rejects.toThrow("successful message response was not an array");
+  });
 });
 
 // ── Cold pass ────────────────────────────────────────────────────────────────
 
 describe("cold pass", () => {
+  function malformedBundle(sessionId: string): MessageBundle {
+    return {
+      info: userMessage(`m-${sessionId}`, sessionId, 100),
+      parts: undefined,
+    } as unknown as MessageBundle;
+  }
+
+  it("quarantines a malformed session and continues processing the pass", async () => {
+    const bad = session("bad", "Bad", PROJECT_DIR, 3000);
+    const good = session("good", "Good", PROJECT_DIR, 2000);
+    const graph: Graph = {
+      sessions: [bad, good],
+      messagesBySession: {
+        bad: [malformedBundle("bad")],
+        good: [
+          bundle(userMessage("m-good", "good", 100), [
+            textPart("p-good", "good", "m-good", "valid session content"),
+          ]),
+        ],
+      },
+    };
+    const { client } = makeDistillFake(graph);
+    const { db, store } = await freshStore();
+    const { gate } = makeSpyGate();
+    const logs: string[] = [];
+    const distiller = createDistiller({
+      client,
+      store,
+      gate,
+      limits: { ...TEST_LIMITS, distillConcurrency: 1 },
+      instanceId: "malformed-continue",
+      log: (message) => logs.push(message),
+    });
+
+    distiller.start();
+    await waitFor(() => distiller.status().coldPass === "done");
+
+    expect(store.getCard("bad")).toBeUndefined();
+    expect(store.getCard("good")?.distillState).toBe("full");
+    expect(logs.some((line) => line.includes("session bad quarantined at timeUpdated 3000:"))).toBe(
+      true,
+    );
+    expect(distiller.status().quarantinedCount).toBe(1);
+    await distiller.stop();
+    db.close();
+  });
+
+  it("does not quarantine on a non-shape deriveCard error; the pass aborts and surfaces it", async () => {
+    // A deriveCard REGRESSION (anything that is not a data-shape failure) must
+    // not sideline healthy sessions while reporting "done". The message below
+    // passes the fetch stage untouched (fetchSessionMessages only walks parts)
+    // and then throws a plain Error inside deriveCard's walk.
+    const boobyTrapped = {
+      info: {
+        id: "m-boom",
+        role: "user",
+        get time(): { created: number } {
+          throw new Error("synthetic deriveCard regression");
+        },
+      },
+      parts: [textPart("p-boom", "boom", "m-boom", "content")],
+    } as unknown as MessageBundle;
+    const graph: Graph = {
+      sessions: [session("boom", "Boom", PROJECT_DIR, 3000)],
+      messagesBySession: { boom: [boobyTrapped] },
+    };
+    const { client } = makeDistillFake(graph);
+    const { db, store } = await freshStore();
+    const { gate } = makeSpyGate();
+    const distiller = createDistiller({
+      client,
+      store,
+      gate,
+      limits: { ...TEST_LIMITS, distillConcurrency: 1 },
+      instanceId: "regression-surface",
+      coldPassRetryMs: 60_000,
+    });
+
+    distiller.start();
+    await waitFor(() => distiller.status().lastError != null);
+
+    expect(distiller.status().lastError).toContain("synthetic deriveCard regression");
+    expect(distiller.status().quarantinedCount).toBe(0); // NOT quarantined
+    expect(distiller.status().coldPass).toBe("idle"); // aborted, not "done"
+    await distiller.stop();
+    db.close();
+  });
+
+  it("skips the write when the lease is taken over between fetch and write (stale writer)", async () => {
+    // A process suspended past the TTL can lose the lease before its heartbeat
+    // callback ever runs. The resumed fetch must not replace the new holder's
+    // rows: the write gate re-verifies ownership against the live lease row.
+    let clock = 1_000_000;
+    let resolveMessages!: (value: unknown) => void;
+    const gatePromise = new Promise<unknown>((resolve) => {
+      resolveMessages = resolve;
+    });
+    const s1 = session("s1", "Alpha", PROJECT_DIR, 3000);
+    const client = {
+      session: {
+        list: async () => ({ data: [s1] }),
+        messages: async (params: { sessionID: string; limit?: number }) => {
+          if (params.limit == null) throw new Error("unbounded fetch");
+          await gatePromise;
+          return messagesResponse(
+            [bundle(userMessage("m1", "s1", 100), [textPart("p1", "s1", "m1", "alpha")])],
+            null,
+          );
+        },
+      },
+    } as unknown as OpencodeClient;
+    const { db, store } = await freshStore(() => clock);
+    const { gate } = makeSpyGate();
+    const distiller = createDistiller({
+      client,
+      store,
+      gate,
+      limits: { ...TEST_LIMITS, distillConcurrency: 1 },
+      instanceId: "suspended",
+      now: () => clock,
+      leaseRetryMs: 600_000,
+    });
+
+    distiller.start();
+    await new Promise((r) => setTimeout(r, 10)); // fetch now blocked in flight
+
+    // Simulated suspension past the TTL: a rival takes the lease over.
+    clock += 31_000;
+    expect(store.acquireLease("rival", 30_000, "rivalbuild", 4)).toBe(true);
+
+    // status() is authoritative WITHOUT side effects: it derives leaseHeld from
+    // the lease row it already reads for the `lease` field, so it reports the
+    // takeover even though the heartbeat callback has not run and the internal
+    // cached flag still says held.
+    expect(distiller.status().leaseHeld).toBe(false);
+    expect(distiller.status().lease?.holder).toBe("rival");
+
+    resolveMessages({});
+    await waitFor(() => distiller.status().coldPass !== "running");
+
+    expect(store.getCard("s1")).toBeUndefined(); // the stale write was skipped
+    await distiller.stop();
+    db.close();
+  });
+
+  it("skips an unchanged quarantined session on a later cold-pass retry", async () => {
+    const graph: Graph = {
+      sessions: [
+        session("bad", "Bad", PROJECT_DIR, 3000),
+        session("flaky", "Flaky", PROJECT_DIR, 2000),
+        session("good", "Good", PROJECT_DIR, 1000),
+      ],
+      messagesBySession: {
+        bad: [malformedBundle("bad")],
+        flaky: [
+          bundle(userMessage("m-flaky", "flaky", 100), [
+            textPart("p-flaky", "flaky", "m-flaky", "flaky content"),
+          ]),
+        ],
+        good: [
+          bundle(userMessage("m-good", "good", 100), [
+            textPart("p-good", "good", "m-good", "good content"),
+          ]),
+        ],
+      },
+    };
+    const { client, sdk } = makeDistillFake(graph, { throwOnce: new Set(["flaky"]) });
+    const { db, store } = await freshStore();
+    const { gate } = makeSpyGate();
+    const distiller = createDistiller({
+      client,
+      store,
+      gate,
+      limits: { ...TEST_LIMITS, distillConcurrency: 1 },
+      instanceId: "malformed-skip",
+      coldPassRetryMs: 15,
+    });
+
+    distiller.start();
+    await waitFor(() => distiller.status().coldPass === "done");
+
+    expect(sdk.list).toBe(2);
+    expect(sdk.messages.filter((call) => call.sessionID === "bad")).toHaveLength(1);
+    expect(store.getCard("good")?.distillState).toBe("full");
+    await distiller.stop();
+    db.close();
+  });
+
+  it("preserves an existing card and FTS rows for a non-array message payload", async () => {
+    const current = session("bad", "Bad", PROJECT_DIR, 2000);
+    const old = session("bad", "Bad", PROJECT_DIR, 1000);
+    const oldMessages = [
+      bundle(userMessage("m-old", "bad", 100), [
+        textPart("p-old", "bad", "m-old", "preserved_fts_marker"),
+      ]),
+    ];
+    const graph: Graph = { sessions: [current], messagesBySession: { bad: oldMessages } };
+    const { client } = makeDistillFake(graph, { nonArray: new Set(["bad"]) });
+    const { db, store } = await freshStore();
+    const seeded = deriveCard({
+      session: metaFromSession(old),
+      messages: oldMessages,
+      parentById: new Map([["bad", null]]),
+    });
+    store.replaceSessionParts("bad", seeded.rows, seeded.card);
+    const { gate } = makeSpyGate();
+    const distiller = createDistiller({
+      client,
+      store,
+      gate,
+      limits: { ...TEST_LIMITS, distillConcurrency: 1 },
+      instanceId: "non-array-preserve",
+    });
+
+    distiller.start();
+    await waitFor(() => distiller.status().coldPass === "done");
+
+    expect(store.getCard("bad")).toEqual(seeded.card);
+    expect(ftsSessions(store.ftsSearch({ strong: ["preserved_fts_marker"], weak: [] }))).toEqual([
+      "bad",
+    ]);
+    await distiller.stop();
+    db.close();
+  });
+
+  it("does not arm a cold-pass retry when discovery fails after stop", async () => {
+    vi.useFakeTimers();
+    const { db, store } = await freshStore();
+    try {
+      let rejectDiscovery!: (error: Error) => void;
+      const discovery = new Promise<Session[]>((_, reject) => {
+        rejectDiscovery = reject;
+      });
+      const discover = vi.fn(() => discovery);
+      const { client } = makeDistillFake({ sessions: [], messagesBySession: {} });
+      const { gate } = makeSpyGate();
+      const distiller = createDistiller({
+        client,
+        store,
+        gate,
+        limits: TEST_LIMITS,
+        instanceId: "late-discovery-failure",
+        coldPassRetryMs: 100,
+        discover,
+      });
+
+      distiller.start();
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(discover).toHaveBeenCalledOnce();
+      const stopping = distiller.stop();
+      rejectDiscovery(new Error("late discovery failure"));
+      await stopping;
+
+      expect(vi.getTimerCount()).toBe(0);
+      expect(discover).toHaveBeenCalledOnce();
+    } finally {
+      db.close();
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not fetch another message page or write progress after stop during a delay", async () => {
+    vi.useFakeTimers();
+    const { db, store } = await freshStore();
+    try {
+      const meta = session("s1", "Paged", PROJECT_DIR, 2000);
+      let messageCalls = 0;
+      const first = bundle(userMessage("m1", "s1", 100), [
+        textPart("p1", "s1", "m1", "first page"),
+      ]);
+      const client = {
+        session: {
+          messages: async () => {
+            messageCalls++;
+            return messagesResponse(
+              messageCalls === 1 ? [first] : [],
+              messageCalls === 1 ? "next" : null,
+            );
+          },
+        },
+      } as unknown as OpencodeClient;
+      const { gate } = makeSpyGate();
+      const distiller = createDistiller({
+        client,
+        store,
+        gate,
+        limits: { ...TEST_LIMITS, distillDelayMs: 100 },
+        instanceId: "stop-pagination",
+        discover: async () => [meta],
+      });
+
+      distiller.start();
+      for (let i = 0; i < 8 && messageCalls === 0; i++) await Promise.resolve();
+      expect(messageCalls).toBe(1);
+      const stopping = distiller.stop();
+      await vi.advanceTimersByTimeAsync(100);
+      await stopping;
+
+      expect(messageCalls).toBe(1);
+      expect(store.getCard("s1")).toBeUndefined();
+      expect(store.getMeta("coldpass_cursor")).toBeUndefined();
+    } finally {
+      db.close();
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not start a message request that was queued in the gate when stopped", async () => {
+    const { db, store } = await freshStore();
+    try {
+      const meta = session("s1", "Queued", PROJECT_DIR, 2000);
+      let messageCalls = 0;
+      let releaseQuery!: () => void;
+      const queryBlocked = new Promise<void>((resolve) => {
+        releaseQuery = resolve;
+      });
+      let queryStarted!: () => void;
+      const queryIsRunning = new Promise<void>((resolve) => {
+        queryStarted = resolve;
+      });
+      let messageQueued!: () => void;
+      const messageIsQueued = new Promise<void>((resolve) => {
+        messageQueued = resolve;
+      });
+      const realGate = createFetchGate({ concurrency: 1 });
+      let backgroundCalls = 0;
+      const gate: FetchGate = {
+        runQuery: (fn) => realGate.runQuery(fn),
+        runBackground: (fn) => {
+          backgroundCalls++;
+          if (backgroundCalls === 2) messageQueued();
+          return realGate.runBackground(fn);
+        },
+        activeQueries: () => realGate.activeQueries(),
+      };
+      const client = {
+        session: {
+          messages: async () => {
+            messageCalls++;
+            return messagesResponse([], null);
+          },
+        },
+      } as unknown as OpencodeClient;
+      const distiller = createDistiller({
+        client,
+        store,
+        gate,
+        limits: TEST_LIMITS,
+        instanceId: "stop-gate-queue",
+        discover: async () => {
+          void gate.runQuery(async () => {
+            queryStarted();
+            await queryBlocked;
+          });
+          return [meta];
+        },
+      });
+
+      distiller.start();
+      await queryIsRunning;
+      await messageIsQueued;
+      const stopping = distiller.stop();
+      releaseQuery();
+      await stopping;
+
+      expect(messageCalls).toBe(0);
+      expect(store.getCard("s1")).toBeUndefined();
+      expect(store.getMeta("coldpass_cursor")).toBeUndefined();
+    } finally {
+      db.close();
+    }
+  });
+
+  it("retries a quarantined session after its update timestamp changes", async () => {
+    const bad = session("bad", "Bad", PROJECT_DIR, 3000);
+    const graph: Graph = {
+      sessions: [bad, session("flaky", "Flaky", PROJECT_DIR, 2000)],
+      messagesBySession: {
+        bad: [malformedBundle("bad")],
+        flaky: [
+          bundle(userMessage("m-flaky", "flaky", 100), [
+            textPart("p-flaky", "flaky", "m-flaky", "flaky content"),
+          ]),
+        ],
+      },
+    };
+    const { client, sdk } = makeDistillFake(graph, { throwOnce: new Set(["flaky"]) });
+    const { db, store } = await freshStore();
+    const { gate } = makeSpyGate();
+    const distiller = createDistiller({
+      client,
+      store,
+      gate,
+      limits: { ...TEST_LIMITS, distillConcurrency: 1 },
+      instanceId: "malformed-update",
+      coldPassRetryMs: 100,
+    });
+
+    distiller.start();
+    await waitFor(() => distiller.status().lastError != null);
+    bad.time.updated = 4000;
+    graph.messagesBySession.bad = [
+      bundle(userMessage("m-bad-fixed", "bad", 100), [
+        textPart("p-bad-fixed", "bad", "m-bad-fixed", "repaired content"),
+      ]),
+    ];
+    await waitFor(() => distiller.status().coldPass === "done");
+
+    expect(sdk.messages.filter((call) => call.sessionID === "bad")).toHaveLength(2);
+    expect(store.getCard("bad")?.timeUpdated).toBe(4000);
+    await distiller.stop();
+    db.close();
+  });
+
   it("distills newest-updated-first, skips up-to-date cards, routes every fetch through the gate", async () => {
     const s1 = session("s1", "Alpha", PROJECT_DIR, 3000);
     const s2 = session("s2", "Bravo", PROJECT_DIR, 2000);
@@ -917,11 +1369,150 @@ describe("lease", () => {
     distiller.stop();
     db.close();
   });
+
+  it("ownsLease does not self-demote on its own stale heartbeat", async () => {
+    // If the row still names THIS instance, nobody has taken over — an expired
+    // heartbeat only means someone COULD. Heartbeat freshness is the
+    // ACQUIRE-side concern of rivals; self-demoting would cost a full
+    // lease-retry stall after any >TTL event-loop hiccup.
+    let clock = 1_000_000;
+    const { client } = makeDistillFake({ sessions: [], messagesBySession: {} });
+    const { db, store } = await freshStore(() => clock);
+    const { gate } = makeSpyGate();
+    const distiller = createDistiller({
+      client,
+      store,
+      gate,
+      limits: { ...TEST_LIMITS, coldPass: false },
+      instanceId: "hiccup",
+      now: () => clock,
+    });
+
+    distiller.start();
+    expect(distiller.ownsLease()).toBe(true);
+
+    clock += 31_000; // heartbeat now looks expired, but the row still names us
+    expect(distiller.ownsLease()).toBe(true);
+    expect(distiller.status().leaseHeld).toBe(true);
+
+    // An actual takeover (someone else's name on the row) IS a loss.
+    expect(store.acquireLease("rival", 30_000, "rivalbuild", 4)).toBe(true);
+    expect(distiller.ownsLease()).toBe(false);
+    expect(distiller.status().leaseHeld).toBe(false);
+
+    await distiller.stop();
+    db.close();
+  });
 });
 
 // ── Incremental ──────────────────────────────────────────────────────────────
 
 describe("incremental", () => {
+  it("logs metadata transport errors without changing a valid card and retries on a later event", async () => {
+    const original = session("s1", "Alpha", PROJECT_DIR, 3000);
+    const graph: Graph = {
+      sessions: [original],
+      messagesBySession: {
+        s1: [
+          bundle(userMessage("m1", "s1", 100), [
+            textPart("p1", "s1", "m1", "preserved metadata transport marker"),
+          ]),
+        ],
+      },
+    };
+    const { client, sdk } = makeDistillFake(graph, {
+      metadataErrorOnce: new Set(["s1"]),
+    });
+    const { db, store } = await freshStore();
+    const { gate } = makeSpyGate();
+    const logs: string[] = [];
+    const distiller = createDistiller({
+      client,
+      store,
+      gate,
+      limits: TEST_LIMITS,
+      instanceId: "metadata-transport",
+      idleDebounceMs: 5,
+      log: (message) => logs.push(message),
+    });
+    distiller.start();
+    await waitFor(() => distiller.status().coldPass === "done");
+    const preserved = store.getCard("s1");
+
+    graph.sessions[0] = session("s1", "Alpha updated", PROJECT_DIR, 4000);
+    graph.messagesBySession.s1 = [
+      bundle(userMessage("m2", "s1", 200), [
+        textPart("p2", "s1", "m2", "fresh metadata transport marker"),
+      ]),
+    ];
+    distiller.onEvent(idleEvent("s1"));
+    await waitFor(() => sdk.get === 1);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    expect(store.getCard("s1")).toEqual(preserved);
+    expect(logs.some((line) => line.includes("session s1 re-distill failed:"))).toBe(true);
+    expect(logs.some((line) => line.includes("metadata transport failed: s1"))).toBe(true);
+    // The apiFailure shape carries neither not-found signal (no name/_tag/404
+    // status), so it takes the transport path and surfaces in lastError.
+    expect(distiller.status().lastError).toContain("metadata transport failed: s1");
+
+    // A later idle event retries normally; the transport failure was neither
+    // interpreted as deletion nor quarantined as malformed session data.
+    distiller.onEvent(idleEvent("s1"));
+    await waitFor(() => store.getCard("s1")?.timeUpdated === 4000);
+    expect(sdk.get).toBe(2);
+    expect(store.getCard("s1")?.summaryHead).toContain("fresh metadata transport marker");
+    await distiller.stop();
+    db.close();
+  });
+
+  it("treats a NotFoundError metadata response as absence: silent, card preserved", async () => {
+    // session.get's real 404 body (`name: "NotFoundError"`, per the v2
+    // SessionGetErrors typing) means the session is GONE — absence, not a
+    // transport failure: no lastError, no quarantine, existing card untouched,
+    // no retry noise in the logs.
+    const graph: Graph = {
+      sessions: [session("s1", "Alpha", PROJECT_DIR, 3000)],
+      messagesBySession: {
+        s1: [
+          bundle(userMessage("m1", "s1", 100), [
+            textPart("p1", "s1", "m1", "preserved not-found marker"),
+          ]),
+        ],
+      },
+    };
+    const { client, sdk } = makeDistillFake(graph, {
+      metadataNotFound: new Set(["s1"]),
+    });
+    const { db, store } = await freshStore();
+    const { gate } = makeSpyGate();
+    const logs: string[] = [];
+    const distiller = createDistiller({
+      client,
+      store,
+      gate,
+      limits: TEST_LIMITS,
+      instanceId: "metadata-not-found",
+      idleDebounceMs: 5,
+      log: (message) => logs.push(message),
+    });
+    distiller.start();
+    await waitFor(() => distiller.status().coldPass === "done");
+    const preserved = store.getCard("s1");
+    expect(preserved).toBeDefined();
+
+    distiller.onEvent(idleEvent("s1"));
+    await waitFor(() => sdk.get === 1);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    expect(store.getCard("s1")).toEqual(preserved); // untouched
+    expect(distiller.status().lastError).toBeUndefined(); // no error surfaced
+    expect(distiller.status().quarantinedCount).toBe(0); // not quarantined
+    expect(logs.some((line) => line.includes("re-distill failed"))).toBe(false); // no retry noise
+    await distiller.stop();
+    db.close();
+  });
+
   it("coalesces an idle burst into a single re-distill", async () => {
     const graph: Graph = {
       sessions: [session("s1", "Alpha", PROJECT_DIR, 3000)],
@@ -1207,6 +1798,7 @@ describe("null store", () => {
       coldPass: "idle",
       distilledCount: 0,
       knownCount: 0,
+      quarantinedCount: 0,
     });
   });
 });

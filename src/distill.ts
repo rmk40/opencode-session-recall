@@ -44,10 +44,20 @@ const DEFAULT_LEASE_RETRY_MS = 60_000;
 const DEFAULT_COLD_PASS_RETRY_MS = 60_000;
 const LEASE_TTL_MS = 30_000;
 const HEARTBEAT_MS = 10_000;
+/** Bound process-lifetime state retained for malformed legacy sessions. */
+const MAX_QUARANTINED_SESSIONS = 1_000;
 
 // ── Shared shapes ────────────────────────────────────────────────────────────
 
 type MsgWithParts = { info: Message; parts: Part[] };
+
+class MalformedSessionError extends Error {
+  override name = "MalformedSessionError";
+}
+
+class SessionMetadataTransportError extends Error {
+  override name = "SessionMetadataTransportError";
+}
 
 /** Human-layer field extracted from one part; the FTS `norm` column and the
  *  per-row ids are added when this becomes a {@link PartTextRow}. */
@@ -91,6 +101,9 @@ export type DistillStatus = {
   coldPass: "idle" | "running" | "done";
   distilledCount: number;
   knownCount: number;
+  /** Sessions currently sidelined as malformed (see the quarantine mechanism);
+   *  observability for "the pass is done but N sessions were skipped". */
+  quarantinedCount: number;
   lastError?: string;
   /** Current distill-lease holder info (this process or whichever build holds it),
    *  from {@link Store.leaseStatus}. Undefined with no store or no lease row yet —
@@ -100,7 +113,12 @@ export type DistillStatus = {
 
 export type Distiller = {
   start(): void;
-  stop(): void;
+  /** Stop accepting or scheduling work immediately, but keep renewing an
+   *  already-held lease until {@link stop} finalizes the handoff. */
+  quiesce(): void;
+  /** Whether this instance still owns a live lease, verified against the store. */
+  ownsLease(): boolean;
+  stop(): Promise<void>;
   onEvent(event: Event): void;
   status(): DistillStatus;
 };
@@ -551,10 +569,16 @@ function readNextCursor(response: unknown): string | null {
  * without `limit` is a 400. The next-page cursor rides the `X-Next-Cursor`
  * header; the body is the `{ info, parts }` array. Throws on an SDK error so the
  * caller's try/catch handles fetch failures uniformly.
+ *
+ * A successful response whose body is not an array is ambiguous: the query path
+ * (browse/context/drill) treats it as a deliberate "empty page, ok:true" — a
+ * documented decision for sessions with no data — while the distiller passes
+ * `strict: true` so its quarantine can distinguish a malformed session from an
+ * empty one.
  */
 export async function fetchMessagePage(
   client: OpencodeClient,
-  opts: { sessionID: string; limit: number; before?: string },
+  opts: { sessionID: string; limit: number; before?: string; strict?: boolean },
 ): Promise<MessagePage> {
   const params =
     opts.before != null
@@ -562,7 +586,13 @@ export async function fetchMessagePage(
       : { sessionID: opts.sessionID, limit: opts.limit };
   const resp = await client.session.messages(params);
   if (resp.error) throw new Error(errmsg(resp.error));
-  const items = Array.isArray(resp.data) ? (resp.data as MsgWithParts[]) : [];
+  if (!Array.isArray(resp.data)) {
+    if (opts.strict) {
+      throw new MalformedSessionError("successful message response was not an array");
+    }
+    return { items: [], nextCursor: readNextCursor(resp.response) };
+  }
+  const items = resp.data as MsgWithParts[];
   return { items, nextCursor: readNextCursor(resp.response) };
 }
 
@@ -596,6 +626,7 @@ const noopStatus = (): DistillStatus => ({
   coldPass: "idle",
   distilledCount: 0,
   knownCount: 0,
+  quarantinedCount: 0,
 });
 
 export function createDistiller(options: DistillerOptions): Distiller {
@@ -603,7 +634,14 @@ export function createDistiller(options: DistillerOptions): Distiller {
 
   // Store unavailable (degraded mode): every method is a clean no-op.
   if (!options.store) {
-    return { start() {}, stop() {}, onEvent() {}, status: noopStatus };
+    return {
+      start() {},
+      quiesce() {},
+      ownsLease: () => false,
+      async stop() {},
+      onEvent() {},
+      status: noopStatus,
+    };
   }
   const store: Store = options.store;
 
@@ -628,6 +666,7 @@ export function createDistiller(options: DistillerOptions): Distiller {
   type Timer = ReturnType<typeof setTimeout>;
 
   let stopped = false;
+  let finalized = false;
   let leaseHeld = false;
   let coldPassState: DistillStatus["coldPass"] = "idle";
   let lastError: string | undefined;
@@ -638,13 +677,40 @@ export function createDistiller(options: DistillerOptions): Distiller {
   let leaseRetryTimer: Timer | undefined;
   let coldPassRetryTimer: Timer | undefined;
   const debounceTimers = new Map<string, Timer>();
-  const inFlight = new Set<string>();
+  let coldPassPromise: Promise<void> | undefined;
+  const inFlight = new Map<string, Promise<void>>();
   const pendingRerun = new Set<string>();
+  const quarantined = new Map<string, number>();
+  let stopPromise: Promise<void> | undefined;
   /** Sessions that saw a removal-shaped event since their last full distill, so
    *  the next re-distill takes the full path rather than appending. */
   const removalSince = new Set<string>();
 
-  const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+  /** Cancellable inter-page politeness sleep. The timers are tracked so
+   *  quiesce() can cancel them: an untracked setTimeout with a long
+   *  distillDelayMs would otherwise keep the runtime alive past dispose. A
+   *  cancelled sleep resolves immediately; the caller's stopped/lease check
+   *  right after it does the actual bail-out. */
+  const pageDelayTimers = new Map<Timer, () => void>();
+  const sleep = (ms: number): Promise<void> =>
+    new Promise((resolve) => {
+      if (stopped) {
+        resolve();
+        return;
+      }
+      const timer = setTimeout(() => {
+        pageDelayTimers.delete(timer);
+        resolve();
+      }, ms);
+      pageDelayTimers.set(timer, resolve);
+    });
+  function cancelPageDelays(): void {
+    for (const [timer, resolve] of pageDelayTimers) {
+      clearTimeout(timer);
+      resolve();
+    }
+    pageDelayTimers.clear();
+  }
 
   const discover =
     options.discover ??
@@ -665,15 +731,53 @@ export function createDistiller(options: DistillerOptions): Distiller {
   // ── Fetch primitives (all through the gate at background priority) ──
 
   async function discoverSessions(): Promise<DistillSessionMeta[]> {
-    const sessions = await gate.runBackground(() => discover());
+    const sessions = await gate.runBackground(() => {
+      if (stopped || !leaseHeld) return Promise.resolve([]);
+      return discover();
+    });
     // Never distill the summarizer's worker session — its prompts embed card
     // digests, which recall must not surface (see isSummarizerTitle).
     return sessions.map(toMeta).filter((meta) => !isSummarizerTitle(meta.title));
   }
 
+  /** Whether an SDK error return means "session does not exist" (absence)
+   *  rather than a transport failure. `session.get`'s 404 body is the generic
+   *  `NotFoundError` discriminated by `name: "NotFoundError"` (SessionGetErrors
+   *  in the v2 typings) — that is the primary check. The `_tag:
+   *  "SessionNotFoundError"` shape belongs to OTHER endpoints' 404s and the
+   *  fields-style `response.status` is transport-level; both are kept as
+   *  belt-and-suspenders fallbacks. Any matching signal → absence. */
+  function isNotFoundError(error: unknown, response: unknown): boolean {
+    if (error && typeof error === "object") {
+      const shaped = error as { name?: unknown; _tag?: unknown };
+      if (shaped.name === "NotFoundError") return true;
+      if (shaped._tag === "SessionNotFoundError") return true;
+    }
+    return (
+      response != null &&
+      typeof response === "object" &&
+      (response as { status?: unknown }).status === 404
+    );
+  }
+
   async function fetchSessionMeta(sessionID: string): Promise<DistillSessionMeta | null> {
-    const resp = await gate.runBackground(() => client.session.get({ sessionID }));
-    if (resp.error || !resp.data || typeof resp.data !== "object") return null;
+    const resp = await gate.runBackground(() => {
+      if (stopped || !leaseHeld) return Promise.resolve(null);
+      return client.session.get({ sessionID });
+    });
+    if (!resp) return null;
+    if (resp.error) {
+      // A recognizable not-found is ABSENCE (session gone → nothing to
+      // distill), not a transport failure to retry.
+      if (isNotFoundError(resp.error, resp.response)) return null;
+      throw new SessionMetadataTransportError(
+        `session ${sessionID} metadata fetch failed: ${errmsg(resp.error)}`,
+      );
+    }
+    if (resp.data == null) return null;
+    if (typeof resp.data !== "object") {
+      throw new MalformedSessionError(`session ${sessionID} metadata response was not an object`);
+    }
     return toMeta(resp.data as Session);
   }
 
@@ -686,15 +790,30 @@ export function createDistiller(options: DistillerOptions): Distiller {
     let rowCount = 0;
     let first = true;
     do {
-      if (!first && limits.distillDelayMs > 0) await sleep(limits.distillDelayMs);
+      if (stopped || !leaseHeld) return all;
+      if (!first && limits.distillDelayMs > 0) {
+        await sleep(limits.distillDelayMs);
+        if (stopped || !leaseHeld) return all;
+      }
       first = false;
       const before = cursor;
-      const page = await gate.runBackground(() =>
-        fetchMessagePage(client, { sessionID, limit: pageMessages, before }),
-      );
-      for (const msg of page.items) {
-        all.push(msg);
-        for (const part of msg.parts) rowCount += distillFields(part).length;
+      const page = await gate.runBackground(() => {
+        if (stopped || !leaseHeld) return Promise.resolve({ items: [], nextCursor: null });
+        return fetchMessagePage(client, { sessionID, limit: pageMessages, before, strict: true });
+      });
+      try {
+        for (const msg of page.items) {
+          all.push(msg);
+          for (const part of msg.parts) rowCount += distillFields(part).length;
+        }
+      } catch (error) {
+        // Only a TypeError here is a data-shape failure (e.g. `parts` missing
+        // on a malformed legacy message); anything else is a code regression
+        // that must abort the pass, not quarantine the session. TypeError is a
+        // proxy, not a proof — see the accepted-tradeoff note at the cold
+        // pass's deriveCard catch for the residual risk this carries.
+        if (!(error instanceof TypeError)) throw error;
+        throw new MalformedSessionError(errmsg(error));
       }
       cursor = page.nextCursor ?? undefined;
     } while (cursor && rowCount < maxRows);
@@ -715,18 +834,32 @@ export function createDistiller(options: DistillerOptions): Distiller {
     let first = true;
     let reached = false;
     do {
-      if (!first && limits.distillDelayMs > 0) await sleep(limits.distillDelayMs);
+      if (stopped || !leaseHeld) return { messages: collected, reached: false };
+      if (!first && limits.distillDelayMs > 0) {
+        await sleep(limits.distillDelayMs);
+        if (stopped || !leaseHeld) return { messages: collected, reached: false };
+      }
       first = false;
       const before = cursor;
-      const page = await gate.runBackground(() =>
-        fetchMessagePage(client, { sessionID, limit: pageMessages, before }),
-      );
-      for (const msg of page.items) {
-        if (msg.info.id === checkpoint) {
-          reached = true;
-          break;
+      const page = await gate.runBackground(() => {
+        if (stopped || !leaseHeld) return Promise.resolve({ items: [], nextCursor: null });
+        return fetchMessagePage(client, { sessionID, limit: pageMessages, before, strict: true });
+      });
+      try {
+        for (const msg of page.items) {
+          if (msg.info.id === checkpoint) {
+            reached = true;
+            break;
+          }
+          collected.push(msg);
         }
-        collected.push(msg);
+      } catch (error) {
+        // TypeError only, matching fetchSessionMessages: a data-shape failure
+        // (`info` missing on a malformed message) quarantines; anything else
+        // is a regression and must surface. Same residual risk as there — see
+        // the accepted-tradeoff note at the cold pass's deriveCard catch.
+        if (!(error instanceof TypeError)) throw error;
+        throw new MalformedSessionError(errmsg(error));
       }
       cursor = reached ? undefined : (page.nextCursor ?? undefined);
     } while (cursor);
@@ -762,6 +895,10 @@ export function createDistiller(options: DistillerOptions): Distiller {
   }
 
   function recomputeRootRollup(rootId: string): void {
+    // Rollup writes replace the root card row; verify authoritative ownership
+    // once per rollup batch (callers reach here after awaited fetches, so the
+    // cached flag alone can be stale after a >TTL suspension).
+    if (!ownsLease()) return;
     const root = store.getCard(rootId);
     if (!root) return;
     const children = store
@@ -772,6 +909,10 @@ export function createDistiller(options: DistillerOptions): Distiller {
   }
 
   function recomputeAllRootRollups(): void {
+    // One authoritative ownership read for the whole rollup sweep (see
+    // recomputeRootRollup); per-row checks would multiply SQLite reads for
+    // no additional safety.
+    if (!ownsLease()) return;
     const rootCards = new Map<string, Card>();
     const childrenByRoot = new Map<string, Card[]>();
     // Load embeddings too: the rollup upsert below rewrites every card column, so
@@ -799,12 +940,21 @@ export function createDistiller(options: DistillerOptions): Distiller {
 
   async function distillFull(session: DistillSessionMeta): Promise<void> {
     const messages = await fetchSessionMessages(session.id, caps.ftsRowsPerSession);
+    // Cheap flag check before parentChainOf touches the store: a detached
+    // continuation (the fetch settled after dispose's bounded wait) must not
+    // read SQLite, which may already be closed.
+    if (stopped || !leaseHeld) return;
     const { card, rows } = deriveCard({
       session,
       messages,
       parentById: parentChainOf(session),
       caps,
     });
+    // Authoritative re-check (live lease row, not the cached flag): a process
+    // suspended past the TTL can lose the lease to a rival before its heartbeat
+    // callback ever runs; the resumed fetch must not replace the new holder's
+    // rows. One leaseStatus() read per write batch.
+    if (stopped || !ownsLease()) return;
     store.replaceSessionParts(session.id, rows, card);
     bumpCardsRev();
   }
@@ -816,6 +966,9 @@ export function createDistiller(options: DistillerOptions): Distiller {
       return;
     }
     const { messages: newMessages, reached } = await fetchNewMessages(session.id, checkpoint);
+    // Authoritative ownership check before the append write (see distillFull);
+    // only synchronous derivation sits between here and appendSessionParts.
+    if (stopped || !ownsLease()) return;
     // If the checkpoint message was never found, the newest pages are NOT a clean
     // append tail (they'd re-insert already-stored parts and hit a UNIQUE
     // violation, wedging the session). Fall back to a full re-distill.
@@ -907,6 +1060,12 @@ export function createDistiller(options: DistillerOptions): Distiller {
     try {
       const discovered = await discoverSessions();
       knownCount = discovered.length;
+      const liveUpdates = new Map(discovered.map((session) => [session.id, session.timeUpdated]));
+      for (const [sessionId, timeUpdated] of quarantined) {
+        // Deletions and updates both invalidate quarantine. An updated session is
+        // retried below; a deleted one no longer consumes retained state.
+        if (liveUpdates.get(sessionId) !== timeUpdated) quarantined.delete(sessionId);
+      }
       const parentById = new Map(discovered.map((s) => [s.id, s.parentId] as const));
       const sorted = [...discovered].sort(
         (a, b) => b.timeUpdated - a.timeUpdated || a.id.localeCompare(b.id),
@@ -924,16 +1083,57 @@ export function createDistiller(options: DistillerOptions): Distiller {
         const upToDate =
           existing?.distillState === "full" && existing.timeUpdated === session.timeUpdated;
         if (!upToDate) {
-          const { card, rows } = deriveCard({
-            session,
-            messages: await fetchSessionMessages(session.id, caps.ftsRowsPerSession),
-            parentById,
-            caps,
-          });
+          if (quarantined.get(session.id) === session.timeUpdated) {
+            examined++;
+            recordProgress(session.timeUpdated);
+            return;
+          }
+
+          let messages: MsgWithParts[];
+          try {
+            messages = await fetchSessionMessages(session.id, caps.ftsRowsPerSession);
+          } catch (error) {
+            if (!(error instanceof MalformedSessionError)) throw error;
+            quarantine(session, error);
+            examined++;
+            recordProgress(session.timeUpdated);
+            return;
+          }
+
+          let card: Card;
+          let rows: PartTextRow[];
+          try {
+            ({ card, rows } = deriveCard({ session, messages, parentById, caps }));
+          } catch (error) {
+            // Quarantine only data-shape failures (mirroring the fetch path
+            // above): a TypeError walking malformed legacy parts is this
+            // session's problem; anything else is a deriveCard regression that
+            // must surface as a pass failure, not silently sideline sessions.
+            //
+            // ACCEPTED TRADEOFF (referenced by the page-walk catches above):
+            // TypeError is a proxy for "malformed data", not a proof. A
+            // TypeError REGRESSION in distillFields/deriveCard — a bug of ours
+            // that happens to throw TypeError — quarantines sessions while the
+            // pass reports "done" instead of aborting. Residual risk accepted
+            // because the alternative (annotating every field access to
+            // distinguish data-shape from code-bug TypeErrors) is worse;
+            // bounded by quarantinedCount observability in status() and the
+            // MAX_QUARANTINED_SESSIONS (1000) cap.
+            if (!(error instanceof MalformedSessionError) && !(error instanceof TypeError)) {
+              throw error;
+            }
+            quarantine(session, error);
+            examined++;
+            recordProgress(session.timeUpdated);
+            return;
+          }
           // The lease can drop (heartbeat takeover) during the fetch above; a
-          // non-holder must never write. Re-check right before the write and
-          // skip it, counting the session as not distilled.
-          if (stopped || !leaseHeld) return;
+          // non-holder must never write. Re-check right before the write —
+          // authoritatively, against the live lease row, because a suspension
+          // past the TTL loses the lease before the heartbeat callback flips
+          // the cached flag — and skip it, counting the session as not
+          // distilled.
+          if (stopped || !ownsLease()) return;
           store.replaceSessionParts(session.id, rows, card);
           bumpCardsRev();
           distilled++;
@@ -945,8 +1145,10 @@ export function createDistiller(options: DistillerOptions): Distiller {
 
       // Losing the lease (a takeover) or stopping mid-pass must NOT finish the
       // pass or recompute rollups as if complete — leave it idle so the new
-      // holder (or a restart) redoes the remainder.
-      if (stopped || !leaseHeld) {
+      // holder (or a restart) redoes the remainder. Authoritative check: a
+      // demoted instance whose rollup recompute silently no-oped must not
+      // declare "done" or kick the summarizer.
+      if (stopped || !ownsLease()) {
         coldPassState = "idle";
         return;
       }
@@ -966,11 +1168,37 @@ export function createDistiller(options: DistillerOptions): Distiller {
     }
   }
 
+  function quarantine(session: DistillSessionMeta, error: unknown): void {
+    // Reinsertion keeps FIFO eviction aligned with the latest failure.
+    quarantined.delete(session.id);
+    quarantined.set(session.id, session.timeUpdated);
+    while (quarantined.size > MAX_QUARANTINED_SESSIONS) {
+      const oldest = quarantined.keys().next().value;
+      if (oldest === undefined) break;
+      quarantined.delete(oldest);
+    }
+    logMsg(
+      `session ${session.id} quarantined at timeUpdated ${session.timeUpdated}: ${errmsg(error)}`,
+    );
+  }
+
+  function startColdPass(): Promise<void> {
+    if (stopped || !leaseHeld) return Promise.resolve();
+    if (coldPassPromise) return coldPassPromise;
+    const running = runColdPass().finally(() => {
+      if (coldPassPromise === running) coldPassPromise = undefined;
+    });
+    coldPassPromise = running;
+    return running;
+  }
+
   function scheduleColdPassRetry(): void {
+    if (stopped || !leaseHeld) return;
     clearTimer(coldPassRetryTimer);
     coldPassRetryTimer = setTimeout(() => {
+      coldPassRetryTimer = undefined;
       if (stopped || !leaseHeld) return;
-      if (coldPassState === "idle" && lastError !== undefined) void runColdPass();
+      if (coldPassState === "idle" && lastError !== undefined) void startColdPass();
     }, coldPassRetryMs);
   }
 
@@ -979,7 +1207,13 @@ export function createDistiller(options: DistillerOptions): Distiller {
   // (Stage 3). Resume correctness comes from the per-card skip above.
   let progressFloor: number | undefined;
   function recordProgress(timeUpdated: number): void {
+    if (stopped || !leaseHeld) return;
     if (progressFloor == null || timeUpdated < progressFloor) {
+      // Authoritative ownership gate (same as every other distiller store
+      // write): this is reached from the quarantine branches and the common
+      // up-to-date skip path, all after awaited fetches. Checked only when the
+      // floor actually moves, so the hot skip path usually costs nothing extra.
+      if (!ownsLease()) return;
       progressFloor = timeUpdated;
       store.setMeta("coldpass_cursor", String(timeUpdated));
     }
@@ -994,18 +1228,25 @@ export function createDistiller(options: DistillerOptions): Distiller {
       sessionID,
       setTimeout(() => {
         debounceTimers.delete(sessionID);
-        void runReDistill(sessionID);
+        startReDistill(sessionID);
       }, idleDebounceMs),
     );
   }
 
-  async function runReDistill(sessionID: string): Promise<void> {
+  function startReDistill(sessionID: string): void {
     if (stopped || !leaseHeld) return; // non-holders and stopped instances write nothing
     if (inFlight.has(sessionID)) {
       pendingRerun.add(sessionID); // coalesce: run once more after the in-flight pass
       return;
     }
-    inFlight.add(sessionID);
+    const running = runReDistill(sessionID).finally(() => {
+      inFlight.delete(sessionID);
+      if (!stopped && pendingRerun.delete(sessionID)) scheduleReDistill(sessionID);
+    });
+    inFlight.set(sessionID, running);
+  }
+
+  async function runReDistill(sessionID: string): Promise<void> {
     // Snapshot-and-clear the removal flag BEFORE any await: a removal event that
     // arrives mid-distill re-adds it independently, so the coalesced rerun still
     // forces a full re-distill instead of appending onto a compacted transcript.
@@ -1013,6 +1254,10 @@ export function createDistiller(options: DistillerOptions): Distiller {
     let succeeded = false;
     try {
       const session = await fetchSessionMeta(sessionID);
+      // A request already in flight at stop time settles late, past dispose's
+      // bounded wait — by then SQLite may be closed, so a detached continuation
+      // must not reach the store reads below.
+      if (stopped || !leaseHeld) return;
       // The summarizer's worker session emits idle events as it is prompted; it
       // is never distilled or carded (its prompts embed card digests).
       if (session && isSummarizerTitle(session.title)) return;
@@ -1025,6 +1270,7 @@ export function createDistiller(options: DistillerOptions): Distiller {
           !hadRemoval;
         if (canAppend && existing) await distillAppend(session, existing);
         else await distillFull(session);
+        if (stopped || !leaseHeld) return;
         // Keep the root's family highlights current with its live children.
         const stored = store.getCard(sessionID);
         if (stored && stored.rootId !== sessionID) recomputeRootRollup(stored.rootId);
@@ -1033,19 +1279,15 @@ export function createDistiller(options: DistillerOptions): Distiller {
       }
     } catch (error) {
       lastError = errmsg(error);
+      logMsg(`session ${sessionID} re-distill failed: ${lastError}`);
     } finally {
       // If the distill did not land, preserve the removal signal for the retry.
       if (!succeeded && hadRemoval) removalSince.add(sessionID);
-      inFlight.delete(sessionID);
-      if (pendingRerun.has(sessionID)) {
-        pendingRerun.delete(sessionID);
-        scheduleReDistill(sessionID);
-      }
     }
   }
 
   function handleDeleted(sessionID: string): void {
-    if (!leaseHeld) return;
+    if (!ownsLease()) return; // authoritative: this path deletes rows immediately
     const rootId = store.getCard(sessionID)?.rootId;
     store.deleteSession(sessionID);
     bumpCardsRev();
@@ -1055,6 +1297,7 @@ export function createDistiller(options: DistillerOptions): Distiller {
       debounceTimers.delete(sessionID);
     }
     removalSince.delete(sessionID);
+    quarantined.delete(sessionID);
     if (rootId && rootId !== sessionID) recomputeRootRollup(rootId);
   }
 
@@ -1067,7 +1310,8 @@ export function createDistiller(options: DistillerOptions): Distiller {
   function scheduleHeartbeat(): void {
     clearTimer(heartbeatTimer);
     heartbeatTimer = setTimeout(() => {
-      if (stopped || !leaseHeld) return;
+      heartbeatTimer = undefined;
+      if (finalized || !leaseHeld) return;
       if (store.heartbeatLease(instanceId)) scheduleHeartbeat();
       else {
         // Lost the lease (taken over): stop acting as holder and try to regain.
@@ -1080,14 +1324,18 @@ export function createDistiller(options: DistillerOptions): Distiller {
             ? `lease lost to ${taker.holder} (build ${taker.build || "?"}, gen ${taker.gen})`
             : "lease lost",
         );
-        scheduleLeaseRetry();
+        if (!stopped) scheduleLeaseRetry();
       }
     }, HEARTBEAT_MS);
   }
 
   function scheduleLeaseRetry(): void {
+    if (stopped || finalized) return;
     clearTimer(leaseRetryTimer);
-    leaseRetryTimer = setTimeout(acquire, leaseRetryMs);
+    leaseRetryTimer = setTimeout(() => {
+      leaseRetryTimer = undefined;
+      acquire();
+    }, leaseRetryMs);
   }
 
   function acquire(): void {
@@ -1096,11 +1344,49 @@ export function createDistiller(options: DistillerOptions): Distiller {
       leaseHeld = true;
       logMsg(`lease acquired (build ${build}, gen ${gen})`);
       scheduleHeartbeat();
-      if (limits.coldPass && coldPassState === "idle") void runColdPass();
+      if (limits.coldPass && coldPassState === "idle") void startColdPass();
     } else {
       leaseHeld = false;
       scheduleLeaseRetry();
     }
+  }
+
+  function ownsLease(): boolean {
+    if (!leaseHeld || finalized) return false;
+    // Authoritative check against the live lease row. Ownership is lost only
+    // when someone else's name is on the row (a takeover happened) or the row
+    // is gone — NOT when our own heartbeat merely looks stale: an expired
+    // heartbeat means a rival COULD take over, and heartbeat freshness is the
+    // ACQUIRE-side concern of that rival. Self-demoting on staleness would cost
+    // a full lease-retry stall after any >TTL event-loop hiccup.
+    const current = store.leaseStatus();
+    const owned = current?.holder === instanceId;
+    if (!owned) {
+      leaseHeld = false;
+      clearTimer(heartbeatTimer);
+      heartbeatTimer = undefined;
+      if (!stopped) scheduleLeaseRetry();
+    }
+    return owned;
+  }
+
+  function quiesce(): void {
+    if (stopped) return;
+    stopped = true;
+    clearTimer(leaseRetryTimer);
+    clearTimer(coldPassRetryTimer);
+    leaseRetryTimer = undefined;
+    coldPassRetryTimer = undefined;
+    for (const timer of debounceTimers.values()) clearTimeout(timer);
+    debounceTimers.clear();
+    pendingRerun.clear();
+    // Wake any inter-page politeness sleep immediately: with a long
+    // distillDelayMs those timers would otherwise keep the runtime alive past
+    // dispose. The woken fetch loop bails on its stopped check.
+    cancelPageDelays();
+    // Deliberately retain heartbeatTimer: summary worker cleanup is lease-owned
+    // and plugin disposal finalizes this distiller only after that cleanup has
+    // settled or reached its shutdown bound.
   }
 
   return {
@@ -1109,16 +1395,20 @@ export function createDistiller(options: DistillerOptions): Distiller {
       acquire();
     },
 
-    stop(): void {
-      stopped = true;
+    quiesce,
+
+    ownsLease,
+
+    stop(): Promise<void> {
+      if (stopPromise) return stopPromise;
+      quiesce();
+      finalized = true;
       clearTimer(heartbeatTimer);
       clearTimer(leaseRetryTimer);
       clearTimer(coldPassRetryTimer);
       heartbeatTimer = undefined;
       leaseRetryTimer = undefined;
       coldPassRetryTimer = undefined;
-      for (const timer of debounceTimers.values()) clearTimeout(timer);
-      debounceTimers.clear();
       if (leaseHeld) {
         try {
           store.releaseLease(instanceId);
@@ -1127,6 +1417,11 @@ export function createDistiller(options: DistillerOptions): Distiller {
         }
       }
       leaseHeld = false;
+      const running = [coldPassPromise, ...inFlight.values()].filter(
+        (promise): promise is Promise<void> => promise !== undefined,
+      );
+      stopPromise = Promise.allSettled(running).then(() => {});
+      return stopPromise;
     },
 
     onEvent(event: Event): void {
@@ -1157,11 +1452,17 @@ export function createDistiller(options: DistillerOptions): Distiller {
 
     status(): DistillStatus {
       const lease = store.leaseStatus();
+      // Derive leaseHeld from the lease row already read for the `lease` field:
+      // authoritative AND side-effect-free (unlike ownsLease(), which mutates
+      // lease state and re-arms timers — that one is for write gates only), and
+      // no extra SQLite read. `leaseHeld &&` keeps a released/finalized
+      // instance reporting false even if the row still names it briefly.
       return {
-        leaseHeld,
+        leaseHeld: leaseHeld && lease?.holder === instanceId,
         coldPass: coldPassState,
         distilledCount,
         knownCount,
+        quarantinedCount: quarantined.size,
         ...(lastError !== undefined ? { lastError } : {}),
         ...(lease ? { lease } : {}),
       };
