@@ -70,6 +70,8 @@ function makeDistillFake(
     throwOnce?: Set<string>;
     nonArray?: Set<string>;
     metadataErrorOnce?: Set<string>;
+    /** session.get returns the v2 404 body (`name: "NotFoundError"`). */
+    metadataNotFound?: Set<string>;
   } = {},
 ): { client: OpencodeClient; sdk: SdkCalls } {
   const sdk: SdkCalls = { list: 0, get: 0, messages: [] };
@@ -85,6 +87,12 @@ function makeDistillFake(
         if (opts.metadataErrorOnce?.has(sessionID) && !threw.has(`meta:${sessionID}`)) {
           threw.add(`meta:${sessionID}`);
           return { error: apiFailure(`metadata transport failed: ${sessionID}`) };
+        }
+        if (opts.metadataNotFound?.has(sessionID)) {
+          // The real SessionGetErrors[404] shape from the v2 typings.
+          return {
+            error: { name: "NotFoundError", data: { message: `session not found: ${sessionID}` } },
+          };
         }
         const found = graph.sessions.find((s) => s.id === sessionID);
         return found ? { data: found } : { error: apiFailure(`not found: ${sessionID}`) };
@@ -1444,6 +1452,9 @@ describe("incremental", () => {
     expect(store.getCard("s1")).toEqual(preserved);
     expect(logs.some((line) => line.includes("session s1 re-distill failed:"))).toBe(true);
     expect(logs.some((line) => line.includes("metadata transport failed: s1"))).toBe(true);
+    // The apiFailure shape carries neither not-found signal (no name/_tag/404
+    // status), so it takes the transport path and surfaces in lastError.
+    expect(distiller.status().lastError).toContain("metadata transport failed: s1");
 
     // A later idle event retries normally; the transport failure was neither
     // interpreted as deletion nor quarantined as malformed session data.
@@ -1451,6 +1462,53 @@ describe("incremental", () => {
     await waitFor(() => store.getCard("s1")?.timeUpdated === 4000);
     expect(sdk.get).toBe(2);
     expect(store.getCard("s1")?.summaryHead).toContain("fresh metadata transport marker");
+    await distiller.stop();
+    db.close();
+  });
+
+  it("treats a NotFoundError metadata response as absence: silent, card preserved", async () => {
+    // session.get's real 404 body (`name: "NotFoundError"`, per the v2
+    // SessionGetErrors typing) means the session is GONE — absence, not a
+    // transport failure: no lastError, no quarantine, existing card untouched,
+    // no retry noise in the logs.
+    const graph: Graph = {
+      sessions: [session("s1", "Alpha", PROJECT_DIR, 3000)],
+      messagesBySession: {
+        s1: [
+          bundle(userMessage("m1", "s1", 100), [
+            textPart("p1", "s1", "m1", "preserved not-found marker"),
+          ]),
+        ],
+      },
+    };
+    const { client, sdk } = makeDistillFake(graph, {
+      metadataNotFound: new Set(["s1"]),
+    });
+    const { db, store } = await freshStore();
+    const { gate } = makeSpyGate();
+    const logs: string[] = [];
+    const distiller = createDistiller({
+      client,
+      store,
+      gate,
+      limits: TEST_LIMITS,
+      instanceId: "metadata-not-found",
+      idleDebounceMs: 5,
+      log: (message) => logs.push(message),
+    });
+    distiller.start();
+    await waitFor(() => distiller.status().coldPass === "done");
+    const preserved = store.getCard("s1");
+    expect(preserved).toBeDefined();
+
+    distiller.onEvent(idleEvent("s1"));
+    await waitFor(() => sdk.get === 1);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    expect(store.getCard("s1")).toEqual(preserved); // untouched
+    expect(distiller.status().lastError).toBeUndefined(); // no error surfaced
+    expect(distiller.status().quarantinedCount).toBe(0); // not quarantined
+    expect(logs.some((line) => line.includes("re-distill failed"))).toBe(false); // no retry noise
     await distiller.stop();
     db.close();
   });

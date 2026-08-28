@@ -429,20 +429,27 @@ const server: Plugin = async (ctx, options) => {
         //   never reach SQLite. Closing after a distiller timeout is safe.
         // - `operations` tracks FOREGROUND tool executions, which have no such
         //   guards: a paused recall/drill fetch can resume straight into card
-        //   coverage reads. If they have not all settled, do NOT close — the
-        //   process is exiting anyway, the store is derived/rebuildable, and an
-        //   unclosed handle is harmless, whereas a use-after-close is not.
-        await settleWithin(distiller.stop(), SHUTDOWN_TIMEOUT_MS);
-        const ops = await settleWithin(Promise.allSettled([...operations]), SHUTDOWN_TIMEOUT_MS);
-        if (!ops.timedOut) {
+        //   coverage reads. If they have not all settled within the bound,
+        //   DEFER the close instead: it fires after disposePromise has resolved
+        //   (cannot hang the host), only once every straggler has settled
+        //   (never closes under a live reader), and so closes eventually — no
+        //   handle leak when opencode disposes a cached per-directory instance
+        //   without the process exiting. A straggler that truly never settles
+        //   degrades to an unclosed handle on a derived, rebuildable store —
+        //   harmless, unlike a use-after-close.
+        const closeDb = (): void => {
           try {
             db?.close();
           } catch {
             // Best-effort: a throwing close must not reject disposePromise
-            // into the host's shutdown finalizer.
+            // (or escape the detached deferral) into the host.
           }
           db = null;
-        }
+        };
+        await settleWithin(distiller.stop(), SHUTDOWN_TIMEOUT_MS);
+        const ops = await settleWithin(Promise.allSettled([...operations]), SHUTDOWN_TIMEOUT_MS);
+        if (ops.timedOut) void Promise.allSettled([...operations]).then(closeDb);
+        else closeDb();
       })();
       return disposePromise;
     },

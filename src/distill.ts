@@ -741,16 +741,17 @@ export function createDistiller(options: DistillerOptions): Distiller {
   }
 
   /** Whether an SDK error return means "session does not exist" (absence)
-   *  rather than a transport failure. Best-effort on both signals the SDK
-   *  exposes: the v2 error body's `_tag` discriminant (`SessionNotFoundError`)
-   *  and the fields-style `response.status` (404). Either matching → absence. */
+   *  rather than a transport failure. `session.get`'s 404 body is the generic
+   *  `NotFoundError` discriminated by `name: "NotFoundError"` (SessionGetErrors
+   *  in the v2 typings) — that is the primary check. The `_tag:
+   *  "SessionNotFoundError"` shape belongs to OTHER endpoints' 404s and the
+   *  fields-style `response.status` is transport-level; both are kept as
+   *  belt-and-suspenders fallbacks. Any matching signal → absence. */
   function isNotFoundError(error: unknown, response: unknown): boolean {
-    if (
-      error &&
-      typeof error === "object" &&
-      (error as { _tag?: unknown })._tag === "SessionNotFoundError"
-    ) {
-      return true;
+    if (error && typeof error === "object") {
+      const shaped = error as { name?: unknown; _tag?: unknown };
+      if (shaped.name === "NotFoundError") return true;
+      if (shaped._tag === "SessionNotFoundError") return true;
     }
     return (
       response != null &&
@@ -808,7 +809,9 @@ export function createDistiller(options: DistillerOptions): Distiller {
       } catch (error) {
         // Only a TypeError here is a data-shape failure (e.g. `parts` missing
         // on a malformed legacy message); anything else is a code regression
-        // that must abort the pass, not quarantine the session.
+        // that must abort the pass, not quarantine the session. TypeError is a
+        // proxy, not a proof — see the accepted-tradeoff note at the cold
+        // pass's deriveCard catch for the residual risk this carries.
         if (!(error instanceof TypeError)) throw error;
         throw new MalformedSessionError(errmsg(error));
       }
@@ -853,7 +856,8 @@ export function createDistiller(options: DistillerOptions): Distiller {
       } catch (error) {
         // TypeError only, matching fetchSessionMessages: a data-shape failure
         // (`info` missing on a malformed message) quarantines; anything else
-        // is a regression and must surface.
+        // is a regression and must surface. Same residual risk as there — see
+        // the accepted-tradeoff note at the cold pass's deriveCard catch.
         if (!(error instanceof TypeError)) throw error;
         throw new MalformedSessionError(errmsg(error));
       }
@@ -1105,9 +1109,16 @@ export function createDistiller(options: DistillerOptions): Distiller {
             // above): a TypeError walking malformed legacy parts is this
             // session's problem; anything else is a deriveCard regression that
             // must surface as a pass failure, not silently sideline sessions.
-            // Accepted tradeoff: a deriveCard TypeError REGRESSION quarantines
-            // rather than aborts; quarantinedCount + the 1000-entry cap bound
-            // the damage and make it diagnosable.
+            //
+            // ACCEPTED TRADEOFF (referenced by the page-walk catches above):
+            // TypeError is a proxy for "malformed data", not a proof. A
+            // TypeError REGRESSION in distillFields/deriveCard — a bug of ours
+            // that happens to throw TypeError — quarantines sessions while the
+            // pass reports "done" instead of aborting. Residual risk accepted
+            // because the alternative (annotating every field access to
+            // distinguish data-shape from code-bug TypeErrors) is worse;
+            // bounded by quarantinedCount observability in status() and the
+            // MAX_QUARANTINED_SESSIONS (1000) cap.
             if (!(error instanceof MalformedSessionError) && !(error instanceof TypeError)) {
               throw error;
             }

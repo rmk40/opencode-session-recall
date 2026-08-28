@@ -379,12 +379,14 @@ describe("plugin entry", () => {
     }
   });
 
-  it("skips the DB close when a foreground tool operation outlives the dispose bound", async () => {
+  it("defers the DB close until a foreground tool operation outliving dispose settles", async () => {
     // `operations` tracks FOREGROUND tool executions, which have no
     // finalized/lease guards: a recall paused in an SDK fetch can resume into
-    // card/store reads. When that wait times out, dispose deliberately does
-    // NOT close SQLite (the process is exiting; the derived store rebuilds) so
-    // the late resumption cannot use-after-close.
+    // card/store reads. When that wait times out, dispose DEFERS the close
+    // until every tracked operation has settled, so the late resumption can
+    // never use-after-close, and the handle still closes eventually (no leak
+    // when opencode disposes a cached per-directory instance without the
+    // process exiting).
     vi.useFakeTimers();
     try {
       let resolveMessages: ((value: { data: [] }) => void) | undefined;
@@ -407,6 +409,11 @@ describe("plugin entry", () => {
       const hooks = await server(ctx({ fetch: vi.fn() }), {});
 
       // Start a foreground tool call that parks inside the SDK fetch.
+      // recall_messages is a proxy for the riskier session-scoped recall/drill
+      // path (wiring the full search tool through this fake needs a card
+      // corpus); fidelity holds because the sqlite mock proxies EVERY store
+      // method, so ANY post-close store call from any tool's resumption would
+      // trip postCloseCalls.
       const toolRun = mustTool(hooks.tool?.recall_messages).execute({ sessionID: "s-park" }, {
         sessionID: "s-park",
         metadata: () => {},
@@ -423,13 +430,20 @@ describe("plugin entry", () => {
       await vi.advanceTimersByTimeAsync(20_000);
       await stopping;
       expect(disposed).toBe(true);
-      // The operations wait timed out → the close was skipped.
+      // The operations wait timed out → the close is DEFERRED, not yet fired:
+      // dispose resolved without closing under the still-parked reader.
       expect(sqliteLifecycle.closes).toBe(0);
 
-      // The parked tool resuming afterwards must not crash or hit a closed
-      // handle (there is none to hit — the close was skipped).
+      // The parked tool resumes and completes without hitting a closed handle
+      // (the deferred close only fires after it settles) …
       resolveMessages?.({ data: [] });
       await toolRun;
+      expect(sqliteLifecycle.postCloseCalls).toBe(0);
+
+      // … and once every straggler has settled, the deferred close DOES fire:
+      // no handle leak on instance disposal without process exit.
+      for (let i = 0; i < 20; i++) await Promise.resolve();
+      expect(sqliteLifecycle.closes).toBe(1);
       expect(sqliteLifecycle.postCloseCalls).toBe(0);
     } finally {
       vi.useRealTimers();

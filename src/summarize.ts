@@ -365,13 +365,25 @@ export function createSummarizer(deps: SummarizerDeps): Summarizer {
         client.session.delete({ sessionID }),
       );
       // Prune only on CONFIRMED success: an SDK error, rejection, or timeout
-      // keeps the id owned so this instance's own later cleanup can retry.
-      // (Retention only helps THIS instance — any next lease holder's orphan
-      // sweep deletes by sentinel title regardless of our bookkeeping.)
+      // keeps the id owned so drainOwnedWorkers retries it at the start of the
+      // next batch. (Retention only helps THIS instance — any next lease
+      // holder's orphan sweep deletes by sentinel title regardless of our
+      // bookkeeping.)
       if (resp && !resp.error) ownedWorkers.delete(sessionID);
     } catch {
       // Best-effort; a lingering sentinel session is excluded everywhere and
       // swept by the next holder's orphan cleanup.
+    }
+  }
+
+  /** Best-effort retry of leftover owned ids (deletes that failed or timed out
+   *  in earlier batches). Runs at the start of each batch, before creating the
+   *  new worker. Bounded: at most a few ids, each delete already capped by
+   *  settleWithin inside ownedWorkerSdk; success prunes, failure keeps the id
+   *  for the next batch's drain. */
+  async function drainOwnedWorkers(): Promise<void> {
+    for (const sessionID of [...ownedWorkers]) {
+      await deleteOwnedWorker(sessionID);
     }
   }
 
@@ -423,6 +435,8 @@ export function createSummarizer(deps: SummarizerDeps): Summarizer {
    *  permit that long would only starve foreground recall for no concurrency
    *  benefit. Worker create/delete/list/abort stay gated (quick server fetches). */
   async function promptBatchFor(cards: Card[]): Promise<Map<string, string>> {
+    // Retry any leftover owned workers from earlier batches before adding one.
+    await drainOwnedWorkers();
     const workerId = await createWorker();
     if (!workerId) return new Map();
     try {

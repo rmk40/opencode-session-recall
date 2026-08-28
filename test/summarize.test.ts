@@ -397,6 +397,42 @@ describe("summarizer worker lifecycle", () => {
     await summarizer.stop();
   });
 
+  it("retries a failed owned-worker delete on the next batch's drain and prunes it", async () => {
+    // A delete that fails keeps the id in ownedWorkers; the start-of-batch
+    // drain retries it before creating the next worker, and prunes on success.
+    const store = await freshStore();
+    store.upsertCard(fullCard("c1", { timeUpdated: 2000 }));
+    store.upsertCard(fullCard("c2", { timeUpdated: 3000 }));
+    const gate = createFetchGate({ concurrency: 2 });
+    const client = makeSummarizerClient(replyKeys(() => "s"));
+    const realDelete = (
+      client.client as unknown as {
+        session: { delete: (p: { sessionID: string }) => Promise<unknown> };
+      }
+    ).session.delete;
+    let failNext = true;
+    const deletes: string[] = [];
+    (
+      client.client as unknown as {
+        session: { delete: (p: { sessionID: string }) => Promise<unknown> };
+      }
+    ).session.delete = async (params) => {
+      deletes.push(params.sessionID);
+      if (failNext) {
+        failNext = false;
+        return { error: { data: { message: "delete failed" } } };
+      }
+      return realDelete(params);
+    };
+
+    await makeSummarizer(store, client.client, gate, { batchSize: 1 }).runColdPass();
+
+    // Batch 1's delete of worker-1 failed; batch 2's drain retried worker-1
+    // (successfully) before its own worker-2 create+delete.
+    expect(deletes).toEqual(["worker-1", "worker-1", "worker-2"]);
+    expect(client.liveWorkers()).toHaveLength(0); // nothing leaked
+  });
+
   it("disables tools and applies a deny-all permission on the worker prompt", async () => {
     const store = await freshStore();
     store.upsertCard(fullCard("c1"));
