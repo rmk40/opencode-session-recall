@@ -126,6 +126,41 @@ describe("deep scope validation", () => {
       cleanup();
     }
   });
+
+  it("sweeps an explicitly named session with no card yet (uncarded shortlist member)", async () => {
+    const h = makeFakeHarness();
+    // Seed the store from the current fixture FIRST, then add the session:
+    // messages exist on the fake client, but no card — the young-session window.
+    const { deps, cleanup } = await makeRecallDeps(h);
+    const young = session("s-deep-young", "Deep Young", PROJECT_DIR, NOW - 1_000);
+    addSession(h, young, [
+      bundle(assistantMessage("m-deep-young-1", young.id, NOW - 2_000), [
+        completedToolPart(
+          "p-deep-young-1",
+          young.id,
+          "m-deep-young-1",
+          "bash",
+          { command: "run" },
+          "output-only crunkleberry needle",
+        ),
+      ]),
+    ]);
+    try {
+      const recall = search(h.client, h.unscoped, true, TEST_LIMITS, deps);
+      const out = await runTool<SearchOutput>(recall, {
+        query: "crunkleberry",
+        deep: true,
+        sessions: ["s-deep-young"],
+      });
+      expect(out.ok).toBe(true);
+      expect(out.coverage?.deep?.sessionsCovered).toBe(1);
+      expect(out.coverage?.sessionsEligible).toBe(1);
+      expect(out.results.some((r) => r.sessionID === "s-deep-young")).toBe(true);
+      expect(out.warnings?.some((w) => /no card yet .*drilled directly/i.test(w))).toBe(true);
+    } finally {
+      cleanup();
+    }
+  });
 });
 
 // ── Output-only needle: the honest-miss pair ─────────────────────────────────

@@ -2129,6 +2129,34 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
           };
         };
 
+        /** Build a target for an id — from its card when known, else a minimal
+         *  target so a session with no card is still drilled/swept. */
+        const targetFor = (id: string): DrillTarget => {
+          const card = cards.get(id);
+          if (card) return registerTarget(card, relevanceOf(card));
+          relevanceBySession.set(id, "unknown");
+          searchedMeta.set(id, { id, title: "", directory: "" });
+          return { sessionId: id, title: "", directory: "", timeUpdated: 0 };
+        };
+
+        /** Whether ANY card exists for the id — including a summarizer worker
+         *  card, which `cards.get()`/`cards.list()` hide. An explicitly named
+         *  session counts as uncarded (drill it directly, bypassing card-based
+         *  filters) only when NO card exists; a carded-but-filtered id keeps
+         *  the filter behavior and a worker card stays excluded. A worker
+         *  session with no card at all cannot be title-checked here — that is
+         *  acceptable: the self-tool/summarizer exclusions in extract.ts still
+         *  apply to the drilled content. */
+        const hasAnyCard = (id: string): boolean =>
+          store ? store.getCard(id) != null : cards.get(id) != null;
+
+        /** Honest-coverage warning for shortlist ids drilled without a card. */
+        const warnUncarded = (count: number): void => {
+          normalized.warnings.push(
+            `${count} session id${count === 1 ? "" : "s"} in the shortlist ${count === 1 ? "has" : "have"} no card yet (not indexed); ${count === 1 ? "it was" : "they were"} drilled directly.`,
+          );
+        };
+
         const singleTarget = sessionID ?? (scope === "session" ? currentSessionID : undefined);
         if (scope === "session" && !singleTarget) {
           const err: ErrorOutput = {
@@ -2171,16 +2199,6 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
           if (before != null) timeFilters.until = before;
           const explicitSet = new Set(explicitSessions);
 
-          /** Build a target for an id — from its card when known, else a minimal
-           *  target so a session with no card is still swept. */
-          const targetFor = (id: string): DrillTarget => {
-            const card = cards.get(id);
-            if (card) return registerTarget(card, relevanceOf(card));
-            relevanceBySession.set(id, "unknown");
-            searchedMeta.set(id, { id, title: "", directory: "" });
-            return { sessionId: id, title: "", directory: "", timeUpdated: 0 };
-          };
-
           if (deepCursor) {
             // Resume from an UNTRUSTED cursor: keep only ids the card store knows
             // (or that an accompanying `sessions` arg explicitly allows), cap the
@@ -2215,6 +2233,18 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
             drillTargets = scoped
               .filter((card) => card.sessionId !== excludeSessionID)
               .map((card) => registerTarget(card, relevanceOf(card)));
+            // Explicitly named ids with NO card yet (a young session the
+            // distiller has not carded) are swept anyway — the caller named
+            // them, so time filters (card metadata) cannot apply; the sweep's
+            // actual fetch decides what's there. Carded-but-filtered ids are
+            // NOT resurrected here (they have metadata and were filtered).
+            const uncarded = explicitSessions.filter(
+              (id) => id !== excludeSessionID && !hasAnyCard(id),
+            );
+            if (uncarded.length > 0) {
+              drillTargets = [...drillTargets, ...uncarded.map(targetFor)];
+              warnUncarded(uncarded.length);
+            }
           } else if (singleTarget) {
             // Explicit sessionID / scope:"session" → sweep exactly that session.
             if (singleTarget !== excludeSessionID) drillTargets = [targetFor(singleTarget)];
@@ -2252,12 +2282,26 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
             requestedSessions != null
               ? Math.min(requestedSessions, Math.max(1, limits.drillSessions))
               : Math.max(1, limits.drillSessions);
-          drillTargets = scopedCards
+          // Explicitly named ids with NO card yet (a young session the
+          // distiller has not carded) are drilled anyway — the caller named
+          // them, so time/title filters (card metadata) cannot apply; the
+          // drill's actual fetch decides what's there. Carded-but-filtered ids
+          // are NOT resurrected (they have metadata and were filtered).
+          // Uncarded ids rank last: carded members fill the cap first.
+          const uncarded = explicitSessions.filter(
+            (id) => id !== excludeSessionID && !hasAnyCard(id),
+          );
+          const cardedTargets = scopedCards
             .filter((card) => card.sessionId !== excludeSessionID)
             .slice(0, cap)
             .map((card) => registerTarget(card, relevanceOf(card)));
+          const uncardedTargets = uncarded
+            .slice(0, Math.max(0, cap - cardedTargets.length))
+            .map(targetFor);
+          if (uncardedTargets.length > 0) warnUncarded(uncardedTargets.length);
+          drillTargets = [...cardedTargets, ...uncardedTargets];
           deepSet = new Set(drillTargets.map((t) => t.sessionId));
-          sessionsEligible = scopedCards.length;
+          sessionsEligible = scopedCards.length + uncarded.length;
           shortlistIDs = drillTargets.map((t) => t.sessionId);
           if (excludeSessionID) {
             skippedByReason.excludedSession = (skippedByReason.excludedSession ?? 0) + 1;
