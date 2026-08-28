@@ -17,7 +17,7 @@ import { openSqlite } from "../src/sqlite.js";
 import { openStore, type Store } from "../src/store.js";
 import { deriveCard, type DistillSessionMeta } from "../src/distill.js";
 import { createFetchGate, type FetchGate } from "../src/fetch-gate.js";
-import { createCardsRuntime } from "../src/cards.js";
+import { createCardsRuntime, cardsLiteFromSessions } from "../src/cards.js";
 import { createDrill } from "../src/drill.js";
 import type { SearchDeps, SemanticSearchConfig } from "../src/search.js";
 
@@ -847,6 +847,54 @@ export async function makeRecallDeps(
     cleanup: () => {
       db.close();
       rmSync(dir, { recursive: true, force: true });
+    },
+  };
+}
+
+/** Build store-null `recall` deps over the fixture's cards-lite source — the
+ *  sibling of {@link makeRecallDeps}, which is unconditionally store-backed
+ *  (it throws when SQLite fails) and deliberately stays that way. Used by the
+ *  ephemeral search/coverage/scope tests (pass `mode: "ephemeral"`) and by the
+ *  driver-missing degraded regression pins (omit `mode`). Nothing touches
+ *  disk, so there is no cleanup. */
+export function makeStoreNullDeps(
+  fixture: FakeHarness,
+  limits: Limits = TEST_LIMITS,
+  opts: {
+    /** Set to build CONFIGURED ephemeral deps; omit for the accidental
+     *  driver-missing degraded path (store null, no mode). */
+    mode?: "ephemeral";
+    /** Ephemeral refresh trigger hook (fire-and-forget at query entry). */
+    maybeRefresh?: () => void;
+    gate?: FetchGate;
+    now?: () => number;
+    deepWallClockMs?: number;
+    cardsNow?: () => number;
+    cardsRefreshIntervalMs?: number;
+  } = {},
+): { deps: SearchDeps } {
+  const gate = opts.gate ?? createFetchGate({ concurrency: limits.concurrency });
+  const liteCards = cardsLiteFromSessions(fixture.globalSessions);
+  const cards = createCardsRuntime({
+    source: { getCards: () => liteCards, revision: () => undefined, degraded: true },
+    now: opts.cardsNow,
+    refreshIntervalMs: opts.cardsRefreshIntervalMs,
+  });
+  const drill = createDrill({
+    client: fixture.client,
+    gate,
+    limits,
+    now: opts.now,
+    deepWallClockMs: opts.deepWallClockMs,
+  });
+  return {
+    deps: {
+      gate,
+      store: null,
+      cards,
+      drill,
+      ...(opts.mode && { mode: opts.mode }),
+      ...(opts.maybeRefresh && { maybeRefresh: opts.maybeRefresh }),
     },
   };
 }

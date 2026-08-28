@@ -4,6 +4,20 @@ All notable changes to this project are documented here. This project follows
 [Conventional Commits](https://www.conventionalcommits.org/) and
 [Semantic Versioning](https://semver.org/).
 
+## Unreleased
+
+### Added
+
+- **`mode: "ephemeral"` option** (issue #4): run with no store and no on-disk
+  artifacts — no SQLite file, nothing under `~/.cache/opencode-session-recall`,
+  no background content indexing. Ranking is metadata-quality over live session
+  listings (refreshed lazily, at most once per 60s window); content search
+  still works through the bounded live drill and deep paths. Semantic,
+  summaries, `compactionRecall`, and sessions enrichment are unavailable in
+  this mode, the default scope flips to `"project"` (explicit
+  `scope: "global"` still works), and `coverage.mode` reports `"ephemeral"`.
+  Persistent-mode behavior is unchanged.
+
 ## 2.2.0
 
 Based on PR #3 by @kernel-oops with maintainer fixes.

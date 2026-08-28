@@ -1,23 +1,44 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { tool, type Hooks, type PluginInput, type ToolDefinition } from "@opencode-ai/plugin";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { TOOLS } from "../src/types.js";
+import { LITE_REFRESH_WINDOW_MS } from "../src/lite-refresh.js";
 import { openSqlite } from "../src/sqlite.js";
-import { openStore } from "../src/store.js";
-import { bundle, PROJECT_DIR, textPart, userMessage } from "./helpers.js";
+import { defaultStorePath, openStore } from "../src/store.js";
+import { bundle, makeContext, PROJECT_DIR, textPart, userMessage } from "./helpers.js";
 
 const createOpencodeClient = vi.hoisted(() => vi.fn((options: unknown) => options));
-const sqliteLifecycle = vi.hoisted(() => ({ closes: 0, postCloseCalls: 0 }));
+const sqliteLifecycle = vi.hoisted(() => ({ opens: 0, closes: 0, postCloseCalls: 0 }));
+const defaultStorePathCalls = vi.hoisted(() => ({ count: 0 }));
 
 vi.mock("@opencode-ai/sdk/v2", () => ({ createOpencodeClient }));
+
+vi.mock("../src/store.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../src/store.js")>();
+  return {
+    ...actual,
+    // Deliberately does NOT delegate: the real defaultStorePath mkdir -p's the
+    // real ~/.cache/opencode-session-recall, which would violate the very
+    // zero-artifact contract the ephemeral tests prove. Nothing in this suite
+    // needs the real value (server() always injects a storePath), so the mock
+    // just counts the call and returns an inert tmpdir-based path string.
+    defaultStorePath: async () => {
+      defaultStorePathCalls.count++;
+      const { join } = await import("node:path");
+      const { tmpdir } = await import("node:os");
+      return join(tmpdir(), "recall-default-store-path-probe.db");
+    },
+  };
+});
 
 vi.mock("../src/sqlite.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../src/sqlite.js")>();
   return {
     ...actual,
     openSqlite: async (...args: Parameters<typeof actual.openSqlite>) => {
+      sqliteLifecycle.opens++;
       const db = await actual.openSqlite(...args);
       if (!db) return db;
       let closed = false;
@@ -44,12 +65,20 @@ vi.mock("../src/sqlite.js", async (importOriginal) => {
 
 // Mock the semantic embedder so the wiring test never downloads a model or
 // touches the network: init resolves immediately and the model stays unready.
+// The constructor/init are spy-counted so the ephemeral no-artifact test can
+// assert they NEVER run (a filesystem assertion would be vacuous under module
+// mocking; the live tuistory pass provides the real-filesystem confirmation).
+const embedderSpies = vi.hoisted(() => ({ constructed: 0, inits: 0 }));
 vi.mock("../src/semantic/embedder.js", () => ({
   SemanticEmbedder: class {
     ready = false;
     initError: string | undefined = "mocked: init not run";
-    constructor(public model: string) {}
-    async init(): Promise<void> {}
+    constructor(public model: string) {
+      embedderSpies.constructed++;
+    }
+    async init(): Promise<void> {
+      embedderSpies.inits++;
+    }
     embed(): Float32Array | undefined {
       return undefined;
     }
@@ -108,8 +137,12 @@ function ctx(config: {
 describe("plugin entry", () => {
   beforeEach(() => {
     createOpencodeClient.mockClear();
+    sqliteLifecycle.opens = 0;
     sqliteLifecycle.closes = 0;
     sqliteLifecycle.postCloseCalls = 0;
+    defaultStorePathCalls.count = 0;
+    embedderSpies.constructed = 0;
+    embedderSpies.inits = 0;
   });
 
   afterEach(async () => {
@@ -680,6 +713,204 @@ describe("plugin entry", () => {
       vi.useRealTimers();
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+
+  it("coerces mode at the plugin level: only the literal 'ephemeral' skips the store open", async () => {
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    try {
+      await server(ctx({ fetch: vi.fn() }), {});
+      expect(sqliteLifecycle.opens).toBe(1);
+
+      await server(ctx({ fetch: vi.fn() }), { mode: "persistent" });
+      expect(sqliteLifecycle.opens).toBe(2);
+
+      // Junk string: persistent behavior, with the one-time log line as the tell.
+      await server(ctx({ fetch: vi.fn() }), { mode: "Ephemeral" });
+      expect(sqliteLifecycle.opens).toBe(3);
+      expect(
+        log.mock.calls.some(
+          (c) => typeof c[0] === "string" && c[0].includes('unrecognized mode "Ephemeral"'),
+        ),
+      ).toBe(true);
+
+      // Non-string: persistent behavior, no unrecognized-mode log.
+      log.mockClear();
+      await server(ctx({ fetch: vi.fn() }), { mode: 7 });
+      expect(sqliteLifecycle.opens).toBe(4);
+      expect(
+        log.mock.calls.some((c) => typeof c[0] === "string" && c[0].includes("unrecognized mode")),
+      ).toBe(false);
+
+      // Empty string: a string, but explicitly excluded from the log clause.
+      // null and object: non-strings (typeof null is "object"), silent too.
+      log.mockClear();
+      await server(ctx({ fetch: vi.fn() }), { mode: "" });
+      await server(ctx({ fetch: vi.fn() }), { mode: null });
+      await server(ctx({ fetch: vi.fn() }), { mode: { value: "ephemeral" } });
+      expect(sqliteLifecycle.opens).toBe(7);
+      expect(
+        log.mock.calls.some((c) => typeof c[0] === "string" && c[0].includes("unrecognized mode")),
+      ).toBe(false);
+
+      const hooks = await server(ctx({ fetch: vi.fn() }), { mode: "ephemeral" });
+      expect(sqliteLifecycle.opens).toBe(7);
+      expect(Object.keys(hooks.tool ?? {}).sort()).toEqual([...TOOLS].sort());
+
+      // The plugin entry — not hand-built test deps — must put `mode` on
+      // SearchDeps: (a) the tool description carries the ephemeral mode line,
+      // and (b) the ephemeral `.optional()` scope schema was selected, so
+      // parsing materializes no scope default. Deleting the mode spread in the
+      // entry file must fail here even though test/ephemeral.test.ts injects
+      // deps by hand.
+      const recall = mustTool(hooks.tool?.recall);
+      expect(recall.description).toContain("Ephemeral mode is configured");
+      expect(tool.schema.object(recall.args).parse({ query: "x" }).scope).toBeUndefined();
+    } finally {
+      log.mockRestore();
+    }
+  });
+
+  it("ephemeral with no storePath never calls defaultStorePath or openSqlite", async () => {
+    await server(ctx({ fetch: vi.fn() }), { mode: "ephemeral", storePath: undefined });
+    expect(defaultStorePathCalls.count).toBe(0);
+    expect(sqliteLifecycle.opens).toBe(0);
+
+    // Positive control: the counter would have moved if the entry file had
+    // called through the mocked module. Invoked directly (not via a persistent
+    // no-storePath plugin, which would create a store file in the real home
+    // cache), so a mock that stops intercepting fails here instead of letting
+    // the zero-count assertion pass vacuously. The mock never touches the
+    // filesystem, so this call itself creates nothing either.
+    await defaultStorePath();
+    expect(defaultStorePathCalls.count).toBe(1);
+  });
+
+  it("ephemeral with a sentinel storePath creates nothing there (storePath ignored)", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "recall-ephemeral-artifact-"));
+    try {
+      await server(ctx({ fetch: vi.fn() }), {
+        mode: "ephemeral",
+        storePath: join(dir, "store.db"),
+      });
+      expect(sqliteLifecycle.opens).toBe(0);
+      expect(readdirSync(dir)).toEqual([]);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("ephemeral + semantic:true never constructs or inits the embedder", async () => {
+    await server(ctx({ fetch: vi.fn() }), { mode: "ephemeral", semantic: true });
+    expect(embedderSpies.constructed).toBe(0);
+    expect(embedderSpies.inits).toBe(0);
+
+    // Positive control: the spies do record when persistent mode wires semantic.
+    await server(ctx({ fetch: vi.fn() }), { semantic: true });
+    expect(embedderSpies.constructed).toBe(1);
+    expect(embedderSpies.inits).toBe(1);
+  });
+
+  it("wires maybeRefresh through the plugin entry: a recall after the window triggers a second list", async () => {
+    // Behavioral pin for the `...(liteRefreshHook && { maybeRefresh })` spread:
+    // deleting it must fail HERE, at plugin level (ephemeral/lite-refresh
+    // suites inject the hook by hand and stay green). The controller captures
+    // `Date.now` at construction, so a spy installed first controls the
+    // refresh window with no fake timers.
+    let clock = 1_000_000;
+    const dateNow = vi.spyOn(Date, "now").mockImplementation(() => clock);
+    try {
+      const listGlobal = vi.fn(async () => ({
+        data: [{ id: "s1", title: "T", directory: PROJECT_DIR, time: { created: 1, updated: 2 } }],
+      }));
+      createOpencodeClient
+        .mockImplementationOnce((options: unknown) => ({
+          ...(options as object),
+          session: {
+            messages: vi.fn(async () => ({ data: [] })),
+            list: vi.fn(async () => ({ data: [] })),
+          },
+        }))
+        .mockImplementationOnce((options: unknown) => ({
+          ...(options as object),
+          experimental: { session: { list: listGlobal } },
+        }));
+
+      const hooks = await server(ctx({ fetch: vi.fn() }), { mode: "ephemeral" });
+      // Init discover: the one startup list.
+      await vi.waitFor(() => expect(listGlobal).toHaveBeenCalledTimes(1));
+
+      // Within the window a query must NOT trigger another list. Use a full
+      // ToolContext and assert ok so this doubles as a plugin-level smoke test
+      // (an incomplete ctx would silently error inside execute and still pass
+      // the wiring assertion — maybeRefresh fires first).
+      const first = await mustTool(hooks.tool?.recall).execute(
+        { query: "checkout" },
+        makeContext().ctx as never,
+      );
+      expect(JSON.parse(String(first)).ok).toBe(true);
+      expect(listGlobal).toHaveBeenCalledTimes(1);
+
+      // Past the window: one query at entry fires exactly one refresh list.
+      clock += LITE_REFRESH_WINDOW_MS + 1;
+      const second = await mustTool(hooks.tool?.recall).execute(
+        { query: "checkout" },
+        makeContext().ctx as never,
+      );
+      expect(JSON.parse(String(second)).ok).toBe(true);
+      await vi.waitFor(() => expect(listGlobal).toHaveBeenCalledTimes(2));
+    } finally {
+      dateNow.mockRestore();
+    }
+  });
+
+  it("ephemeral runs no background content work beyond the permitted metadata list", async () => {
+    const messages = vi.fn(async () => ({ data: [] }));
+    const create = vi.fn(async () => ({ data: { id: "worker-1" } }));
+    const listGlobal = vi.fn(async () => ({
+      data: [{ id: "s1", title: "T", directory: PROJECT_DIR, time: { created: 1, updated: 2 } }],
+    }));
+    createOpencodeClient
+      .mockImplementationOnce((options: unknown) => ({
+        ...(options as object),
+        session: { messages, create, list: vi.fn(async () => ({ data: [] })) },
+      }))
+      .mockImplementationOnce((options: unknown) => ({
+        ...(options as object),
+        experimental: { session: { list: listGlobal } },
+      }));
+
+    const hooks = await server(ctx({ fetch: vi.fn() }), {
+      mode: "ephemeral",
+      coldPass: true,
+      summaries: { enabled: true, model: "test/cheap" },
+    });
+    // The one permitted startup network call: the bounded metadata list.
+    await vi.waitFor(() => expect(listGlobal).toHaveBeenCalled());
+    // A session event must not start distill work either (no-op distiller).
+    await hooks.event?.({
+      event: { type: "session.idle", properties: { sessionID: "s1" } },
+    } as never);
+    await new Promise((resolve) => setTimeout(resolve, 25));
+    // No distiller-initiated message fetches, no summarizer worker sessions.
+    expect(messages).not.toHaveBeenCalled();
+    expect(create).not.toHaveBeenCalled();
+    await hooks.dispose?.();
+    expect(sqliteLifecycle.opens).toBe(0);
+    expect(sqliteLifecycle.closes).toBe(0);
+  });
+
+  it("keeps LLM-facing tool instructions compact in ephemeral mode", async () => {
+    const hooks = await server(ctx({ fetch: vi.fn() }), { mode: "ephemeral" });
+    const definitions = Object.values(hooks.tool ?? {});
+    const totalChars = definitions.reduce(
+      (total, definition) => total + llmFacingChars(definition),
+      0,
+    );
+
+    // Same bounds as persistent: the mode-aware description line must fit the
+    // existing budget, not stretch it.
+    expect(totalChars).toBeLessThan(11_000);
+    expect(llmFacingChars(mustTool(hooks.tool?.recall))).toBeLessThan(6_500);
   });
 
   it("fails clearly if SDK internals needed for transport extraction change", async () => {

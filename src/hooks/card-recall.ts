@@ -21,7 +21,13 @@ export type CardRecallHit = {
   anchors: string[];
 };
 
-export type CardRecallDeps = { cards: CardsRuntime; store: Store | null };
+export type CardRecallDeps = {
+  cards: CardsRuntime;
+  store: Store | null;
+  /** Ephemeral cards-lite refresh trigger (fire-and-forget at query entry);
+   *  flows through from SearchDeps. See lite-refresh.ts. */
+  maybeRefresh?: () => void;
+};
 
 const MAX_ANCHORS = 4;
 const MIN_ANCHOR_CHARS = 3;
@@ -31,6 +37,9 @@ export function cardRecall(
   query: string,
   opts: { limit: number; filters?: CardFilters },
 ): CardRecallHit[] {
+  // Ephemeral cards-lite refresh trigger: fire-and-forget; this query proceeds
+  // on the current snapshot (see lite-refresh.ts).
+  deps.maybeRefresh?.();
   const parsed = parseQuery(query);
   const filters = opts.filters ?? {};
 

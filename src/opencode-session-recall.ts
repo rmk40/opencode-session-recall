@@ -21,6 +21,7 @@ import {
 } from "./store.js";
 import { EMBED_REPRESENTATION } from "./embedding-text.js";
 import { createCardsRuntime, cardsLiteFromSessions, type CardSource } from "./cards.js";
+import { createLiteRefresh, type LiteRefreshController } from "./lite-refresh.js";
 import { createDrill } from "./drill.js";
 import { createDistiller } from "./distill.js";
 import { createSummarizer, parseModelId, type Summarizer } from "./summarize.js";
@@ -81,6 +82,12 @@ const PLUGIN_BUILD = `schema${SCHEMA_VERSION}.gen${EMBED_REPRESENTATION}`;
 type Options = {
   primary?: boolean;
   global?: boolean;
+  /** `"ephemeral"` runs the plugin with no persistent store and zero disk
+   *  artifacts: cards are metadata-only (built live from the session list),
+   *  content recall comes from drill/deep at query time, and the semantic
+   *  layer is forced off (its embedder writes model weights to the cache dir).
+   *  Anything else (including absence) is persistent mode. */
+  mode?: "persistent" | "ephemeral";
   /** Inject a system-prompt reminder to use recall (R1a). Default: true. */
   nudge?: boolean;
   /** Run gated automatic recall on each user message (R1b). Default: false. */
@@ -112,6 +119,31 @@ const server: Plugin = async (ctx, options) => {
   const nudge = opts.nudge !== false;
   const autoRecallEnabled = opts.autoRecall === true;
   const compactionRecallEnabled = opts.compactionRecall === true;
+  // Hand-coerced like every other option (options carry no Zod schema — the
+  // value arrives as untyped JSON): only the literal string "ephemeral"
+  // enables the mode; anything else — including a typo — is persistent, with a
+  // one-time log line as the tell.
+  const modeRaw: unknown = opts.mode;
+  const ephemeral = modeRaw === "ephemeral";
+  if (!ephemeral && typeof modeRaw === "string" && modeRaw !== "" && modeRaw !== "persistent") {
+    pluginLog(`unrecognized mode ${JSON.stringify(modeRaw)}; running in persistent mode`);
+  }
+  if (ephemeral) {
+    if (optionalString(opts.storePath)) {
+      pluginLog("ephemeral mode: storePath is ignored (no store is opened)");
+    }
+    if (opts.semantic === true) {
+      pluginLog(
+        "ephemeral mode: semantic is forced off (the embedder caches model weights on disk)",
+      );
+    }
+    if (opts.summaries?.enabled === true) {
+      pluginLog("ephemeral mode: summaries are inert (they require the persistent store)");
+    }
+    if (opts.compactionRecall === true) {
+      pluginLog("ephemeral mode: compactionRecall is inert (it reads the persistent store)");
+    }
+  }
   let disposed = false;
   let disposePromise: Promise<void> | undefined;
   const operations = new Set<Promise<unknown>>();
@@ -188,7 +220,10 @@ const server: Plugin = async (ctx, options) => {
   let semantic: SemanticSearchConfig | undefined;
   let semanticModel: string | undefined;
   let semanticReady: Promise<void> | undefined;
-  if (opts.semantic === true) {
+  // Ephemeral force-disables the semantic layer: SemanticEmbedder.init() runs
+  // BEFORE the store block and eagerly writes model weights under the cache
+  // dir, which would violate the mode's zero-artifact contract.
+  if (opts.semantic === true && !ephemeral) {
     try {
       const { SemanticEmbedder } = await import("./semantic/embedder.js");
       const model = optionalString(opts.semanticModel) ?? DEFAULT_SEMANTIC_MODEL;
@@ -222,17 +257,24 @@ const server: Plugin = async (ctx, options) => {
   // The derived, versioned store is the sole persistence. If SQLite is
   // unavailable (no driver, unwritable dir) or the schema is newer than this
   // build understands, `store` stays null and the plugin degrades to ephemeral
-  // cards-lite built from the session list.
-  const storePath = optionalString(opts.storePath) ?? (await defaultStorePath());
+  // cards-lite built from the session list. In configured ephemeral mode the
+  // whole open sequence — including defaultStorePath(), which mkdirs the cache
+  // dir — is skipped: `store`/`db` stay null by construction.
   let store: Store | null = null;
   let db: SqliteDb | null = null;
-  if (storePath) {
-    db = await openSqlite(storePath);
-    if (db) store = openStore(db);
+  if (!ephemeral) {
+    const storePath = optionalString(opts.storePath) ?? (await defaultStorePath());
+    if (storePath) {
+      db = await openSqlite(storePath);
+      if (db) store = openStore(db);
+    }
   }
 
   // Degraded cards-lite: fetch the session list once (best-effort) and keep
   // metadata-only cards in memory. The tier-1 runtime reads the live array.
+  // Configured ephemeral mode additionally wires the refresh controller so
+  // the snapshot self-heals (sessions created after init become visible); the
+  // accidental driver-missing degraded path keeps the frozen one-shot snapshot.
   let liteCards: Card[] = [];
   const cardSource: CardSource = store
     ? {
@@ -243,17 +285,39 @@ const server: Plugin = async (ctx, options) => {
         writeEmbeddings: (model, gen, rows) => store.writeCardEmbeddings(model, gen, rows),
       }
     : { getCards: () => liteCards, revision: () => undefined, degraded: true };
+  let liteRefresh: LiteRefreshController | undefined;
   if (!store) {
-    void track(
-      discover()
-        .then((list) => {
-          if (!disposed)
-            liteCards = cardsLiteFromSessions(list as Parameters<typeof cardsLiteFromSessions>[0]);
-        })
-        .catch(() => {
-          // Best-effort; a failed list just leaves cards-lite empty until retried.
-        }),
-    );
+    if (ephemeral) {
+      liteRefresh = createLiteRefresh({
+        list: async () =>
+          cardsLiteFromSessions((await discover()) as Parameters<typeof cardsLiteFromSessions>[0]),
+        assign: (next) => {
+          liteCards = next;
+        },
+        // `cards` and `gate` are declared BELOW this block (the CardSource
+        // literal must exist before the runtime, and the gate block follows) —
+        // resolve them lazily in closures that only run after init completes.
+        // Capturing either eagerly here would hit the TDZ; do not reorder.
+        invalidate: () => cards.invalidate(),
+        runQuery: (fn) => gate.runQuery(fn),
+        track,
+        disposed: () => disposed,
+      });
+      void liteRefresh.initialRefresh();
+    } else {
+      void track(
+        discover()
+          .then((list) => {
+            if (!disposed)
+              liteCards = cardsLiteFromSessions(
+                list as Parameters<typeof cardsLiteFromSessions>[0],
+              );
+          })
+          .catch(() => {
+            // Best-effort; a failed list just leaves cards-lite empty until retried.
+          }),
+      );
+    }
   }
 
   // One shared fetch gate gates every SDK call in the query/distill paths so the
@@ -334,7 +398,18 @@ const server: Plugin = async (ctx, options) => {
   }
   if (limits.coldPass) distiller.start();
 
-  const deps: SearchDeps = { gate, store, cards, drill, semantic };
+  const liteRefreshHook = liteRefresh;
+  const deps: SearchDeps = {
+    gate,
+    store,
+    cards,
+    drill,
+    semantic,
+    // Configured, never derived from store === null: the accidental degraded
+    // path must keep its existing behavior and wording.
+    ...(ephemeral && { mode: "ephemeral" as const }),
+    ...(liteRefreshHook && { maybeRefresh: () => liteRefreshHook.maybeRefresh() }),
+  };
   // recall_sessions serves the card store directly when it exists (digest, top
   // files/tools, family rollups); degraded mode leaves listings bare.
   const enrichment: SessionEnrichment | undefined = store

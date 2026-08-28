@@ -70,6 +70,14 @@ export type SearchDeps = {
    *  here for the bounded zero-lexical-hit part-level rescue (semantic-
    *  shortlisted sessions only). Absent = lexical-only. */
   semantic?: SemanticSearchConfig;
+  /** Set only when the plugin is CONFIGURED in ephemeral mode (no persistent
+   *  store by choice). Never derived from `store === null`: the accidental
+   *  driver-missing degraded path keeps its existing wording and defaults. */
+  mode?: "ephemeral";
+  /** Ephemeral cards-lite refresh trigger: called fire-and-forget once at
+   *  query entry (search tool and card-tier hook path) so the metadata
+   *  snapshot lazily self-heals. See lite-refresh.ts. */
+  maybeRefresh?: () => void;
 };
 
 /** Wall-clock budget for the synchronous literal/regex scan loops (ms). Bounds
@@ -1412,12 +1420,26 @@ export function buildSuggestions(input: {
     input.after > input.coverage.cards.storeRecency;
   if (staleWindow) {
     if (input.coverage.cards?.degraded) {
-      add(0, {
-        reason:
-          "No content index is available (degraded mode); recent sessions are not searchable.",
-        action:
-          "Use recall_sessions for live session metadata; recall_messages reads a known session directly.",
-      });
+      // Mode-gated wording: in configured ephemeral mode this branch fires on
+      // snapshot lag (lite cards carry real timeUpdated values, so an
+      // in-window `since` usually matches eligible cards), not routinely —
+      // reword it for that meaning. The driver-missing degraded wording stays
+      // byte-identical.
+      if (input.coverage.mode === "ephemeral") {
+        add(0, {
+          reason:
+            "No persistent index by configuration (ephemeral mode) — content matches come from live drill; the metadata snapshot has not caught up to this time window.",
+          action:
+            "For very recent sessions, list them with recall_sessions and name them via sessions: [...].",
+        });
+      } else {
+        add(0, {
+          reason:
+            "No content index is available (degraded mode); recent sessions are not searchable.",
+          action:
+            "Use recall_sessions for live session metadata; recall_messages reads a known session directly.",
+        });
+      }
     } else {
       add(0, {
         reason:
@@ -1697,7 +1719,7 @@ export function search(
   limits: Limits,
   deps: SearchDeps,
 ): ToolDefinition {
-  const { cards, drill, store, gate } = deps;
+  const { cards, drill, store, gate, mode, maybeRefresh } = deps;
   return tool({
     description: `Search prior opencode conversations by message/tool-output content. Primary history-discovery tool; prefer over recall_sessions for topical discovery (titles only).
 
@@ -1707,17 +1729,32 @@ Skip trivial commands, simple local code/file lookup, simple edits with full con
 
 For "how did we do X before": match:"smart", group:"session" (current session is already excluded by default); if results are weak, search the project directory literally for the tool/command name and inspect tool-input hits with expand:"context" or recall_context.
 
-First call: for broad discovery use match:"smart", group:"session", scope:"global" (default), 5-10 results, and short terms from error text/feature/config/file/decision. The current session and its subagent sessions are excluded by default; pass excludeCurrentSession:false to search them (or use scope:"session"). Use role:"user" for requirements/decisions. Use expand:"context" or "message" when top-hit evidence will avoid a follow-up.
+First call: for broad discovery use match:"smart", group:"session", ${mode ? 'scope:"project" (default in this mode; cross-project needs an explicit scope:"global")' : 'scope:"global" (default)'}, 5-10 results, and short terms from error text/feature/config/file/decision. The current session and its subagent sessions are excluded by default; pass excludeCurrentSession:false to search them (or use scope:"session"). Use role:"user" for requirements/decisions. Use expand:"context" or "message" when top-hit evidence will avoid a follow-up.
 
 If memory exists, store only durable findings: preferences, project decisions, reusable root causes, environment facts, behavior corrections, or repeatable success/failure. Do not store ephemeral details, one-off commands, transient errors, or implementation minutiae.
 
-Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (invalid pattern errors). Smart/fuzzy include score/matchedTerms and fall back to literal. Results are snippets; use recall_get/context for full content. coverage reports what was searched; coverage.loadErrors reports partial session-load failures.`,
+Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (invalid pattern errors). Smart/fuzzy include score/matchedTerms and fall back to literal. Results are snippets; use recall_get/context for full content. coverage reports what was searched; coverage.loadErrors reports partial session-load failures.${mode ? '\n\nEphemeral mode is configured: no persistent content index (coverage.cards full:0/storeRecency:0 is the configured state, not an empty history). Ranking is metadata-quality; for content recall rely on drilled results, deep sweeps, or name sessions via sessions:[...]. The default scope in this mode is "project" (not global): limitedBy:["scope"] on defaulted queries is configured behavior, and an explicit scope:"global" always works.' : ""}`,
     args: {
       query: tool.schema.string().min(1).describe("Search text"),
-      scope: tool.schema
-        .enum(["session", "project", "global"])
-        .default("global")
-        .describe("global=all projects, project=current project, session=current only"),
+      // Ephemeral mode deliberately uses `.optional()` with NO schema default:
+      // a schema `.default("project")` would materialize on parsed callers and
+      // destroy explicitness detection (an omitted scope must stay
+      // distinguishable from an explicit one for the deep gate), while a bare
+      // default-less enum is REQUIRED in Zod — the host validates even though
+      // it discards the parse — so omitted calls would fail and the
+      // model-facing JSON schema would demand `scope`. The runtime pickEnum
+      // fallback resolves undefined → "project" instead.
+      scope: mode
+        ? tool.schema
+            .enum(["session", "project", "global"])
+            .optional()
+            .describe(
+              "global=all projects, project=current project (default in this mode), session=current only",
+            )
+        : tool.schema
+            .enum(["session", "project", "global"])
+            .default("global")
+            .describe("global=all projects, project=current project, session=current only"),
       match: tool.schema
         .enum(["literal", "smart", "fuzzy", "regex"])
         .default("literal")
@@ -1819,6 +1856,9 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
         .describe("Snippet context chars"),
     },
     async execute(args, ctx: ToolContext): Promise<string> {
+      // Ephemeral cards-lite refresh trigger: fire-and-forget at query entry;
+      // this query proceeds on the current snapshot (see lite-refresh.ts).
+      maybeRefresh?.();
       // Defensive defaults and validation: some callers (e.g. live MCP) may
       // bypass Zod and forward raw caller args. Coerce missing values to safe
       // defaults and clamp/whitelist invalid values rather than trusting Zod.
@@ -1855,11 +1895,16 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
         return clampNumber(label, Math.trunc(value), min, max, defenseWarnings);
       };
 
+      // Runtime default: ephemeral mode resolves an omitted/invalid scope to
+      // "project" (metadata-only ranking over the global corpus is noise);
+      // persistent mode keeps "global". Under both parsed and raw execution
+      // `args.scope === undefined` reliably means "not supplied" (the
+      // ephemeral schema has no Zod default to materialize).
       const scope = pickEnum(
         "scope",
         args.scope,
         ["session", "project", "global"] as const,
-        "global",
+        mode ? "project" : "global",
       );
       const matchMode = pickEnum(
         "match",
@@ -2082,8 +2127,18 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
               "deepCursor is malformed; drop it to start a new deep sweep. Pass only a nextCursor returned by a prior deep response.",
             );
           }
+          // Explicitness fork — NOT a redefinition of `projectScope`: the gate
+          // counts only explicitly supplied, project-valued constraints (raw
+          // scope "project", project:true), so a mode-defaulted resolved scope
+          // never satisfies it. (Explicit scope "session" never sets
+          // `bucketDirectory`; session-scoped deep passes via `hasSingleTarget`
+          // below.) Unconditional in both modes — byte-identical in persistent,
+          // and no mode branch in security-adjacent logic. `projectScope` and
+          // all consumers of the RESOLVED scope keep the resolved value; that
+          // is what makes the ephemeral default do anything. Used ONLY here.
+          const explicitProjectScope = args.scope === "project" || args.project === true;
           const projectConstraint =
-            directoryFilter != null || (projectScope && bucketDirectory != null);
+            directoryFilter != null || (explicitProjectScope && bucketDirectory != null);
           // An explicit sessionID (or scope:"session" with a current session) is
           // itself a concrete scope — deep treats it as sessions:[that id].
           const hasSingleTarget =
@@ -2723,8 +2778,14 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
           );
         }
         if (cardsCoverage.degraded) {
+          // Mode-gated wording: configured ephemeral operation is not damage.
+          // The driver-missing degraded path keeps its wording byte-identical
+          // (the eval pins /metadata-only|degraded/i; the ephemeral wording
+          // intentionally matches neither).
           normalized.warnings.push(
-            "Cards are metadata-only (card store unavailable); content search is degraded.",
+            mode
+              ? "Ephemeral mode (configured): session cards are metadata-quality; content matches come from live drill, not a persistent index."
+              : "Cards are metadata-only (card store unavailable); content search is degraded.",
           );
         } else if (cardsCoverage.fullCards < cardsCoverage.totalCards) {
           normalized.warnings.push(
@@ -2762,6 +2823,7 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
           }
           const sessionsSkipped = Object.values(skippedByReason).reduce((a, b) => a + b, 0);
           const coverage: SearchCoverage = {
+            ...(mode != null && { mode }),
             totalSessionsKnown: false,
             sessionsDiscovered: cardsCoverage.totalCards,
             sessionsEligible,

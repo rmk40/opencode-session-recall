@@ -133,6 +133,7 @@ A search tool only helps if the agent reaches for it. The plugin has three featu
 | `semanticWeight`   | `number`  | `0.35`                     | Blend weight for the semantic signal, clamped to 0.05–0.95                                                                                    |
 | `semanticModel`    | `string`  | `minishlab/potion-base-8M` | Hugging Face model id for the static-embedding model                                                                                          |
 | `summaries`        | `object`  | off                        | Opt-in LLM card summaries: `{ enabled, model: "providerID/modelID", agent?, maxPromptsPerPass? }`. See [LLM summaries](#llm-summaries-opt-in) |
+| `mode`             | `string`  | `"persistent"`             | `"ephemeral"` runs with no store and no on-disk artifacts. See [Ephemeral mode](#ephemeral-mode-opt-in)                                       |
 
 Advanced limits (all have sensible defaults):
 
@@ -277,7 +278,7 @@ Compaction in OpenCode doesn't delete anything. Tool outputs get a `compacted` t
 This plugin reads them back through the OpenCode SDK:
 
 - No direct database queries. All access goes through the SDK; opencode's database stays the sole source of truth.
-- One derived index, built in the background and safe to delete. There is nothing for you to set up or sync.
+- One derived index, built in the background and safe to delete. There is nothing for you to set up or sync. ([Ephemeral mode](#ephemeral-mode-opt-in) skips the index entirely.)
 - Every message fetch is bounded and paginated. A search never pulls a whole session into memory, and a background distiller never competes with a live query. (Metadata listings, like the parent/child lookup, are single bounded-in-practice calls.)
 - Long-running work respects abort signals.
 - Cross-project search is on by default; disable it with `global: false`.
@@ -285,7 +286,7 @@ This plugin reads them back through the OpenCode SDK:
 
 ### The derived store
 
-A background distiller reads history through the SDK once and writes a compact index to a local SQLite file (`~/.cache/opencode-session-recall/store-v1.db`). The first cold pass walks every session one at a time, distills each into a card plus a set of slim index rows, and checkpoints as it goes; after that, opencode's `session.idle` and related events drive incremental updates, so the store stays current without polling. It is derived and versioned: delete the file and it rebuilds itself in the background, and a store written by a newer build than yours makes the plugin fall back to a degraded metadata-only mode rather than misread it. Multiple opencode processes share the file safely through a single-writer lease. The store uses the runtime's built-in SQLite (`bun:sqlite`, with `node:sqlite` for tests), so it adds no npm dependency; if neither driver is available, the plugin degrades to in-memory metadata cards with no persistence.
+Everything in this section describes the default persistent mode; [ephemeral mode](#ephemeral-mode-opt-in) opts out of all of it. A background distiller reads history through the SDK once and writes a compact index to a local SQLite file (`~/.cache/opencode-session-recall/store-v1.db`). The first cold pass walks every session one at a time, distills each into a card plus a set of slim index rows, and checkpoints as it goes; after that, opencode's `session.idle` and related events drive incremental updates, so the store stays current without polling. It is derived and versioned: delete the file and it rebuilds itself in the background, and a store written by a newer build than yours makes the plugin fall back to a degraded metadata-only mode rather than misread it. Multiple opencode processes share the file safely through a single-writer lease. The store uses the runtime's built-in SQLite (`bun:sqlite`, with `node:sqlite` for tests), so it adds no npm dependency; if neither driver is available, the plugin degrades to in-memory metadata cards with no persistence.
 
 ### Two tiers: cards and the slim index
 
@@ -305,6 +306,26 @@ The one thing tiers 1 through 2 cannot serve is a needle that exists only in a t
 ### Degraded modes
 
 The plugin always answers something. With no SQLite driver, it serves metadata-only cards built from the session list. While the cold pass is still running, it serves whatever is distilled so far and reports the distilled fraction in `coverage.cards`. A schema newer than the running build, or a corrupt file, triggers a background rebuild while the degraded path serves in the meantime.
+
+### Ephemeral mode (opt-in)
+
+`mode: "ephemeral"` runs the plugin with no store at all: no SQLite file is opened, nothing is written under `~/.cache/opencode-session-recall`, and no background content indexing runs. Session ranking works from metadata cards built from the session list, and content search still happens, live, through the bounded drill and deep paths. `coverage.mode` reports `"ephemeral"` so a miss stays legible.
+
+```jsonc
+{
+  "plugin": [["opencode-session-recall", { "mode": "ephemeral" }]],
+}
+```
+
+What you give up, and what it costs:
+
+- **No content index.** Ranking is metadata-quality (titles, directories, recency) rather than card-quality. Content matches come from live drill at query time instead of an index built once in the background, so the content cost is per query: bounded by the same drill session/page/char caps, but recurring. The per-query cost is higher than persistent mode's because there are no index anchors to aim at: drill pages newest-first through up to `drillSessions` sessions instead of jumping to known hits. The mode's only background network work is the one bounded startup `session.list` plus a metadata refresh at most once per 60 seconds (queries trigger it; `autoRecall` can too).
+- **Features that need the store are off.** `semantic` is force-disabled (its model cache is itself a disk artifact), `summaries` never runs, `compactionRecall` is inert, and `recall_sessions` listings lose their card enrichment.
+- **The default scope is `"project"`, not `"global"`.** Metadata-only ranking over a many-thousand-session global corpus is noise, so a defaulted query stays in the current project and reports `limitedBy: ["scope"]`. An explicit `scope: "global"` works as always.
+
+Switching an existing install to ephemeral does not clean up after persistent mode: the old store file stays where it was, and any orphaned `[recall-summarizer]` worker sessions stay too, because ephemeral never holds the lease that sweeps them. Delete `~/.cache/opencode-session-recall/` yourself if you want it gone.
+
+Two things ephemeral mode is not: `coldPass: false` only skips the background distiller and still creates the cache directory and store file, so it is not a no-artifact setting. And if what you want is full search quality without persistent disk artifacts, point `storePath` at a tmpfs or ramdisk instead; that keeps the whole index, on storage that vanishes on reboot.
 
 ### Semantic search (opt-in)
 

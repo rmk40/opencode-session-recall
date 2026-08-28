@@ -198,7 +198,11 @@ export type CardsRuntime = {
   /** Semantic-layer diagnostics, or undefined when semantic is not configured on.
    *  Reflects live readiness and the current vector count. */
   semanticStatus(): SemanticStatus | undefined;
-  /** Force the next rank() to rebuild from the source (tests). */
+  /** Force the next card access to rebuild from the source, bypassing the
+   *  refresh-interval gate. Production caller: the ephemeral cards-lite
+   *  refresh controller after a successful list (lite-refresh.ts) — the sole
+   *  rebuild signal for the lite source, whose `revision()` stays a pure
+   *  `() => undefined`. Also used by tests. */
   invalidate(): void;
   /** Prevent deferred semantic warm-up from touching its source after shutdown. */
   dispose(): void;

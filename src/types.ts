@@ -106,6 +106,10 @@ export type SearchSuggestion = {
 };
 
 export type SearchCoverage = {
+  /** Present only when the plugin is configured in ephemeral mode: cards are
+   *  metadata-quality by configuration (no persistent index), not by failure.
+   *  Never set on the accidental driver-missing degraded path. */
+  mode?: "ephemeral";
   totalSessionsAvailable?: number;
   totalSessionsKnown: boolean;
   sessionsDiscovered: number;
