@@ -44,6 +44,14 @@ const DEFAULT_IDLE_DEBOUNCE_MS = 3_000;
 /** Abort a drain after this many prompts fail in a row: a misconfigured model
  *  must not burn the whole per-pass budget. Latches until the next cold pass. */
 const MAX_CONSECUTIVE_FAILURES = 3;
+/** Leftover owned-worker deletes retried per batch (aggregate bound: without
+ *  it, persistent failures make batch k drain k-1 ids — O(n²) deletes, or
+ *  worse, serial 15s timeouts wedging the pass while holding the lease). */
+const MAX_DRAIN_PER_BATCH = 3;
+/** Failed delete attempts per owned worker before giving up on it. The next
+ *  holder's sentinel-based orphan sweep is the backstop, and sentinel-titled
+ *  sessions are excluded from every recall path, so giving up is safe. */
+const MAX_DELETE_ATTEMPTS = 2;
 const INVENTORY_TOKENS = 24;
 const FILES_SHOWN = 6;
 const TOOLS_SHOWN = 8;
@@ -110,6 +118,9 @@ export type SummarizerDeps = {
   promptTimeoutMs?: number;
   shutdownTimeoutMs?: number;
   idleDebounceMs?: number;
+  /** Failed delete attempts per owned worker before the give-up drops it
+   *  (spec: MAX_DELETE_ATTEMPTS). */
+  maxDeleteAttempts?: number;
 };
 
 export type Summarizer = {
@@ -256,6 +267,7 @@ export function createSummarizer(deps: SummarizerDeps): Summarizer {
   const politenessMs = Math.max(0, deps.politenessMs ?? DEFAULT_POLITENESS_MS);
   const promptTimeoutMs = Math.max(1, deps.promptTimeoutMs ?? DEFAULT_PROMPT_TIMEOUT_MS);
   const shutdownTimeoutMs = Math.max(1, deps.shutdownTimeoutMs ?? DEFAULT_SHUTDOWN_TIMEOUT_MS);
+  const maxDeleteAttempts = Math.max(1, deps.maxDeleteAttempts ?? MAX_DELETE_ATTEMPTS);
   const idleDebounceMs = Math.max(0, deps.idleDebounceMs ?? DEFAULT_IDLE_DEBOUNCE_MS);
   const maxPromptsPerPass = Math.max(1, config.maxPromptsPerPass ?? DEFAULT_MAX_PROMPTS_PER_PASS);
 
@@ -280,6 +292,8 @@ export function createSummarizer(deps: SummarizerDeps): Summarizer {
   let stopPromise: Promise<void> | undefined;
   const debounceTimers = new Map<string, Timer>();
   const ownedWorkers = new Set<string>();
+  /** Failed delete attempts per owned worker id (see MAX_DELETE_ATTEMPTS). */
+  const deleteAttempts = new Map<string, number>();
   const workerTitle = summarizerWorkerTitle(ownerToken);
 
   // ── Worker session lifecycle ──
@@ -358,6 +372,7 @@ export function createSummarizer(deps: SummarizerDeps): Summarizer {
 
   async function deleteOwnedWorker(sessionID: string): Promise<void> {
     if (!ownedWorkers.has(sessionID)) return;
+    let succeeded = false;
     try {
       // NOT lease-gated: this instance created the worker and uniquely owns it;
       // losing the SQLite writer lease mid-batch must not leak the session.
@@ -366,23 +381,42 @@ export function createSummarizer(deps: SummarizerDeps): Summarizer {
       );
       // Prune only on CONFIRMED success: an SDK error, rejection, or timeout
       // keeps the id owned so drainOwnedWorkers retries it at the start of the
-      // next batch. (Retention only helps THIS instance — any next lease
-      // holder's orphan sweep deletes by sentinel title regardless of our
-      // bookkeeping.)
-      if (resp && !resp.error) ownedWorkers.delete(sessionID);
+      // next batch (up to MAX_DELETE_ATTEMPTS failures).
+      succeeded = resp != null && !resp.error;
     } catch {
       // Best-effort; a lingering sentinel session is excluded everywhere and
       // swept by the next holder's orphan cleanup.
+    }
+    if (succeeded) {
+      ownedWorkers.delete(sessionID);
+      deleteAttempts.delete(sessionID);
+      return;
+    }
+    const attempts = (deleteAttempts.get(sessionID) ?? 0) + 1;
+    if (attempts >= maxDeleteAttempts) {
+      // Give up: drop the id so the retained set stays bounded. Safe because
+      // the next lease holder's sentinel-based orphan sweep deletes it, and
+      // sentinel-titled sessions are excluded from every recall path meanwhile.
+      ownedWorkers.delete(sessionID);
+      deleteAttempts.delete(sessionID);
+      logMsg(
+        `worker ${sessionID} delete gave up after ${attempts} attempts; orphan sweep will reap it`,
+      );
+    } else {
+      deleteAttempts.set(sessionID, attempts);
     }
   }
 
   /** Best-effort retry of leftover owned ids (deletes that failed or timed out
    *  in earlier batches). Runs at the start of each batch, before creating the
-   *  new worker. Bounded: at most a few ids, each delete already capped by
-   *  settleWithin inside ownedWorkerSdk; success prunes, failure keeps the id
-   *  for the next batch's drain. */
+   *  new worker. Bounds: at most MAX_DRAIN_PER_BATCH deletes per batch (each
+   *  already settleWithin-capped), and each id is retried at most
+   *  MAX_DELETE_ATTEMPTS times before deleteOwnedWorker drops it — the next
+   *  holder's sentinel-based orphan sweep is the backstop for dropped ids.
+   *  Success prunes; a failure under the attempt cap keeps the id for the next
+   *  batch's drain. */
   async function drainOwnedWorkers(): Promise<void> {
-    for (const sessionID of [...ownedWorkers]) {
+    for (const sessionID of [...ownedWorkers].slice(0, MAX_DRAIN_PER_BATCH)) {
       await deleteOwnedWorker(sessionID);
     }
   }
@@ -437,6 +471,14 @@ export function createSummarizer(deps: SummarizerDeps): Summarizer {
   async function promptBatchFor(cards: Card[]): Promise<Map<string, string>> {
     // Retry any leftover owned workers from earlier batches before adding one.
     await drainOwnedWorkers();
+    // Bounded-backlog policy: a still-saturated backlog after the drain means
+    // deletes are persistently failing. Skip this batch rather than creating
+    // yet another worker that will likely join the leak; the per-id give-up in
+    // deleteOwnedWorker shrinks the backlog so a later batch proceeds.
+    if (ownedWorkers.size >= MAX_DRAIN_PER_BATCH) {
+      logMsg(`skipping batch: ${ownedWorkers.size} owned workers still undeleted after drain`);
+      return new Map();
+    }
     const workerId = await createWorker();
     if (!workerId) return new Map();
     try {

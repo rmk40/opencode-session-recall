@@ -448,8 +448,19 @@ const server: Plugin = async (ctx, options) => {
         };
         await settleWithin(distiller.stop(), SHUTDOWN_TIMEOUT_MS);
         const ops = await settleWithin(Promise.allSettled([...operations]), SHUTDOWN_TIMEOUT_MS);
-        if (ops.timedOut) void Promise.allSettled([...operations]).then(closeDb);
-        else closeDb();
+        if (ops.timedOut) {
+          // Diagnosable, not silent: until the stragglers settle, the SQLite
+          // handle stays open — this line is the marker if it never closes.
+          pluginLog(
+            `dispose: ${operations.size} operation(s) outlived the ${SHUTDOWN_TIMEOUT_MS}ms bound; deferring SQLite close until they settle`,
+          );
+          void Promise.allSettled([...operations]).then(() => {
+            pluginLog("dispose: deferred SQLite close firing (stragglers settled)");
+            closeDb();
+          });
+        } else {
+          closeDb();
+        }
       })();
       return disposePromise;
     },

@@ -32,6 +32,7 @@ import {
   textPart,
   toolResultText,
   userMessage,
+  type SummarizerClient,
   type SummaryPromptCall,
   type SummaryPromptResult,
 } from "./helpers.js";
@@ -425,12 +426,81 @@ describe("summarizer worker lifecycle", () => {
       return realDelete(params);
     };
 
-    await makeSummarizer(store, client.client, gate, { batchSize: 1 }).runColdPass();
+    const summarizer = makeSummarizer(store, client.client, gate, { batchSize: 1 });
+    await summarizer.runColdPass();
 
     // Batch 1's delete of worker-1 failed; batch 2's drain retried worker-1
     // (successfully) before its own worker-2 create+delete.
     expect(deletes).toEqual(["worker-1", "worker-1", "worker-2"]);
     expect(client.liveWorkers()).toHaveLength(0); // nothing leaked
+    await summarizer.stop();
+  });
+
+  /** Replace the fake client's delete with one that always fails, recording ids. */
+  function failAllDeletes(client: SummarizerClient): string[] {
+    const deletes: string[] = [];
+    (
+      client.client as unknown as {
+        session: { delete: (p: { sessionID: string }) => Promise<unknown> };
+      }
+    ).session.delete = async (params) => {
+      deletes.push(params.sessionID);
+      return { error: { data: { message: "delete always fails" } } };
+    };
+    return deletes;
+  }
+
+  it("gives up on a persistently failing delete after 2 attempts (set stays bounded)", async () => {
+    // Persistent delete failures must not grow ownedWorkers one id per batch
+    // (O(n^2) deletes / serial timeout wedge): each id is dropped after
+    // MAX_DELETE_ATTEMPTS (2) failures — the sentinel orphan sweep reaps it.
+    const store = await freshStore();
+    for (let i = 0; i < 4; i++) store.upsertCard(fullCard(`c${i}`, { timeUpdated: 2000 + i }));
+    const gate = createFetchGate({ concurrency: 2 });
+    const client = makeSummarizerClient(replyKeys(() => "s"));
+    const deletes = failAllDeletes(client);
+
+    const logs: string[] = [];
+    const summarizer = makeSummarizer(store, client.client, gate, {
+      batchSize: 1,
+      log: (message) => logs.push(message),
+    });
+    await summarizer.runColdPass();
+
+    // No id is delete-attempted more than twice (its own batch's finally plus
+    // at most one drain retry) before the give-up drops it.
+    const countsById = new Map<string, number>();
+    for (const id of deletes) countsById.set(id, (countsById.get(id) ?? 0) + 1);
+    for (const [id, count] of countsById) {
+      expect(count, `delete attempts for ${id}`).toBeLessThanOrEqual(2);
+    }
+    expect(logs.some((line) => line.includes("delete gave up after 2 attempts"))).toBe(true);
+    await summarizer.stop();
+  });
+
+  it("skips worker creation while the retained backlog stays saturated after a drain", async () => {
+    // Bounded-backlog policy: with the give-up delayed (high maxDeleteAttempts)
+    // the retained set grows to MAX_DRAIN_PER_BATCH (3); from then on each
+    // batch drains at most 3 and — still saturated — skips creating another
+    // worker instead of adding to the leak.
+    const store = await freshStore();
+    for (let i = 0; i < 6; i++) store.upsertCard(fullCard(`c${i}`, { timeUpdated: 2000 + i }));
+    const gate = createFetchGate({ concurrency: 2 });
+    const client = makeSummarizerClient(replyKeys(() => "s"));
+    failAllDeletes(client);
+
+    const logs: string[] = [];
+    const summarizer = makeSummarizer(store, client.client, gate, {
+      batchSize: 1,
+      maxDeleteAttempts: 100, // keep ids retained so the backlog saturates
+      log: (message) => logs.push(message),
+    });
+    await summarizer.runColdPass();
+
+    expect(logs.some((line) => line.includes("skipping batch"))).toBe(true);
+    // Only the pre-saturation batches created workers (3 = MAX_DRAIN_PER_BATCH).
+    expect(client.calls.creates.length).toBe(3);
+    await summarizer.stop();
   });
 
   it("disables tools and applies a deny-all permission on the worker prompt", async () => {
