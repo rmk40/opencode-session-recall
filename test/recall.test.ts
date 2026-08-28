@@ -2029,8 +2029,12 @@ describe("explicit shortlist includes uncarded sessions", () => {
     ];
   }
 
-  async function setup(h: FakeHarness = makeFakeHarness(), limits: Limits = TEST_LIMITS) {
-    const { deps, store, cleanup } = await makeRecallDeps(h, limits);
+  async function setup(
+    h: FakeHarness = makeFakeHarness(),
+    limits: Limits = TEST_LIMITS,
+    opts: Parameters<typeof makeRecallDeps>[2] = {},
+  ) {
+    const { deps, store, cleanup } = await makeRecallDeps(h, limits, opts);
     cleanups.push(cleanup);
     return { recall: search(h.client, h.unscoped, true, limits, deps), store };
   }
@@ -2058,7 +2062,7 @@ describe("explicit shortlist includes uncarded sessions", () => {
     expect(out.coverage?.sessionsEligible).toBe(2);
     expect(out.coverage?.sessionsSearched).toBe(2);
     expect(
-      out.warnings?.some((w) => /1 session id .*no card yet .*selected for direct/i.test(w)),
+      out.warnings?.some((w) => /1 session id .*no card visible .*selected for direct/i.test(w)),
     ).toBe(true);
   });
 
@@ -2075,7 +2079,7 @@ describe("explicit shortlist includes uncarded sessions", () => {
     expect(out.coverage?.sessionsEligible).toBe(1);
     expect(out.coverage?.sessionsSearched).toBe(1);
     expect(out.results.some((r) => r.sessionID === "s-only-young")).toBe(true);
-    expect(out.warnings?.some((w) => /no card yet/i.test(w))).toBe(true);
+    expect(out.warnings?.some((w) => /no card visible/i.test(w))).toBe(true);
   });
 
   it("tolerates a nonexistent id: ok:true, other sessions still searched", async () => {
@@ -2147,11 +2151,14 @@ describe("explicit shortlist includes uncarded sessions", () => {
     expect(out.ok).toBe(true);
     expect(out.results.some((r) => r.sessionID === "s-young-bounded")).toBe(false);
     expect(out.coverage?.sessionsEligible).toBe(0);
-    expect(out.warnings?.some((w) => /no card yet/i.test(w))).toBeFalsy();
+    expect(out.warnings?.some((w) => /no card visible/i.test(w))).toBeFalsy();
   });
 
-  it("falls back to a selection-bypass drill when the metadata fetch throws, and says so", async () => {
-    const h = makeFakeHarness({ getThrows: new Set(["s-unverifiable"]) });
+  it("falls back to a selection-bypass drill when BOTH metadata probes throw, and says so", async () => {
+    const h = makeFakeHarness({
+      getThrows: new Set(["s-unverifiable"]),
+      unscopedGetThrows: new Set(["s-unverifiable"]),
+    });
     const { recall } = await setup(h);
     addUncarded(h, "s-unverifiable", "Unverifiable", "blenkinsop needle", NOW - 60_000);
 
@@ -2233,12 +2240,14 @@ describe("explicit shortlist includes uncarded sessions", () => {
     expect(out.results.some((r) => r.sessionID === "s-worker-young")).toBe(false);
     expect(out.coverage?.sessionsEligible).toBe(0);
     expect(out.coverage?.sessionsSearched).toBe(0);
-    expect(out.warnings?.some((w) => /no card yet/i.test(w))).toBeFalsy();
+    expect(out.warnings?.some((w) => /no card visible/i.test(w))).toBeFalsy();
   });
 
   it("drills a store-only fresh card the facade snapshot has not seen (refresh window)", async () => {
     const h = makeFakeHarness();
-    const { recall, store } = await setup(h);
+    // Freeze the facade clock: refreshIfStale never re-checks the revision, so
+    // the pre-seed snapshot deterministically survives the second seed below.
+    const { recall, store } = await setup(h, TEST_LIMITS, { cardsNow: () => 1_000 });
     // Force the runtime to take its snapshot of the seeded store NOW.
     await runTool<SearchOutput>(recall, { query: "warmup" });
     // A fresh session is carded in the STORE only (snapshot is ≤5s stale).
@@ -2262,7 +2271,7 @@ describe("explicit shortlist includes uncarded sessions", () => {
     expect(out.ok).toBe(true);
     expect(out.results.some((r) => r.sessionID === "s-store-only")).toBe(true);
     expect(out.coverage?.sessionsEligible).toBe(1);
-    expect(out.warnings?.some((w) => /no card yet/i.test(w))).toBe(true);
+    expect(out.warnings?.some((w) => /no card visible/i.test(w))).toBe(true);
   });
 
   it("skips an uncarded member named by excludeSessionID", async () => {
@@ -2278,6 +2287,25 @@ describe("explicit shortlist includes uncarded sessions", () => {
     expect(out.ok).toBe(true);
     expect(out.results.some((r) => r.sessionID === "s-excluded-young")).toBe(false);
     expect(out.coverage?.sessionsSearched).toBe(0);
+  });
+
+  it("searches an uncarded own session under the IMPLICIT excludeCurrent default", async () => {
+    const h = makeFakeHarness();
+    const { recall } = await setup(h);
+    addUncarded(h, "s-own-young", "Own Young", "krellbore only here");
+    // No excludeCurrentSession arg: the implicit broad-discovery default must
+    // not drop a session the caller explicitly named — that would reproduce
+    // the sessionsEligible:0 signature for exactly the young-session case.
+    const { ctx } = makeContext({ sessionID: "s-own-young" });
+
+    const out = await runTool<SearchOutput>(
+      recall,
+      { query: "krellbore", sessions: ["s-own-young"] },
+      ctx,
+    );
+    expect(out.ok).toBe(true);
+    expect(out.coverage?.sessionsEligible).toBe(1);
+    expect(out.results.some((r) => r.sessionID === "s-own-young")).toBe(true);
   });
 
   it("skips an uncarded current session when excludeCurrentSession:true", async () => {
@@ -2313,7 +2341,7 @@ describe("explicit shortlist includes uncarded sessions", () => {
     expect(out.ok).toBe(true);
     expect(
       out.warnings?.some((w) =>
-        /2 session ids .*no card yet .*they were selected for direct drilling/i.test(w),
+        /2 session ids .*no card visible .*they were selected for direct drilling/i.test(w),
       ),
     ).toBe(true);
   });
@@ -2345,13 +2373,95 @@ describe("explicit shortlist includes uncarded sessions", () => {
     expect(out.results.some((r) => r.sessionID === "s-cap-young")).toBe(false);
     expect(out.coverage?.sessionsEligible).toBe(2);
     expect(out.coverage?.limitedBy).toContain("sessionsLimit");
-    expect(out.warnings?.some((w) => /no card yet/i.test(w))).toBeFalsy();
+    expect(out.warnings?.some((w) => /no card visible/i.test(w))).toBeFalsy();
     expect(
       out.warnings?.some((w) =>
-        /1 named session id was not searched: the session cap was filled by indexed sessions/i.test(
-          w,
-        ),
+        /1 named session id was not searched: the session cap was reached/i.test(w),
       ),
     ).toBe(true);
+  });
+
+  it("bounds the metadata probe fan-out to the cap (lazy chunked probing)", async () => {
+    const h = makeFakeHarness();
+    const { recall } = await setup(h);
+    const ids: string[] = [];
+    for (let i = 0; i < 6; i++) {
+      const id = `s-fan-${i}`;
+      ids.push(id);
+      addUncarded(h, id, `Fan ${i}`, `dribblet ${i}`);
+    }
+
+    const before = h.calls.get.length;
+    const out = await runTool<SearchOutput>(recall, {
+      query: "dribblet",
+      sessions: ids,
+      sessionLimit: 1,
+    });
+    expect(out.ok).toBe(true);
+    expect(out.coverage?.sessionsSearched).toBe(1);
+    // Only the first parallel chunk (4) is probed for a cap of 1 — never all 6.
+    const probeCalls = h.calls.get.slice(before).filter((c) => c.sessionID.startsWith("s-fan-"));
+    expect(probeCalls.length).toBeLessThanOrEqual(4);
+    // The remainder is reported as not searched, not silently dropped.
+    expect(
+      out.warnings?.some((w) =>
+        /5 named session ids were not searched: the session cap was reached/i.test(w),
+      ),
+    ).toBe(true);
+    expect(out.coverage?.sessionsEligible).toBe(6);
+  });
+
+  it("clamps a Zod-bypassed oversized sessions list with a warning", async () => {
+    const h = makeFakeHarness();
+    const { recall } = await setup(h);
+    addUncarded(h, "s-clamp-first", "Clamp First", "wobblegate needle");
+    // 150 ids, the real one first; the host-bypass path must clamp to 100.
+    const ids = ["s-clamp-first", ...Array.from({ length: 149 }, (_, i) => `s-clamp-pad-${i}`)];
+
+    const out = await runToolRaw<SearchOutput>(recall, {
+      query: "wobblegate",
+      sessions: ids,
+      sessionLimit: 1,
+    });
+    expect(out.ok).toBe(true);
+    expect(
+      out.warnings?.some((w) =>
+        /sessions was truncated to the first 100 ids \(150 given\)/i.test(w),
+      ),
+    ).toBe(true);
+    expect(out.results.some((r) => r.sessionID === "s-clamp-first")).toBe(true);
+  });
+
+  it("resolves a cross-project id via the unscoped probe when the scoped get fails", async () => {
+    // Scoped get throws; the unscoped retry succeeds → verified target with
+    // real metadata (no unverified fallback, bounds still apply).
+    const h = makeFakeHarness({ getThrows: new Set(["s-crossproj"]) });
+    const { recall } = await setup(h);
+    addUncarded(h, "s-crossproj", "Cross Project", "pindlewort needle");
+
+    const out = await runTool<SearchOutput>(recall, {
+      query: "pindlewort",
+      sessions: ["s-crossproj"],
+    });
+    expect(out.ok).toBe(true);
+    expect(out.results.some((r) => r.sessionID === "s-crossproj")).toBe(true);
+    expect(out.warnings?.some((w) => /could not be verified/i.test(w))).toBeFalsy();
+  });
+
+  it("excludes a truly-uncarded worker whose scoped probe fails but unscoped succeeds", async () => {
+    // The leak-relevant retry case: the worker lives outside the caller's
+    // scope (scoped get throws), but the unscoped probe finds its sentinel
+    // title → excluded, not admitted unverified.
+    const h = makeFakeHarness({ getThrows: new Set(["s-worker-cross"]) });
+    const { recall } = await setup(h);
+    addUncarded(h, "s-worker-cross", "[recall-summarizer] owner=cross", "glimfrost digest text");
+
+    const out = await runTool<SearchOutput>(recall, {
+      query: "glimfrost",
+      sessions: ["s-worker-cross"],
+    });
+    expect(out.ok).toBe(true);
+    expect(out.results.some((r) => r.sessionID === "s-worker-cross")).toBe(false);
+    expect(out.coverage?.sessionsSearched).toBe(0);
   });
 });

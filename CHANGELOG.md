@@ -19,28 +19,40 @@ Based on PR #3 by @kernel-oops with maintainer fixes.
   is decided against the same cards-facade snapshot the carded filter reads, so a
   session carded milliseconds ago (store has it, ≤5s-stale snapshot does not) is
   still drilled rather than falling between the two views.
-- **Uncarded shortlist ids get a live metadata probe** (`session.get` per id,
-  bounded by the shortlist size). On success: a summarizer worker title excludes
-  the id entirely (closing a content leak — a worker's prompt/reply is plain text
-  the part-level filters do not catch), `before`/`after` bounds apply against the
-  session's `time.updated` (previously a young session could satisfy a
-  `before: <90 days ago>` bound), and the target carries its real title/directory.
-  On failure (cross-project, deleted): the id is drilled anyway with selection
-  bounds bypassed, and the warning says so. The `title` filter never applies to
-  uncarded ids. `excludeSessionID` and `excludeCurrentSession: true` both skip an
-  uncarded id.
+- **Uncarded shortlist ids get a live metadata probe.** Probes run lazily in
+  small parallel chunks and stop once the session cap is filled, so a long
+  shortlist with a small `sessionLimit` never fans out a probe per id. On
+  success: a summarizer worker title excludes the id entirely (closing a content
+  leak — a worker's prompt/reply is plain text the part-level filters do not
+  catch), `before`/`after` bounds apply against the session's `time.updated`
+  (previously a young session could satisfy a `before: <90 days ago>` bound),
+  and the target carries its real title/directory. A failed scoped probe retries
+  once on the unscoped client (workers and cross-project sessions live there);
+  only when both fail is the id drilled unverified with selection bounds
+  bypassed — and the warning says so. The `title` filter never applies to
+  uncarded ids. `excludeSessionID` skips an uncarded id; the current session is
+  skipped only on an EXPLICIT `excludeCurrentSession: true` (the implicit
+  broad-discovery default does not drop a session the caller named by id).
+- **Deep resume honors the same guards.** A `deepCursor` resume that readmits
+  uncarded ids via a repeated `sessions: [...]` arg routes them through the
+  identical probe/worker-exclusion/bounds path instead of sweeping them
+  unguarded.
+- **`sessions` is capped at 100 ids** (schema max plus a defensive clamp with a
+  warning on the Zod-bypass host path).
 - **Coverage semantics:** uncarded shortlist members count toward
   `sessionsEligible` (carded members that pass filters + uncarded ids admitted
-  after the probe). The session cap fills carded-first; uncarded ids rank last.
+  or cap-deferred). The session cap fills carded-first; uncarded ids rank last.
 - **New warnings:**
-  - `N session id(s) in the shortlist has/have no card yet (not indexed); it was/they
-were selected for direct drilling.` — with a suffix `M could not be verified
-(metadata fetch failed), so time bounds were not applied.` when probes failed.
-  - `N named session id(s) was/were not searched: the session cap was filled by
-indexed sessions.` — when the cap truncates uncarded ids.
+  - `N session id(s) in the shortlist has/have no card visible to this search yet
+(not yet indexed, or the index snapshot lags); it was/they were selected for
+direct drilling.` — with a suffix `M could not be verified (metadata fetch
+failed), so selection time bounds were not applied.` when both probes failed.
+  - `N named session id(s) was/were not searched: the session cap was reached.`
+    — when the cap truncates uncarded ids.
   - The deep-resume drop warning now suggests repeating `sessions: [...]`
     alongside the cursor, since an untrusted cursor alone readmits only ids the
-    card store knows.
+    card store knows (also documented on the `deepCursor` arg, in the
+    `nextCursor` type contract, and in the README).
 
 ### Added
 

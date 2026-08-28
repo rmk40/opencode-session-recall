@@ -157,9 +157,9 @@ describe("deep scope validation", () => {
       expect(out.coverage?.deep?.sessionsCovered).toBe(1);
       expect(out.coverage?.sessionsEligible).toBe(1);
       expect(out.results.some((r) => r.sessionID === "s-deep-young")).toBe(true);
-      expect(out.warnings?.some((w) => /no card yet .*selected for direct drilling/i.test(w))).toBe(
-        true,
-      );
+      expect(
+        out.warnings?.some((w) => /no card visible .*selected for direct drilling/i.test(w)),
+      ).toBe(true);
     } finally {
       cleanup();
     }
@@ -200,6 +200,58 @@ describe("deep scope validation", () => {
       expect(currentExcluded.ok).toBe(true);
       expect(currentExcluded.results.some((r) => r.sessionID === "s-deep-excl")).toBe(false);
       expect(currentExcluded.coverage?.sessionsSearched).toBe(0);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("resume + repeated sessions applies the uncarded guards (worker leak closed)", async () => {
+    const h = makeFakeHarness();
+    const { deps, cleanup } = await makeRecallDeps(h);
+    // A truly-uncarded summarizer worker: no card anywhere, sentinel title only
+    // reachable via the live metadata probe. Readmitted on resume purely via
+    // the repeated sessions arg — the guard must still fire.
+    const worker = session(
+      "s-resume-worker",
+      "[recall-summarizer] owner=res",
+      PROJECT_DIR,
+      NOW - 1_000,
+    );
+    addSession(h, worker, [
+      bundle(userMessage("m-resume-worker-1", worker.id, NOW - 2_000), [
+        textPart("p-resume-worker-1", worker.id, "m-resume-worker-1", "snorkelwick digest text"),
+      ]),
+    ]);
+    // A legitimate uncarded session alongside it, to prove the guarded path
+    // still admits ordinary ids on resume.
+    const young = session("s-resume-young", "Resume Young", PROJECT_DIR, NOW - 1_000);
+    addSession(h, young, [
+      bundle(userMessage("m-resume-young-1", young.id, NOW - 2_000), [
+        textPart("p-resume-young-1", young.id, "m-resume-young-1", "snorkelwick real needle"),
+      ]),
+    ]);
+    const cursor = encodeDeepCursor({
+      v: 1,
+      remaining: ["s-resume-worker", "s-resume-young"],
+      current: null,
+      before: null,
+    });
+    try {
+      const recall = search(h.client, h.unscoped, true, TEST_LIMITS, deps);
+      const out = await runTool<SearchOutput>(recall, {
+        query: "snorkelwick",
+        deepCursor: cursor,
+        sessions: ["s-resume-worker", "s-resume-young"],
+      });
+      expect(out.ok).toBe(true);
+      // The worker is excluded by its live-fetched title; the ordinary
+      // uncarded id is swept with the uncarded warning.
+      expect(out.results.some((r) => r.sessionID === "s-resume-worker")).toBe(false);
+      expect(JSON.stringify(out.results)).not.toContain("digest text");
+      expect(out.results.some((r) => r.sessionID === "s-resume-young")).toBe(true);
+      expect(out.warnings?.some((w) => /no card visible .*selected for direct/i.test(w))).toBe(
+        true,
+      );
     } finally {
       cleanup();
     }

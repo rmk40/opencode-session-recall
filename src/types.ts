@@ -267,7 +267,9 @@ export type SearchOutput = {
   queryPlan?: { variants: string[]; selected: string[] };
   /** Present only for a deep sweep that stopped on a budget: an opaque
    *  continuation token; pass it back as `deepCursor` to resume exactly where
-   *  coverage stopped. */
+   *  coverage stopped. If the original request named uncarded sessions via
+   *  `sessions:[...]`, repeat that arg alongside the cursor — the untrusted
+   *  cursor alone only readmits ids the card store knows. */
   nextCursor?: string;
 };
 

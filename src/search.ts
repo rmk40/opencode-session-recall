@@ -110,6 +110,13 @@ const MAX_NEAR_MISSES = 3;
 /** Hard cap on how many targets a resumed deep cursor may reconstitute, so an
  *  untrusted cursor cannot inflate the swept set beyond a sane bound. */
 const MAX_RESUME_TARGETS = 500;
+/** Hard cap on the explicit `sessions` shortlist (schema max + defensive clamp
+ *  for the Zod-bypass host path). Matches the default session-list page size;
+ *  it also bounds the uncarded metadata-probe fan-out on the deep path. */
+const MAX_SHORTLIST_SESSIONS = 100;
+/** Uncarded metadata probes run in parallel chunks of this size, so a long
+ *  shortlist neither serializes every probe nor floods the fetch gate. */
+const PROBE_CHUNK = 4;
 const EXPANSION_TRUNCATED = "\n[truncated by recall expansion]";
 
 type ExpandMode = "none" | "context" | "message";
@@ -1739,9 +1746,10 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
         .describe("Max sessions to drill (caps drill fan-out)"),
       sessions: tool.schema
         .array(tool.schema.string())
+        .max(MAX_SHORTLIST_SESSIONS)
         .optional()
         .describe(
-          "Explicit session-id shortlist. Without deep: drill exactly these (skips card ranking for selection; results are still ranked). With deep: the sweep scope.",
+          `Explicit session-id shortlist (max ${MAX_SHORTLIST_SESSIONS}). Without deep: drill exactly these (skips card ranking for selection; results are still ranked). With deep: the sweep scope.`,
         ),
       deep: tool.schema
         .boolean()
@@ -1958,7 +1966,9 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
             );
       // Deep-mode args (defensively coerced against the Zod-bypass host path).
       const deepRequested = typeof args.deep === "boolean" ? args.deep : false;
-      const explicitSessions = Array.isArray(args.sessions)
+      // The schema caps `sessions` at MAX_SHORTLIST_SESSIONS, but the host may
+      // bypass Zod (AGENTS.md), so clamp defensively here too.
+      const explicitSessionsRaw = Array.isArray(args.sessions)
         ? [
             ...new Set(
               args.sessions
@@ -1967,6 +1977,12 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
             ),
           ]
         : [];
+      const explicitSessions = explicitSessionsRaw.slice(0, MAX_SHORTLIST_SESSIONS);
+      if (explicitSessionsRaw.length > MAX_SHORTLIST_SESSIONS) {
+        defenseWarnings.push(
+          `sessions was truncated to the first ${MAX_SHORTLIST_SESSIONS} ids (${explicitSessionsRaw.length} given).`,
+        );
+      }
       const deepCursorRaw = optionalString(args.deepCursor);
 
       const fail = (error: string): string =>
@@ -2129,8 +2145,12 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
           };
         };
 
-        /** Build a target for an id — from its card when known, else a minimal
-         *  target so a session with no card is still drilled/swept. */
+        /** Build a target for an id — from its facade card when known, else a
+         *  minimal blank target. Callers: the deep-resume path (facade-carded
+         *  ids reconstituted from a cursor) and the deep singleTarget sweep.
+         *  Uncarded shortlist ids do NOT come through here — they go through
+         *  `resolveUncarded`, which probes live metadata (worker exclusion,
+         *  time bounds, real title/directory). */
         const targetFor = (id: string): DrillTarget => {
           const card = cards.get(id);
           if (card) return registerTarget(card, relevanceOf(card));
@@ -2160,72 +2180,125 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
           ids.filter(
             (id) =>
               id !== excludeSessionID &&
-              // Respect the caller's current-session exclusion for uncarded
-              // ids. (The carded shortlist path predates this and does not
-              // apply excludeCurrent — an older inconsistency, out of scope.)
-              !(excludeCurrent && currentSessionID === id) &&
+              // Skip the current session only on an EXPLICIT
+              // excludeCurrentSession:true. The implicit default (true for
+              // broad discovery) must not apply here: the caller targeted a
+              // specific session by id, matching the scope-aware-default
+              // philosophy above — and silently dropping an uncarded own id
+              // would reproduce the original sessionsEligible:0 signature for
+              // exactly the young-session population this path exists for.
+              // (The carded shortlist half applies no exclusion at all — an
+              // older inconsistency, out of scope.)
+              !(excludeExplicit === true && currentSessionID === id) &&
               cards.get(id) == null &&
               !workerCard(id),
           );
 
-        /** Resolve uncarded shortlist ids into drill targets via a live
-         *  metadata probe (same `client.session.get` pattern as the
-         *  singleTarget path). On success: a summarizer worker title excludes
-         *  the id entirely (a truly-uncarded worker cannot be caught by the
-         *  card-title checks, and its content — plain user/assistant text —
-         *  would otherwise sail through the extract-level part filters), and
-         *  before/after bounds apply against `time.updated`. On failure
-         *  (cross-project 404, deleted): fall back to a minimal unverified
-         *  target with bounds bypassed — the warning says so. */
-        const resolveUncarded = async (
-          ids: string[],
-        ): Promise<Array<{ target: DrillTarget; verified: boolean }>> => {
-          const resolved: Array<{ target: DrillTarget; verified: boolean }> = [];
-          for (const id of ids) {
-            let meta: { title: string; directory: string; updated: number } | undefined;
+        /** One uncarded id's metadata probe: the scoped client first, then one
+         *  retry on the UNSCOPED client — workers and cross-project sessions
+         *  live outside the caller's directory scope, so the retry closes most
+         *  "probe failed → admitted unverified" gaps (including a worker whose
+         *  scoped fetch 404s). Only when BOTH fail is the id admitted
+         *  unverified (fail-open: reachability of a caller-named session
+         *  outweighs the residual risk, which the warning reports). */
+        const probeMeta = async (
+          id: string,
+        ): Promise<{ title: string; directory: string; updated: number } | undefined> => {
+          for (const c of [client, unscoped]) {
             try {
-              const sess = await gate.runQuery(() => client.session.get({ sessionID: id }));
+              const sess = await gate.runQuery(() => c.session.get({ sessionID: id }));
               if (sess.data) {
                 const data = sess.data as Session | GlobalSession;
-                meta = { title: data.title, directory: data.directory, updated: data.time.updated };
+                return { title: data.title, directory: data.directory, updated: data.time.updated };
               }
             } catch {
-              // Unverified fallback below.
-            }
-            if (meta) {
-              if (isSummarizerTitle(meta.title)) continue; // worker: never a target
-              if (after != null && meta.updated < after) continue;
-              if (before != null && meta.updated > before) continue;
-              relevanceBySession.set(id, "unknown");
-              searchedMeta.set(id, { id, title: meta.title, directory: meta.directory });
-              resolved.push({
-                target: {
-                  sessionId: id,
-                  title: meta.title,
-                  directory: meta.directory,
-                  timeUpdated: meta.updated,
-                },
-                verified: true,
-              });
-            } else {
-              relevanceBySession.set(id, "unknown");
-              searchedMeta.set(id, { id, title: "", directory: "" });
-              resolved.push({
-                target: { sessionId: id, title: "", directory: "", timeUpdated: 0 },
-                verified: false,
-              });
+              // Try the next client / fall through to unverified.
             }
           }
-          return resolved;
+          return undefined;
         };
 
-        /** Honest-coverage warning for shortlist ids selected without a card. */
+        /** Resolve uncarded shortlist ids into drill targets via live metadata
+         *  probes ({@link probeMeta}). On success: a summarizer worker title
+         *  excludes the id entirely (a truly-uncarded worker cannot be caught
+         *  by the card-title checks, and its content — plain user/assistant
+         *  text — would otherwise sail through the extract-level part
+         *  filters), and before/after bounds apply against `time.updated`. On
+         *  double failure: a minimal unverified target with selection bounds
+         *  bypassed — the warning says so.
+         *
+         *  Lazy + bounded: probes run in parallel chunks of {@link PROBE_CHUNK}
+         *  and stop once `wanted` targets are admitted (excluded ids — worker
+         *  or out-of-bounds — do not count toward `wanted`, so probing
+         *  continues past them). Ids never probed are returned as `unprobed`
+         *  for the cap-truncation warning. */
+        const resolveUncarded = async (
+          ids: string[],
+          wanted: number,
+        ): Promise<{
+          resolved: Array<{ target: DrillTarget; verified: boolean }>;
+          unprobed: number;
+        }> => {
+          const resolved: Array<{ target: DrillTarget; verified: boolean }> = [];
+          let index = 0;
+          while (index < ids.length && resolved.length < wanted && !ctx.abort.aborted) {
+            const chunk = ids.slice(index, index + PROBE_CHUNK);
+            index += chunk.length;
+            const metas = await Promise.all(chunk.map(probeMeta));
+            for (let i = 0; i < chunk.length; i++) {
+              if (resolved.length >= wanted) {
+                // Probed but over the cap: count as unprobed for the warning —
+                // it genuinely was not searched.
+                index -= chunk.length - i;
+                index = Math.max(index, 0);
+                break;
+              }
+              const id = chunk[i]!;
+              const meta = metas[i];
+              if (meta) {
+                if (isSummarizerTitle(meta.title)) continue; // worker: never a target
+                if (after != null && meta.updated < after) continue;
+                if (before != null && meta.updated > before) continue;
+                relevanceBySession.set(id, "unknown");
+                searchedMeta.set(id, { id, title: meta.title, directory: meta.directory });
+                resolved.push({
+                  target: {
+                    sessionId: id,
+                    title: meta.title,
+                    directory: meta.directory,
+                    timeUpdated: meta.updated,
+                  },
+                  verified: true,
+                });
+              } else {
+                relevanceBySession.set(id, "unknown");
+                searchedMeta.set(id, { id, title: "", directory: "" });
+                resolved.push({
+                  target: { sessionId: id, title: "", directory: "", timeUpdated: 0 },
+                  verified: false,
+                });
+              }
+            }
+          }
+          return { resolved, unprobed: ids.length - index };
+        };
+
+        /** Honest-coverage warning for shortlist ids selected without a card.
+         *  "No card visible" covers both real states: not yet indexed, or
+         *  carded so recently that this reader's snapshot has not seen it. */
         const warnUncarded = (count: number, unverified: number): void => {
-          let msg = `${count} session id${count === 1 ? "" : "s"} in the shortlist ${count === 1 ? "has" : "have"} no card yet (not indexed); ${count === 1 ? "it was" : "they were"} selected for direct drilling.`;
+          let msg = `${count} session id${count === 1 ? "" : "s"} in the shortlist ${count === 1 ? "has" : "have"} no card visible to this search yet (not yet indexed, or the index snapshot lags); ${count === 1 ? "it was" : "they were"} selected for direct drilling.`;
           if (unverified > 0) {
-            msg += ` ${unverified} could not be verified (metadata fetch failed), so time bounds were not applied.`;
+            msg += ` ${unverified} could not be verified (metadata fetch failed), so selection time bounds were not applied.`;
           }
           normalized.warnings.push(msg);
+        };
+
+        /** Distinct honest warning for named ids never reached under the cap. */
+        const warnCapDropped = (count: number): void => {
+          normalized.warnings.push(
+            `${count} named session id${count === 1 ? "" : "s"} ${count === 1 ? "was" : "were"} not searched: the session cap was reached.`,
+          );
         };
 
         const singleTarget = sessionID ?? (scope === "session" ? currentSessionID : undefined);
@@ -2290,7 +2363,27 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
               if (cards.get(id) || explicitSet.has(id)) kept.push(id);
               else dropped.push(id);
             }
-            drillTargets = kept.map(targetFor);
+            // Kept ids split by how they were admitted: facade-carded ids
+            // reconstitute directly from their card, while explicit-only ids
+            // (readmitted purely via the repeated `sessions` arg) get the SAME
+            // guards as a fresh uncarded shortlist — worker exclusion, live
+            // metadata probe, time bounds, current-session exclusion, warning.
+            // Without this split a resume would bypass every uncarded guard.
+            const explicitOnly = uncardedShortlist(kept.filter((id) => cards.get(id) == null));
+            const { resolved } = await resolveUncarded(explicitOnly, explicitOnly.length);
+            const resolvedById = new Map(resolved.map((r) => [r.target.sessionId, r] as const));
+            drillTargets = [];
+            for (const id of kept) {
+              if (cards.get(id)) drillTargets.push(targetFor(id));
+              else {
+                const r = resolvedById.get(id);
+                if (r) drillTargets.push(r.target);
+                // else: excluded by the uncarded guards (worker/bounds/current).
+              }
+            }
+            if (resolved.length > 0) {
+              warnUncarded(resolved.length, resolved.filter((r) => !r.verified).length);
+            }
             if (dropped.length > 0) {
               const sample = dropped.slice(0, 3).join(", ");
               normalized.warnings.push(
@@ -2313,7 +2406,9 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
             // have metadata and were filtered).
             const uncarded = uncardedShortlist(explicitSessions);
             if (uncarded.length > 0) {
-              const resolved = await resolveUncarded(uncarded);
+              // Deep has no session-count cap; the shortlist schema max is the
+              // bound on this probe fan-out.
+              const { resolved } = await resolveUncarded(uncarded, uncarded.length);
               if (resolved.length > 0) {
                 drillTargets = [...drillTargets, ...resolved.map((r) => r.target)];
                 warnUncarded(resolved.length, resolved.filter((r) => !r.verified).length);
@@ -2365,25 +2460,25 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
           // the caller named them explicitly. Carded-but-filtered ids are
           // NOT resurrected (they have metadata and were filtered).
           // Uncarded ids rank last: carded members fill the cap first.
-          const uncarded = uncardedShortlist(explicitSessions);
-          const resolvedUncarded = uncarded.length > 0 ? await resolveUncarded(uncarded) : [];
           const cardedTargets = scopedCards
             .filter((card) => card.sessionId !== excludeSessionID)
             .slice(0, cap)
             .map((card) => registerTarget(card, relevanceOf(card)));
-          const uncardedTaken = resolvedUncarded.slice(0, Math.max(0, cap - cardedTargets.length));
+          // Probe lazily: only as many uncarded ids as the cap leaves room for
+          // are resolved; the unprobed remainder is reported, not fetched.
+          const uncarded = uncardedShortlist(explicitSessions);
+          const remaining = Math.max(0, cap - cardedTargets.length);
+          const { resolved: uncardedTaken, unprobed } =
+            uncarded.length > 0
+              ? await resolveUncarded(uncarded, remaining)
+              : { resolved: [], unprobed: 0 };
           if (uncardedTaken.length > 0) {
             warnUncarded(uncardedTaken.length, uncardedTaken.filter((r) => !r.verified).length);
           }
-          const uncardedDropped = resolvedUncarded.length - uncardedTaken.length;
-          if (uncardedDropped > 0) {
-            normalized.warnings.push(
-              `${uncardedDropped} named session id${uncardedDropped === 1 ? "" : "s"} ${uncardedDropped === 1 ? "was" : "were"} not searched: the session cap was filled by indexed sessions.`,
-            );
-          }
+          if (unprobed > 0) warnCapDropped(unprobed);
           drillTargets = [...cardedTargets, ...uncardedTaken.map((r) => r.target)];
           deepSet = new Set(drillTargets.map((t) => t.sessionId));
-          sessionsEligible = scopedCards.length + resolvedUncarded.length;
+          sessionsEligible = scopedCards.length + uncardedTaken.length + unprobed;
           shortlistIDs = drillTargets.map((t) => t.sessionId);
           if (excludeSessionID) {
             skippedByReason.excludedSession = (skippedByReason.excludedSession ?? 0) + 1;

@@ -87,6 +87,9 @@ export type FakeOptions = {
   messageThrows?: Set<string>;
   noMessageData?: Set<string>;
   getThrows?: Set<string>;
+  /** The UNSCOPED client's session.get throws for these ids (the scoped
+   *  client's failures are `getThrows`; the search probe retries unscoped). */
+  unscopedGetThrows?: Set<string>;
   messageLookupErrors?: Record<string, string>;
   noSingleMessageData?: Set<string>;
   afterMessagesCall?: (sessionID: string) => void;
@@ -576,6 +579,16 @@ export function makeFakeHarness(options: FakeOptions = {}): FakeHarness {
     },
     session: {
       children: childrenFake("unscoped"),
+      // The unscoped client sees ALL sessions (global list), matching the real
+      // server: a cross-project id a scoped get 404s on still resolves here.
+      get: async ({ sessionID }: { sessionID: string }) => {
+        calls.get.push({ sessionID });
+        if (options.unscopedGetThrows?.has(sessionID)) {
+          throw new Error(`unscoped get failed: ${sessionID}`);
+        }
+        const found = fixture.globalSessions.find((s) => s.id === sessionID);
+        return found ? { data: found } : { error: apiFailure(`Session not found: ${sessionID}`) };
+      },
     },
   };
 
@@ -799,6 +812,11 @@ export async function makeRecallDeps(
     deepWallClockMs?: number;
     /** Inject a (spy) gate to assert fetches route through it. */
     gate?: FetchGate;
+    /** Inject the cards runtime's clock + refresh interval (stale-snapshot
+     *  tests: freeze the clock so the facade deterministically keeps serving
+     *  its loaded snapshot regardless of wall time). */
+    cardsNow?: () => number;
+    cardsRefreshIntervalMs?: number;
   } = {},
 ): Promise<{ deps: SearchDeps; store: Store; cleanup: () => void }> {
   const dir = mkdtempSync(join(tmpdir(), "recall-deps-"));
@@ -813,6 +831,8 @@ export async function makeRecallDeps(
     source: { getCards: () => store.allCards(), revision: () => store.getMeta("cards_rev") },
     embedder: opts.semantic?.embedder,
     semanticWeight: opts.semantic?.weight,
+    now: opts.cardsNow,
+    refreshIntervalMs: opts.cardsRefreshIntervalMs,
   });
   const drill = createDrill({
     client: fixture.client,
