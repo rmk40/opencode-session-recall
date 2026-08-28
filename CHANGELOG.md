@@ -4,7 +4,7 @@ All notable changes to this project are documented here. This project follows
 [Conventional Commits](https://www.conventionalcommits.org/) and
 [Semantic Versioning](https://semver.org/).
 
-## Unreleased
+## 2.2.0
 
 Based on PR #3 by @kernel-oops with maintainer fixes.
 
