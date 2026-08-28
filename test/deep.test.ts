@@ -10,6 +10,7 @@ import {
   bundle,
   completedToolPart,
   globalSessionFrom,
+  makeContext,
   makeFakeHarness,
   makeRecallDeps,
   runTool,
@@ -156,7 +157,49 @@ describe("deep scope validation", () => {
       expect(out.coverage?.deep?.sessionsCovered).toBe(1);
       expect(out.coverage?.sessionsEligible).toBe(1);
       expect(out.results.some((r) => r.sessionID === "s-deep-young")).toBe(true);
-      expect(out.warnings?.some((w) => /no card yet .*drilled directly/i.test(w))).toBe(true);
+      expect(out.warnings?.some((w) => /no card yet .*selected for direct drilling/i.test(w))).toBe(
+        true,
+      );
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("deep: skips an uncarded member excluded by excludeSessionID or excludeCurrentSession", async () => {
+    const h = makeFakeHarness();
+    const { deps, cleanup } = await makeRecallDeps(h);
+    const young = session("s-deep-excl", "Deep Excluded", PROJECT_DIR, NOW - 1_000);
+    addSession(h, young, [
+      bundle(userMessage("m-deep-excl-1", young.id, NOW - 2_000), [
+        textPart("p-deep-excl-1", young.id, "m-deep-excl-1", "murkfen only here"),
+      ]),
+    ]);
+    try {
+      const recall = search(h.client, h.unscoped, true, TEST_LIMITS, deps);
+      const excluded = await runTool<SearchOutput>(recall, {
+        query: "murkfen",
+        deep: true,
+        sessions: ["s-deep-excl"],
+        excludeSessionID: "s-deep-excl",
+      });
+      expect(excluded.ok).toBe(true);
+      expect(excluded.results.some((r) => r.sessionID === "s-deep-excl")).toBe(false);
+      expect(excluded.coverage?.sessionsSearched).toBe(0);
+
+      const { ctx } = makeContext({ sessionID: "s-deep-excl" });
+      const currentExcluded = await runTool<SearchOutput>(
+        recall,
+        {
+          query: "murkfen",
+          deep: true,
+          sessions: ["s-deep-excl"],
+          excludeCurrentSession: true,
+        },
+        ctx,
+      );
+      expect(currentExcluded.ok).toBe(true);
+      expect(currentExcluded.results.some((r) => r.sessionID === "s-deep-excl")).toBe(false);
+      expect(currentExcluded.coverage?.sessionsSearched).toBe(0);
     } finally {
       cleanup();
     }

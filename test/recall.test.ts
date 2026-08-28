@@ -18,6 +18,7 @@ import {
   makeRecallDeps,
   runTool,
   runToolRaw,
+  seedStore,
   session,
   setStrictNoLimitMessages,
   textPart,
@@ -2011,21 +2012,27 @@ describe("recall", () => {
 describe("explicit shortlist includes uncarded sessions", () => {
   const NOW = Date.now();
 
-  function addUncarded(h: FakeHarness, id: string, title: string, text: string): void {
-    const s = session(id, title, PROJECT_DIR, NOW - 1_000);
+  function addUncarded(
+    h: FakeHarness,
+    id: string,
+    title: string,
+    text: string,
+    updated = NOW - 1_000,
+  ): void {
+    const s = session(id, title, PROJECT_DIR, updated);
     h.sessions.push(s);
     h.globalSessions.push(globalSessionFrom(s));
     h.messagesBySession[id] = [
-      bundle(userMessage(`m-${id}-1`, id, NOW - 2_000), [
+      bundle(userMessage(`m-${id}-1`, id, updated - 1_000), [
         textPart(`p-${id}-1`, id, `m-${id}-1`, text),
       ]),
     ];
   }
 
   async function setup(h: FakeHarness = makeFakeHarness(), limits: Limits = TEST_LIMITS) {
-    const { deps, cleanup } = await makeRecallDeps(h, limits);
+    const { deps, store, cleanup } = await makeRecallDeps(h, limits);
     cleanups.push(cleanup);
-    return search(h.client, h.unscoped, true, limits, deps);
+    return { recall: search(h.client, h.unscoped, true, limits, deps), store };
   }
 
   it("drills an uncarded shortlist member: hit returned, eligible counted, warning present", async () => {
@@ -2038,7 +2045,7 @@ describe("explicit shortlist includes uncarded sessions", () => {
         textPart("p-carded-1", carded.id, "m-carded-1", "nothing relevant in the carded session"),
       ]),
     ];
-    const recall = await setup(h);
+    const { recall } = await setup(h);
     // Added AFTER the store was seeded → messages exist, no card (the live bug).
     addUncarded(h, "s-young", "Young Uncarded", "the zorblatt needle lives only here");
 
@@ -2050,12 +2057,14 @@ describe("explicit shortlist includes uncarded sessions", () => {
     expect(out.results.some((r) => r.sessionID === "s-young")).toBe(true);
     expect(out.coverage?.sessionsEligible).toBe(2);
     expect(out.coverage?.sessionsSearched).toBe(2);
-    expect(out.warnings?.some((w) => /no card yet .*drilled directly/i.test(w))).toBe(true);
+    expect(
+      out.warnings?.some((w) => /1 session id .*no card yet .*selected for direct/i.test(w)),
+    ).toBe(true);
   });
 
   it("searches an uncarded-only shortlist instead of reporting zero eligible sessions", async () => {
     const h = makeFakeHarness();
-    const recall = await setup(h);
+    const { recall } = await setup(h);
     addUncarded(h, "s-only-young", "Only Young", "flumoxide appears in the young session");
 
     const out = await runTool<SearchOutput>(recall, {
@@ -2071,7 +2080,7 @@ describe("explicit shortlist includes uncarded sessions", () => {
 
   it("tolerates a nonexistent id: ok:true, other sessions still searched", async () => {
     const h = makeFakeHarness();
-    const recall = await setup(h);
+    const { recall } = await setup(h);
     addUncarded(h, "s-real-young", "Real Young", "grimwold hides here");
 
     const out = await runTool<SearchOutput>(recall, {
@@ -2083,9 +2092,11 @@ describe("explicit shortlist includes uncarded sessions", () => {
     // The bad id's fetch failure is a per-target load error, not a crash.
     expect(out.coverage?.loadErrors?.count).toBe(1);
     expect(out.coverage?.loadErrors?.samples?.[0]).toContain("s-no-such-session");
+    // The metadata probe could not verify it → the warning says so.
+    expect(out.warnings?.some((w) => /1 could not be verified/i.test(w))).toBe(true);
   });
 
-  it("carded members honor since/title filters; uncarded bypass them", async () => {
+  it("carded members honor since/title filters; a fresh uncarded id still lands", async () => {
     const h = makeFakeHarness();
     const oldCarded = session("s-old-carded", "Old Carded", PROJECT_DIR, NOW - 86_400_000);
     h.sessions.push(oldCarded);
@@ -2095,11 +2106,11 @@ describe("explicit shortlist includes uncarded sessions", () => {
         textPart("p-old-carded-1", oldCarded.id, "m-old-carded-1", "sproket mention old"),
       ]),
     ];
-    const recall = await setup(h);
+    const { recall } = await setup(h);
     addUncarded(h, "s-fresh", "Fresh Uncarded", "sproket mention fresh");
 
-    // `after` excludes the old carded card; the uncarded id has no card
-    // metadata to filter on, so it is drilled regardless.
+    // `after` excludes the old carded card; the fresh uncarded id passes the
+    // bound via its live-fetched metadata and is drilled.
     const out = await runTool<SearchOutput>(recall, {
       query: "sproket",
       sessions: ["s-old-carded", "s-fresh"],
@@ -2110,7 +2121,7 @@ describe("explicit shortlist includes uncarded sessions", () => {
     expect(out.results.some((r) => r.sessionID === "s-old-carded")).toBe(false);
     expect(out.coverage?.sessionsEligible).toBe(1);
 
-    // Same for a title filter that matches no carded member.
+    // The title filter never applies to uncarded ids (named explicitly).
     const titled = await runTool<SearchOutput>(recall, {
       query: "sproket",
       sessions: ["s-old-carded", "s-fresh"],
@@ -2119,6 +2130,192 @@ describe("explicit shortlist includes uncarded sessions", () => {
     expect(titled.ok).toBe(true);
     expect(titled.results.some((r) => r.sessionID === "s-fresh")).toBe(true);
     expect(titled.results.some((r) => r.sessionID === "s-old-carded")).toBe(false);
+  });
+
+  it("applies before/after bounds to a verified uncarded session (live metadata)", async () => {
+    const h = makeFakeHarness();
+    const { recall } = await setup(h);
+    // A minutes-old uncarded session must NOT satisfy a before-bound far in
+    // the past (the wrong-answer case the metadata fetch closes).
+    addUncarded(h, "s-young-bounded", "Young Bounded", "crontide needle", NOW - 60_000);
+
+    const out = await runTool<SearchOutput>(recall, {
+      query: "crontide",
+      sessions: ["s-young-bounded"],
+      before: NOW - 90 * 86_400_000,
+    });
+    expect(out.ok).toBe(true);
+    expect(out.results.some((r) => r.sessionID === "s-young-bounded")).toBe(false);
+    expect(out.coverage?.sessionsEligible).toBe(0);
+    expect(out.warnings?.some((w) => /no card yet/i.test(w))).toBeFalsy();
+  });
+
+  it("falls back to a selection-bypass drill when the metadata fetch throws, and says so", async () => {
+    const h = makeFakeHarness({ getThrows: new Set(["s-unverifiable"]) });
+    const { recall } = await setup(h);
+    addUncarded(h, "s-unverifiable", "Unverifiable", "blenkinsop needle", NOW - 60_000);
+
+    // session.get throws (cross-project 404 analogue): the SELECTION time
+    // bound cannot be checked, so the id is drilled anyway and the warning
+    // notes the unverified fallback. (Part-level time filters still apply to
+    // the drilled candidates — message times are ground truth.)
+    const out = await runTool<SearchOutput>(recall, {
+      query: "blenkinsop",
+      sessions: ["s-unverifiable"],
+      before: NOW - 90 * 86_400_000,
+    });
+    expect(out.ok).toBe(true);
+    // Selected and drilled (not silently dropped at selection)…
+    expect(out.coverage?.sessionsEligible).toBe(1);
+    expect(out.coverage?.sessionsSearched).toBe(1);
+    // …though the part-level `before` filter rightly excludes its young parts.
+    expect(out.results.some((r) => r.sessionID === "s-unverifiable")).toBe(false);
+    expect(
+      out.warnings?.some((w) => /1 could not be verified .*time bounds were not applied/i.test(w)),
+    ).toBe(true);
+
+    // Without a bound the fallback target's content is reachable.
+    const unbounded = await runTool<SearchOutput>(recall, {
+      query: "blenkinsop",
+      sessions: ["s-unverifiable"],
+    });
+    expect(unbounded.ok).toBe(true);
+    expect(unbounded.results.some((r) => r.sessionID === "s-unverifiable")).toBe(true);
+    expect(unbounded.warnings?.some((w) => /1 could not be verified/i.test(w))).toBe(true);
+  });
+
+  it("excludes a persisted summarizer worker card named in the shortlist", async () => {
+    const h = makeFakeHarness();
+    const worker = session(
+      "s-worker-carded",
+      "[recall-summarizer] owner=abc",
+      PROJECT_DIR,
+      NOW - 5_000,
+    );
+    h.sessions.push(worker);
+    h.globalSessions.push(globalSessionFrom(worker));
+    h.messagesBySession[worker.id] = [
+      bundle(userMessage("m-worker-1", worker.id, NOW - 6_000), [
+        textPart("p-worker-1", worker.id, "m-worker-1", "wibblesnap digest prompt"),
+      ]),
+    ];
+    // Seed AFTER pushing → the worker HAS a card in the store; the cards
+    // facade hides it (isSummarizerTitle), so it must not resurface as
+    // "uncarded" via the store fallback.
+    const { recall } = await setup(h);
+
+    const out = await runTool<SearchOutput>(recall, {
+      query: "wibblesnap",
+      sessions: ["s-worker-carded"],
+    });
+    expect(out.ok).toBe(true);
+    expect(out.results.some((r) => r.sessionID === "s-worker-carded")).toBe(false);
+    expect(out.coverage?.sessionsEligible).toBe(0);
+    expect(out.coverage?.sessionsSearched).toBe(0);
+  });
+
+  it("excludes a truly-uncarded summarizer worker via the live title fetch (leak test)", async () => {
+    const h = makeFakeHarness();
+    const { recall } = await setup(h);
+    // No card at all: only the live session.get title identifies the worker.
+    addUncarded(
+      h,
+      "s-worker-young",
+      "[recall-summarizer] owner=xyz",
+      "sparklewick digest prompt text",
+    );
+
+    const out = await runTool<SearchOutput>(recall, {
+      query: "sparklewick",
+      sessions: ["s-worker-young"],
+    });
+    expect(out.ok).toBe(true);
+    expect(out.results.some((r) => r.sessionID === "s-worker-young")).toBe(false);
+    expect(out.coverage?.sessionsEligible).toBe(0);
+    expect(out.coverage?.sessionsSearched).toBe(0);
+    expect(out.warnings?.some((w) => /no card yet/i.test(w))).toBeFalsy();
+  });
+
+  it("drills a store-only fresh card the facade snapshot has not seen (refresh window)", async () => {
+    const h = makeFakeHarness();
+    const { recall, store } = await setup(h);
+    // Force the runtime to take its snapshot of the seeded store NOW.
+    await runTool<SearchOutput>(recall, { query: "warmup" });
+    // A fresh session is carded in the STORE only (snapshot is ≤5s stale).
+    const fresh = session("s-store-only", "Store Only Fresh", PROJECT_DIR, NOW - 500);
+    h.sessions.push(fresh);
+    h.globalSessions.push(globalSessionFrom(fresh));
+    h.messagesBySession[fresh.id] = [
+      bundle(userMessage("m-store-only-1", fresh.id, NOW - 1_500), [
+        textPart("p-store-only-1", fresh.id, "m-store-only-1", "glimmerpost lives here"),
+      ]),
+    ];
+    seedStore(store, h);
+    // Do NOT bump time / invalidate: the facade still serves the pre-seed
+    // snapshot (cards.get(id) == null) while the store already has the card —
+    // the reviewer-flagged stale-window scenario.
+
+    const out = await runTool<SearchOutput>(recall, {
+      query: "glimmerpost",
+      sessions: ["s-store-only"],
+    });
+    expect(out.ok).toBe(true);
+    expect(out.results.some((r) => r.sessionID === "s-store-only")).toBe(true);
+    expect(out.coverage?.sessionsEligible).toBe(1);
+    expect(out.warnings?.some((w) => /no card yet/i.test(w))).toBe(true);
+  });
+
+  it("skips an uncarded member named by excludeSessionID", async () => {
+    const h = makeFakeHarness();
+    const { recall } = await setup(h);
+    addUncarded(h, "s-excluded-young", "Excluded Young", "thrumbolt only here");
+
+    const out = await runTool<SearchOutput>(recall, {
+      query: "thrumbolt",
+      sessions: ["s-excluded-young"],
+      excludeSessionID: "s-excluded-young",
+    });
+    expect(out.ok).toBe(true);
+    expect(out.results.some((r) => r.sessionID === "s-excluded-young")).toBe(false);
+    expect(out.coverage?.sessionsSearched).toBe(0);
+  });
+
+  it("skips an uncarded current session when excludeCurrentSession:true", async () => {
+    const h = makeFakeHarness();
+    const { recall } = await setup(h);
+    addUncarded(h, "s-cur-young", "Current Young", "vexolith only here");
+    const { ctx } = makeContext({ sessionID: "s-cur-young" });
+
+    const out = await runTool<SearchOutput>(
+      recall,
+      {
+        query: "vexolith",
+        sessions: ["s-cur-young"],
+        excludeCurrentSession: true,
+      },
+      ctx,
+    );
+    expect(out.ok).toBe(true);
+    expect(out.results.some((r) => r.sessionID === "s-cur-young")).toBe(false);
+    expect(out.coverage?.sessionsSearched).toBe(0);
+  });
+
+  it("pluralizes the warning for two or more uncarded ids", async () => {
+    const h = makeFakeHarness();
+    const { recall } = await setup(h);
+    addUncarded(h, "s-plural-a", "Plural A", "dringle in a");
+    addUncarded(h, "s-plural-b", "Plural B", "dringle in b");
+
+    const out = await runTool<SearchOutput>(recall, {
+      query: "dringle",
+      sessions: ["s-plural-a", "s-plural-b"],
+    });
+    expect(out.ok).toBe(true);
+    expect(
+      out.warnings?.some((w) =>
+        /2 session ids .*no card yet .*they were selected for direct drilling/i.test(w),
+      ),
+    ).toBe(true);
   });
 
   it("applies the sessions cap across the combined list, carded first", async () => {
@@ -2131,11 +2328,12 @@ describe("explicit shortlist includes uncarded sessions", () => {
         textPart("p-cap-carded-1", carded.id, "m-cap-carded-1", "quibblet in the carded one"),
       ]),
     ];
-    const recall = await setup(h);
+    const { recall } = await setup(h);
     addUncarded(h, "s-cap-young", "Cap Young", "quibblet in the young one");
 
     // Cap 1: the carded member fills the only slot; the uncarded id is sliced
-    // out (ranked last) and no "drilled directly" warning fires for it.
+    // out (ranked last), no "selected for direct drilling" warning fires for
+    // it, and a DISTINCT warning reports the drop instead of silence.
     const out = await runTool<SearchOutput>(recall, {
       query: "quibblet",
       sessions: ["s-cap-young", "s-cap-carded"],
@@ -2148,5 +2346,12 @@ describe("explicit shortlist includes uncarded sessions", () => {
     expect(out.coverage?.sessionsEligible).toBe(2);
     expect(out.coverage?.limitedBy).toContain("sessionsLimit");
     expect(out.warnings?.some((w) => /no card yet/i.test(w))).toBeFalsy();
+    expect(
+      out.warnings?.some((w) =>
+        /1 named session id was not searched: the session cap was filled by indexed sessions/i.test(
+          w,
+        ),
+      ),
+    ).toBe(true);
   });
 });
