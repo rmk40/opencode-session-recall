@@ -4,6 +4,27 @@ All notable changes to this project are documented here. This project follows
 [Conventional Commits](https://www.conventionalcommits.org/) and
 [Semantic Versioning](https://semver.org/).
 
+## Unreleased
+
+### Added
+
+- **`authorship` filter on `recall`**: ask for what a human actually typed.
+  `role: "user"` is a transport fact, not an authorship one — a survey of this
+  machine's corpus (`docs/surveys/user-role-authorship.sql`) found only ~51% of
+  user-role text was typed by a person; ~37% is orchestrator-authored prompts
+  inside subagent sessions, plus host/tool injection and TUI status blocks.
+  Candidates now classify as `human`, `delegated`, `injected`, `model`,
+  `title`, or `unknown` from structural signals only (message role, part flags,
+  session parentage, part type), and `authorship` selects any of them or an
+  array of them. Narrowing to `human` also restricts normal ranked selection to
+  root sessions on both the card and FTS paths, so child sessions stop
+  consuming drill budget; explicitly named sessions and deep sweeps are exempt.
+  Unresolvable parentage classifies `unknown` and is withheld from `human`
+  rather than assumed — the filter fails closed. Results carry
+  `why.authorship`, and `coverage` reports `limitedBy: ["authorship"]` plus
+  `skippedByReason.authorship`, all only when the filter is active or
+  `explain: true`, so default responses are unchanged.
+
 ## 2.3.0
 
 ### Added

@@ -29,6 +29,13 @@ import {
   isSummarizerTitle,
   evidenceClassFor,
 } from "./extract.js";
+import {
+  authorshipOf,
+  parentageOf,
+  AUTHORSHIP_VALUES,
+  type Authorship,
+  type AuthorshipCounts,
+} from "./authorship.js";
 import { parseQuery } from "./query.js";
 import { candidateEligible, type Candidate, type CandidateFilters } from "./candidates.js";
 import type { CandidateEmbedder } from "./corpus.js";
@@ -37,7 +44,7 @@ import { clamp01, bm25Search, type Bm25Hit } from "./bm25.js";
 import { smartSnippet, truncatePreservingMatch } from "./snippet.js";
 import { compileRegex, regexFirstIndex, regexSnippet } from "./regex.js";
 import { classifyQuery } from "./route.js";
-import type { CardsRuntime, CardHit, CardFilters } from "./cards.js";
+import type { CardsRuntime, CardHit, CardFilters, CardRankFilters, RankStats } from "./cards.js";
 import {
   encodeDeepCursor,
   decodeDeepCursor,
@@ -684,12 +691,17 @@ function formatExpandedMsg(
 // literal/regex hits (and the hits kept under a scan limit) are now the most
 // recent ones — the old scans iterated chronologically and kept the oldest.
 
-/** Build a SearchResult from a cached candidate hit (literal/regex paths). */
+/** Build a SearchResult from a cached candidate hit (literal/regex paths).
+ *  `emitAuthorship` is the gate that keeps default responses byte-identical:
+ *  the field is added only when the caller narrowed `authorship` or asked for
+ *  `explain`. This route does NOT spread `candidate.why`, so the addition has
+ *  to be made here explicitly. */
 function candidateResult(
   candidate: Candidate,
   relevance: DirectoryRelevance,
   matchedField: ResultWhy["matchedFields"][number],
   snip: string,
+  emitAuthorship = false,
 ): SearchResult {
   return annotateResult({
     sessionID: candidate.sessionID,
@@ -711,6 +723,7 @@ function candidateResult(
       recency: recencyLabel(candidate.time),
       confidence: candidate.partType === "title" ? "medium" : "high",
       evidenceClass: evidenceClassFor(candidate.partType, candidate.toolName, [matchedField]),
+      ...(emitAuthorship && { authorship: authorshipOf(candidate) }),
     },
   });
 }
@@ -721,6 +734,7 @@ function scan(
   query: string,
   limit: number,
   width?: number,
+  emitAuthorship = false,
 ): { results: SearchResult[]; total: number } {
   const results: SearchResult[] = [];
   let total = 0;
@@ -738,7 +752,13 @@ function scan(
       total++;
       if (results.length < limit) {
         results.push(
-          candidateResult(candidate, relevance, field.field, snippet(field.text, query, width)),
+          candidateResult(
+            candidate,
+            relevance,
+            field.field,
+            snippet(field.text, query, width),
+            emitAuthorship,
+          ),
         );
       }
     }
@@ -753,6 +773,7 @@ function regexScanCandidates(
   re: RegExp,
   limit: number,
   width?: number,
+  emitAuthorship = false,
 ): { results: SearchResult[]; total: number } {
   const results: SearchResult[] = [];
   let total = 0;
@@ -774,6 +795,7 @@ function regexScanCandidates(
             relevance,
             field.field,
             regexSnippet(re, field.text, width, matchIndex),
+            emitAuthorship,
           ),
         );
       }
@@ -791,6 +813,7 @@ function rankedToSearchResults(
   query: ReturnType<typeof parseQuery>,
   width: number | undefined,
   relevanceBySession: Map<string, DirectoryRelevance>,
+  emitAuthorship = false,
 ): SearchResult[] {
   return ranked.map((r) => {
     const c = r.candidate;
@@ -830,6 +853,7 @@ function rankedToSearchResults(
           r.matchedFields.length > 0
             ? r.matchedFields
             : (c.why?.matchedFields ?? defaultMatchedFields(c.partType)),
+        ...(emitAuthorship && { authorship: authorshipOf(c) }),
       },
       titleMatch: c.titleMatch,
     });
@@ -864,6 +888,7 @@ function semanticRescueResult(
   width: number | undefined,
   mode: MatchMode,
   explain: boolean,
+  emitAuthorship = false,
 ): SearchResult {
   const result = annotateResult({
     sessionID: candidate.sessionID,
@@ -887,6 +912,7 @@ function semanticRescueResult(
       recency: recencyLabel(candidate.time),
       confidence: "low",
       evidenceClass: evidenceClassFor(candidate.partType, candidate.toolName, []),
+      ...(emitAuthorship && { authorship: authorshipOf(candidate) }),
       semanticSimilarity: partSimilarity,
     },
   });
@@ -913,6 +939,7 @@ function rescueZeroHitSessions(input: {
   width: number | undefined;
   mode: MatchMode;
   explain: boolean;
+  emitAuthorship: boolean;
 }): SearchResult[] {
   const embedder = input.semantic?.embedder;
   if (input.reserved.length === 0 || !embedder?.ready) return [];
@@ -952,6 +979,7 @@ function rescueZeroHitSessions(input: {
         input.width,
         input.mode,
         input.explain,
+        input.emitAuthorship,
       ),
     );
   }
@@ -1075,6 +1103,10 @@ export function groupBySession(results: SearchResult[]): SearchResult[] {
           hit.snippet.length > TOP_EVIDENCE_SNIPPET_CHARS
             ? `${hit.snippet.slice(0, TOP_EVIDENCE_SNIPPET_CHARS)}…`
             : hit.snippet,
+        // Inherits the emit gate for free: `why.authorship` is populated
+        // exactly when the caller narrowed authorship or asked for explain, so
+        // default grouped responses are unchanged.
+        ...(hit.why?.authorship && { authorship: hit.why.authorship }),
       }));
 
     return {
@@ -1393,6 +1425,9 @@ export function buildSuggestions(input: {
   shortlistIDs: string[];
   /** Normalized lower time bound (ms epoch), when the caller set one. */
   after?: number;
+  /** The normalized authorship buckets, when the caller narrowed them. Absent
+   *  for the default `"any"`, so the hint below cannot fire on a plain query. */
+  authorship?: Authorship[];
 }): SearchSuggestion[] | undefined {
   // Suggestions are ranked before the MAX_SUGGESTIONS slice so plan-mandated
   // guidance (exact code tokens, shortlisted-but-unranked sessions) cannot be
@@ -1503,6 +1538,19 @@ export function buildSuggestions(input: {
       reason: `The type:${JSON.stringify(typeFilter)} filter may be hiding other evidence.`,
       action: 'Retry with type:"all" to include text, reasoning, and tool output.',
       example: { type: "all" },
+    });
+  }
+
+  if (input.results.length === 0 && input.authorship && input.authorship.length > 0) {
+    // Only name the delegated bucket when it is actually being withheld —
+    // otherwise the reason contradicts an authorship:"delegated" request.
+    const hidesDelegated = !input.authorship.includes("delegated");
+    add(0, {
+      reason: `The authorship:${JSON.stringify(input.authorship)} filter withholds every other kind of text${
+        hidesDelegated ? ", including agent-authored prompts in subagent sessions" : ""
+      }.`,
+      action: 'Retry with authorship:"any" to see who else wrote about this.',
+      example: { authorship: "any" },
     });
   }
 
@@ -1618,6 +1666,7 @@ function attachCommonOutput<T extends SearchOutput>(
     codeTokens: string[];
     shortlistIDs: string[];
     after?: number;
+    authorship?: Authorship[];
   },
 ): T {
   input.coverage.directoryBucketCounts = countDirectoryBuckets(input.final);
@@ -1638,6 +1687,7 @@ function attachCommonOutput<T extends SearchOutput>(
     codeTokens: input.codeTokens,
     shortlistIDs: input.shortlistIDs,
     ...(input.after != null && { after: input.after }),
+    ...(input.authorship && { authorship: input.authorship }),
   });
   if (suggestions) out.suggestions = suggestions;
   const nearMisses = buildNearMisses(input.final, input.searchedSessions);
@@ -1729,7 +1779,7 @@ Skip trivial commands, simple local code/file lookup, simple edits with full con
 
 For "how did we do X before": match:"smart", group:"session" (current session is already excluded by default); if results are weak, search the project directory literally for the tool/command name and inspect tool-input hits with expand:"context" or recall_context.
 
-First call: for broad discovery use match:"smart", group:"session", ${mode ? 'scope:"project" (default in this mode; cross-project needs an explicit scope:"global")' : 'scope:"global" (default)'}, 5-10 results, and short terms from error text/feature/config/file/decision. The current session and its subagent sessions are excluded by default; pass excludeCurrentSession:false to search them (or use scope:"session"). Use role:"user" for requirements/decisions. Use expand:"context" or "message" when top-hit evidence will avoid a follow-up.
+First call: for broad discovery use match:"smart", group:"session", ${mode ? 'scope:"project" (default in this mode; cross-project needs an explicit scope:"global")' : 'scope:"global" (default)'}, 5-10 results, and short terms from error text/feature/config/file/decision. The current session and its subagent sessions are excluded by default; pass excludeCurrentSession:false to search them (or use scope:"session"). Use role:"user" for requirements/decisions, and authorship:"human" when you specifically want what a person typed — role:"user" also carries subagent prompts written by an orchestrating agent and host-injected text. Use expand:"context" or "message" when top-hit evidence will avoid a follow-up.
 
 If memory exists, store only durable findings: preferences, project decisions, reusable root causes, environment facts, behavior corrections, or repeatable success/failure. Do not store ephemeral details, one-off commands, transient errors, or implementation minutiae.
 
@@ -1775,6 +1825,15 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
         .default("all")
         .describe("Part type filter"),
       role: tool.schema.enum(["user", "assistant", "all"]).default("all").describe("Role filter"),
+      authorship: tool.schema
+        .union([
+          tool.schema.enum([...AUTHORSHIP_VALUES, "any"]),
+          tool.schema.array(tool.schema.enum([...AUTHORSHIP_VALUES])),
+        ])
+        .optional()
+        .describe(
+          'Who wrote it (default "any"): human=typed by a person in a root session, delegated=written by an orchestrating agent (subagent prompts and subtask parts), injected=host/tool-injected or host-ignored user-role content, model=assistant output, title=session title, unknown=parentage could not be resolved. Accepts an array to union buckets. Different question from role, which is transport-level.',
+        ),
       sessionLimit: tool.schema
         .number()
         .min(1)
@@ -1863,6 +1922,11 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
       // bypass Zod and forward raw caller args. Coerce missing values to safe
       // defaults and clamp/whitelist invalid values rather than trusting Zod.
       const defenseWarnings: string[] = [];
+      // Ordinary advisory warnings raised during argument inspection. Kept
+      // apart from `defenseWarnings`, which is unshifted to the FRONT of the
+      // list as "we ignored what you sent"; these report a well-formed request
+      // that cannot match, so they belong in the normal warning order.
+      const argWarnings: string[] = [];
       const pickEnum = <T extends string>(
         label: string,
         value: unknown,
@@ -1875,6 +1939,60 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
           `Ignored ${label}:${JSON.stringify(value)}; using ${label}:${JSON.stringify(fallbackValue)}.`,
         );
         return fallbackValue;
+      };
+      /**
+       * Enum-SET coercion for `authorship`. `pickEnum` is string-only and
+       * returns the whole fallback on a bad value, which for a filter would
+       * silently WIDEN the result set — the wrong failure direction for an
+       * argument whose purpose is exclusion. So an array drops invalid members
+       * INDIVIDUALLY (naming each), deduplicates, collapses to `"any"` if
+       * `"any"` appears anywhere, and only falls back to `"any"` when nothing
+       * usable is left. Returns `"any"` (no narrowing) or the wanted set.
+       */
+      const pickEnumSet = <T extends string>(
+        label: string,
+        value: unknown,
+        allowed: readonly T[],
+      ): "any" | Set<T> => {
+        // ONLY `undefined` is omission. An explicit `null` is a non-string,
+        // non-array value and takes the warned fallback like any other junk.
+        if (value === undefined) return "any";
+        const isAllowed = (v: unknown): v is T =>
+          typeof v === "string" && (allowed as readonly string[]).includes(v);
+        const fallback = (): "any" => {
+          defenseWarnings.push(`Ignored ${label}:${JSON.stringify(value)}; using ${label}:"any".`);
+          return "any";
+        };
+        if (typeof value === "string") {
+          if (value === "any") return "any";
+          return isAllowed(value) ? new Set<T>([value]) : fallback();
+        }
+        if (!Array.isArray(value)) return fallback();
+
+        const kept = new Set<T>();
+        const dropped: unknown[] = [];
+        let sawAny = false;
+        for (const member of value) {
+          if (member === "any") {
+            sawAny = true;
+            continue;
+          }
+          if (isAllowed(member)) kept.add(member);
+          else dropped.push(member);
+        }
+        if (dropped.length > 0) {
+          defenseWarnings.push(
+            `Ignored invalid ${label} value${dropped.length === 1 ? "" : "s"} ${dropped
+              .map((d) => JSON.stringify(d))
+              .join(", ")}.`,
+          );
+        }
+        if (sawAny) return "any";
+        if (kept.size === 0) {
+          defenseWarnings.push(`Ignored empty ${label}; using ${label}:"any".`);
+          return "any";
+        }
+        return kept;
       };
       const pickNumber = (
         label: string,
@@ -1921,6 +2039,19 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
         "all",
       );
       const role = pickEnum("role", args.role, ["user", "assistant", "all"] as const, "all");
+      // `role` is transport-level and unchanged; `authorship` answers the
+      // separate "who composed this" question (see src/authorship.ts).
+      const authorshipSet = pickEnumSet("authorship", args.authorship, AUTHORSHIP_VALUES);
+      const authorshipActive = authorshipSet !== "any";
+      const authorshipFilter = authorshipSet === "any" ? undefined : authorshipSet;
+      /** The normalized set is exactly `{human}` — the trigger for the
+       *  selection-tier root-only restriction (step 5). `["human"]` triggers it;
+       *  `["human","delegated"]` does not. */
+      const humanOnly =
+        authorshipSet !== "any" && authorshipSet.size === 1 && authorshipSet.has("human");
+      /** Emit `why.authorship` / `topEvidence.authorship`. Gated so responses
+       *  stay byte-identical when authorship is absent/"any" AND explain:false. */
+      const emitAuthorship = authorshipActive || explain;
       const fallback = typeof args.fallback === "boolean" ? args.fallback : false;
       const expandMode = pickEnum(
         "expand",
@@ -2037,6 +2168,33 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
         return fail('toolName can only be used with type:"all" or type:"tool"');
       }
 
+      // Empty-by-construction authorship combinations. Warnings, not errors:
+      // the request is well-formed, it just cannot match anything.
+      if (authorshipSet !== "any") {
+        // With `type:"tool"` or a `toolName`, every candidate is a tool part —
+        // which classifies `injected` on a user envelope and `model` on an
+        // assistant one. Any set disjoint from those two matches nothing.
+        const toolPartsOnly = partType === "tool" || toolName != null;
+        if (toolPartsOnly && !authorshipSet.has("injected") && !authorshipSet.has("model")) {
+          argWarnings.push(
+            `authorship:${JSON.stringify([...authorshipSet])} with ${
+              toolName ? "toolName" : 'type:"tool"'
+            } matches nothing: tool parts classify only as "injected" or "model".`,
+          );
+        }
+        // Mirror case: title candidates are only built when titles are
+        // searchable at all, which happens before authorship ever runs.
+        if (
+          authorshipSet.size === 1 &&
+          authorshipSet.has("title") &&
+          !canSearchTitles(partType, toolName)
+        ) {
+          argWarnings.push(
+            'authorship:"title" matches nothing with a type or toolName filter: session titles are only searched when type:"all" and no toolName is set.',
+          );
+        }
+      }
+
       // Contradictory exclusion filters are caller errors, but only when the
       // exclusion was explicit — the implicit default never conflicts because
       // it does not apply to session scope or explicit sessionID targets.
@@ -2081,6 +2239,7 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
       if ("ok" in normalized) return fail(normalized.error);
       // Surface defensive-default warnings alongside time/expansion warnings.
       normalized.warnings.unshift(...defenseWarnings);
+      normalized.warnings.push(...argWarnings);
       const { before, after } = normalized;
 
       ctx.metadata({
@@ -2102,6 +2261,7 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
         const smartMode: "smart" | "fuzzy" = matchMode === "fuzzy" ? "fuzzy" : "smart";
         const searchTitles = canSearchTitles(partType, toolName);
         const filters: CandidateFilters = { type: partType, role, before, after, toolName };
+        if (authorshipActive) pushUnique(normalized.limitedBy, "authorship");
         const groupMode: GroupMode = groupArg;
         const isGrouped = groupMode === "session";
 
@@ -2183,6 +2343,17 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
         // score, and the sessions the reserved-slot band pulled into the drill.
         const semanticBySession = new Map<string, number>();
         let semanticReserved: string[] = [];
+        /** Sessions the authorship root-only restriction removed from selection,
+         *  across BOTH selection paths (card ranking and the FTS admission
+         *  chain). Kept as ids so the two paths cannot double-count the same
+         *  session; reported as `skippedByReason.authorship`. */
+        const authorshipSkippedIds = new Set<string>();
+        // Child sessions the FTS admission chain dropped under `authorship:"human"`,
+        // held until the shortlist cap is known so they can be counted the same
+        // cap-aware way the ranked lane is. `ftsLaneAll` is the same lane with
+        // those ids left IN, in iteration order — the counterfactual lane.
+        const authorshipFtsDropped: string[] = [];
+        const ftsLaneAll: string[] = [];
 
         /** Register a card as a drill target (relevance + coverage metadata). */
         const registerTarget = (card: Card, relevance: DirectoryRelevance): DrillTarget => {
@@ -2197,6 +2368,11 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
             title: card.title,
             directory: card.directory,
             timeUpdated: card.timeUpdated,
+            // `Card.parentId` is two-state (`string | null`) — the distiller
+            // collapses missing/non-string to `null`, so a card-backed target
+            // reads `null` as root and can never express `unknown`. Accepted:
+            // a card exists only for a session the distiller discovered.
+            parentID: card.parentId,
           };
         };
 
@@ -2211,6 +2387,8 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
           if (card) return registerTarget(card, relevanceOf(card));
           relevanceBySession.set(id, "unknown");
           searchedMeta.set(id, { id, title: "", directory: "" });
+          // No metadata at all: `parentID` is deliberately OMITTED, which the
+          // authorship classifier reads as `unknown` (never root). Fail-closed.
           return { sessionId: id, title: "", directory: "", timeUpdated: 0 };
         };
 
@@ -2258,14 +2436,25 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
          *  outweighs the residual risk, which the warning reports). */
         const probeMeta = async (
           id: string,
-        ): Promise<{ title: string; directory: string; updated: number } | undefined> => {
+        ): Promise<
+          { title: string; directory: string; updated: number; parentID: string | null } | undefined
+        > => {
           const probeClients = client === unscoped ? [client] : [client, unscoped];
           for (const c of probeClients) {
             try {
               const sess = await gate.runQuery(() => c.session.get({ sessionID: id }));
               if (sess.data) {
                 const data = sess.data as Session | GlobalSession;
-                return { title: data.title, directory: data.directory, updated: data.time.updated };
+                return {
+                  title: data.title,
+                  directory: data.directory,
+                  updated: data.time.updated,
+                  // A SUCCESSFUL fetch whose `parentID` is absent means root,
+                  // so it maps to `null` — never `undefined` (which is reserved
+                  // for "no metadata"). Read defensively: the cast site is
+                  // `Session | GlobalSession`.
+                  parentID: typeof data.parentID === "string" ? data.parentID : null,
+                };
               }
             } catch {
               // Try the next client / fall through to unverified.
@@ -2324,12 +2513,15 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
                     title: meta.title,
                     directory: meta.directory,
                     timeUpdated: meta.updated,
+                    parentID: meta.parentID,
                   },
                   verified: true,
                 });
               } else {
                 relevanceBySession.set(id, "unknown");
                 searchedMeta.set(id, { id, title: "", directory: "" });
+                // Both probes failed: `parentID` is OMITTED → `unknown`, never
+                // root. An unverified target must not be able to claim `human`.
                 resolved.push({
                   target: { sessionId: id, title: "", directory: "", timeUpdated: 0 },
                   verified: false,
@@ -2371,6 +2563,9 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
           let sTitle = "";
           let sDir = "";
           let sUpdated = 0;
+          // Stays `undefined` unless the fetch succeeds: no metadata →
+          // `unknown` parentage, never root.
+          let sParent: string | null | undefined;
           try {
             const sess = await gate.runQuery(() => client.session.get({ sessionID: singleTarget }));
             if (sess.data) {
@@ -2378,12 +2573,19 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
               sTitle = data.title;
               sDir = data.directory;
               sUpdated = data.time.updated;
+              sParent = typeof data.parentID === "string" ? data.parentID : null;
             }
           } catch {
             // Proceed without metadata; drill still fetches the session's parts.
           }
           drillTargets = [
-            { sessionId: singleTarget, title: sTitle, directory: sDir, timeUpdated: sUpdated },
+            {
+              sessionId: singleTarget,
+              title: sTitle,
+              directory: sDir,
+              timeUpdated: sUpdated,
+              parentID: sParent,
+            },
           ];
           deepSet = new Set([singleTarget]);
           relevanceBySession.set(singleTarget, "unknown");
@@ -2552,26 +2754,59 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
           if (scope !== "global") pushUnique(normalized.limitedBy, "scope");
         } else {
           // ── Tier 1: rank cards ──
-          const cardFilters: CardFilters = {};
+          const cardFilters: CardRankFilters = {};
           if (after != null) cardFilters.since = after;
           if (before != null) cardFilters.until = before;
           if (excludeCurrent && currentSessionID) cardFilters.excludeFamilyOf = currentSessionID;
-          let cardHits: CardHit[] = cards.rank(queryMeta, cardFilters);
+          // Selection-tier win for the dominant contaminant: under
+          // authorship:{human} a child session can contribute no result at all,
+          // so drop it from ranking and let a root session take the slot. The
+          // type fence (CardRankFilters) keeps this off every `cards.list`
+          // caller, which must never drop a session named by id.
+          if (humanOnly) cardFilters.rootOnly = true;
+          // Coverage for that restriction comes back from the ranking pass
+          // itself, which already knows which cards it discarded and whether
+          // they had any signal. The directory/scope bucketing below is applied
+          // to them here, since `rank` never sees it.
+          const rankStats: RankStats = { rootOnlySkipped: [] };
+          let cardHits: CardHit[] = cards.rank(
+            queryMeta,
+            cardFilters,
+            humanOnly ? rankStats : undefined,
+          );
+
+          // Hoisted so the authorship skip accounting below applies the exact
+          // same title predicate `eligible` did, instead of over-counting a
+          // child card that the title filter would have removed anyway.
+          const titleLower = title ? title.toLowerCase() : undefined;
+          const passesTitle = (card: Card): boolean =>
+            titleLower === undefined || card.title.toLowerCase().includes(titleLower);
 
           if (title) {
-            const titleLower = title.toLowerCase();
-            cardHits = cardHits.filter((hit) => hit.card.title.toLowerCase().includes(titleLower));
+            cardHits = cardHits.filter((hit) => passesTitle(hit.card));
             pushUnique(normalized.limitedBy, "title");
           }
 
           // ── Directory / project bucketing (reuses the old relevance machinery) ──
           let eligible = cardHits.map((hit) => ({ hit, relevance: relevanceOf(hit.card) }));
+          // Which relevance buckets this query actually kept. Recorded so the
+          // authorship skip accounting below is measured against exactly the
+          // same population `eligible` is, instead of the whole store.
+          const keptRelevances = new Set<DirectoryRelevance>([
+            "exact",
+            "project",
+            "global",
+            "unknown",
+          ]);
           if (bucketDirectory) {
             pushUnique(normalized.limitedBy, directoryFilter ? "directory" : "scope");
             const exact = eligible.filter((e) => e.relevance === "exact");
             const proj = eligible.filter((e) => e.relevance === "project");
             const glob = eligible.filter((e) => e.relevance === "global");
             if (directoryFilter && fallback) {
+              // `eligible` is rebuilt from the three named buckets, so an
+              // "unknown"-relevance card is dropped here too.
+              keptRelevances.delete("unknown");
               eligible = [...exact, ...proj, ...glob];
               directoryBucketsSearched = [
                 ...(exact.length > 0 ? (["exact"] as const) : []),
@@ -2584,6 +2819,8 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
                 );
               }
             } else if (projectScope && !directoryFilter) {
+              keptRelevances.delete("global");
+              keptRelevances.delete("unknown");
               eligible = [...exact, ...proj];
               directoryBucketsSearched = [
                 ...(exact.length > 0 ? (["exact"] as const) : []),
@@ -2591,12 +2828,34 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
               ];
               if (glob.length > 0) skippedByReason.directory = glob.length;
             } else {
+              keptRelevances.delete("project");
+              keptRelevances.delete("global");
+              keptRelevances.delete("unknown");
               eligible = exact;
               directoryBucketsSearched = exact.length > 0 ? ["exact"] : [];
               const skipped = proj.length + glob.length;
               if (skipped > 0) skippedByReason.directory = skipped;
             }
           }
+
+          // The restriction's coverage entry: cards that would have ranked, and
+          // that this query's OTHER selection guards (title, directory
+          // bucketing) would also have kept. Counting a card that another
+          // guard would have removed anyway would misattribute the skip.
+          //
+          // The FTS injection below applies the directory guard but NOT `title`
+          // — that path has never gated admission on `title` — so a child it
+          // drops genuinely was in contention there and is counted. The two
+          // paths therefore attribute against their own admission rules, which
+          // is the honest reading; they dedupe into one id set.
+          //
+          // Held for later: the count is only meaningful once the shortlist cap
+          // is known (see the counterfactual merge below, which fills
+          // `authorshipSkippedIds`), because "carried a signal" admits nearly
+          // every card when semantic ranking is on.
+          const skippedContenders = rankStats.rootOnlySkipped.filter(
+            (s) => passesTitle(s.card) && keptRelevances.has(relevanceOf(s.card)),
+          );
 
           for (const e of eligible) {
             relevanceBySession.set(e.hit.sessionId, e.relevance);
@@ -2677,6 +2936,26 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
                   continue;
                 }
               }
+              // This path never goes through `cards.rank`/`CardFilters`, so the
+              // roots-only restriction needs its own check here. Not marginal:
+              // FTS rows are the human-text class, exactly where delegated
+              // prompts live, so child sessions arrive disproportionately via
+              // `ftsOnly` for prompt-shaped queries. Placed LAST so the count
+              // only claims sessions the other guards would have admitted —
+              // consistent with the card-rank count above. Held rather than
+              // counted: like the ranked lane, this only becomes a meaningful
+              // number once the shortlist cap is known.
+              if (humanOnly && parentageOf(card.parentId) === "child") {
+                authorshipFtsDropped.push(id);
+                // Recorded in ITERATION order, interleaved with the admitted
+                // ids, because `mergeShortlist` reserves a prefix of this lane.
+                // Appending the dropped ids afterwards instead would demote them
+                // behind every admitted id and systematically under-count the
+                // lane this check exists for.
+                ftsLaneAll.push(id);
+                continue;
+              }
+              ftsLaneAll.push(id);
               relevanceBySession.set(id, relevance);
               searchedMeta.set(id, { id, title: card.title, directory: card.directory });
               cardById.set(id, card);
@@ -2691,6 +2970,65 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
               : Math.max(1, limits.drillSessions);
           const semanticSlots = semanticIds.length > 0 ? limits.semanticSlots : 0;
           const mergedIds = mergeShortlist(eligibleIds, ftsOnly, semanticIds, cap, semanticSlots);
+
+          // How many child sessions the roots-only restriction cost the
+          // shortlist: re-run the real `mergeShortlist` with the dropped
+          // children restored and count the restored ids that land in it.
+          //
+          // Why not just count every child that carried a signal: that is
+          // technically true and practically useless. Semantic scoring maps
+          // cosine to [0,1], so nearly every card scores above zero and the
+          // number collapses to "every child session in the store" (4,488 of
+          // 4,978 on a real corpus), swamping `sessionsSkipped`, whose other
+          // keys are all post-ranking and small.
+          //
+          // This is a close APPROXIMATION, not a proof, and it is a diagnostic
+          // counter rather than behavior. Three known imprecisions, all small
+          // and all in the under-reporting direction except the first:
+          //   - the ranked lane is rebuilt in pure score order, while the real
+          //     lane is bucket-major (exact, then project, then global) when
+          //     directory bucketing is on, so a restored card can place higher
+          //     or lower than it truly would;
+          //   - `semanticIds` is derived from the post-restriction ranking, so
+          //     a restored child can never claim a reserved semantic slot;
+          //   - `rank`'s recency near-miss fallback records no skips, so a
+          //     zero-signal query attributes nothing.
+          // Only the top `cap` of the ranked restore list can reach a shortlist
+          // of size `cap`, so it is sliced before the merge. That bounds the
+          // MERGE by the cap; collecting and sorting the contenders is still
+          // O(children). Measured on a 4,580-child store with a code-token
+          // query: +0.46ms over an unrestricted rank, against a 50ms budget.
+          if (skippedContenders.length > 0 || authorshipFtsDropped.length > 0) {
+            const restoredCards = [...skippedContenders]
+              .sort((a, b) => b.score - a.score)
+              .slice(0, cap);
+            const rankedRestored = new Set(restoredCards.map((s) => s.card.sessionId));
+            const restoredIds = new Set([...rankedRestored, ...authorshipFtsDropped]);
+            const counterfactualCardIds = [
+              ...eligible.map((e) => ({ id: e.hit.sessionId, score: e.hit.score })),
+              ...restoredCards.map((s) => ({ id: s.card.sessionId, score: s.score })),
+            ]
+              .sort((a, b) => b.score - a.score)
+              .map((e) => e.id);
+            // A child that is both a rank contender and an FTS hit would have
+            // been skipped by the FTS loop (`eligibleIdSet`), so it must not
+            // inflate the FTS lane and earn a bigger reserved band. Keyed on
+            // EVERY contender, not the cap-sliced restore list: a beyond-cap
+            // contender cannot win a card-lane slot either, so excluding it
+            // from both lanes is faithful, not merely cheaper.
+            const rankedContenders = new Set(skippedContenders.map((s) => s.card.sessionId));
+            const counterfactualFts = ftsLaneAll.filter((id) => !rankedContenders.has(id));
+            const counterfactual = mergeShortlist(
+              counterfactualCardIds,
+              counterfactualFts,
+              semanticIds,
+              cap,
+              semanticSlots,
+            );
+            for (const id of counterfactual) {
+              if (restoredIds.has(id)) authorshipSkippedIds.add(id);
+            }
+          }
           // Which sessions the semantic reservation actually surfaced: the ids in
           // the shortlist that the lexical-only merge would NOT have selected.
           // These are the rescue-eligible / semantically-contributed sessions —
@@ -2704,17 +3042,27 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
             .filter((id) => id !== excludeSessionID)
             .map((id) => {
               const card = cardById.get(id);
+              // This is the DEFAULT recall path: it builds target literals
+              // inline rather than through `registerTarget`, so parentage has
+              // to be read here too. `cardById` is populated from both the
+              // eligible cards and the FTS injection; a missing card leaves
+              // `parentID` undefined → `unknown` (fail-closed).
               return {
                 sessionId: id,
                 title: card?.title ?? "",
                 directory: card?.directory ?? "",
                 timeUpdated: card?.timeUpdated ?? 0,
+                parentID: card?.parentId,
               };
             });
 
           if (excludeSessionID) {
             skippedByReason.excludedSession = (skippedByReason.excludedSession ?? 0) + 1;
             pushUnique(normalized.limitedBy, "excludedSession");
+          }
+          if (authorshipSkippedIds.size > 0) {
+            skippedByReason.authorship =
+              (skippedByReason.authorship ?? 0) + authorshipSkippedIds.size;
           }
           const shortlistSkipped = Math.max(0, eligibleIds.length - drillTargets.length);
           if (requestedSessions != null && sessionsEligible > requestedSessions) {
@@ -2758,6 +3106,7 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
           explain,
           filter: (candidate: Candidate) => candidateEligible(candidate, filters),
           searchTitles,
+          authorship: authorshipFilter,
           abort: ctx.abort,
         };
         const abortedOutput = (): string =>
@@ -2804,14 +3153,59 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
           searchedSessions: Array<{ id: string; title: string; directory: string }>;
           loadErrorCount: number;
           incomplete: boolean;
+          /** Statement half of the empty-pool warning, when the authorship pass
+           *  emptied at least one drilled session. finish() adds the advice. */
+          authorshipEmptied?: string;
         } => {
           let partsSearched = 0;
+          let authorshipEmptied: string | undefined;
           const msgIds = new Set<string>();
           for (const pool of pools) {
             for (const candidate of pool.candidates) {
               if (candidate.partType === "title") continue;
               partsSearched++;
               msgIds.add(candidate.messageID);
+            }
+          }
+          // Authorship narrowed everything away: say so, naming the buckets and
+          // counts, so an empty answer is not read as "no such history". Lives
+          // here rather than per-route so it reaches every route — including
+          // the single-target branch a subagent's scope:"session" +
+          // authorship:"human" always takes, which bypasses the selection tier.
+          if (authorshipFilter) {
+            // Detected PER POOL, not globally: one surviving candidate in one
+            // session must not hide the fact that the pass emptied ten others.
+            // The predicate is `authorshipRemoved` (which counts the title
+            // candidate) rather than the bucket sum, so it says exactly "the
+            // authorship stage emptied this pool" and not "eligibility left it
+            // empty" — independent of the fact that a title candidate can never
+            // be a pool's ONLY member (it is derived from a non-empty eligible
+            // pool, so an all-title drop is unreachable and the breakdown below
+            // is always populated in practice). Counts come only from the
+            // emptied pools, so the breakdown explains the emptiness rather
+            // than restating the whole query.
+            let emptied = 0;
+            const dropped: AuthorshipCounts = {};
+            for (const pool of pools) {
+              if (pool.candidates.length > 0 || (pool.authorshipRemoved ?? 0) === 0) continue;
+              emptied++;
+              for (const [bucket, count] of Object.entries(pool.authorshipDropped ?? {})) {
+                dropped[bucket as Authorship] = (dropped[bucket as Authorship] ?? 0) + count;
+              }
+            }
+            if (emptied > 0) {
+              const entries = Object.entries(dropped).sort(
+                (a, b) => b[1] - a[1] || a[0].localeCompare(b[0]),
+              );
+              const breakdown =
+                entries.length > 0
+                  ? ` (${entries.map(([bucket, count]) => `${bucket} ${count}`).join(", ")})`
+                  : "";
+              // Composed here, emitted in finish() — the advice half depends on
+              // whether the query ended up with anything, which is not known
+              // until the results are sliced. A successful narrowed query
+              // should report what it withheld without being told to widen.
+              authorshipEmptied = `authorship:${JSON.stringify([...authorshipFilter])} removed every candidate from ${emptied} of ${pools.length} drilled session${pools.length === 1 ? "" : "s"}${breakdown}.`;
             }
           }
           const loadErrorCount = loadErrors.length;
@@ -2847,7 +3241,13 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
           const searchedSessions = drilledSessions.map(
             (id) => searchedMeta.get(id) ?? { id, title: "", directory: "" },
           );
-          return { coverage, searchedSessions, loadErrorCount, incomplete: loadErrorCount > 0 };
+          return {
+            coverage,
+            searchedSessions,
+            loadErrorCount,
+            incomplete: loadErrorCount > 0,
+            ...(authorshipEmptied != null && { authorshipEmptied }),
+          };
         };
 
         const queryLower = args.query.toLowerCase();
@@ -2896,6 +3296,13 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
           outCtx: ReturnType<typeof buildOutputContext>,
         ): Promise<T> => {
           const warnings = [...normalized.warnings];
+          if (outCtx.authorshipEmptied) {
+            warnings.push(
+              final.length === 0
+                ? `${outCtx.authorshipEmptied} Widen it or pass authorship:"any" to see them.`
+                : outCtx.authorshipEmptied,
+            );
+          }
           // Count the returned results the semantic tier surfaced (reserved-slot
           // inclusions plus zero-lexical-hit rescues, both keyed by the session
           // set the reservation added).
@@ -2927,6 +3334,7 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
               codeTokens: queryMeta.codeTokens,
               shortlistIDs,
               ...(after != null && { after }),
+              ...(authorshipFilter && { authorship: [...authorshipFilter] }),
             },
           );
         };
@@ -3001,11 +3409,11 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
           candidates: Candidate[],
           relevance: DirectoryRelevance,
           remaining: number,
-        ) => scan(candidates, relevance, args.query, remaining, widthArg);
+        ) => scan(candidates, relevance, args.query, remaining, widthArg, emitAuthorship);
         const regexMatcher =
           (re: RegExp) =>
           (candidates: Candidate[], relevance: DirectoryRelevance, remaining: number) =>
-            regexScanCandidates(candidates, relevance, re, remaining, widthArg);
+            regexScanCandidates(candidates, relevance, re, remaining, widthArg, emitAuthorship);
 
         const loadErrorSuffixOf = (count: number): string =>
           count > 0 ? `, ${count} load error${count !== 1 ? "s" : ""}` : "";
@@ -3027,6 +3435,7 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
             query: queryMeta,
             filter: (candidate: Candidate) => candidateEligible(candidate, filters),
             searchTitles,
+            authorship: authorshipFilter,
             charsPerQuery: limits.deepCharsPerQuery,
             resume: deepResume,
             abort: ctx.abort,
@@ -3072,6 +3481,7 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
               queryMeta,
               widthArg,
               relevanceBySession,
+              emitAuthorship,
             );
             const sliced = applyGroupAndSlice(allResults, allResults.length, false);
             ({ final, total: outTotal, truncated } = sliced);
@@ -3176,6 +3586,7 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
           queryMeta,
           widthArg,
           relevanceBySession,
+          emitAuthorship,
         );
 
         // ── Zero-lexical-hit semantic rescue (Path A) ──
@@ -3196,6 +3607,7 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
           width: widthArg,
           mode: smartMode,
           explain,
+          emitAuthorship,
         });
         if (rescued.length > 0) {
           allResults = [...allResults, ...rescued].sort(

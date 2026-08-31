@@ -8,6 +8,11 @@ export type SessionMeta = {
   title: string;
   directory: string;
   directoryRelevance?: DirectoryRelevance;
+  /** Tri-state session parentage for authorship classification: a string is a
+   *  real parent id, `null` means metadata said root, and `undefined`/omitted
+   *  means metadata was unavailable (see src/authorship.ts). Safe by omission:
+   *  forgetting it yields `unknown`, never a false `human`. */
+  parentID?: string | null;
 };
 
 export type MsgInfo = {
@@ -34,6 +39,14 @@ export type Candidate = {
   why?: ResultWhy;
   directoryRelevance?: DirectoryRelevance;
   titleMatch?: { title: string; matchedTerms?: string[] };
+
+  // ── Authorship inputs (structural; see src/authorship.ts) ──
+  /** Host/tool-injected part (SDK `TextPart.synthetic`). */
+  synthetic?: boolean;
+  /** Host rendering hint, e.g. a TUI status block (SDK `TextPart.ignored`). */
+  ignored?: boolean;
+  /** Tri-state parentage of this candidate's session (see {@link SessionMeta}). */
+  sessionParentID?: string | null;
 
   // Deduplicated tokens for matched-term metadata checks
   tokens: string[];
@@ -108,6 +121,12 @@ export function buildCandidates(
       }
       charsUsed += rawText.length;
 
+      // Authorship part flags. The SDK declares both on TextPart only, so the
+      // type narrowing carries them — no cast. A non-text part leaves them
+      // undefined, which the classifier reads as "not flagged".
+      const synthetic = part.type === "text" && part.synthetic === true ? true : undefined;
+      const ignored = part.type === "text" && part.ignored === true ? true : undefined;
+
       const candidate: Candidate = {
         sessionID: session.id,
         sessionTitle: session.title,
@@ -118,6 +137,9 @@ export function buildCandidates(
         partID: part.id,
         partType: part.type,
         isPruned: pruned(part),
+        synthetic,
+        ignored,
+        sessionParentID: session.parentID,
         rawText,
         fieldTexts: fields,
         tokens: tokenize(rawText),

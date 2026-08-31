@@ -196,9 +196,10 @@ function stringField(obj: Record<string, unknown> | undefined, key: string): str
 /** Whether a text part is auto-recall's synthetic `<recall-auto>` injection,
  *  which must never be indexed (recall would find its own prior injections). */
 function isRecallAutoText(part: Part): boolean {
+  // (`synthetic` is declared on the SDK's TextPart, so no cast is needed.)
   return (
     part.type === "text" &&
-    (part as { synthetic?: boolean }).synthetic === true &&
+    part.synthetic === true &&
     part.text?.startsWith("<recall-auto>") === true
   );
 }

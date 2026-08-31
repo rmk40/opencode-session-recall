@@ -13,6 +13,7 @@ import {
 import { buildSessionDigest } from "./corpus.js";
 import { normalize } from "./normalize.js";
 import { searchable } from "./extract.js";
+import { authorshipOf, type Authorship, type AuthorshipCounts } from "./authorship.js";
 import { bm25Search, type Bm25Hit, type Bm25Mode } from "./bm25.js";
 import { mergeShortlistHits } from "./rerank.js";
 import type { FtsHit } from "./store.js";
@@ -43,6 +44,13 @@ export type DrillTarget = {
   title: string;
   directory: string;
   timeUpdated: number;
+  /** Tri-state session parentage, carried into every candidate this target
+   *  produces so the authorship classifier can tell a human prompt from a
+   *  delegated one. `string` = has a parent, `null` = metadata said root,
+   *  `undefined`/omitted = metadata unavailable → `unknown`. Safe by omission:
+   *  a construction site that forgets the key fails CLOSED (withholds from
+   *  `authorship: "human"`) rather than claiming agent text is human-typed. */
+  parentID?: string | null;
 };
 
 export type DrillInput = {
@@ -64,6 +72,10 @@ export type DrillInput = {
    *  `assembleSession` title binding) — the newest eligible candidate carries
    *  the session title so title hits participate in ranking/scanning. */
   searchTitles?: boolean;
+  /** Authorship buckets to keep. Applied as the LAST stage of {@link poolFor},
+   *  after the title candidate is built, so the title is filtered by the same
+   *  rule as everything else. Absent = no authorship narrowing. */
+  authorship?: ReadonlySet<Authorship>;
   /** Cooperative cancellation: a fired signal stops the drill before the next
    *  session's fetch (a hook timeout, for example), so no further SDK calls are
    *  made once the caller has given up. */
@@ -77,6 +89,17 @@ export type DrillInput = {
 export type DrilledPool = {
   target: DrillTarget;
   candidates: Candidate[];
+  /** Per-bucket counts of candidates the authorship stage removed. Present only
+   *  when an authorship filter ran. The title candidate is deliberately NOT
+   *  attributed: a title is dropped by definition under any set that excludes
+   *  `"title"`, so counting it would add a constant per-session term that says
+   *  nothing about what content was withheld. */
+  authorshipDropped?: AuthorshipCounts;
+  /** Total candidates the authorship stage removed, INCLUDING the unattributed
+   *  title candidate. Present only when an authorship filter ran. This is what
+   *  tells "the pass emptied this pool" apart from "eligibility left it empty",
+   *  including for a pool whose only survivor would have been its title. */
+  authorshipRemoved?: number;
 };
 
 export type DrillOutput = {
@@ -109,6 +132,8 @@ export type DeepInput = {
   filter?: (candidate: Candidate) => boolean;
   /** Append each session's bound title candidate (mirrors the drill). */
   searchTitles?: boolean;
+  /** Authorship buckets to keep (mirrors {@link DrillInput.authorship}). */
+  authorship?: ReadonlySet<Authorship>;
   /** Retained-chars budget for the whole sweep (`limits.deepCharsPerQuery`). */
   charsPerQuery: number;
   /** Resume state: the page cursor to continue the FIRST session from. */
@@ -220,7 +245,10 @@ export function decodeDeepCursor(raw: string): DeepCursorPayload | null {
   }
 }
 
-type CacheEntry = { candidates: Candidate[]; chars: number };
+/** One cached session build. `parentID` records the session parentage the
+ *  cached candidates are currently STAMPED with, so a hit served to a target
+ *  that disagrees can be restamped instead of silently inheriting it. */
+type CacheEntry = { candidates: Candidate[]; chars: number; parentID: string | null | undefined };
 
 const MAX_LOAD_ERROR_SAMPLES = 5;
 
@@ -329,17 +357,44 @@ export function createDrill(deps: DrillDeps): Drill {
     );
   }
 
+  /** Return the entry's candidates carrying `parentID` as their session
+   *  parentage. The common case (the stamp already matches) returns the cached
+   *  array untouched. On a mismatch the candidates are SHALLOW-COPIED before
+   *  restamping: the cached array may be held by a concurrent reader, and
+   *  mutating it in place would retroactively change that reader's
+   *  classification. The cache entry itself is never rewritten, so it stays the
+   *  canonical build for whichever target filled it. */
+  function restamped(entry: CacheEntry, parentID: string | null | undefined): CacheEntry {
+    if (entry.parentID === parentID) return entry;
+    const candidates = entry.candidates.map((candidate) => ({
+      ...candidate,
+      sessionParentID: parentID,
+    }));
+    return { candidates, chars: entry.chars, parentID };
+  }
+
   async function candidatesFor(
     target: DrillTarget,
     needles: string[],
     ftsHits: FtsHit[] | undefined,
   ): Promise<CacheEntry> {
+    // The key deliberately omits `target.parentID`. Two targets for the same
+    // session CAN disagree about parentage at the same `timeUpdated` — a card
+    // whose `timeUpdated` is 0, or an id with no card at all, produces the same
+    // `${sessionId}:0` key as the metadata-less fallback — so the key alone
+    // cannot be trusted to imply matching parentage. Extending the key would
+    // instead refetch the same session, which is exactly what this cache
+    // exists to avoid. So parentage is treated as TARGET metadata rather than
+    // message-derived data: a hit whose stamp disagrees with the current target
+    // is restamped onto a copy (below). Getting this wrong fails OPEN — cached
+    // root parentage served to an unknown-parentage target would let its
+    // candidates satisfy `authorship: "human"`.
     const key = `${target.sessionId}:${target.timeUpdated}`;
     const cached = cache.get(key);
     if (cached) {
       cache.delete(key); // move to MRU
       cache.set(key, cached);
-      return cached;
+      return restamped(cached, target.parentID);
     }
 
     const messages = await fetchDrilledMessages(target, needles, ftsHits);
@@ -347,6 +402,7 @@ export function createDrill(deps: DrillDeps): Drill {
       id: target.sessionId,
       title: target.title,
       directory: target.directory,
+      parentID: target.parentID,
     });
     for (const candidate of candidates) populateNormalized(candidate);
 
@@ -357,7 +413,7 @@ export function createDrill(deps: DrillDeps): Drill {
     const normalizedDigest = digestText ? normalize(digestText) : "";
     for (const candidate of candidates) candidate.digestText = normalizedDigest;
 
-    const entry: CacheEntry = { candidates, chars: charsUsed };
+    const entry: CacheEntry = { candidates, chars: charsUsed, parentID: target.parentID };
     cache.set(key, entry);
     cachedTotal += charsUsed;
     evict();
@@ -397,38 +453,84 @@ export function createDrill(deps: DrillDeps): Drill {
       }
       queryRetained += entry.chars;
       drilledSessions.push(target.sessionId);
-      pools.push({ target, candidates: poolFor(target, entry.candidates, input) });
+      pools.push({ target, ...poolFor(target, entry.candidates, input) });
     }
     return { pools, drilledSessions, loadErrors, budgetExhausted };
   }
 
-  /** The per-query scan/score pool for one drilled session: the cached
-   *  (unfiltered) candidates narrowed by the query filter, with the bound title
-   *  candidate appended when title search applies. Mirrors `assembleSession`.
-   *  Shared by the bounded drill and the deep sweep. */
+  /**
+   * The per-query scan/score pool for one drilled session, in THREE ORDERED
+   * STAGES. The order is load-bearing:
+   *
+   * 1. **Eligibility** — the query's type/role/time/toolName predicate
+   *    (`candidateEligible`), mirroring `assembleSession`.
+   * 2. **Title construction** — from the ELIGIBLE pool, exactly as before: the
+   *    representative is `eligible[0]` (newest eligible) and the bound title
+   *    candidate is appended when title search applies.
+   * 3. **Authorship** — over the COMBINED pool, title included.
+   *
+   * Stage 3 must not move ahead of stage 2. The title candidate is *derived
+   * from* the pool (it borrows the representative's messageID/role/time), not
+   * merely appended to it, so filtering first can leave nothing to build from
+   * and would make `authorship: "title"` return nothing on every session. With
+   * this order the title needs no special-casing at all: it classifies `title`
+   * and the ordinary filter decides.
+   *
+   * Shared by the bounded drill and the deep sweep.
+   */
   function poolFor(
     target: DrillTarget,
     cached: Candidate[],
-    input: { filter?: (candidate: Candidate) => boolean; searchTitles?: boolean },
-  ): Candidate[] {
+    input: {
+      filter?: (candidate: Candidate) => boolean;
+      searchTitles?: boolean;
+      authorship?: ReadonlySet<Authorship>;
+    },
+  ): { candidates: Candidate[]; authorshipDropped?: AuthorshipCounts; authorshipRemoved?: number } {
+    // ── Stage 1: eligibility ──
     const eligible = input.filter ? cached.filter(input.filter) : cached;
-    if (!input.searchTitles) return eligible;
-    const representative = eligible[0]; // newest eligible, matching assembleSession
-    if (!representative) return eligible;
-    const title = buildTitleCandidate(
-      { id: target.sessionId, title: target.title, directory: target.directory },
-      {
-        id: representative.messageID,
-        role: representative.role,
-        time: { created: representative.time },
-      },
-    );
-    if (!title) return eligible;
-    populateNormalized(title);
-    // All of a session's candidates carry the same stamped digest; reuse it so
-    // the title candidate participates in ranking exactly as before.
-    title.digestText = cached[0]?.digestText ?? "";
-    return [...eligible, title];
+
+    // ── Stage 2: title construction from the eligible pool ──
+    let pool = eligible;
+    if (input.searchTitles) {
+      const representative = eligible[0]; // newest eligible, matching assembleSession
+      if (representative) {
+        const title = buildTitleCandidate(
+          { id: target.sessionId, title: target.title, directory: target.directory },
+          {
+            id: representative.messageID,
+            role: representative.role,
+            time: { created: representative.time },
+          },
+        );
+        if (title) {
+          populateNormalized(title);
+          // All of a session's candidates carry the same stamped digest; reuse
+          // it so the title candidate participates in ranking exactly as before.
+          title.digestText = cached[0]?.digestText ?? "";
+          pool = [...eligible, title];
+        }
+      }
+    }
+
+    // ── Stage 3: authorship over the combined pool (title included) ──
+    if (!input.authorship) return { candidates: pool };
+    const wanted = input.authorship;
+    const kept: Candidate[] = [];
+    const authorshipDropped: AuthorshipCounts = {};
+    let authorshipRemoved = 0;
+    for (const candidate of pool) {
+      const bucket = authorshipOf(candidate);
+      if (wanted.has(bucket)) {
+        kept.push(candidate);
+        continue;
+      }
+      authorshipRemoved++;
+      // Title drops are counted but not attributed — see DrilledPool.
+      if (candidate.partType === "title") continue;
+      authorshipDropped[bucket] = (authorshipDropped[bucket] ?? 0) + 1;
+    }
+    return { candidates: kept, authorshipDropped, authorshipRemoved };
   }
 
   return {
@@ -512,6 +614,7 @@ export function createDrill(deps: DrillDeps): Drill {
           id: target.sessionId,
           title: target.title,
           directory: target.directory,
+          parentID: target.parentID,
         });
         for (const candidate of candidates) populateNormalized(candidate);
         const digestText = buildSessionDigest(candidates);
@@ -541,7 +644,7 @@ export function createDrill(deps: DrillDeps): Drill {
           }
           continue;
         }
-        pools.push({ target, candidates: poolFor(target, swept.candidates, input) });
+        pools.push({ target, ...poolFor(target, swept.candidates, input) });
         drilledSessions.push(target.sessionId);
         if (swept.stopped) {
           sessionsPartial++;

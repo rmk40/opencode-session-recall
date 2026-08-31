@@ -132,10 +132,8 @@ export function searchableFields(part: Part): SearchableField[] {
       // query-like terms; indexing them would let recall find its own prior
       // injections. Only our sentinel is excluded — other synthetic parts
       // (e.g. host-injected context) stay searchable.
-      if (
-        (part as { synthetic?: boolean }).synthetic === true &&
-        part.text?.startsWith("<recall-auto>")
-      ) {
+      // (`synthetic` is declared on the SDK's TextPart, so no cast is needed.)
+      if (part.synthetic === true && part.text?.startsWith("<recall-auto>")) {
         return [];
       }
       return part.text ? [{ field: "text", text: part.text }] : [];

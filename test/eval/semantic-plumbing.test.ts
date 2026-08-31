@@ -263,4 +263,24 @@ describe("semantic plumbing eval (fake concept embedder, default gate)", () => {
     const withSlots = await run(tool, PARAPHRASES[0]);
     expect(withSlots.results.some((r) => r.sessionID === TARGET)).toBe(true);
   });
+
+  it("labels rescue results with why.authorship under the same gate as every other route", async () => {
+    // The zero-lexical-hit rescue is the third result constructor; this corpus
+    // is the only place it reliably fires, so the authorship gate is pinned
+    // here rather than in test/authorship-recall.test.ts.
+    const plain = await run(tool, PARAPHRASES[1]);
+    const plainHit = plain.results.find((r) => r.sessionID === TARGET);
+    expect(plainHit).toBeDefined();
+    expect(plainHit!.why?.authorship, "default responses stay byte-identical").toBeUndefined();
+
+    const explained = await run(tool, PARAPHRASES[1], { explain: true });
+    const explainedHit = explained.results.find((r) => r.sessionID === TARGET);
+    expect(explainedHit).toBeDefined();
+    expect(explainedHit!.why?.authorship).toBeDefined();
+
+    const filtered = await run(tool, PARAPHRASES[1], { authorship: ["human", "model"] });
+    const filteredHit = filtered.results.find((r) => r.sessionID === TARGET);
+    expect(filteredHit).toBeDefined();
+    expect(["human", "model"]).toContain(filteredHit!.why?.authorship);
+  });
 });

@@ -9,6 +9,7 @@ import {
   createCardsRuntime,
   exclusionFamilyFromCards,
   type CardSource,
+  type RankStats,
 } from "../src/cards.js";
 import { cardVectorStamp, EMBED_REPRESENTATION } from "../src/embedding-text.js";
 import { exclusionFamily } from "../src/search.js";
@@ -141,6 +142,65 @@ describe("cards tier-1 rank", () => {
     expect(ids(runtime.rank(q, { directoryFilter: "/a" }))).toEqual(["s-old"]);
     expect(ids(runtime.rank(q, { scope: "exact", directory: "/b" }))).toEqual(["s-new"]);
     expect(ids(runtime.rank(q, { scope: "project", projectId: "pa" }))).toEqual(["s-old"]);
+    db.close();
+  });
+
+  it("rootOnly drops only positively-child cards, keeping root and degenerate parentage", async () => {
+    const { db, store } = await freshStore();
+    store.upsertCard(makeCard("s-root", { inventory: "widget parser", parentId: null }));
+    store.upsertCard(makeCard("s-child", { inventory: "widget parser", parentId: "s-root" }));
+    // A degenerate stored value: NOT trustworthy metadata, so it is kept at
+    // selection and left to the part-level authorship rule, which classifies it
+    // `unknown`. This is the agreement pinned in test/authorship.test.ts,
+    // exercised here through the real filter.
+    store.upsertCard(makeCard("s-degenerate", { inventory: "widget parser", parentId: "" }));
+    const runtime = createCardsRuntime({ source: storeSource(store) });
+    const q = parseQuery("widget parser");
+
+    expect(ids(runtime.rank(q, {})).sort()).toEqual(["s-child", "s-degenerate", "s-root"]);
+    expect(ids(runtime.rank(q, { rootOnly: true })).sort()).toEqual(["s-degenerate", "s-root"]);
+    // The restriction is ranking-only, and the type fence makes that permanent:
+    // `list` takes CardFilters, whose `rootOnly` is `never`.
+    expect(runtime.list({}).length).toBe(3);
+    // @ts-expect-error rootOnly must never reach list() — it backs the explicit
+    // shortlist and deep, which must never drop a session named by id.
+    const fenced = runtime.list({ rootOnly: true });
+    // And this is why the fence matters rather than a comment: the shared
+    // passesFilters WOULD honor it, silently dropping a caller-named session.
+    expect(fenced.length).toBe(2);
+    db.close();
+  });
+
+  it("reports only the contending cards the root restriction removed", async () => {
+    const { db, store } = await freshStore();
+    store.upsertCard(makeCard("s-root", { inventory: "widget parser" }));
+    store.upsertCard(makeCard("s-child-hit", { inventory: "widget parser", parentId: "s-root" }));
+    // A child card with no signal for this query: never in contention, so the
+    // restriction did not cost the caller anything by dropping it.
+    store.upsertCard(makeCard("s-child-quiet", { inventory: "unrelated", parentId: "s-root" }));
+    // A child card the time bound would have dropped anyway: not attributable
+    // to authorship.
+    store.upsertCard(
+      makeCard("s-child-old", {
+        inventory: "widget parser",
+        parentId: "s-root",
+        timeUpdated: 100,
+      }),
+    );
+    const runtime = createCardsRuntime({ source: storeSource(store) });
+    const q = parseQuery("widget parser");
+
+    const stats: RankStats = { rootOnlySkipped: [] };
+    expect(ids(runtime.rank(q, { rootOnly: true, since: 1000 }, stats))).toEqual(["s-root"]);
+    expect(stats.rootOnlySkipped.map((s) => s.card.sessionId)).toEqual(["s-child-hit"]);
+    // The score is what makes the count usable downstream: it has to be a real
+    // ranking score, comparable to the hits, not a placeholder.
+    expect(stats.rootOnlySkipped[0]?.score).toBeGreaterThan(0);
+
+    // Nothing is collected when the restriction is off.
+    const off: RankStats = { rootOnlySkipped: [] };
+    runtime.rank(q, { since: 1000 }, off);
+    expect(off.rootOnlySkipped).toEqual([]);
     db.close();
   });
 

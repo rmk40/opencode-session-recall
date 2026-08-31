@@ -73,6 +73,127 @@ const target = (id: string): DrillTarget => ({
   timeUpdated: 2000,
 });
 
+// ── LRU parentage: the cache key omits parentage, so the entry must be
+// restamped from the CURRENT target on every hit. Two targets for one session
+// can legitimately share a key while disagreeing about parentage (a card with
+// `timeUpdated: 0`, or an id with no card, collides with the metadata-less
+// fallback target), and inheriting a cached stamp fails OPEN: unknown-parentage
+// candidates would classify `human`.
+describe("drill LRU parentage restamping", () => {
+  const parentageGraph = (): Graph => ({
+    messagesBySession: {
+      "s-p": [
+        bundle(userMessage("m1", "s-p", 1000), [
+          textPart("p1", "s-p", "m1", "needle typed into the session"),
+        ]),
+      ],
+    },
+  });
+
+  /** Same session id and the same `timeUpdated`, so both targets hit one cache key. */
+  const rootTarget: DrillTarget = {
+    sessionId: "s-p",
+    title: "s-p",
+    directory: PROJECT_DIR,
+    timeUpdated: 0,
+    parentID: null,
+  };
+  const unknownTarget: DrillTarget = {
+    sessionId: "s-p",
+    title: "s-p",
+    directory: PROJECT_DIR,
+    timeUpdated: 0,
+    // parentID omitted: no metadata → unknown.
+  };
+  const childTarget: DrillTarget = { ...rootTarget, parentID: "s-parent" };
+
+  async function humanPool(
+    drill: ReturnType<typeof createDrill>,
+    t: DrillTarget,
+  ): Promise<{ human: number; parentage: Array<string | null | undefined> }> {
+    const out = await drill.pools({
+      sessions: [t],
+      deepSet: new Set([t.sessionId]),
+      query: parseQuery("needle"),
+      mode: "smart",
+      explain: false,
+      authorship: new Set(["human"] as const),
+    });
+    const all = await drill.pools({
+      sessions: [t],
+      deepSet: new Set([t.sessionId]),
+      query: parseQuery("needle"),
+      mode: "smart",
+      explain: false,
+    });
+    return {
+      human: out.pools[0]?.candidates.length ?? 0,
+      parentage: (all.pools[0]?.candidates ?? []).map((c) => c.sessionParentID),
+    };
+  }
+
+  it("does not serve a cached root stamp to an unknown-parentage target", async () => {
+    const { client, calls } = makeDrillFake(parentageGraph());
+    const { gate } = makeSpyGate();
+    const drill = createDrill({ client, gate, limits: TEST_LIMITS });
+
+    const first = await humanPool(drill, rootTarget);
+    expect(first.human).toBe(1); // root session → human
+    expect(first.parentage).toEqual([null]);
+
+    const fetchesAfterFirst = calls.messages.length;
+    const second = await humanPool(drill, unknownTarget);
+    // Served from the cache (no refetch) but reclassified for THIS target.
+    expect(calls.messages.length).toBe(fetchesAfterFirst);
+    expect(second.parentage).toEqual([undefined]);
+    expect(second.human).toBe(0); // unknown parentage is withheld from "human"
+  });
+
+  it("does not serve a cached unknown stamp to a root target (the reverse order)", async () => {
+    const { client, calls } = makeDrillFake(parentageGraph());
+    const { gate } = makeSpyGate();
+    const drill = createDrill({ client, gate, limits: TEST_LIMITS });
+
+    const first = await humanPool(drill, unknownTarget);
+    expect(first.human).toBe(0);
+
+    const fetchesAfterFirst = calls.messages.length;
+    const second = await humanPool(drill, rootTarget);
+    expect(calls.messages.length).toBe(fetchesAfterFirst);
+    expect(second.parentage).toEqual([null]);
+    expect(second.human).toBe(1);
+  });
+
+  it("does not serve a cached root stamp to a child target", async () => {
+    const { client } = makeDrillFake(parentageGraph());
+    const { gate } = makeSpyGate();
+    const drill = createDrill({ client, gate, limits: TEST_LIMITS });
+
+    await humanPool(drill, rootTarget);
+    const second = await humanPool(drill, childTarget);
+    expect(second.parentage).toEqual(["s-parent"]);
+    expect(second.human).toBe(0); // a child session's user text is delegated
+  });
+
+  it("leaves the cached array untouched when restamping (no retroactive reclassification)", async () => {
+    const { client } = makeDrillFake(parentageGraph());
+    const { gate } = makeSpyGate();
+    const drill = createDrill({ client, gate, limits: TEST_LIMITS });
+
+    const rootPools = await drill.pools({
+      sessions: [rootTarget],
+      deepSet: new Set(["s-p"]),
+      query: parseQuery("needle"),
+      mode: "smart",
+      explain: false,
+    });
+    const held = rootPools.pools[0]!.candidates;
+    await humanPool(drill, unknownTarget);
+    // The earlier caller's candidates still say what they said.
+    expect(held.map((c) => c.sessionParentID)).toEqual([null]);
+  });
+});
+
 describe("drill tier-2", () => {
   it("reranks drilled candidates, surfacing the matching session, all fetches through the gate", async () => {
     const graph: Graph = {

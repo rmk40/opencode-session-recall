@@ -1,3 +1,5 @@
+import type { Authorship } from "./authorship.js";
+
 export const TOOLS = [
   "recall",
   "recall_get",
@@ -133,6 +135,7 @@ export type SearchCoverage = {
     | "time"
     | "type"
     | "role"
+    | "authorship"
     | "sessionsLimit"
     | "maxSessions"
     | "providerLimit"
@@ -193,6 +196,10 @@ export type ResultWhy = {
   recency?: "recent" | "older" | "unknown";
   confidence?: "high" | "medium" | "low";
   evidenceClass?: EvidenceClass;
+  /** Who composed this part (see src/authorship.ts). Emitted ONLY when the
+   *  caller narrowed `authorship` or asked for `explain` — default responses
+   *  stay byte-identical to pre-authorship builds. */
+  authorship?: Authorship;
   /** Semantic (cosine-derived, 0..1) similarity behind this result. Present for
    *  a zero-lexical-hit semantic rescue (its whole basis), and for any result
    *  under explain:true when the semantic layer scored its session. */
@@ -213,6 +220,11 @@ export type TopEvidence = {
   partID: string;
   evidenceClass: EvidenceClass;
   snippet: string;
+  /** Who composed this evidence. Optional and emitted under the SAME predicate
+   *  as {@link ResultWhy.authorship} (active filter or `explain`), so grouped
+   *  output can answer the authorship question without changing default
+   *  grouped responses. */
+  authorship?: Authorship;
 };
 
 export type SearchResult = {

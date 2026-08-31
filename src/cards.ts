@@ -4,6 +4,7 @@ import type { ParsedQuery } from "./query.js";
 import { normalize, tokenizeAll } from "./normalize.js";
 import { embeddingTextOf, cardVectorStamp, EMBED_REPRESENTATION } from "./embedding-text.js";
 import { isSummarizerTitle } from "./extract.js";
+import { parentageOf } from "./authorship.js";
 import { clamp01, recencyMultiplier } from "./bm25.js";
 import { cosineSimilarity } from "./semantic/similarity.js";
 import type { CandidateEmbedder } from "./corpus.js";
@@ -99,6 +100,58 @@ export type CardFilters = {
   directoryFilter?: string;
   /** Exclude the current session and its whole family (see {@link exclusionFamilyFromCards}). */
   excludeFamilyOf?: string;
+  /** Declared as `never` so the ranking-only restriction cannot be smuggled in
+   *  here; see {@link CardRankFilters}. */
+  rootOnly?: never;
+};
+
+/**
+ * {@link CardFilters} plus the ranking-only root restriction.
+ *
+ * The fence is a real type error, not an excess-property warning: `CardFilters`
+ * declares `rootOnly?: never`, so a `CardRankFilters` VARIABLE (not just a
+ * literal) is unassignable to the `CardFilters` parameter of
+ * {@link CardsRuntime.list}, while a plain `CardFilters` still flows into
+ * {@link CardsRuntime.rank}. `cards.list` backs the explicit-shortlist and deep
+ * branches, which must never drop a session the caller named by id.
+ */
+export type CardRankFilters = Omit<CardFilters, "rootOnly"> & {
+  /**
+   * Drop cards whose parentage is positively a CHILD ({@link parentageOf}).
+   * Root and unknown-parentage cards are kept: the restriction is fail-open at
+   * selection and fail-closed at part-level filtering, and it reads parentage
+   * through the same helper the classifier uses so the two cannot disagree.
+   *
+   * Distinct from {@link CardFilters.excludeFamilyOf}, which excludes one named
+   * family and cannot express "roots only".
+   *
+   * Set by exactly one caller: the tier-1 ranking branch when `authorship`
+   * normalizes to `{human}`. No candidate in a child session can classify
+   * `human` (the classifier's parent rule fires before the root rule), so such
+   * a session contributes zero results either way — dropping it at selection
+   * frees a shortlist slot for a session that can.
+   */
+  rootOnly?: boolean;
+};
+
+/** Optional out-parameter for {@link CardsRuntime.rank}: what the ranking pass
+ *  discarded, for coverage reporting. Filled only when the corresponding filter
+ *  is set, and measured against the query's own contention set. */
+export type RankStats = {
+  /** Cards {@link CardRankFilters.rootOnly} removed that would OTHERWISE have
+   *  ranked: they passed every other filter and carried a lexical or semantic
+   *  signal. Cards are returned rather than a count so the caller can apply its
+   *  own directory/scope bucketing, which `rank` does not see.
+   *
+   *  Each carries the score it WOULD have ranked with, computed identically to
+   *  a real hit. The caller needs it because "had a signal" is far too loose to
+   *  report on its own: with semantic ranking on, cosine similarity is mapped
+   *  to [0,1] so essentially every card carries a nonzero score, and the raw
+   *  count collapses to "every child session in the store" (measured: 4,488 of
+   *  4,978 on a real corpus). The score is the input to the caller's estimate
+   *  of which cards would have taken a shortlist slot; that estimate is
+   *  explicitly approximate (see the counterfactual merge in `search.ts`). */
+  rootOnlySkipped: Array<{ card: Card; score: number }>;
 };
 
 export type CardsCoverage = {
@@ -183,7 +236,7 @@ export type CardsRuntimeDeps = {
 };
 
 export type CardsRuntime = {
-  rank(query: ParsedQuery, filters: CardFilters): CardHit[];
+  rank(query: ParsedQuery, filters: CardRankFilters, stats?: RankStats): CardHit[];
   /** Every card passing the metadata filters (no query ranking), newest-first.
    *  The deep sweep uses this to enumerate its scoped session set — deep is
    *  exhaustive within scope, so it must not rank/prune by query. */
@@ -490,18 +543,28 @@ export function createCardsRuntime(deps: CardsRuntimeDeps): CardsRuntime {
     else lastLoad = now(); // nothing changed; defer the next revision check
   }
 
-  function directoryRelevance(card: Card, filters: CardFilters): DirectoryRelevance {
+  function directoryRelevance(
+    card: Card,
+    // Only the two labeling fields — accepting the narrow shape keeps this
+    // usable from both the rank and list paths despite the `rootOnly` fence.
+    filters: Pick<CardFilters, "directory" | "projectId">,
+  ): DirectoryRelevance {
     if (filters.directory && card.directory === filters.directory) return "exact";
     if (filters.projectId && card.projectId === filters.projectId) return "project";
     if (!card.directory && !card.projectId) return "unknown";
     return "global";
   }
 
-  function passesFilters(card: Card, filters: CardFilters, excluded: Set<string>): boolean {
+  function passesFilters(card: Card, filters: CardRankFilters, excluded: Set<string>): boolean {
     // A summarizer worker card (a crash can leave one persisted) is never a
     // result; centralize the exclusion here so rank() and list() both honor it.
     if (isSummarizerTitle(card.title)) return false;
     if (excluded.has(card.sessionId)) return false;
+    // Roots-only selection (authorship:{human}); never set by list() callers
+    // (the type fence on CardRankFilters enforces that). Parentage is read
+    // through the SAME helper the authorship classifier uses, so a degenerate
+    // value cannot be a child here and a human there.
+    if (filters.rootOnly && parentageOf(card.parentId) === "child") return false;
     if (filters.since != null && card.timeUpdated < filters.since) return false;
     if (filters.until != null && card.timeUpdated > filters.until) return false;
     if (filters.agent && card.agent !== filters.agent) return false;
@@ -565,7 +628,7 @@ export function createCardsRuntime(deps: CardsRuntimeDeps): CardsRuntime {
       disposed = true;
     },
 
-    rank(query, filters): CardHit[] {
+    rank(query, filters, stats): CardHit[] {
       refreshIfStale();
       const excluded = filters.excludeFamilyOf
         ? exclusionFamilyFromCards(cards, filters.excludeFamilyOf)
@@ -575,19 +638,47 @@ export function createCardsRuntime(deps: CardsRuntimeDeps): CardsRuntime {
       const semantic = semanticScore(query);
       const codeTokens = query.codeTokens.map((t) => t.toLowerCase());
 
-      const hits: CardHit[] = [];
-      for (const card of cards) {
-        if (!passesFilters(card, filters, excluded)) continue;
-        const lex = lexical.get(card.sessionId) ?? 0;
-        const sem = semantic.get(card.sessionId) ?? 0;
-        if (lex <= 0 && sem <= 0) continue;
+      // Attribution for the rootOnly skip count: the same filters with the
+      // restriction lifted, so a card that also fails a time bound or a scope
+      // is never blamed on authorship. Hoisted — one allocation, not one per card.
+      const withoutRootOnly: CardRankFilters | undefined =
+        stats && filters.rootOnly ? { ...filters, rootOnly: false } : undefined;
 
+      // One scoring definition, shared by real hits and by the rootOnly skip
+      // accounting, so a skipped card's score is comparable to a hit's.
+      const scoreOf = (card: Card, lex: number, sem: number): number => {
         let score = semantic.size > 0 ? (1 - semanticWeight) * lex + semanticWeight * sem : lex;
         if (codeTokens.length > 0) {
           const inventoryLower = card.inventory.toLowerCase();
           if (codeTokens.some((token) => inventoryLower.includes(token))) score *= CODE_TOKEN_MULT;
         }
-        score *= recencyMultiplier(card.timeUpdated);
+        return score * recencyMultiplier(card.timeUpdated);
+      };
+
+      const hits: CardHit[] = [];
+      for (const card of cards) {
+        if (!passesFilters(card, filters, excluded)) {
+          // Count only cards the restriction ALONE removed and that would have
+          // become hits: the contention set every other skippedByReason key is
+          // measured against. The near-miss fallback below is deliberately not
+          // counted (those cards have no signal, so they were never contending).
+          if (withoutRootOnly && passesFilters(card, withoutRootOnly, excluded)) {
+            const skippedLex = lexical.get(card.sessionId) ?? 0;
+            const skippedSem = semantic.get(card.sessionId) ?? 0;
+            if (skippedLex > 0 || skippedSem > 0) {
+              // Same score a real hit would get, so the caller can rank these
+              // against the hits and keep only the ones that would have taken a
+              // shortlist slot. See RankStats for why the bare count is useless.
+              stats!.rootOnlySkipped.push({ card, score: scoreOf(card, skippedLex, skippedSem) });
+            }
+          }
+          continue;
+        }
+        const lex = lexical.get(card.sessionId) ?? 0;
+        const sem = semantic.get(card.sessionId) ?? 0;
+        if (lex <= 0 && sem <= 0) continue;
+
+        const score = scoreOf(card, lex, sem);
         hits.push({
           sessionId: card.sessionId,
           score,

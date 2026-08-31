@@ -1,0 +1,11 @@
+{
+  "_note": "Captured from a live opencode SDK response (GET /session/{id}/message/{id}) on 2026-08-28. Pins that TextPart.ignored crosses the SDK boundary populated, which gates the `injected` classifier rule in docs/plans/genuine-prompt-filtering.md Step 0. Text redacted; only the flag shape matters.",
+  "part": {
+    "id": "prt_f078d44d9002rnOhQRNzIfg8og",
+    "sessionID": "ses_238a035a5ffepR3aPqGSbKXRkk",
+    "messageID": "msg_f078d44d900199cC8oYcHajGuF",
+    "type": "text",
+    "text": "<redacted: opencode-multikey status table rendered into a user message>",
+    "ignored": true
+  }
+}
