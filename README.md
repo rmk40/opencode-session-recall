@@ -3,6 +3,7 @@
 [![npm version](https://img.shields.io/npm/v/opencode-session-recall)](https://www.npmjs.com/package/opencode-session-recall)
 [![npm downloads](https://img.shields.io/npm/dm/opencode-session-recall)](https://www.npmjs.com/package/opencode-session-recall)
 [![license](https://img.shields.io/npm/l/opencode-session-recall)](https://github.com/rmk40/opencode-session-recall/blob/main/LICENSE)
+[![discord](https://img.shields.io/badge/discord-discussion-5865F2?logo=discord&logoColor=white)](https://discord.com/channels/1391832426048651334/1493798786550464672)
 
 **Search and retrieve everything your agent has ever done, across every session and every project, straight from OpenCode's own database.**
 
@@ -375,6 +376,10 @@ On safety: the worker prompt carries only card fields (never message bodies), di
 ```
 
 Then set `summaries` to `{ "enabled": true, "model": "…", "agent": "recall-summarizer" }`.
+
+## Questions and feedback
+
+There is a [discussion thread](https://discord.com/channels/1391832426048651334/1493798786550464672) for this plugin in the OpenCode Discord. Discord only resolves that link once you are in the server, so join through [discord.gg/opencode](https://discord.gg/opencode) first if you are not already. Bugs and feature requests are better as [GitHub issues](https://github.com/rmk40/opencode-session-recall/issues), where they can be tracked against a release.
 
 ## Contributing
 
