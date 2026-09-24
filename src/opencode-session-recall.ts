@@ -197,13 +197,27 @@ const server: Plugin = async (ctx, options) => {
   const cfg = inner.getConfig();
   if (!cfg.fetch) throw new Error("opencode-session-recall: SDK client has no custom fetch");
 
+  // The SDK exposes `headers` as a `Headers` instance. `Headers` keeps its
+  // entries in internal slots, not own enumerable properties, so object spread
+  // and rest-destructuring both read it as empty. Materialize a plain object
+  // first; otherwise the `Authorization` header is silently dropped when the
+  // SDK re-spreads the config for a `directory` (and when we build `unscoped`
+  // below), which breaks every request against a password-protected server.
+  const toHeaderObject = (h: unknown): Record<string, string> => {
+    if (!h) return {};
+    if (typeof (h as { entries?: unknown }).entries === "function")
+      return Object.fromEntries((h as { entries(): Iterable<[string, string]> }).entries());
+    return { ...(h as Record<string, string>) };
+  };
+  const cfgHeaders = toHeaderObject(cfg.headers);
+
   // eslint-disable-next-line @typescript-eslint/no-unused-vars
-  const { "x-opencode-directory": _, ...rest } = (cfg.headers ?? {}) as Record<string, string>;
+  const { "x-opencode-directory": _, ...rest } = cfgHeaders;
 
   const client = createOpencodeClient({
     baseUrl: cfg.baseUrl,
     fetch: cfg.fetch,
-    headers: cfg.headers,
+    headers: cfgHeaders,
     directory: ctx.directory,
   });
 

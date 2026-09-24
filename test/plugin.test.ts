@@ -122,7 +122,7 @@ function llmFacingChars(definition: ToolDefinition): number {
 function ctx(config: {
   baseUrl?: string;
   fetch?: unknown;
-  headers?: Record<string, string>;
+  headers?: Record<string, string> | Headers;
 }): PluginInput {
   return {
     client: { _client: { getConfig: () => config } },
@@ -163,6 +163,32 @@ describe("plugin entry", () => {
       baseUrl: "http://server",
       fetch,
       headers,
+      directory: PROJECT_DIR,
+    });
+    expect(createOpencodeClient).toHaveBeenNthCalledWith(2, {
+      baseUrl: "http://server",
+      fetch,
+      headers: { authorization: "Bearer test" },
+    });
+  });
+
+  it("keeps auth headers when the SDK exposes getConfig().headers as a Headers instance", async () => {
+    // The real v1 host client's getConfig().headers is a Headers instance, which
+    // does not survive object spread or rest-destructuring. Both rebuilt clients
+    // must still receive the Authorization header (otherwise every request 401s
+    // against a password-protected server such as OpenChamber).
+    const fetch = vi.fn();
+    const headers = new Headers({
+      "x-opencode-directory": PROJECT_DIR,
+      authorization: "Bearer test",
+    });
+
+    await server(ctx({ baseUrl: "http://server", fetch, headers }), {});
+
+    expect(createOpencodeClient).toHaveBeenNthCalledWith(1, {
+      baseUrl: "http://server",
+      fetch,
+      headers: { "x-opencode-directory": PROJECT_DIR, authorization: "Bearer test" },
       directory: PROJECT_DIR,
     });
     expect(createOpencodeClient).toHaveBeenNthCalledWith(2, {
