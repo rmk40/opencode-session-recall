@@ -25,6 +25,19 @@ All notable changes to this project are documented here. This project follows
   `skippedByReason.authorship`, all only when the filter is active or
   `explain: true`, so default responses are unchanged.
 
+### Fixed
+
+- **Auth headers dropped when the SDK exposes `getConfig().headers` as a
+  `Headers` instance**: the plugin rebuilds its scoped and unscoped SDK clients
+  from the host client's config, but `Headers` keeps its entries in internal
+  slots rather than own enumerable properties, so object spread and
+  rest-destructuring read it as empty. The `Authorization` header was lost on
+  both clients; this only bites against a password-protected server (for
+  example OpenChamber, which sets `OPENCODE_SERVER_PASSWORD` and enforces Basic
+  auth), where every `session.list` returned 401, the tools reported
+  `Failed to list sessions: {}`, and the store never received cards. The headers
+  are now materialized into a plain object before use.
+
 ## 2.3.0
 
 ### Added
