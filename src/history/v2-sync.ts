@@ -314,8 +314,10 @@ export function createV2Sync(db: ReadOnlyDb, opts: V2SyncOptions = {}): DistillS
     const mark = watermark(meta, keys.mark, at);
     const pos = parsePos(meta.get(keys.pos));
     // A clamped watermark (after long downtime) must not outrun a window that
-    // is still being drained: keep reading from the persisted position.
-    const lower = pos ? Math.min(mark - overlapMs, pos.t) : mark - overlapMs;
+    // is still being drained: keep reading from the persisted position. Keys
+    // are integer milliseconds, so `pos.t - 1` admits rows at exactly pos.t,
+    // which the keyset tie-break (same time, larger id) still needs.
+    const lower = pos ? Math.min(mark - overlapMs, pos.t - 1) : mark - overlapMs;
     await pause();
     // One row past the page tells a full page from a drained window.
     const fetched = query(lower, pos, limit + 1);

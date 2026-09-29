@@ -499,8 +499,10 @@ describe("v2 poll queries", () => {
 
   it("keeps draining a window from its position after downtime clamps the watermark", async () => {
     const at = Date.now();
-    for (const id of ["ses_a", "ses_b", "ses_c"]) addSession(id, at - 120_000);
+    for (const id of ["ses_a", "ses_a2", "ses_b", "ses_c"]) addSession(id, at - 120_000);
     addRow("ses_a", "user", user("a", at - 60_000), at - 60_000);
+    // Shares the cursor's timestamp but sorts after it: not yet processed.
+    addRow("ses_a2", "user", user("a2", at - 60_000), at - 60_000);
     addRow("ses_b", "user", user("b", at - 40_000), at - 40_000);
     addRow("ses_c", "user", user("c", at - 1_000), at - 1_000);
     // A window was mid-drain (after ses_a) when the service went down; the
@@ -516,7 +518,7 @@ describe("v2 poll queries", () => {
     meta.set(POLL_WATERMARK_KEY, String(at - 90_000));
     meta.set(POLL_CURSOR_KEY, JSON.stringify([at - 60_000, "ses_a"]));
     const signals = await pollOnce(sync, meta);
-    expect(signals.map((s) => s.sessionID)).toEqual(["ses_b", "ses_c"]);
+    expect(signals.map((s) => s.sessionID)).toEqual(["ses_a2", "ses_b", "ses_c"]);
   });
 
   it("commits nothing until told to, and isolates a failing session scan", async () => {
