@@ -25,7 +25,7 @@ The project uses `tsup` for bundling and `tsc` for declaration files. ESM-only (
 npm run typecheck && npm run compile
 ```
 
-Output goes to `dist/`. The single entry point is `src/opencode-session-recall.ts`.
+Output goes to `dist/`. The single entry point is `src/opencode-session-recall.ts`; the root `server.js` re-exports it for local-directory installs on opencode v2.
 
 ## Architecture
 
@@ -73,19 +73,23 @@ flowchart TB
     SDK --> DB
 ```
 
-The plugin registers five tools via the OpenCode plugin API, plus optional event hooks for proactive recall (see [Invocation hooks](#invocation-hooks)). The tools, drill, and distiller read opencode history only through the host-neutral `HistorySource` interface (`src/history/source.ts`): session listings and lookups, children, bounded message pages, and single messages. The entry builds the v1 implementation (`src/history/v1.ts`), which calls the OpenCode SDK over the host's in-process transport; nothing queries opencode's database directly. Only the entry may import the v1 adapter, and only the adapter may import SDK values (both enforced by ESLint), so a second host can supply its own `HistorySource` without touching the core.
+The plugin registers five tools via the OpenCode plugin API, plus optional event hooks for proactive recall (see [Invocation hooks](#invocation-hooks)). The tools, drill, and distiller read opencode history only through the host-neutral `HistorySource` interface (`src/history/source.ts`): session listings and lookups, children, bounded message pages, and single messages. The v1 host entry (`src/host/v1.ts`) loads the v1 implementation (`src/history/v1.ts`) lazily; it calls the OpenCode SDK over the host's in-process transport. Only `src/host/v1.ts` may load the v1 adapter, and only the adapter may import SDK values (both enforced by ESLint), so a second host can supply its own `HistorySource` without touching the core.
 
 ### Module map
 
 | Module                       | Purpose                                                                                                                                                                                                                           |
 | ---------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `opencode-session-recall.ts` | Plugin entry point for the v1 host. Parses options, builds the v1 history source, the shared fetch gate, card store, drill, and distiller; registers tools and hooks                                                              |
+| `opencode-session-recall.ts` | Package entry: the one default export `{ id, server, setup }` both hosts load (v1 calls `server`, v2 calls `setup`)                                                                                                               |
+| `host/v1.ts`                 | The v1 host entry (`server`). Parses options, lazily loads the v1 history source, builds the shared fetch gate, card store, drill, and distiller; registers tools and hooks                                                       |
+| `host/v2.ts`                 | The v2 host entry (`setup`). A capability probe keeps it inert under v1.18's partial-context `setup` call                                                                                                                         |
+| `host/registry.ts`           | The process-wide registry on `globalThis` (shared across module re-evaluations and between `server` and `setup`)                                                                                                                  |
+| `host/opencode-v2-types.ts`  | Vendored v2 plugin types, checked against `@opencode/plugin` by `test/host-v2-types.test.ts`                                                                                                                                      |
 | `search.ts`                  | `recall` tool. Orchestrates the tiers (cards → slim FTS → drill), deep-sweep mode, literal/regex/smart paths, filters, expansion, grouping                                                                                        |
 | `store.ts`                   | SQLite card + slim-FTS store: schema v4, additive migrations (v1→v2→v3→v4)/rebuild, host fence (`store_host`, `source_db`), per-session transactional replace, FTS query, card-vector persistence with per-row generations, lease |
 | `distill.ts`                 | The distiller: human-layer extractor, card builder, resumable cold pass, and incremental updates driven by host-neutral `DistillSignal`s                                                                                          |
 | `history/source.ts`          | The `HistorySource` seam: the one interface the core reads opencode history through (listings, lookups, children, bounded pages, single messages), plus `assertBoundedLimit`                                                      |
 | `history/model.ts`           | Host-neutral history shapes (`HistoryMessage`, `HistorySession`) and `compareMessages` ordering                                                                                                                                   |
-| `history/v1.ts`              | The v1 `HistorySource` over the HTTP SDK: builds the scoped and unscoped clients and owns `fetchMessagePage()`, the only `session.messages` call. Imported only by the entry                                                      |
+| `history/v1.ts`              | The v1 `HistorySource` over the HTTP SDK: builds the scoped and unscoped clients and owns `fetchMessagePage()`, the only `session.messages` call. Loaded only by `host/v1.ts`                                                     |
 | `history/v1-events.ts`       | Maps v1 bus events to the distiller's host-neutral `DistillSignal`s                                                                                                                                                               |
 | `host/opencode-v1-types.ts`  | Vendored v1 plugin types (`Hooks`, `ToolContext`, `PluginInput`, and the rest), checked against `@opencode-ai/plugin` by `test/host-v1-types.test.ts`                                                                             |
 | `tool-def.ts`                | Local `tool()` drop-in with `tool.schema` (zod), so the bundle imports no host package at runtime                                                                                                                                 |
@@ -166,7 +170,7 @@ flowchart TB
 
 ### Invocation hooks
 
-Besides the five tools, the plugin optionally registers OpenCode event hooks so the agent uses recall proactively. They are wired in `opencode-session-recall.ts` and gated by plugin options. Each hook is fully wrapped in `try/catch`: OpenCode runs hooks through `Effect.promise`, where a thrown hook becomes a fatal defect, so the hooks must never throw.
+Besides the five tools, the plugin optionally registers OpenCode event hooks so the agent uses recall proactively. They are wired in `host/v1.ts` and gated by plugin options. Each hook is fully wrapped in `try/catch`: OpenCode runs hooks through `Effect.promise`, where a thrown hook becomes a fatal defect, so the hooks must never throw.
 
 | Hook                                 | Option (default)         | Module                       | Behavior                                                                                                  |
 | ------------------------------------ | ------------------------ | ---------------------------- | --------------------------------------------------------------------------------------------------------- |
@@ -416,7 +420,7 @@ All ranking constants are at the top of `bm25.ts`:
 
 1. Create a new file in `src/` following the pattern in `get.ts` or `context.ts`
 2. Export a function that takes the `HistorySource` (plus the fetch gate and limits it needs) and returns a tool built with `tool()` from `tool-def.ts`
-3. Register it in `opencode-session-recall.ts`
+3. Register it in `host/v1.ts`
 4. Add the tool name to the `TOOLS` array in `types.ts`
 
 ## Commit conventions

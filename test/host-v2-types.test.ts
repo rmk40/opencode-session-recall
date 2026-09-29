@@ -15,6 +15,7 @@ import type {
   V2ToolInfo,
 } from "../src/host/opencode-v2-types.js";
 import { z } from "zod";
+import entry from "../src/opencode-session-recall.js";
 
 /**
  * The vendored v2 types (`src/host/opencode-v2-types.ts`) against the real
@@ -23,8 +24,8 @@ import { z } from "zod";
  * - what the host hands us (context, tool context, hook events, editors) must
  *   be assignable to the vendored shape, or our code reads fields the host
  *   does not provide;
- * - what we hand the host (each tool definition) must be assignable to the
- *   real shape, or the host would reject it.
+ * - what we hand the host (the plugin and each tool definition) must be
+ *   assignable to the real shape, or the host would reject it.
  */
 
 type HostContext = Parameters<Plugin.Plugin["setup"]>[0];
@@ -47,6 +48,7 @@ describe("vendored v2 host types", () => {
   });
 
   it("produce what the host accepts", () => {
+    expectTypeOf(entry).toExtend<Plugin.Plugin>();
     expectTypeOf<V2ToolInfo>().toExtend<Info>();
     // Tool inputs are this package's zod schemas.
     expectTypeOf(z.object({ query: z.string() })).toExtend<V2StandardSchema>();
