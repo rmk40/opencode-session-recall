@@ -29,6 +29,7 @@ import {
   bundle,
   completedToolPart,
   errorToolPart,
+  executeToolPart,
   messagesResponse,
   paginateBundles,
   PROJECT_DIR,
@@ -291,6 +292,18 @@ describe("distillFields", () => {
         ),
       ),
     ).toEqual([]);
+  });
+
+  it("excludes a Code Mode execute part that called a recall tool", () => {
+    const viaRecall = executeToolPart("p1", "s1", "m1", ["plugin.recall"], "prior");
+    const other = executeToolPart("p2", "s1", "m1", ["context7.query-docs"], "docs");
+    expect(distillFields(viaRecall)).toEqual([]);
+    expect(distillFields(other).length).toBeGreaterThan(0);
+
+    const messages = [bundle(assistantMessage("m1", "s1", 1_000), [viaRecall, other])];
+    const { card, rows } = deriveCard(deriveInput("s1", messages));
+    expect(card.tools).toEqual(["execute"]);
+    expect(rows.every((row) => !row.partId.startsWith("p1#"))).toBe(true);
   });
 
   it("excludes only the synthetic recall-auto sentinel", () => {

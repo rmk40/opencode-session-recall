@@ -257,6 +257,24 @@ export function completedToolPart(
   };
 }
 
+/** A v2 Code Mode `execute` part whose metadata records the tools it called
+ *  (`state.metadata.toolCalls`, opencode v2 `core/src/codemode/tool.ts`). */
+export function executeToolPart(
+  id: string,
+  sessionID: string,
+  messageID: string,
+  calledTools: string[],
+  output: string,
+): Part {
+  const part = completedToolPart(id, sessionID, messageID, "execute", { code: "run()" }, output);
+  if (part.type === "tool" && part.state.status === "completed") {
+    part.state.metadata = {
+      toolCalls: calledTools.map((tool) => ({ tool, status: "completed" })),
+    };
+  }
+  return part;
+}
+
 export function errorToolPart(
   id: string,
   sessionID: string,

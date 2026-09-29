@@ -12,6 +12,7 @@ import {
   assistantMessage,
   bundle,
   completedToolPart,
+  executeToolPart,
   globalSessionFrom,
   makeContext,
   makeFakeHarness,
@@ -710,6 +711,37 @@ describe("recall", () => {
     // The known self-output string must not appear anywhere in the expansion.
     const serialized = JSON.stringify(out.expanded);
     expect(serialized).not.toContain("unique-self-recall-result");
+  });
+
+  it("redacts a Code Mode execute part that called recall inside expansion", async () => {
+    const h = makeFakeHarness();
+    const bundles = h.messagesBySession["s-current"]!;
+    const host = bundles.find((m) => m.info.id === "m-current-5")!;
+    host.parts.push(
+      executeToolPart(
+        "p-current-exec",
+        "s-current",
+        "m-current-5",
+        ["opencode-session-recall.recall"],
+        "unique-execute-recall-body",
+      ),
+    );
+    const tool = await recallTool(h);
+
+    const out = await runTool<SearchOutput>(tool, {
+      query: "rate-limit middleware",
+      scope: "session",
+      sessionID: "s-current",
+      expand: "context",
+      window: 10,
+    });
+
+    const parts = (out.expanded?.flatMap((e) => e.messages ?? []) ?? []).flatMap((m) => m.parts);
+    const exec = parts.filter((p) => p.id === "p-current-exec");
+    expect(exec).toHaveLength(1);
+    expect(exec[0]!.content).toBe("[recall output omitted]");
+    expect(exec[0]!.output).toBeUndefined();
+    expect(JSON.stringify(out)).not.toContain("unique-execute-recall-body");
   });
 
   it("truncates large expanded text fields with an explicit marker", async () => {
