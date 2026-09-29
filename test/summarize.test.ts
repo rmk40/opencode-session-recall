@@ -222,7 +222,7 @@ describe("summarizer worker-session exclusion", () => {
       },
     } as unknown as OpencodeClient;
     const distiller: Distiller = createDistiller({
-      client,
+      source: createV1HistorySource({ scoped: client, unscoped: client }),
       store,
       gate,
       limits: TEST_LIMITS,

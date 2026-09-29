@@ -1,8 +1,8 @@
-import type { OpencodeClient, Event, Part, Session } from "@opencode-ai/sdk/v2";
+import type { Event, Part } from "@opencode-ai/sdk/v2";
 import { errmsg, DISCOVERY_LIMIT, type Limits } from "./types.js";
-import { compareMessages, type HistoryMessage } from "./history/model.js";
-import { MalformedSessionError, type MessagePage } from "./history/source.js";
-import { fetchMessagePage, isNotFoundError } from "./history/v1.js";
+import { compareMessages, type HistoryMessage, type HistorySession } from "./history/model.js";
+import { MalformedSessionError, type HistorySource, type MessagePage } from "./history/source.js";
+import { fetchMessagePage } from "./history/v1.js";
 import type { Card, FamilyRollup, LeaseInfo, PartTextRow, Store } from "./store.js";
 import type { FetchGate } from "./fetch-gate.js";
 import { isSelfTool, toolNameMatches, pruned, isSummarizerTitle } from "./extract.js";
@@ -121,18 +121,18 @@ export type Distiller = {
 };
 
 export type DistillerOptions = {
-  client: OpencodeClient;
+  source: HistorySource;
   store: Store | null;
   gate: FetchGate;
   limits: Limits;
   instanceId: string;
   log?: (message: string) => void;
   now?: () => number;
-  /** Session discovery for the cold pass. Defaults to a scoped
-   *  `client.session.list({ limit: DISCOVERY_LIMIT })`; the plugin injects a
+  /** Session discovery for the cold pass. Defaults to a project-scope
+   *  `source.listSessions({ limit: DISCOVERY_LIMIT })`; the plugin injects a
    *  global-vs-scoped variant. Returns raw session rows (mapped to card metadata
    *  internally); the distiller still routes the call through the fetch gate. */
-  discover?: () => Promise<Session[]>;
+  discover?: () => Promise<HistorySession[]>;
   /** Plugin build tag recorded in the distill-lease value for cross-process
    *  diagnosis (see the plugin entry). Defaults to `"unknown"`. */
   build?: string;
@@ -547,7 +547,7 @@ export type { MessagePage };
 
 // ── The distiller ────────────────────────────────────────────────────────────
 
-function toMeta(session: Session): DistillSessionMeta {
+function toMeta(session: HistorySession): DistillSessionMeta {
   const record = session as unknown as Record<string, unknown>;
   const time = (record.time ?? {}) as { created?: number; updated?: number };
   return {
@@ -579,7 +579,7 @@ const noopStatus = (): DistillStatus => ({
 });
 
 export function createDistiller(options: DistillerOptions): Distiller {
-  const { client, gate, limits, instanceId } = options;
+  const { source, gate, limits, instanceId } = options;
 
   // Store unavailable (degraded mode): every method is a clean no-op.
   if (!options.store) {
@@ -663,10 +663,10 @@ export function createDistiller(options: DistillerOptions): Distiller {
 
   const discover =
     options.discover ??
-    (async (): Promise<Session[]> => {
-      const resp = await client.session.list({ limit: DISCOVERY_LIMIT });
-      if (resp.error) throw new Error(errmsg(resp.error));
-      return Array.isArray(resp.data) ? (resp.data as Session[]) : [];
+    (async (): Promise<HistorySession[]> => {
+      const listing = await source.listSessions({ scope: "project", limit: DISCOVERY_LIMIT });
+      if (!listing.ok) throw new Error(listing.error);
+      return listing.items;
     });
 
   /** Bump the card-revision counter after every store write, so the tier-1 card
@@ -690,24 +690,23 @@ export function createDistiller(options: DistillerOptions): Distiller {
   }
 
   async function fetchSessionMeta(sessionID: string): Promise<DistillSessionMeta | null> {
-    const resp = await gate.runBackground(() => {
+    const lookup = await gate.runBackground(() => {
       if (stopped || !leaseHeld) return Promise.resolve(null);
-      return client.session.get({ sessionID });
+      return source.getSession(sessionID, { scope: "project" });
     });
-    if (!resp) return null;
-    if (resp.error) {
-      // A recognizable not-found is ABSENCE (session gone → nothing to
-      // distill), not a transport failure to retry.
-      if (isNotFoundError(resp.error, resp.response)) return null;
+    if (!lookup) return null;
+    if (!lookup.ok) {
+      // A recognizable not-found (or an empty response) is ABSENCE (session
+      // gone → nothing to distill), not a transport failure to retry.
+      if (lookup.reason === "not-found") return null;
+      if (lookup.reason === "malformed") {
+        throw new MalformedSessionError(`session ${sessionID} metadata response was not an object`);
+      }
       throw new SessionMetadataTransportError(
-        `session ${sessionID} metadata fetch failed: ${errmsg(resp.error)}`,
+        `session ${sessionID} metadata fetch failed: ${lookup.error}`,
       );
     }
-    if (resp.data == null) return null;
-    if (typeof resp.data !== "object") {
-      throw new MalformedSessionError(`session ${sessionID} metadata response was not an object`);
-    }
-    return toMeta(resp.data as Session);
+    return toMeta(lookup.value);
   }
 
   /** Page a session newest-first, stopping once `maxRows` human-layer rows have
@@ -731,7 +730,7 @@ export function createDistiller(options: DistillerOptions): Distiller {
       const before = cursor;
       const page = await gate.runBackground(() => {
         if (stopped || !leaseHeld) return Promise.resolve({ items: [], nextCursor: null });
-        return fetchMessagePage(client, { sessionID, limit: pageMessages, before, strict: true });
+        return source.messagePage({ sessionID, limit: pageMessages, before, strict: true });
       });
       try {
         for (const msg of page.items) {
@@ -775,7 +774,7 @@ export function createDistiller(options: DistillerOptions): Distiller {
       const before = cursor;
       const page = await gate.runBackground(() => {
         if (stopped || !leaseHeld) return Promise.resolve({ items: [], nextCursor: null });
-        return fetchMessagePage(client, { sessionID, limit: pageMessages, before, strict: true });
+        return source.messagePage({ sessionID, limit: pageMessages, before, strict: true });
       });
       try {
         for (const msg of page.items) {

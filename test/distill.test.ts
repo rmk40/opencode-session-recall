@@ -17,6 +17,10 @@ import {
 } from "../src/distill.js";
 import type { HistorySource } from "../src/history/source.js";
 import { createV1HistorySource } from "../src/history/v1.js";
+
+/** A v1 history source over one fake client (tests that hand-roll a client). */
+const v1 = (client: OpencodeClient): HistorySource =>
+  createV1HistorySource({ scoped: client, unscoped: client });
 import {
   apiFailure,
   assistantMessage,
@@ -603,12 +607,12 @@ describe("cold pass", () => {
         ],
       },
     };
-    const { client } = makeDistillFake(graph);
+    const { source } = makeDistillFake(graph);
     const { db, store } = await freshStore();
     const { gate } = makeSpyGate();
     const logs: string[] = [];
     const distiller = createDistiller({
-      client,
+      source,
       store,
       gate,
       limits: { ...TEST_LIMITS, distillConcurrency: 1 },
@@ -648,11 +652,11 @@ describe("cold pass", () => {
       sessions: [session("boom", "Boom", PROJECT_DIR, 3000)],
       messagesBySession: { boom: [boobyTrapped] },
     };
-    const { client } = makeDistillFake(graph);
+    const { source } = makeDistillFake(graph);
     const { db, store } = await freshStore();
     const { gate } = makeSpyGate();
     const distiller = createDistiller({
-      client,
+      source,
       store,
       gate,
       limits: { ...TEST_LIMITS, distillConcurrency: 1 },
@@ -696,7 +700,7 @@ describe("cold pass", () => {
     const { db, store } = await freshStore(() => clock);
     const { gate } = makeSpyGate();
     const distiller = createDistiller({
-      client,
+      source: v1(client),
       store,
       gate,
       limits: { ...TEST_LIMITS, distillConcurrency: 1 },
@@ -748,11 +752,11 @@ describe("cold pass", () => {
         ],
       },
     };
-    const { client, sdk } = makeDistillFake(graph, { throwOnce: new Set(["flaky"]) });
+    const { source, sdk } = makeDistillFake(graph, { throwOnce: new Set(["flaky"]) });
     const { db, store } = await freshStore();
     const { gate } = makeSpyGate();
     const distiller = createDistiller({
-      client,
+      source,
       store,
       gate,
       limits: { ...TEST_LIMITS, distillConcurrency: 1 },
@@ -779,7 +783,7 @@ describe("cold pass", () => {
       ]),
     ];
     const graph: Graph = { sessions: [current], messagesBySession: { bad: oldMessages } };
-    const { client } = makeDistillFake(graph, { nonArray: new Set(["bad"]) });
+    const { source } = makeDistillFake(graph, { nonArray: new Set(["bad"]) });
     const { db, store } = await freshStore();
     const seeded = deriveCard({
       session: metaFromSession(old),
@@ -789,7 +793,7 @@ describe("cold pass", () => {
     store.replaceSessionParts("bad", seeded.rows, seeded.card);
     const { gate } = makeSpyGate();
     const distiller = createDistiller({
-      client,
+      source,
       store,
       gate,
       limits: { ...TEST_LIMITS, distillConcurrency: 1 },
@@ -816,10 +820,10 @@ describe("cold pass", () => {
         rejectDiscovery = reject;
       });
       const discover = vi.fn(() => discovery);
-      const { client } = makeDistillFake({ sessions: [], messagesBySession: {} });
+      const { source } = makeDistillFake({ sessions: [], messagesBySession: {} });
       const { gate } = makeSpyGate();
       const distiller = createDistiller({
-        client,
+        source,
         store,
         gate,
         limits: TEST_LIMITS,
@@ -866,7 +870,7 @@ describe("cold pass", () => {
       } as unknown as OpencodeClient;
       const { gate } = makeSpyGate();
       const distiller = createDistiller({
-        client,
+        source: v1(client),
         store,
         gate,
         limits: { ...TEST_LIMITS, distillDelayMs: 100 },
@@ -927,7 +931,7 @@ describe("cold pass", () => {
         },
       } as unknown as OpencodeClient;
       const distiller = createDistiller({
-        client,
+        source: v1(client),
         store,
         gate,
         limits: TEST_LIMITS,
@@ -969,11 +973,11 @@ describe("cold pass", () => {
         ],
       },
     };
-    const { client, sdk } = makeDistillFake(graph, { throwOnce: new Set(["flaky"]) });
+    const { source, sdk } = makeDistillFake(graph, { throwOnce: new Set(["flaky"]) });
     const { db, store } = await freshStore();
     const { gate } = makeSpyGate();
     const distiller = createDistiller({
-      client,
+      source,
       store,
       gate,
       limits: { ...TEST_LIMITS, distillConcurrency: 1 },
@@ -1019,12 +1023,12 @@ describe("cold pass", () => {
         ],
       },
     };
-    const { client, sdk } = makeDistillFake(graph);
+    const { source, sdk } = makeDistillFake(graph);
     const { db, store } = await freshStore();
     store.upsertCard(fullCard("s2", 2000)); // already current → must be skipped
     const { gate, background } = makeSpyGate();
     const distiller = createDistiller({
-      client,
+      source,
       store,
       gate,
       limits: { ...TEST_LIMITS, distillConcurrency: 1 },
@@ -1056,12 +1060,12 @@ describe("cold pass", () => {
         s3: [bundle(userMessage("m3", "s3", 100), [textPart("p3", "s3", "m3", "charlie xray")])],
       },
     };
-    const { client } = makeDistillFake(graph, { throwOnce: new Set(["s2"]) });
+    const { source } = makeDistillFake(graph, { throwOnce: new Set(["s2"]) });
     const { db, store } = await freshStore();
     const { gate } = makeSpyGate();
     const limits = { ...TEST_LIMITS, distillConcurrency: 1 };
 
-    const first = createDistiller({ client, store, gate, limits, instanceId: "cold-a" });
+    const first = createDistiller({ source, store, gate, limits, instanceId: "cold-a" });
     first.start();
     await waitFor(() => first.status().coldPass !== "running");
     expect(first.status().lastError).toBeDefined();
@@ -1070,7 +1074,7 @@ describe("cold pass", () => {
     expect(store.getCard("s3")).toBeUndefined(); // never reached (pass aborted)
     first.stop(); // releases the lease
 
-    const second = createDistiller({ client, store, gate, limits, instanceId: "cold-b" });
+    const second = createDistiller({ source, store, gate, limits, instanceId: "cold-b" });
     second.start();
     await waitFor(() => second.status().coldPass === "done");
     expect(store.getCard("s2")?.distillState).toBe("full"); // completed on resume
@@ -1089,11 +1093,11 @@ describe("cold pass", () => {
       sessions: [session("g", "Giant", PROJECT_DIR, 5000)],
       messagesBySession: { g: messages },
     };
-    const { client } = makeDistillFake(graph);
+    const { source } = makeDistillFake(graph);
     const { db, store } = await freshStore();
     const { gate } = makeSpyGate();
     const distiller = createDistiller({
-      client,
+      source,
       store,
       gate,
       limits: { ...TEST_LIMITS, ftsRowsPerSession: 5 },
@@ -1127,11 +1131,11 @@ describe("cold pass", () => {
         ]),
       ];
     }
-    const { client } = makeDistillFake({ sessions: [root, ...children], messagesBySession });
+    const { source } = makeDistillFake({ sessions: [root, ...children], messagesBySession });
     const { db, store } = await freshStore();
     const { gate } = makeSpyGate();
     const distiller = createDistiller({
-      client,
+      source,
       store,
       gate,
       limits: TEST_LIMITS,
@@ -1157,13 +1161,13 @@ describe("cold pass", () => {
       R: [bundle(userMessage("mR", "R", 100), [textPart("pR", "R", "mR", "root coordination")])],
       C0: [bundle(userMessage("mC0", "C0", 100), [textPart("pC0", "C0", "mC0", "child work")])],
     };
-    const { client } = makeDistillFake({ sessions: [root, child], messagesBySession });
+    const { source } = makeDistillFake({ sessions: [root, child], messagesBySession });
     const { db, store } = await freshStore();
     const { gate } = makeSpyGate();
 
     // First pass distills the family and builds the root's rollup.
     const first = createDistiller({
-      client,
+      source,
       store,
       gate,
       limits: TEST_LIMITS,
@@ -1184,7 +1188,7 @@ describe("cold pass", () => {
     // Warm restart: the cold pass skips the up-to-date cards but still recomputes
     // every root's rollup. That rollup upsert must NOT wipe the persisted vector.
     const second = createDistiller({
-      client,
+      source,
       store,
       gate,
       limits: TEST_LIMITS,
@@ -1214,11 +1218,11 @@ describe("cold pass", () => {
       },
     };
     // s2 throws on its first fetch (mid-pass "crash"); succeeds on the retry.
-    const { client, sdk } = makeDistillFake(graph, { throwOnce: new Set(["s2"]) });
+    const { source, sdk } = makeDistillFake(graph, { throwOnce: new Set(["s2"]) });
     const { db, store } = await freshStore();
     const { gate } = makeSpyGate();
     const distiller = createDistiller({
-      client,
+      source,
       store,
       gate,
       limits: { ...TEST_LIMITS, distillConcurrency: 2 },
@@ -1248,11 +1252,11 @@ describe("cold pass", () => {
         s2: [bundle(userMessage("m2", "s2", 100), [textPart("p2", "s2", "m2", "two content")])],
       },
     };
-    const { client, sdk } = makeDistillFake(graph);
+    const { source, sdk } = makeDistillFake(graph);
     const { db, store } = await freshStore();
     const { gate, background } = makeSpyGate();
     const distiller = createDistiller({
-      client,
+      source,
       store,
       gate,
       limits: TEST_LIMITS,
@@ -1278,11 +1282,11 @@ describe("cold pass", () => {
         s1: [bundle(userMessage("m1", "s1", 100), [textPart("p1", "s1", "m1", "one content")])],
       },
     };
-    const { client } = makeDistillFake(graph);
+    const { source } = makeDistillFake(graph);
     const { db, store } = await freshStore();
     const { gate } = makeSpyGate();
     const distiller = createDistiller({
-      client,
+      source,
       store,
       gate,
       limits: TEST_LIMITS,
@@ -1312,12 +1316,12 @@ describe("lease", () => {
         s1: [bundle(userMessage("m1", "s1", 100), [textPart("p1", "s1", "m1", "alpha")])],
       },
     };
-    const { client, sdk } = makeDistillFake(graph);
+    const { source, sdk } = makeDistillFake(graph);
     const { db, store } = await freshStore();
     expect(store.acquireLease("other", 30_000, "otherbuild", 4)).toBe(true); // someone else holds it
     const { gate } = makeSpyGate();
     const distiller = createDistiller({
-      client,
+      source,
       store,
       gate,
       limits: TEST_LIMITS,
@@ -1346,12 +1350,12 @@ describe("lease", () => {
         s1: [bundle(userMessage("m1", "s1", 100), [textPart("p1", "s1", "m1", "alpha")])],
       },
     };
-    const { client } = makeDistillFake(graph);
+    const { source } = makeDistillFake(graph);
     const { db, store } = await freshStore(() => clock);
     expect(store.acquireLease("A", 30_000, "buildA", 4)).toBe(true); // A holds it, then "dies" (no heartbeat)
     const { gate } = makeSpyGate();
     const distiller = createDistiller({
-      client,
+      source,
       store,
       gate,
       limits: { ...TEST_LIMITS, distillConcurrency: 1 },
@@ -1378,11 +1382,11 @@ describe("lease", () => {
     // ACQUIRE-side concern of rivals; self-demoting would cost a full
     // lease-retry stall after any >TTL event-loop hiccup.
     let clock = 1_000_000;
-    const { client } = makeDistillFake({ sessions: [], messagesBySession: {} });
+    const { source } = makeDistillFake({ sessions: [], messagesBySession: {} });
     const { db, store } = await freshStore(() => clock);
     const { gate } = makeSpyGate();
     const distiller = createDistiller({
-      client,
+      source,
       store,
       gate,
       limits: { ...TEST_LIMITS, coldPass: false },
@@ -1422,14 +1426,14 @@ describe("incremental", () => {
         ],
       },
     };
-    const { client, sdk } = makeDistillFake(graph, {
+    const { source, sdk } = makeDistillFake(graph, {
       metadataErrorOnce: new Set(["s1"]),
     });
     const { db, store } = await freshStore();
     const { gate } = makeSpyGate();
     const logs: string[] = [];
     const distiller = createDistiller({
-      client,
+      source,
       store,
       gate,
       limits: TEST_LIMITS,
@@ -1483,14 +1487,14 @@ describe("incremental", () => {
         ],
       },
     };
-    const { client, sdk } = makeDistillFake(graph, {
+    const { source, sdk } = makeDistillFake(graph, {
       metadataNotFound: new Set(["s1"]),
     });
     const { db, store } = await freshStore();
     const { gate } = makeSpyGate();
     const logs: string[] = [];
     const distiller = createDistiller({
-      client,
+      source,
       store,
       gate,
       limits: TEST_LIMITS,
@@ -1522,11 +1526,11 @@ describe("incremental", () => {
         s1: [bundle(userMessage("m1", "s1", 100), [textPart("p1", "s1", "m1", "alpha")])],
       },
     };
-    const { client, sdk } = makeDistillFake(graph);
+    const { source, sdk } = makeDistillFake(graph);
     const { db, store } = await freshStore();
     const { gate } = makeSpyGate();
     const distiller = createDistiller({
-      client,
+      source,
       store,
       gate,
       limits: TEST_LIMITS,
@@ -1555,13 +1559,13 @@ describe("incremental", () => {
         ],
       },
     };
-    const { client } = makeDistillFake(graph);
+    const { source } = makeDistillFake(graph);
     const { db, store } = await freshStore();
     const { gate } = makeSpyGate();
     // appendThresholdParts 0 makes the session append-eligible, so only the
     // removal semantics (not size) force the full path that drops stale rows.
     const distiller = createDistiller({
-      client,
+      source,
       store,
       gate,
       limits: TEST_LIMITS,
@@ -1598,11 +1602,11 @@ describe("incremental", () => {
         ],
       },
     };
-    const { client } = makeDistillFake(graph);
+    const { source } = makeDistillFake(graph);
     const { db, store } = await freshStore();
     const { gate } = makeSpyGate();
     const distiller = createDistiller({
-      client,
+      source,
       store,
       gate,
       limits: TEST_LIMITS,
@@ -1651,11 +1655,11 @@ describe("incremental", () => {
       ]),
     ];
     const graph: Graph = { sessions: [s1], messagesBySession: { s1: [...initial] } };
-    const { client, sdk } = makeDistillFake(graph);
+    const { source, sdk } = makeDistillFake(graph);
     const { db, store } = await freshStore();
     const { gate } = makeSpyGate();
     const distiller = createDistiller({
-      client,
+      source,
       store,
       gate,
       limits: TEST_LIMITS,
@@ -1716,12 +1720,12 @@ describe("incremental", () => {
     const initial = [message(0), message(1), message(2), message(3)];
     const appended = [message(4), message(5), message(6), message(7)];
     const graph: Graph = { sessions: [s1], messagesBySession: { s1: [...initial] } };
-    const { client } = makeDistillFake(graph);
+    const { source } = makeDistillFake(graph);
     const { db, store } = await freshStore();
     const { gate } = makeSpyGate();
     // Cap of 5 rows: 4 initial + 4 appended = 8 → the 3 oldest rows are evicted.
     const distiller = createDistiller({
-      client,
+      source,
       store,
       gate,
       limits: { ...TEST_LIMITS, ftsRowsPerSession: 5 },
@@ -1781,10 +1785,10 @@ describe("incremental", () => {
 
 describe("null store", () => {
   it("is a clean no-op with no lease and idle status", () => {
-    const { client } = makeDistillFake({ sessions: [], messagesBySession: {} });
+    const { source } = makeDistillFake({ sessions: [], messagesBySession: {} });
     const { gate } = makeSpyGate();
     const distiller = createDistiller({
-      client,
+      source,
       store: null,
       gate,
       limits: TEST_LIMITS,

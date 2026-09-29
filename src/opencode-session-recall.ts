@@ -345,7 +345,7 @@ const server: Plugin = async (ctx, options) => {
   // process holds the distill lease.
   let summarizer: Summarizer | undefined;
   const distiller = createDistiller({
-    client,
+    source,
     store,
     gate,
     limits,
