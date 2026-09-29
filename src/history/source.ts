@@ -1,0 +1,82 @@
+import type { HistoryMessage, HistorySession } from "./model.js";
+
+/**
+ * The host-neutral history seam.
+ *
+ * A {@link HistorySource} is the only way the core reads opencode history. The
+ * v1 adapter (`history/v1.ts`) wraps the HTTP SDK clients; a v2 adapter reads
+ * `opencode.db`. Consumers keep their own gating (fetch gate, lease checks) at
+ * the call site, so a source method is exactly one host read.
+ *
+ * Error contract: a host error RESPONSE (the SDK's `{ error }` return) becomes
+ * `{ ok: false, error }` carrying the same string the model saw before the
+ * seam existed. A transport failure that THROWS still rejects, so every
+ * caller's existing try/catch keeps producing the same output.
+ */
+
+/** A session listing: host rows, or the host's error string. */
+export type Listing<T> = { ok: true; items: T[] } | { ok: false; error: string };
+
+/**
+ * A point lookup. `not-found` covers both an explicit not-found error and an
+ * empty response; `error` is any other host error; `malformed` is a successful
+ * response whose body has the wrong shape. `error` carries the host's string
+ * when there was one, so callers can keep their own wording for the empty case.
+ */
+export type Lookup<T> =
+  | { ok: true; value: T }
+  | { ok: false; reason: "not-found"; error?: string }
+  | { ok: false; reason: "error"; error: string }
+  | { ok: false; reason: "malformed"; error: string };
+
+/** One newest-first page of a session's messages. `nextCursor` is opaque and
+ *  null at the end of the session. */
+export type MessagePage = { items: HistoryMessage[]; nextCursor: string | null };
+
+export type SessionScope = "project" | "global";
+
+export interface HistorySource {
+  readonly kind: "v1-http" | "v2-sqlite";
+  /** Whether project and global lookups can disagree (v1: a directory-scoped
+   *  client can 404 on a session the unscoped client resolves). Callers that
+   *  probe project-then-global skip the second probe when this is false. */
+  readonly scopedLookup: boolean;
+  listSessions(o: {
+    scope: SessionScope;
+    limit: number;
+    search?: string;
+  }): Promise<Listing<HistorySession>>;
+  getSession(id: string, o: { scope: SessionScope }): Promise<Lookup<HistorySession>>;
+  /** Direct children of a session (non-array host payloads become empty). */
+  listChildren(parentID: string): Promise<Listing<HistorySession>>;
+  /**
+   * One bounded page, newest first. `limit` is required and runtime-checked;
+   * an unknown cursor or session rejects rather than silently restarting.
+   * `strict` turns an ambiguous non-array body into a
+   * {@link MalformedSessionError} instead of an empty page.
+   */
+  messagePage(o: {
+    sessionID: string;
+    limit: number;
+    before?: string;
+    strict?: boolean;
+  }): Promise<MessagePage>;
+  getMessage(sessionID: string, messageID: string): Promise<Lookup<HistoryMessage>>;
+}
+
+/** A session whose stored data has the wrong shape (quarantined by the
+ *  distiller rather than retried). */
+export class MalformedSessionError extends Error {
+  override name = "MalformedSessionError";
+}
+
+/**
+ * Reject any page limit that is not a positive integer. Omitting the limit is
+ * the legacy whole-session fetch (the incident path), so every message read
+ * checks it at runtime rather than trusting the type.
+ */
+export function assertBoundedLimit(limit: unknown): asserts limit is number {
+  if (typeof limit !== "number" || !Number.isInteger(limit) || limit < 1) {
+    throw new Error(`message page limit must be a positive integer, got ${String(limit)}`);
+  }
+}

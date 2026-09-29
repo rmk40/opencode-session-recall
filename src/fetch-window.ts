@@ -1,6 +1,7 @@
-import type { Message, OpencodeClient, Part } from "@opencode-ai/sdk/v2";
+import type { OpencodeClient } from "@opencode-ai/sdk/v2";
 import { errmsg } from "./types.js";
 import { fetchMessagePage } from "./distill.js";
+import { compareMessages, type HistoryMessage } from "./history/model.js";
 
 // Re-export the bounded page primitive so the browse tools have a single
 // pagination entry point (they never call the unpaginated `session.messages`).
@@ -22,8 +23,6 @@ export { fetchMessagePage } from "./distill.js";
  * what paging extends toward, bounded by `after`-count and the page cap.
  */
 
-type MsgWithParts = { info: Message; parts: Part[] };
-
 /** Wrap an SDK call, e.g. through the shared fetch gate. Defaults to a direct
  *  call for the browse tools, which do not share the query-path gate. */
 export type FetchRunner = <T>(fn: () => Promise<T>) => Promise<T>;
@@ -32,7 +31,7 @@ const directRunner: FetchRunner = (fn) => fn();
 export type MessageWindow = {
   /** Window messages, chronological (oldest-first). Empty when the target was
    *  not found within the fetch cap or the session had none. */
-  messages: MsgWithParts[];
+  messages: HistoryMessage[];
   /** Index of the target within {@link MessageWindow.messages}, -1 if absent. */
   centerIndex: number;
   hasMoreBefore: boolean;
@@ -69,7 +68,7 @@ export async function fetchMessageWindow(
   opts: MessageWindowOptions,
   run: FetchRunner = directRunner,
 ): Promise<MessageWindow> {
-  const collected: MsgWithParts[] = []; // newest-first accumulation
+  const collected: HistoryMessage[] = []; // newest-first accumulation
   const seen = new Set<string>();
   let cursor: string | undefined;
   let reachedEnd = false;
@@ -109,9 +108,7 @@ export async function fetchMessageWindow(
     if (collected.length >= opts.maxMessages) break;
   } while (cursor);
 
-  const chrono = [...collected].sort(
-    (a, b) => a.info.time.created - b.info.time.created || a.info.id.localeCompare(b.info.id),
-  );
+  const chrono = [...collected].sort(compareMessages);
   const centerIndex = chrono.findIndex((m) => m.info.id === opts.messageID);
   if (centerIndex === -1) {
     return {

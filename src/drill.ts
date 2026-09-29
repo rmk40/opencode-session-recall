@@ -1,8 +1,9 @@
-import type { Message, OpencodeClient, Part } from "@opencode-ai/sdk/v2";
+import type { OpencodeClient } from "@opencode-ai/sdk/v2";
 import { errmsg, type Limits } from "./types.js";
 import type { FetchGate } from "./fetch-gate.js";
 import type { ParsedQuery } from "./query.js";
 import { fetchMessagePage } from "./distill.js";
+import { compareMessages, type HistoryMessage } from "./history/model.js";
 import {
   buildCandidates,
   buildTitleCandidate,
@@ -36,8 +37,6 @@ import type { FtsHit } from "./store.js";
  * per-query retained budget caps the whole drill; a small LRU keyed
  * (session, time.updated) keeps repeat/refined queries warm.
  */
-
-type MsgWithParts = { info: Message; parts: Part[] };
 
 export type DrillTarget = {
   sessionId: string;
@@ -256,7 +255,7 @@ function anchorNeedles(query: ParsedQuery): string[] {
   return [...query.tokens, ...query.phrases, ...query.codeTokens.map((t) => t.toLowerCase())];
 }
 
-function partsMatchAnchor(page: MsgWithParts[], needles: string[]): boolean {
+function partsMatchAnchor(page: HistoryMessage[], needles: string[]): boolean {
   if (needles.length === 0) return true;
   for (const msg of page) {
     for (const part of msg.parts) {
@@ -271,7 +270,7 @@ function partsMatchAnchor(page: MsgWithParts[], needles: string[]): boolean {
 
 /** Rough retained-bytes estimate for a fetched message, matching the per-part
  *  cap the candidate build applies, so paging can stop before over-fetching. */
-function estimateRetained(msg: MsgWithParts): number {
+function estimateRetained(msg: HistoryMessage): number {
   let total = 0;
   for (const part of msg.parts) {
     for (const text of searchable(part)) total += Math.min(text.length, MAX_CHARS_PER_CANDIDATE);
@@ -298,8 +297,8 @@ export function createDrill(deps: DrillDeps): Drill {
     target: DrillTarget,
     needles: string[],
     ftsHits: FtsHit[] | undefined,
-  ): Promise<MsgWithParts[]> {
-    const byId = new Map<string, MsgWithParts>();
+  ): Promise<HistoryMessage[]> {
+    const byId = new Map<string, HistoryMessage>();
     let retained = 0;
 
     // Untargeted: bounded newest-first paging.
@@ -345,16 +344,14 @@ export function createDrill(deps: DrillDeps): Drill {
           client.session.message({ sessionID: target.sessionId, messageID }),
         );
         if (resp.error || !resp.data) continue;
-        const bundle = resp.data as MsgWithParts;
+        const bundle = resp.data as HistoryMessage;
         byId.set(bundle.info.id, bundle);
         retained += estimateRetained(bundle);
       }
     }
 
     // Chronological (oldest-first) for buildCandidates, which walks newest-first.
-    return [...byId.values()].sort(
-      (a, b) => a.info.time.created - b.info.time.created || a.info.id.localeCompare(b.info.id),
-    );
+    return [...byId.values()].sort(compareMessages);
   }
 
   /** Return the entry's candidates carrying `parentID` as their session
@@ -577,7 +574,7 @@ export function createDrill(deps: DrillDeps): Drill {
         target: DeepTarget,
         startBefore: string | null,
       ): Promise<{ candidates: Candidate[]; nextBefore: string | null; stopped: boolean }> => {
-        const messages: MsgWithParts[] = [];
+        const messages: HistoryMessage[] = [];
         let cursor: string | undefined = startBefore ?? undefined;
         let stopped = false;
         let fetchedAny = false;
@@ -607,9 +604,7 @@ export function createDrill(deps: DrillDeps): Drill {
           if (!cursor) break; // session fully swept
         }
 
-        const chrono = [...messages].sort(
-          (a, b) => a.info.time.created - b.info.time.created || a.info.id.localeCompare(b.info.id),
-        );
+        const chrono = [...messages].sort(compareMessages);
         const { candidates } = buildCandidates(chrono, {
           id: target.sessionId,
           title: target.title,

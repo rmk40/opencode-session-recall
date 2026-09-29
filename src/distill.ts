@@ -1,5 +1,7 @@
-import type { OpencodeClient, Event, Message, Part, Session } from "@opencode-ai/sdk/v2";
+import type { OpencodeClient, Event, Part, Session } from "@opencode-ai/sdk/v2";
 import { errmsg, DISCOVERY_LIMIT, type Limits } from "./types.js";
+import { compareMessages, type HistoryMessage } from "./history/model.js";
+import { MalformedSessionError, type MessagePage } from "./history/source.js";
 import type { Card, FamilyRollup, LeaseInfo, PartTextRow, Store } from "./store.js";
 import type { FetchGate } from "./fetch-gate.js";
 import { isSelfTool, toolNameMatches, pruned, isSummarizerTitle } from "./extract.js";
@@ -49,12 +51,6 @@ const MAX_QUARANTINED_SESSIONS = 1_000;
 
 // ── Shared shapes ────────────────────────────────────────────────────────────
 
-type MsgWithParts = { info: Message; parts: Part[] };
-
-class MalformedSessionError extends Error {
-  override name = "MalformedSessionError";
-}
-
 class SessionMetadataTransportError extends Error {
   override name = "SessionMetadataTransportError";
 }
@@ -86,7 +82,7 @@ export type DistillSessionMeta = {
 export type DeriveCardInput = {
   session: DistillSessionMeta;
   /** The session's messages, any order (sorted chronologically internally). */
-  messages: MsgWithParts[];
+  messages: HistoryMessage[];
   /** Known session graph (id → parentId) for root resolution. */
   parentById: Map<string, string | null>;
   caps?: { ftsRowsPerSession?: number; inventoryTokens?: number };
@@ -218,7 +214,7 @@ function statementText(part: Part): string | undefined {
 }
 
 /** The first genuine text part of a message (for the outcome head). */
-function firstTextPartText(msg: MsgWithParts): string | undefined {
+function firstTextPartText(msg: HistoryMessage): string | undefined {
   for (const part of msg.parts) {
     if (part.type === "text" && !isRecallAutoText(part) && part.text) return part.text;
   }
@@ -319,7 +315,7 @@ type Walk = {
  * card contribution. `prevForFirst` is the message id preceding the first walked
  * message (the checkpoint, when appending) so drill neighbor ids stay correct.
  */
-function walkMessages(chrono: MsgWithParts[], prevForFirst: string | null): Walk {
+function walkMessages(chrono: HistoryMessage[], prevForFirst: string | null): Walk {
   const rows: PartTextRow[] = [];
   const files: string[] = [];
   const tools: string[] = [];
@@ -390,10 +386,8 @@ function walkMessages(chrono: MsgWithParts[], prevForFirst: string | null): Walk
   };
 }
 
-function sortChronological(messages: MsgWithParts[]): MsgWithParts[] {
-  return [...messages].sort(
-    (a, b) => a.info.time.created - b.info.time.created || a.info.id.localeCompare(b.info.id),
-  );
+function sortChronological(messages: HistoryMessage[]): HistoryMessage[] {
+  return [...messages].sort(compareMessages);
 }
 
 /** Keep the newest `cap` rows (rows arrive oldest-first, so the tail is newest). */
@@ -545,7 +539,7 @@ export function deriveCard(input: DeriveCardInput): DerivedCard {
 
 // ── Paginated fetch ──────────────────────────────────────────────────────────
 
-export type MessagePage = { items: MsgWithParts[]; nextCursor: string | null };
+export type { MessagePage };
 
 /** Read `X-Next-Cursor` from a fields-style response's fetch `Response`, case-
  *  insensitively (native `Headers.get` folds case) and defensively (a missing
@@ -593,7 +587,7 @@ export async function fetchMessagePage(
     }
     return { items: [], nextCursor: readNextCursor(resp.response) };
   }
-  const items = resp.data as MsgWithParts[];
+  const items = resp.data as HistoryMessage[];
   return { items, nextCursor: readNextCursor(resp.response) };
 }
 
@@ -785,8 +779,11 @@ export function createDistiller(options: DistillerOptions): Distiller {
   /** Page a session newest-first, stopping once `maxRows` human-layer rows have
    *  accrued so a giant session never forces a full fetch (its newest rows win
    *  the per-session cap). */
-  async function fetchSessionMessages(sessionID: string, maxRows: number): Promise<MsgWithParts[]> {
-    const all: MsgWithParts[] = [];
+  async function fetchSessionMessages(
+    sessionID: string,
+    maxRows: number,
+  ): Promise<HistoryMessage[]> {
+    const all: HistoryMessage[] = [];
     let cursor: string | undefined;
     let rowCount = 0;
     let first = true;
@@ -829,8 +826,8 @@ export function createDistiller(options: DistillerOptions): Distiller {
   async function fetchNewMessages(
     sessionID: string,
     checkpoint: string,
-  ): Promise<{ messages: MsgWithParts[]; reached: boolean }> {
-    const collected: MsgWithParts[] = [];
+  ): Promise<{ messages: HistoryMessage[]; reached: boolean }> {
+    const collected: HistoryMessage[] = [];
     let cursor: string | undefined;
     let first = true;
     let reached = false;
@@ -1090,7 +1087,7 @@ export function createDistiller(options: DistillerOptions): Distiller {
             return;
           }
 
-          let messages: MsgWithParts[];
+          let messages: HistoryMessage[];
           try {
             messages = await fetchSessionMessages(session.id, caps.ftsRowsPerSession);
           } catch (error) {

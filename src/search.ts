@@ -1,5 +1,5 @@
 import { tool, type ToolDefinition, type ToolContext } from "@opencode-ai/plugin";
-import type { OpencodeClient, Session, GlobalSession, Part, Message } from "@opencode-ai/sdk/v2";
+import type { OpencodeClient, Session, GlobalSession } from "@opencode-ai/sdk/v2";
 import {
   errmsg,
   optionalString,
@@ -55,6 +55,7 @@ import {
 import type { Store, FtsHit, Card } from "./store.js";
 import type { FetchGate } from "./fetch-gate.js";
 import { fetchMessageWindow, type FetchRunner } from "./fetch-window.js";
+import type { HistoryMessage } from "./history/model.js";
 
 /** The embedder as the search path consumes it: the cache-facing surface plus
  *  the init error, so the one-time "unavailable" warning can explain why. */
@@ -148,11 +149,6 @@ type MatchFinder = (text: string) => number;
 type TimeValue = number | string | undefined;
 
 // ── Types ────────────────────────────────────────────────────────────
-
-type MsgWithParts = {
-  info: Message;
-  parts: Array<Part>;
-};
 
 type SessionMetaInternal = {
   id: string;
@@ -663,7 +659,7 @@ export function truncateExpandedPart(
 }
 
 function formatExpandedMsg(
-  msg: MsgWithParts,
+  msg: HistoryMessage,
   budget: ExpansionBudget,
   matchedPartID?: string,
   findMatch?: MatchFinder,
@@ -1274,7 +1270,7 @@ async function expandSearchResults(
           );
           continue;
         }
-        const bundle = resp.data as MsgWithParts;
+        const bundle = resp.data as HistoryMessage;
         expanded.push({
           resultIndex,
           sessionID: result.sessionID,
