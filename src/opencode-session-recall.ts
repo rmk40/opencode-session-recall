@@ -17,6 +17,7 @@ import {
   VECTORS_REV_KEY,
   type Store,
   type StoreHost,
+  type StoreIdentity,
   type Card,
 } from "./store.js";
 import { EMBED_REPRESENTATION } from "./embedding-text.js";
@@ -44,8 +45,10 @@ const SHUTDOWN_TIMEOUT_MS = 2_500;
 /** v1 plugin log: `[recall] `-prefixed lines on the host console. */
 const pluginLog = createLogger(consoleSink);
 
-/** The store host lane this entry runs as (see {@link StoreHost}). */
-const STORE_HOST: StoreHost = "opencode-v1";
+/** The store identity this entry opens with (see {@link StoreIdentity}): the
+ *  v1 host, which has no source database. */
+const STORE_IDENTITY: StoreIdentity = { host: "opencode-v1" };
+const STORE_HOST: StoreHost = STORE_IDENTITY.host;
 
 /**
  * Plugin build tag — recorded in the distill lease and surfaced in
@@ -150,7 +153,7 @@ const server: Plugin = async (ctx, options) => {
     if (storePath) {
       db = await openSqlite(storePath);
       if (db) {
-        const opened = openStore(db, STORE_HOST);
+        const opened = openStore(db, STORE_IDENTITY);
         if (opened.ok) store = opened.store;
         else pluginLog(`store refused (${opened.reason}): ${storePath}; running degraded`);
       }

@@ -158,13 +158,20 @@ rather than misreading a format it doesn't understand. So the migration story fo
 schema change is: add a `v(N-1)→vN` additive step when you can, bump
 `SCHEMA_VERSION`, and ship. Old in-place stores upgrade, foreign ones rebuild.
 
-Schema 4 adds the **host fence**. `openStore(db, host, { source })` compares the
-opener's host with `meta.store_host` (schema 1-3 implies `opencode-v1`) and its
-source with `meta.source_db` (the v2 host's `opencode.db` path; absent on both sides
-for v1). A mismatch refuses with `host-mismatch` or `source-mismatch` **before any
-migration**, so a v2 opener never upgrades a v1 store. Refusals never rebuild or
-write: two hosts pointed at one file would otherwise wipe each other on every start.
-The reset is manual: quit opencode, delete the store file, restart.
+Schema 4 adds the **host fence**. `openStore(db, identity)` takes a
+`StoreIdentity`: `{ host: "opencode-v1" }` or
+`{ host: "opencode-v2", source }`, so v1 cannot pass a source and v2 must. It
+compares the host with `meta.store_host` (schema 1-3 without a stamp implies
+`opencode-v1`) and the source with `meta.source_db` by exact string, so the v2
+`source` must be a canonical `realpath`. A present host stamp is checked **first**,
+before `schema_version` is even read, so no schema state (missing, garbled,
+pre-fence) can rebuild or migrate another host's file. A mismatch refuses with
+`host-mismatch` or `source-mismatch` **before any migration**, so a v2 opener never
+upgrades a v1 store. Refusals never rebuild or write: the fence transaction rolls
+back, and `journal_mode=WAL` is only set after the fence accepts, because it
+rewrites the file header. Two hosts pointed at one file would otherwise wipe each
+other on every start. The reset is manual: quit every opencode process sharing the
+store, delete the store file, restart.
 
 Several opencode processes run one plugin instance each and share the file,
 coordinated by a single `distill_lease` row in `meta` (holder, heartbeat, 30s TTL,

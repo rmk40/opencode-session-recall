@@ -30,8 +30,20 @@ import { EMBED_REPRESENTATION } from "./embedding-text.js";
 
 export const SCHEMA_VERSION = 4;
 
+/**
+ * Who opens a store: the host lane (recorded in `meta.store_host`) and, for the
+ * opencode v2 host, the history database it distills (`meta.source_db`). The v1
+ * host reads history over HTTP and has no source; the v2 host must name one.
+ *
+ * `source` is compared with the stamp by exact string equality, so it must be
+ * canonical: the v2 entry passes the `realpath` of the resolved `opencode.db`.
+ * Two spellings of one file (a symlink, a relative path, a trailing slash)
+ * would otherwise refuse each other as `source-mismatch`.
+ */
+export type StoreIdentity = { host: "opencode-v1" } | { host: "opencode-v2"; source: string };
+
 /** The opencode host lane that writes a store. Recorded in `meta.store_host`. */
-export type StoreHost = "opencode-v1" | "opencode-v2";
+export type StoreHost = StoreIdentity["host"];
 
 /**
  * Plugin build tag, `schema{N}.gen{M}.{host}`: recorded in the distill lease and
@@ -216,10 +228,6 @@ export type FtsHit = {
 export type StoreOptions = {
   /** Injectable clock for lease TTL logic; defaults to `Date.now`. */
   now?: () => number;
-  /** Identity of the history database the store is distilled from (the v2
-   *  host's resolved `opencode.db` path). Stamped into `meta.source_db` on a
-   *  rebuild and compared on every open. The v1 host passes none. */
-  source?: string;
 };
 
 /** Why {@link openStore} refused a store. Every refusal leaves the file
@@ -229,7 +237,8 @@ export type StoreOptions = {
  *    missing or unknown).
  *  - `source-mismatch`: the store was distilled from a different history
  *    database.
- *  - `error`: the open or schema check threw. */
+ *  - `error`: the open, the schema check or a migration threw; the migration
+ *    rolls back with it. */
 export type StoreRefusal = "newer" | "host-mismatch" | "source-mismatch" | "error";
 
 /** The refusals the fence decides; `error` is anything that threw instead. */
@@ -682,13 +691,13 @@ function checkIdentity(
 }
 
 /**
- * Open a {@link Store} for `host` over an already-open {@link SqliteDb}. Sets
+ * Open a {@link Store} for `identity` over an already-open {@link SqliteDb}. Sets
  * the busy timeout, checks the fence and migrates or rebuilds under one
  * transaction, and only then switches an accepted store to WAL.
  *
  * Refuses, leaving the file untouched (no migration, no rebuild, no write), when
  * another host owns the store, when the store was distilled from a different
- * `opts.source`, or when the schema stamp is newer than this build. A host
+ * `identity.source`, or when the schema stamp is newer than this build. A host
  * stamp is checked first, before the schema stamp is even read, so a store
  * stamped for another host is refused whatever its schema state; a pre-fence
  * (schema 1-3) store without a stamp implies the v1 host, so a v2-host opener
@@ -697,9 +706,14 @@ function checkIdentity(
  * would make two hosts sharing one file wipe each other on every start. An
  * absent stamp or a foreign layout is still dropped and rebuilt for `host`.
  */
-export function openStore(db: SqliteDb, host: StoreHost, opts?: StoreOptions): OpenStoreResult {
+export function openStore(
+  db: SqliteDb,
+  identity: StoreIdentity,
+  opts?: StoreOptions,
+): OpenStoreResult {
   const now = opts?.now ?? Date.now;
-  const source = opts?.source;
+  const host = identity.host;
+  const source = identity.host === "opencode-v2" ? identity.source : undefined;
   try {
     db.exec(PRE_FENCE_PRAGMAS);
     db.tx((): void => {

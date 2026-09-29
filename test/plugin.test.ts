@@ -723,7 +723,7 @@ describe("plugin entry", () => {
     try {
       const seedDb = await openSqlite(storePath);
       if (!seedDb) throw new Error("openSqlite returned null for seed");
-      const seeded = openStore(seedDb, "opencode-v2", { source: "/data/opencode.db" });
+      const seeded = openStore(seedDb, { host: "opencode-v2", source: "/data/opencode.db" });
       if (!seeded.ok) throw new Error(seeded.reason);
       seedDb.close();
 

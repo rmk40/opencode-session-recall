@@ -65,7 +65,7 @@ type MetadataCall = { title?: string; metadata?: Record<string, unknown> };
 /** Open a store as the v1 host, mapping any refusal to `null` (the shape the
  *  v1 entry degrades on). Tests of the refusal reasons call `openStore`. */
 export function openV1Store(db: SqliteDb, opts?: StoreOptions): Store | null {
-  const opened = openStore(db, "opencode-v1", opts);
+  const opened = openStore(db, { host: "opencode-v1" }, opts);
   return opened.ok ? opened.store : null;
 }
 

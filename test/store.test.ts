@@ -9,13 +9,16 @@ import {
   type Card,
   type PartTextRow,
   type Store,
-  type StoreHost,
+  type StoreIdentity,
   type StoreRefusal,
 } from "../src/store.js";
 import { openV1Store } from "./helpers.js";
 
 // These tests run against the REAL node:sqlite driver (Node >= 22.5). Under
 // vitest there is no `Bun` global, so openSqlite selects node:sqlite.
+
+const V1: StoreIdentity = { host: "opencode-v1" };
+const v2 = (source: string): StoreIdentity => ({ host: "opencode-v2", source });
 
 const tmpDirs: string[] = [];
 
@@ -142,15 +145,14 @@ function snapshot(db: SqliteDb): unknown {
 }
 
 /**
- * Open `path` on a fresh connection as `host` and assert a refusal with
+ * Open `path` on a fresh connection as `identity` and assert a refusal with
  * `reason` that wrote nothing: the connection's `total_changes()` stays 0 and
  * the file matches its pre-open snapshot.
  */
 async function expectRefusal(
   path: string,
-  host: StoreHost,
+  identity: StoreIdentity,
   reason: StoreRefusal,
-  opts?: { source?: string },
 ): Promise<void> {
   const probe = await openSqlite(path);
   if (!probe) throw new Error("probe open failed");
@@ -159,7 +161,7 @@ async function expectRefusal(
 
   const db = await openSqlite(path);
   if (!db) throw new Error("reopen failed");
-  expect(openStore(db, host, opts)).toEqual({ ok: false, reason });
+  expect(openStore(db, identity)).toEqual({ ok: false, reason });
   expect(db.get("SELECT total_changes() AS n")?.n).toBe(0);
   expect(snapshot(db)).toEqual(before);
   db.close();
@@ -304,12 +306,12 @@ async function buildV3Store(path: string): Promise<void> {
   db.close();
 }
 
-/** Create a fresh v4 store at `path` as `host` (optionally with a source) and
- *  seed one card so a later rebuild would be visible. */
-async function buildV4Store(path: string, host: StoreHost, source?: string): Promise<void> {
+/** Create a fresh v4 store at `path` as `identity` and seed one card so a later
+ *  rebuild would be visible. */
+async function buildV4Store(path: string, identity: StoreIdentity): Promise<void> {
   const db = await openSqlite(path);
   if (!db) throw new Error("open failed");
-  const opened = openStore(db, host, source === undefined ? undefined : { source });
+  const opened = openStore(db, identity);
   if (!opened.ok) throw new Error(`openStore refused: ${opened.reason}`);
   opened.store.replaceSessionParts("s1", [makePart("p1", "keeper_marker")], makeCard("s1"));
   db.close();
@@ -329,9 +331,7 @@ describe("store migration", () => {
   it("stamps the v2 host and its source on a fresh db", async () => {
     const db = await openSqlite(freshDbPath());
     if (!db) throw new Error("open failed");
-    const opened = openStore(db, "opencode-v2", {
-      source: "/data/opencode.db",
-    });
+    const opened = openStore(db, v2("/data/opencode.db"));
     if (!opened.ok) throw new Error(opened.reason);
     expect(opened.store.getMeta("schema_version")).toBe("4");
     expect(opened.store.getMeta("store_host")).toBe("opencode-v2");
@@ -371,9 +371,7 @@ describe("store migration", () => {
 
     const db2 = await openSqlite(path);
     if (!db2) throw new Error("reopen failed");
-    const opened = openStore(db2, "opencode-v2", {
-      source: "/data/opencode.db",
-    });
+    const opened = openStore(db2, v2("/data/opencode.db"));
     if (!opened.ok) throw new Error(opened.reason);
     expect(opened.store.getMeta("schema_version")).toBe("4");
     expect(opened.store.getMeta("store_host")).toBe("opencode-v2");
@@ -638,7 +636,7 @@ describe("store migration", () => {
       const db = await openSqlite(path);
       if (!db) throw new Error("reopen failed");
       const spy = instrument(db, fail);
-      expect(openStore(spy.db, "opencode-v1")).toEqual({ ok: false, reason: "error" });
+      expect(openStore(spy.db, V1)).toEqual({ ok: false, reason: "error" });
       expect(spy.txOutcomes).toEqual(["rolled-back"]);
       db.close();
 
@@ -666,9 +664,7 @@ describe("store migration", () => {
     // schema_version stays 3, no distill_cursor column, no host stamp.
     const path = freshDbPath();
     await buildV3Store(path);
-    await expectRefusal(path, "opencode-v2", "host-mismatch", {
-      source: "/data/opencode.db",
-    });
+    await expectRefusal(path, v2("/data/opencode.db"), "host-mismatch");
 
     const db = await openSqlite(path);
     if (!db) throw new Error("reopen failed");
@@ -680,45 +676,59 @@ describe("store migration", () => {
 
   it("refuses a v4 store owned by the v1 host when the v2 host opens it", async () => {
     const path = freshDbPath();
-    await buildV4Store(path, "opencode-v1");
-    await expectRefusal(path, "opencode-v2", "host-mismatch", {
-      source: "/data/opencode.db",
-    });
+    await buildV4Store(path, V1);
+    await expectRefusal(path, v2("/data/opencode.db"), "host-mismatch");
   });
 
   it("refuses a v4 store owned by the v2 host when the v1 host opens it", async () => {
     const path = freshDbPath();
-    await buildV4Store(path, "opencode-v2", "/data/opencode.db");
-    await expectRefusal(path, "opencode-v1", "host-mismatch");
+    await buildV4Store(path, v2("/data/opencode.db"));
+    await expectRefusal(path, V1, "host-mismatch");
   });
 
   it("refuses a v4 store whose host stamp is missing instead of guessing an owner", async () => {
     const path = freshDbPath();
-    await buildV4Store(path, "opencode-v1");
+    await buildV4Store(path, V1);
     const db = await openSqlite(path);
     if (!db) throw new Error("reopen failed");
     db.run("DELETE FROM meta WHERE key='store_host'");
     db.close();
-    await expectRefusal(path, "opencode-v1", "host-mismatch");
+    await expectRefusal(path, V1, "host-mismatch");
   });
 
   it("refuses a v2-host store distilled from a different source database", async () => {
     const path = freshDbPath();
-    await buildV4Store(path, "opencode-v2", "/data/a/opencode.db");
-    await expectRefusal(path, "opencode-v2", "source-mismatch", {
-      source: "/data/b/opencode.db",
-    });
-    await expectRefusal(path, "opencode-v2", "source-mismatch");
+    await buildV4Store(path, v2("/data/a/opencode.db"));
+    await expectRefusal(path, v2("/data/b/opencode.db"), "source-mismatch");
+  });
+
+  it("requires a source for the v2 host and forbids one for v1, in the type", () => {
+    // @ts-expect-error the v2 host must name its source database
+    const noSource: StoreIdentity = { host: "opencode-v2" };
+    // @ts-expect-error the v1 host reads over HTTP and has no source database
+    const v1Source: StoreIdentity = { host: "opencode-v1", source: "/data/opencode.db" };
+    expect([noSource.host, v1Source.host]).toEqual(["opencode-v2", "opencode-v1"]);
+  });
+
+  it("refuses a v2-host store whose source stamp is missing", async () => {
+    // The type makes a v2 open without a source unrepresentable, so a v2 store
+    // without a source stamp only arises from a hand edit. It is refused, not
+    // adopted by whichever source opens it next.
+    const path = freshDbPath();
+    await buildV4Store(path, v2("/data/opencode.db"));
+    const db = await openSqlite(path);
+    if (!db) throw new Error("reopen failed");
+    db.run("DELETE FROM meta WHERE key='source_db'");
+    db.close();
+    await expectRefusal(path, v2("/data/opencode.db"), "source-mismatch");
   });
 
   it("opens a store whose host and source both match, keeping its data", async () => {
     const path = freshDbPath();
-    await buildV4Store(path, "opencode-v2", "/data/opencode.db");
+    await buildV4Store(path, v2("/data/opencode.db"));
     const db = await openSqlite(path);
     if (!db) throw new Error("reopen failed");
-    const opened = openStore(db, "opencode-v2", {
-      source: "/data/opencode.db",
-    });
+    const opened = openStore(db, v2("/data/opencode.db"));
     if (!opened.ok) throw new Error(opened.reason);
     expect(opened.store.getCard("s1")).not.toBeUndefined();
     expect(sessions(opened.store.ftsSearch({ strong: ["keeper_marker"], weak: [] }))).toEqual([
@@ -729,24 +739,24 @@ describe("store migration", () => {
 
   it("rolls the fence transaction back on a refusal instead of committing it", async () => {
     const path = freshDbPath();
-    await buildV4Store(path, "opencode-v2", "/data/opencode.db");
+    await buildV4Store(path, v2("/data/opencode.db"));
     const db = await openSqlite(path);
     if (!db) throw new Error("reopen failed");
     const spy = instrument(db);
-    expect(openStore(spy.db, "opencode-v1")).toEqual({ ok: false, reason: "host-mismatch" });
+    expect(openStore(spy.db, V1)).toEqual({ ok: false, reason: "host-mismatch" });
     expect(spy.txOutcomes).toEqual(["rolled-back"]);
     db.close();
   });
 
   it("leaves a refused file's journal mode alone and switches an accepted one to WAL", async () => {
     const path = freshDbPath();
-    await buildV4Store(path, "opencode-v2", "/data/opencode.db");
+    await buildV4Store(path, v2("/data/opencode.db"));
     const raw = await openSqlite(path);
     if (!raw) throw new Error("reopen failed");
     raw.exec("PRAGMA journal_mode=DELETE;");
     raw.close();
 
-    await expectRefusal(path, "opencode-v1", "host-mismatch");
+    await expectRefusal(path, V1, "host-mismatch");
     const after = await openSqlite(path);
     if (!after) throw new Error("reopen failed");
     expect(after.get("PRAGMA journal_mode")?.journal_mode).toBe("delete");
@@ -754,7 +764,7 @@ describe("store migration", () => {
 
     const db = await openSqlite(path);
     if (!db) throw new Error("reopen failed");
-    const opened = openStore(db, "opencode-v2", { source: "/data/opencode.db" });
+    const opened = openStore(db, v2("/data/opencode.db"));
     expect(opened.ok).toBe(true);
     expect(db.get("PRAGMA journal_mode")?.journal_mode).toBe("wal");
     db.close();
@@ -762,17 +772,15 @@ describe("store migration", () => {
 
   it("refuses a store whose schema is newer than the code, for either host", async () => {
     const path = freshDbPath();
-    await buildV4Store(path, "opencode-v1");
+    await buildV4Store(path, V1);
     const db = await openSqlite(path);
     if (!db) throw new Error("reopen failed");
     db.run("UPDATE meta SET value='5' WHERE key='schema_version'");
     db.close();
-    await expectRefusal(path, "opencode-v1", "newer");
+    await expectRefusal(path, V1, "newer");
     // A foreign host stamp is checked before the schema stamp, so the other
     // host is refused as a mismatch rather than as a newer format.
-    await expectRefusal(path, "opencode-v2", "host-mismatch", {
-      source: "/data/opencode.db",
-    });
+    await expectRefusal(path, v2("/data/opencode.db"), "host-mismatch");
   });
 
   it("refuses a foreign-stamped store with a missing or unparseable schema stamp", async () => {
@@ -783,12 +791,12 @@ describe("store migration", () => {
       "UPDATE meta SET value='not-a-number' WHERE key='schema_version'",
     ]) {
       const path = freshDbPath();
-      await buildV4Store(path, "opencode-v2", "/data/opencode.db");
+      await buildV4Store(path, v2("/data/opencode.db"));
       const db = await openSqlite(path);
       if (!db) throw new Error("reopen failed");
       db.run(damage);
       db.close();
-      await expectRefusal(path, "opencode-v1", "host-mismatch");
+      await expectRefusal(path, V1, "host-mismatch");
     }
   });
 
@@ -800,7 +808,7 @@ describe("store migration", () => {
     raw.run("INSERT INTO meta(key, value) VALUES('store_host', 'opencode-v2')");
     raw.close();
 
-    await expectRefusal(path, "opencode-v1", "host-mismatch");
+    await expectRefusal(path, V1, "host-mismatch");
     const db = await openSqlite(path);
     if (!db) throw new Error("reopen failed");
     expect(rawMeta(db, "schema_version")).toBe("3");
@@ -832,6 +840,7 @@ describe("store migration", () => {
 
 describe("pluginBuild", () => {
   it("tags the schema, representation generation and host", () => {
+    expect(pluginBuild("opencode-v1")).toBe("schema4.gen4.opencode-v1");
     expect(pluginBuild("opencode-v2")).toBe("schema4.gen4.opencode-v2");
   });
 });
