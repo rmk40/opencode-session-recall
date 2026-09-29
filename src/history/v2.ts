@@ -36,8 +36,14 @@ import {
  *   every read is one statement. No transaction is ever held, least of all
  *   across an `await`.
  * - Bounded: every `session_message` statement binds `LIMIT ?` (a test spy
- *   enforces it), and a page also stops at a byte ceiling read from
- *   `length(data)` before any row body is loaded.
+ *   enforces it), and a page also stops at a byte ceiling on the rows'
+ *   encoded size, read before any row body is loaded. A row larger than the
+ *   ceiling on its own is never loaded at all: it projects as a placeholder
+ *   message (see {@link oversizedData}), so paging, drill, deep and the
+ *   distiller keep moving past it, and the placeholder text is what gets
+ *   indexed. The body statement re-checks each row's size, since a row can
+ *   grow between the two statements. (The compaction status filter still
+ *   parses a compaction row's JSON inside SQLite; nothing reaches JS.)
  * - Polite: an `await` on a macrotask separates statements, so a page never
  *   holds the shared v2 service's event loop for more than one statement.
  * - Tolerant: a row with unparseable data is skipped (a
@@ -154,8 +160,9 @@ export type V2SourceOptions = {
   /** The opencode project id `scope: "project"` filters to. Without one
    *  (the distiller's global facade), project-scope listings reject. */
   projectID?: string;
-  /** Per-page cap on summed `length(data)`; a page always holds at least one
-   *  row. Default 4 MiB. */
+  /** Per-page cap on summed encoded `data` bytes, and the largest single row
+   *  whose body is ever loaded (a larger one becomes a placeholder). A page
+   *  always holds at least one row. Default 4 MiB. */
   pageByteCeiling?: number;
   /** Awaited between statements. Default: one macrotask (`setTimeout(0)`). */
   yieldBetween?: () => Promise<void>;
@@ -199,6 +206,41 @@ const CONTENT_FILTER = `type IN (${CONTENT_TYPE_LIST})
  *  sessionCreated). */
 const FORK_FILTER = "(? = 0 OR time_created >= ?)";
 const MESSAGE_COLUMNS = "id, session_id, type, seq, time_created, time_updated, data";
+const MESSAGE_META_COLUMNS = "id, session_id, type, seq, time_created, time_updated";
+
+/**
+ * SQL for a row's encoded size in bytes. `octet_length` (SQLite 3.43+) reads
+ * only the record header; `length(CAST(data AS BLOB))` works everywhere but
+ * loads the value inside SQLite. `length(data)` would count characters, which
+ * undercounts multibyte text.
+ */
+function byteLengthSql(db: SqliteDb): string {
+  try {
+    db.get("SELECT octet_length('x') AS n");
+    return "octet_length(data)";
+  } catch {
+    return "length(CAST(data AS BLOB))";
+  }
+}
+
+/** The text a placeholder carries in place of a row too large to load. */
+export function oversizedNote(bytes: number, ceiling: number): string {
+  return `[message omitted by opencode-session-recall: ${bytes} bytes exceeds the ${ceiling}-byte read limit]`;
+}
+
+/**
+ * Minimal data for a placeholder row of `type`, shaped so the projector yields
+ * one text part carrying `note`. User-role types project as a plain user
+ * message; assistant and compaction rows keep their role.
+ */
+function oversizedData(
+  type: string,
+  note: string,
+): { type: string; data: Record<string, unknown> } {
+  if (type === "assistant") return { type, data: { content: [{ type: "text", text: note }] } };
+  if (type === "compaction") return { type, data: { status: "completed", summary: note } };
+  return { type: "user", data: { text: note } };
+}
 
 type SessionRecord = { row: V2SessionRow; fork: boolean };
 
@@ -262,6 +304,23 @@ export function createV2HistorySource(db: SqliteDb, opts: V2SourceOptions = {}):
   const projectID = opts.projectID;
   const byteCeiling = opts.pageByteCeiling ?? DEFAULT_PAGE_BYTE_CEILING;
   const pause = opts.yieldBetween ?? macrotask;
+  const BYTES = byteLengthSql(db);
+  /** A row's columns, with `data` NULL when it is larger than the ceiling
+   *  now (re-checked here, not trusted from an earlier size read), plus its
+   *  size. Binds the ceiling first. */
+  const BODY_COLUMNS = `${MESSAGE_META_COLUMNS}, ${BYTES} AS bytes,
+    CASE WHEN ${BYTES} <= ? THEN data END AS data`;
+
+  /** Decode a body row, or build the placeholder for one too large to load. */
+  function decodeBody(row: Row): DecodedRow {
+    const message = toMessageRow(row);
+    const bytes = asNumber(row.bytes) ?? 0;
+    if (row.data === null && bytes > byteCeiling) {
+      const { type, data } = oversizedData(message.type, oversizedNote(bytes, byteCeiling));
+      return { ok: true, row: { ...message, type, data: "" }, data };
+    }
+    return decodeRow(message);
+  }
 
   /** One statement; a driver error rejects with context (a transport-style
    *  failure in the source contract). */
@@ -423,13 +482,12 @@ export function createV2HistorySource(db: SqliteDb, opts: V2SourceOptions = {}):
   /** Decode rows (newest first), dropping or, under `strict`, rejecting
    *  unparseable ones, then project them. */
   async function project(
-    rows: V2MessageRow[],
+    rows: DecodedRow[],
     record: SessionRecord,
     strict: boolean,
   ): Promise<HistoryMessage[]> {
     const decoded: Array<Extract<DecodedRow, { ok: true }>> = [];
-    for (const row of rows) {
-      const d = decodeRow(row);
+    for (const d of rows) {
       if (d.ok) decoded.push(d);
       else if (strict) throw new MalformedSessionError(d.reason);
     }
@@ -493,7 +551,7 @@ export function createV2HistorySource(db: SqliteDb, opts: V2SourceOptions = {}):
       await pause();
       const sizes = read("page sizes", () =>
         db.all(
-          `SELECT seq, length(data) AS bytes FROM session_message
+          `SELECT seq, ${BYTES} AS bytes FROM session_message
            WHERE session_id = ? AND seq < ? AND ${CONTENT_FILTER} AND ${FORK_FILTER}
            ORDER BY seq DESC LIMIT ?`,
           [o.sessionID, below, ...fork, o.limit + 1],
@@ -505,8 +563,10 @@ export function createV2HistorySource(db: SqliteDb, opts: V2SourceOptions = {}):
       for (const size of sizes) {
         if (take >= o.limit) break;
         const rowBytes = asNumber(size.bytes) ?? 0;
-        if (take > 0 && bytes + rowBytes > byteCeiling) break;
-        bytes += rowBytes;
+        // An oversized row is never loaded, so it costs the page nothing.
+        const cost = rowBytes > byteCeiling ? 0 : rowBytes;
+        if (take > 0 && bytes + cost > byteCeiling) break;
+        bytes += cost;
         take++;
       }
       const newest = asNumber(sizes[0]!.seq) ?? 0;
@@ -516,12 +576,12 @@ export function createV2HistorySource(db: SqliteDb, opts: V2SourceOptions = {}):
       await pause();
       const rows = read("page rows", () =>
         db.all(
-          `SELECT ${MESSAGE_COLUMNS} FROM session_message
+          `SELECT ${BODY_COLUMNS} FROM session_message
            WHERE session_id = ? AND seq <= ? AND seq >= ? AND ${CONTENT_FILTER} AND ${FORK_FILTER}
            ORDER BY seq DESC LIMIT ?`,
-          [o.sessionID, newest, oldest, ...fork, take],
+          [byteCeiling, o.sessionID, newest, oldest, ...fork, take],
         ),
-      ).map(toMessageRow);
+      ).map(decodeBody);
 
       const items = await project(rows, record, o.strict === true);
       return { items, nextCursor: more ? encodeV2Cursor(oldest) : null };
@@ -540,15 +600,15 @@ export function createV2HistorySource(db: SqliteDb, opts: V2SourceOptions = {}):
       await pause();
       const row = read("message", () =>
         db.get(
-          `SELECT ${MESSAGE_COLUMNS} FROM session_message
+          `SELECT ${BODY_COLUMNS} FROM session_message
            WHERE id = ? AND session_id = ? AND ${FORK_FILTER} LIMIT ?`,
-          [messageID, sessionID, record.fork ? 1 : 0, record.row.time_created, 1],
+          [byteCeiling, messageID, sessionID, record.fork ? 1 : 0, record.row.time_created, 1],
         ),
       );
       if (!row) return notFound;
-      const decoded = decodeRow(toMessageRow(row));
+      const decoded = decodeBody(row);
       if (!decoded.ok) return { ok: false, reason: "malformed", error: decoded.reason };
-      const [message] = await project([decoded.row], record, false);
+      const [message] = await project([decoded], record, false);
       return message ? { ok: true, value: message } : notFound;
     },
   };

@@ -11,7 +11,10 @@ import {
   encodeV2Cursor,
   openOpencodeDb,
 } from "../src/history/v2.js";
-import { makeFakeHarness, PROJECT_DIR } from "./helpers.js";
+import { makeFakeHarness, openV1Store, PROJECT_DIR, TEST_LIMITS } from "./helpers.js";
+import { openSqlite } from "../src/sqlite.js";
+import { createDistiller } from "../src/distill.js";
+import { createFetchGate } from "../src/fetch-gate.js";
 import {
   insertMessage,
   insertProject,
@@ -301,18 +304,34 @@ describe("v2 history source", () => {
     ).rejects.toBeInstanceOf(MalformedSessionError);
   });
 
-  it("caps a page by summed data length but always returns one row", async () => {
+  /** A LIMIT-spied source with a small byte ceiling and a scriptable yield. */
+  async function capped(t: V2TestDb, onYield?: (call: number) => void) {
+    const opened = await openOpencodeDb(t.path);
+    if (!opened.ok) throw new Error(opened.reason);
+    cleanups.push(() => opened.db.close());
+    const yields = { calls: 0 };
+    const source = createV2HistorySource(limitSpy(opened.db), {
+      pageByteCeiling: 1_500,
+      yieldBetween: async () => {
+        yields.calls++;
+        onYield?.(yields.calls);
+      },
+    });
+    return { source, yields };
+  }
+
+  const partText = (m: HistoryMessage | undefined) =>
+    m?.parts.map((p) => (p.type === "text" ? p.text : "")).join("");
+
+  it("caps a page by summed data bytes", async () => {
     const t = await fresh();
     session(t, "ses_c");
     const ids = [
       message(t, "ses_c", "user", text("a".repeat(600))),
       message(t, "ses_c", "user", text("b".repeat(600))),
-      message(t, "ses_c", "user", text("c".repeat(3_000))),
+      message(t, "ses_c", "user", text("c".repeat(1_000))),
     ];
-    const opened = await openOpencodeDb(t.path);
-    if (!opened.ok) throw new Error(opened.reason);
-    cleanups.push(() => opened.db.close());
-    const source = createV2HistorySource(limitSpy(opened.db), { pageByteCeiling: 1_500 });
+    const { source } = await capped(t);
     const first = await source.messagePage({ sessionID: "ses_c", limit: 10 });
     expect(first.items.map((m) => m.info.id)).toEqual([ids[2]]);
     const second = await source.messagePage({
@@ -322,6 +341,135 @@ describe("v2 history source", () => {
     });
     expect(second.items.map((m) => m.info.id)).toEqual([ids[1], ids[0]]);
     expect(second.nextCursor).toBeNull();
+  });
+
+  it("measures multibyte text in encoded bytes, not characters", async () => {
+    const t = await fresh();
+    session(t, "ses_mb");
+    // ~530 characters but ~1,030 bytes each: two fit by characters, not bytes.
+    const older = message(t, "ses_mb", "user", text("é".repeat(500)));
+    const newer = message(t, "ses_mb", "user", text("é".repeat(500)));
+    // ~630 characters, ~1,830 bytes: over the ceiling on its own.
+    const wide = message(t, "ses_mb", "user", text("€".repeat(600)));
+    const { source } = await capped(t);
+    const first = await source.messagePage({ sessionID: "ses_mb", limit: 10 });
+    expect(first.items.map((m) => m.info.id)).toEqual([wide, newer]);
+    expect(partText(first.items[0])).toMatch(/message omitted .* bytes exceeds the 1500-byte/);
+    expect(partText(first.items[1])).toBe("é".repeat(500));
+    const second = await source.messagePage({
+      sessionID: "ses_mb",
+      limit: 10,
+      before: first.nextCursor!,
+    });
+    expect(second.items.map((m) => m.info.id)).toEqual([older]);
+  });
+
+  it("falls back to a CAST byte count on SQLite without octet_length", async () => {
+    const t = await fresh();
+    session(t, "ses_old");
+    const older = message(t, "ses_old", "user", text("é".repeat(500)));
+    const newer = message(t, "ses_old", "user", text("é".repeat(500)));
+    const opened = await openOpencodeDb(t.path);
+    if (!opened.ok) throw new Error(opened.reason);
+    cleanups.push(() => opened.db.close());
+    const spied = limitSpy(opened.db);
+    const noOctet = (sql: string): void => {
+      if (/octet_length/.test(sql)) throw new Error("no such function: octet_length");
+    };
+    const oldSqlite: typeof spied = {
+      ...spied,
+      get: (sql, params) => (noOctet(sql), spied.get(sql, params)),
+      all: (sql, params) => (noOctet(sql), spied.all(sql, params)),
+    };
+    const source = createV2HistorySource(oldSqlite, { pageByteCeiling: 1_500 });
+    const first = await source.messagePage({ sessionID: "ses_old", limit: 10 });
+    expect(first.items.map((m) => m.info.id)).toEqual([newer]);
+    expect(spied.statements.some((sql) => sql.includes("CAST(data AS BLOB)"))).toBe(true);
+    const second = await source.messagePage({
+      sessionID: "ses_old",
+      limit: 10,
+      before: first.nextCursor!,
+    });
+    expect(second.items.map((m) => m.info.id)).toEqual([older]);
+  });
+
+  it("projects a row over the ceiling as a placeholder instead of loading it", async () => {
+    const t = await fresh();
+    session(t, "ses_big");
+    const before = message(t, "ses_big", "user", text("small before"));
+    const huge = message(t, "ses_big", "assistant", reply("z".repeat(5_000)));
+    const after = message(t, "ses_big", "user", text("small after"));
+    const { source } = await capped(t);
+
+    // Strict (the distiller) does not reject it, and paging moves past it.
+    const page = await source.messagePage({ sessionID: "ses_big", limit: 10, strict: true });
+    expect(page.items.map((m) => m.info.id)).toEqual([after, huge, before]);
+    expect(page.nextCursor).toBeNull();
+    const placeholder = page.items[1]!;
+    expect(placeholder.info.role).toBe("assistant");
+    expect(partText(placeholder)).toMatch(
+      /^\[message omitted by opencode-session-recall: \d+ bytes/,
+    );
+    expect(partText(placeholder)).not.toContain("zzz");
+
+    const lookup = await source.getMessage("ses_big", huge);
+    expect(lookup.ok && partText(lookup.value)).toBe(partText(placeholder));
+  });
+
+  it("lets the distiller card a session past an oversized row, indexing the placeholder", async () => {
+    const t = await fresh();
+    session(t, "ses_dist");
+    message(t, "ses_dist", "user", text("tiny prompt about widgets"));
+    message(t, "ses_dist", "assistant", reply("q".repeat(5_000)));
+    const { source } = await capped(t);
+    const dir = mkdtempSync(join(tmpdir(), "recall-v2-distill-"));
+    cleanups.push(() => rmSync(dir, { recursive: true, force: true }));
+    const storeDb = await openSqlite(join(dir, "store.db"));
+    const store = storeDb && openV1Store(storeDb);
+    if (!storeDb || !store) throw new Error("store open failed");
+    cleanups.push(() => storeDb.close());
+    const listed = await source.listSessions({ scope: "global", limit: 10 });
+    const distiller = createDistiller({
+      source,
+      store,
+      gate: createFetchGate({ concurrency: 2 }),
+      limits: TEST_LIMITS,
+      instanceId: "v2-oversized",
+      discover: async () => (listed.ok ? listed.items : []),
+    });
+    distiller.start();
+    const start = Date.now();
+    while (distiller.status().coldPass !== "done") {
+      if (Date.now() - start > 5_000) throw new Error(JSON.stringify(distiller.status()));
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    await distiller.stop();
+
+    expect(distiller.status().quarantinedCount).toBe(0);
+    expect(store.getCard("ses_dist")?.distillState).toBe("full");
+    const hit = (term: string) =>
+      store.ftsSearch({ strong: [term], weak: [] }).map((h) => h.sessionId);
+    expect(hit("widgets")).toEqual(["ses_dist"]);
+    expect(hit("omitted")).toEqual(["ses_dist"]);
+  });
+
+  it("re-checks a row's size when it grows between the size read and the body read", async () => {
+    const t = await fresh();
+    session(t, "ses_grow");
+    const growing = message(t, "ses_grow", "assistant", reply("short"));
+    const { source, yields } = await capped(t, (call) => {
+      // Call 1 precedes the size read, call 2 the body read.
+      if (call === 2) {
+        t.db.run("UPDATE session_message SET data = ? WHERE id = ?", [
+          JSON.stringify(reply("y".repeat(5_000))),
+          growing,
+        ]);
+      }
+    });
+    yields.calls = 0;
+    const page = await source.messagePage({ sessionID: "ses_grow", limit: 10 });
+    expect(page.items.map((m) => m.info.id)).toEqual([growing]);
+    expect(partText(page.items[0])).toMatch(/message omitted/);
   });
 
   it("orders sessions by max(time_updated, time_idle) with NULL idle, id breaking ties", async () => {
