@@ -2,7 +2,12 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createDistiller, type Distiller, type PollMeta } from "../src/distill.js";
+import {
+  createDistiller,
+  type Distiller,
+  type DistillSync,
+  type PollMeta,
+} from "../src/distill.js";
 import { createFetchGate } from "../src/fetch-gate.js";
 import { openStore, type Store } from "../src/store.js";
 import { openSqlite, type ReadOnlyDb, type SqliteDb } from "../src/sqlite.js";
@@ -89,7 +94,10 @@ async function waitFor(pred: () => boolean, timeoutMs = 3_000): Promise<void> {
   }
 }
 
-function startDistiller(sync: V2SyncOptions = {}): Distiller {
+function startDistiller(
+  sync: V2SyncOptions = {},
+  wrap: (inner: DistillSync) => DistillSync = (inner) => inner,
+): Distiller {
   const source = createV2HistorySource(reader, { yieldBetween: async () => {} });
   const created = createDistiller({
     source,
@@ -102,12 +110,14 @@ function startDistiller(sync: V2SyncOptions = {}): Distiller {
       if (!listing.ok) throw new Error(listing.error);
       return listing.items;
     },
-    sync: createV2Sync(reader, {
-      pollIntervalMs: 15,
-      sessionScanEveryMs: 0,
-      yieldBetween: async () => {},
-      ...sync,
-    }),
+    sync: wrap(
+      createV2Sync(reader, {
+        pollIntervalMs: 15,
+        sessionScanEveryMs: 0,
+        yieldBetween: async () => {},
+        ...sync,
+      }),
+    ),
     idleDebounceMs: 5,
     yieldBetween: async () => {},
   });
@@ -231,6 +241,43 @@ describe("v2 distiller freshness", () => {
       reply,
     ]);
     await waitFor(() => hits("etaneedle").length > 0);
+  });
+
+  it("never stamps a checkpoint over content read from a tail that moved mid-fetch", async () => {
+    // Older than the poll's first window, so no new-row signal helps: only
+    // the checkpoint decides whether the session is read again.
+    const at = Date.now();
+    addSession("ses_1", at - 70_000);
+    addRow("ses_1", "user", user("omicronneedle", at - 69_000), at - 69_000);
+    let streaming: string | undefined;
+    // Interleaving: the tail is checkpointed (only the user row), then a reply
+    // starts streaming before the messages are fetched, so the fetch reads
+    // its partial text.
+    const d = startDistiller({}, (inner) => ({
+      ...inner,
+      async checkpoint(sessionID) {
+        const cp = await inner.checkpoint(sessionID);
+        streaming ??= addRow(
+          "ses_1",
+          "assistant",
+          assistant("partial words", at - 68_000, false),
+          at - 68_000,
+        );
+        return cp;
+      },
+    }));
+    await waitFor(() => d.status().coldPass === "done");
+    expect(hits("partial")).toEqual(["ses_1"]);
+
+    // The reply completes in place. A checkpoint describing only the user row
+    // would call the card "grown", append nothing past the reply, and stamp
+    // the completed tail as fresh over the partial text.
+    v2db.db.run("UPDATE session_message SET data = ?, time_updated = ? WHERE id = ?", [
+      JSON.stringify(assistant("partial words then pineedle", at - 68_000, true)),
+      Date.now(),
+      streaming!,
+    ]);
+    await waitFor(() => hits("pineedle").length > 0);
   });
 
   it("treats a tail changed in place, a revert, and appended rows differently", async () => {

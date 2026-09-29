@@ -225,6 +225,11 @@ export function createV2Sync(db: ReadOnlyDb, opts: V2SyncOptions = {}): DistillS
     stored: string | null | undefined,
   ): Promise<TailChange> {
     const cp = parseCheckpoint(stored);
+    // An unsettled tail is always "rewritten": the running row changes in
+    // place, so an append from it would keep its partial text. The cost is a
+    // full re-distill of that session on every poll while a turn streams,
+    // bounded by the per-session row cap and only for sessions with a live or
+    // recently abandoned turn (see abandonAfterMs).
     if (!cp || cp.unsettled !== null) return "rewritten";
     const sessKey = sessionKey(sessionID);
     if (sessKey === null) return "rewritten";

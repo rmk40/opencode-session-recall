@@ -869,15 +869,36 @@ export function createDistiller(options: DistillerOptions): Distiller {
     return { messages: collected, reached };
   }
 
-  /** The session's tail before a distill (sync hosts only). Taken BEFORE the
-   *  message fetch, so rows landing during the fetch make the stored cursor
-   *  look stale (a redundant re-distill) rather than current (a missed one). */
+  /** The session's tail (sync hosts only); see {@link bracketCheckpoint}. */
   async function fetchCheckpoint(sessionID: string): Promise<DistillCheckpoint | null> {
     if (!sync) return null;
     return gate.runBackground(() => {
       if (stopped || !leaseHeld) return Promise.resolve(null);
       return sync.checkpoint(sessionID);
     });
+  }
+
+  /**
+   * The checkpoint a distill may stamp, given the tail taken BEFORE its fetch.
+   * The tail is read again AFTER the fetch; only when both describe the same
+   * tail (same newest row, same `time_updated`, same session key, same
+   * unsettled state) is the fetched content known to be what the checkpoint
+   * describes. If the tail moved during the fetch (a row landed, a streaming
+   * row grew), the card is stored with no checkpoint, which the next compare
+   * treats as rewritten (a full re-distill), and the session is queued for
+   * the next poll. A checkpoint therefore never claims content the distill
+   * did not read, and an empty append can never stamp a newer tail over it.
+   */
+  async function bracketCheckpoint(
+    sessionID: string,
+    before: DistillCheckpoint | null,
+  ): Promise<{ checkpoint: DistillCheckpoint | null; moved: boolean }> {
+    if (!sync) return { checkpoint: null, moved: false };
+    const after = await fetchCheckpoint(sessionID);
+    if (before && after && before.cursor === after.cursor) {
+      return { checkpoint: after, moved: false };
+    }
+    return { checkpoint: null, moved: after !== null };
   }
 
   async function tailChange(
@@ -897,9 +918,13 @@ export function createDistiller(options: DistillerOptions): Distiller {
     return sync ? { ...card, distillCursor: checkpoint?.cursor ?? null } : card;
   }
 
-  function noteSettled(sessionID: string, checkpoint: DistillCheckpoint | null): void {
+  function noteSettled(
+    sessionID: string,
+    checkpoint: DistillCheckpoint | null,
+    moved = false,
+  ): void {
     if (!sync) return;
-    if (checkpoint && !checkpoint.settled) unsettled.add(sessionID);
+    if (moved || (checkpoint && !checkpoint.settled)) unsettled.add(sessionID);
     else unsettled.delete(sessionID);
   }
 
@@ -988,8 +1013,9 @@ export function createDistiller(options: DistillerOptions): Distiller {
   // ── Distill one session ──
 
   async function distillFull(session: DistillSessionMeta): Promise<void> {
-    const checkpoint = await fetchCheckpoint(session.id);
+    const before = await fetchCheckpoint(session.id);
     const messages = await fetchSessionMessages(session.id, caps.ftsRowsPerSession);
+    const { checkpoint, moved } = await bracketCheckpoint(session.id, before);
     // Cheap flag check before parentChainOf touches the store: a detached
     // continuation (the fetch settled after dispose's bounded wait) must not
     // read SQLite, which may already be closed.
@@ -1007,7 +1033,7 @@ export function createDistiller(options: DistillerOptions): Distiller {
     if (stopped || !ownsLease()) return;
     store.replaceSessionParts(session.id, rows, withCheckpoint(card, checkpoint));
     bumpCardsRev();
-    noteSettled(session.id, checkpoint);
+    noteSettled(session.id, checkpoint, moved);
   }
 
   async function distillAppend(session: DistillSessionMeta, oldCard: Card): Promise<void> {
@@ -1016,8 +1042,9 @@ export function createDistiller(options: DistillerOptions): Distiller {
       await distillFull(session);
       return;
     }
-    const tail = await fetchCheckpoint(session.id);
+    const before = await fetchCheckpoint(session.id);
     const { messages: newMessages, reached } = await fetchNewMessages(session.id, checkpoint);
+    const { checkpoint: tail, moved } = await bracketCheckpoint(session.id, before);
     // Authoritative ownership check before the append write (see distillFull);
     // only synchronous derivation sits between here and appendSessionParts.
     if (stopped || !ownsLease()) return;
@@ -1045,7 +1072,7 @@ export function createDistiller(options: DistillerOptions): Distiller {
           ),
         );
         bumpCardsRev();
-        noteSettled(session.id, tail);
+        noteSettled(session.id, tail, moved);
       }
       return;
     }
@@ -1095,7 +1122,7 @@ export function createDistiller(options: DistillerOptions): Distiller {
       ),
     );
     bumpCardsRev();
-    noteSettled(session.id, tail);
+    noteSettled(session.id, tail, moved);
   }
 
   // ── Cold pass ──
@@ -1173,9 +1200,11 @@ export function createDistiller(options: DistillerOptions): Distiller {
 
           let messages: HistoryMessage[];
           let checkpoint: DistillCheckpoint | null;
+          let moved: boolean;
           try {
-            checkpoint = await fetchCheckpoint(session.id);
+            const before = await fetchCheckpoint(session.id);
             messages = await fetchSessionMessages(session.id, caps.ftsRowsPerSession);
+            ({ checkpoint, moved } = await bracketCheckpoint(session.id, before));
           } catch (error) {
             if (!(error instanceof MalformedSessionError)) throw error;
             quarantine(session, error);
@@ -1220,7 +1249,7 @@ export function createDistiller(options: DistillerOptions): Distiller {
           if (stopped || !ownsLease()) return;
           store.replaceSessionParts(session.id, rows, withCheckpoint(card, checkpoint));
           bumpCardsRev();
-          noteSettled(session.id, checkpoint);
+          noteSettled(session.id, checkpoint, moved);
           distilled++;
           distilledCount = distilled; // status counts only sessions actually distilled
         }
