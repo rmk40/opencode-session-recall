@@ -1607,7 +1607,9 @@ describe("cold pass", () => {
 
     // c is gone from the host by the follow-up pass, which prunes it.
     graph.sessions = graph.sessions.filter((s) => s.id !== "c");
-    await waitFor(() => sdk.list === 2 && distiller.status().coldPass === "done", 3_000);
+    // At least the follow-up pass (sdk.list counts discoveries); later ones
+    // change nothing.
+    await waitFor(() => sdk.list >= 2 && distiller.status().coldPass === "done", 3_000);
     expect(distiller.status().failingCount).toBe(0);
     expect(distiller.status().skippedCount).toBe(0);
     await distiller.stop();

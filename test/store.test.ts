@@ -934,6 +934,10 @@ describe("cards CRUD", () => {
     // cardSessionIds() lists the same sessions without loading the cards.
     store.upsertCard(makeCard("s2"));
     expect(store.cardSessionIds().sort()).toEqual(["s1", "s2"]);
+    // cardCount() counts them; a deleted session's card leaves the count.
+    expect(store.cardCount()).toBe(2);
+    store.deleteSession("s2");
+    expect(store.cardCount()).toBe(1);
     db.close();
   });
 
