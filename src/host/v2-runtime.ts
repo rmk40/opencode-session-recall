@@ -115,13 +115,16 @@ async function tryRealPath(path: string): Promise<string | null> {
   }
 }
 
-/** The real path of a file that may not exist yet: its real directory plus
- *  its name. `:memory:` stays as is. */
+/** The real path of a store file: the file itself when it exists (so a
+ *  symlinked store file resolves to its target), else its real directory
+ *  plus its name (the file is created on first open). `:memory:` stays. */
 async function realFilePath(path: string): Promise<string> {
   if (path === ":memory:") return path;
   try {
     const p = await loadPath();
     const resolved = p.resolve(path);
+    const whole = await tryRealPath(resolved);
+    if (whole !== null) return whole;
     const dir = (await tryRealPath(p.dirname(resolved))) ?? p.dirname(resolved);
     return p.resolve(dir, p.basename(resolved));
   } catch {

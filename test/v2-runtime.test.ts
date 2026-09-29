@@ -108,3 +108,39 @@ describe("v2 runtime source canonicalization", () => {
     expect((await storeMeta(storePath)).source_db).toBe("/elsewhere/opencode.db");
   });
 });
+
+describe("v2 runtime store canonicalization", () => {
+  function resolveWith(storePath: string, opencodeDbPath: string) {
+    return v2RuntimeFactory({
+      options: options({ storePath, opencodeDbPath }),
+      channel: "latest",
+      log: () => {},
+    }).resolve();
+  }
+
+  it("resolves a symlinked store file to its target, so both spellings share a runtime", async () => {
+    const v2 = await makeV2Db();
+    dbs.push(v2);
+    const real = join(dir, "real-store.db");
+    const seed = await openSqlite(real);
+    seed?.close();
+    const link = join(dir, "linked-store.db");
+    symlinkSync(real, link);
+
+    const viaReal = await resolveWith(real, v2.path);
+    const viaLink = await resolveWith(link, v2.path);
+    expect(viaLink.store).toBe(realpathSync(real));
+    expect(viaLink).toEqual(viaReal);
+  });
+
+  it("resolves a store file that does not exist yet through its real directory", async () => {
+    const v2 = await makeV2Db();
+    dbs.push(v2);
+    const realDir = join(dir, "cache");
+    const { mkdirSync } = await import("node:fs");
+    mkdirSync(realDir);
+    symlinkSync(realDir, join(dir, "cache-link"));
+    const identity = await resolveWith(join(dir, "cache-link", "store.db"), v2.path);
+    expect(identity.store).toBe(join(realpathSync(realDir), "store.db"));
+  });
+});
