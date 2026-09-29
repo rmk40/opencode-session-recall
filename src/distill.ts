@@ -53,6 +53,9 @@ const LEASE_TTL_MS = 30_000;
 const HEARTBEAT_MS = 10_000;
 /** Bound process-lifetime state retained for malformed legacy sessions. */
 const MAX_QUARANTINED_SESSIONS = 1_000;
+/** Consecutive failed re-distills before an unsettled session stops being
+ *  re-read on every poll. */
+const MAX_UNSETTLED_FAILURES = 3;
 /** With `yieldBetween`, long store sweeps pause after this many writes. */
 const YIELD_EVERY_WRITES = 50;
 
@@ -699,6 +702,11 @@ export function createDistiller(options: DistillerOptions): Distiller {
    *  signal hundreds of sessions at once; at most `distillConcurrency`
    *  re-distills run at a time and the rest wait here, in signal order. */
   const reDistillQueue = new Set<string>();
+  /** Consecutive failed re-distills of an unsettled session. Past
+   *  {@link MAX_UNSETTLED_FAILURES} the session leaves the per-poll re-read
+   *  set, so a session that always fails is not retried forever (a later
+   *  signal or cold pass still picks it up). */
+  const reDistillFailures = new Map<string, number>();
   const reDistillWidth = Math.max(1, Math.floor(limits.distillConcurrency));
   const quarantined = new Map<string, number>();
   let stopPromise: Promise<void> | undefined;
@@ -1461,11 +1469,24 @@ export function createDistiller(options: DistillerOptions): Distiller {
         const stored = store.getCard(sessionID);
         if (stored && stored.rootId !== sessionID) recomputeRootRollup(stored.rootId);
         succeeded = true;
+        reDistillFailures.delete(sessionID);
         options.onSessionDistilled?.(sessionID);
       }
     } catch (error) {
       lastError = errmsg(error);
       logMsg(`session ${sessionID} re-distill failed: ${lastError}`);
+      if (unsettled.has(sessionID)) {
+        const failures = (reDistillFailures.get(sessionID) ?? 0) + 1;
+        if (failures >= MAX_UNSETTLED_FAILURES) {
+          unsettled.delete(sessionID);
+          reDistillFailures.delete(sessionID);
+          logMsg(
+            `session ${sessionID} no longer re-read on every poll after ${failures} failed re-distills`,
+          );
+        } else {
+          reDistillFailures.set(sessionID, failures);
+        }
+      }
     } finally {
       // If the distill did not land, preserve the removal signal for the retry.
       if (!succeeded && hadRemoval) removalSince.add(sessionID);
@@ -1486,6 +1507,7 @@ export function createDistiller(options: DistillerOptions): Distiller {
     quarantined.delete(sessionID);
     unsettled.delete(sessionID);
     reDistillQueue.delete(sessionID);
+    reDistillFailures.delete(sessionID);
     if (rootId && rootId !== sessionID) recomputeRootRollup(rootId);
   }
 

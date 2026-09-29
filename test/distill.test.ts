@@ -1901,6 +1901,57 @@ describe("sync-host re-distill fan-out", () => {
   });
 });
 
+describe("sync-host unsettled retries", () => {
+  it("stops re-reading an unsettled session on every poll after repeated failures", async () => {
+    const graph: Graph = {
+      sessions: [session("s1", "One", PROJECT_DIR, 1_000)],
+      messagesBySession: {
+        s1: [bundle(userMessage("m1", "s1", 100), [textPart("p1", "s1", "m1", "one")])],
+      },
+    };
+    const { source: inner } = makeDistillFake(graph);
+    let failing = false;
+    let failedReads = 0;
+    const source: HistorySource = {
+      ...inner,
+      messagePage: async (o) => {
+        if (failing) {
+          failedReads++;
+          throw new Error("history read failed");
+        }
+        return inner.messagePage(o);
+      },
+    };
+    const sync: DistillSync = {
+      // Always unsettled: every poll re-reads the session.
+      checkpoint: async () => ({ cursor: "tail", settled: false }),
+      compare: async () => "rewritten",
+      missing: async () => [],
+      poll: async () => [],
+      pollIntervalMs: 3,
+    };
+    const { db, store } = await freshStore();
+    const distiller = createDistiller({
+      source,
+      store,
+      gate: createFetchGate({ concurrency: 4 }),
+      limits: { ...TEST_LIMITS, coldPass: true },
+      instanceId: "unsettled-failures",
+      sync,
+      idleDebounceMs: 1,
+      log: () => {},
+    });
+    distiller.start();
+    await waitFor(() => distiller.status().coldPass === "done");
+    failing = true;
+    await waitFor(() => failedReads >= 3);
+    await new Promise((resolve) => setTimeout(resolve, 60)); // many more polls
+    expect(failedReads).toBe(3);
+    await distiller.stop();
+    db.close();
+  });
+});
+
 describe("null store", () => {
   it("is a clean no-op with no lease and idle status", () => {
     const { source } = makeDistillFake({ sessions: [], messagesBySession: {} });
