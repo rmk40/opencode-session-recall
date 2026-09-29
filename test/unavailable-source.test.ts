@@ -13,12 +13,18 @@ import { createDrill } from "../src/drill.js";
 import { createFetchGate } from "../src/fetch-gate.js";
 import type { SearchOutput, SessionsOutput } from "../src/types.js";
 import {
+  bundle,
+  globalSessionFrom,
   makeContext,
   makeFakeHarness,
   makeRecallDeps,
   OTHER_DIR,
+  PROJECT_DIR,
   runTool,
+  session,
   TEST_LIMITS,
+  textPart,
+  userMessage,
 } from "./helpers.js";
 
 /**
@@ -133,6 +139,89 @@ describe("unavailable history source", () => {
         role: "assistant",
       });
       expect(assistantOnly.results.every((r) => r.role === "assistant")).toBe(true);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("recall from cards never claims a role or author a card field does not record", async () => {
+    const h = makeFakeHarness();
+    // A session with only a user request: no answer exists.
+    const lone = session("s-user-only", "Zebra question", PROJECT_DIR, Date.now() - 5_000);
+    h.sessions.push(lone);
+    h.globalSessions.push(globalSessionFrom(lone));
+    h.messagesBySession[lone.id] = [
+      bundle(userMessage("m-lone", lone.id, Date.now() - 5_500), [
+        textPart("p-lone", lone.id, "m-lone", "zebraneedle asked but never answered"),
+      ]),
+    ];
+    const { deps, cleanup } = await makeRecallDeps(h, TEST_LIMITS);
+    try {
+      const { source } = countingUnavailable();
+      const drill = createDrill({ source, gate: deps.gate, limits: TEST_LIMITS });
+      const recall = search(source, true, TEST_LIMITS, { ...deps, drill });
+      const lonely = (out: SearchOutput) => out.results.filter((r) => r.sessionID === lone.id);
+
+      for (const narrowing of [{ role: "assistant" }, { authorship: "model" }]) {
+        const out = await runTool<SearchOutput>(recall, {
+          query: "zebraneedle",
+          scope: "global",
+          ...narrowing,
+        });
+        expect(out.ok).toBe(true);
+        expect(lonely(out), JSON.stringify(narrowing)).toEqual([]);
+      }
+      // Unfiltered, the request is found as what it is: user text.
+      const plain = await runTool<SearchOutput>(recall, { query: "zebraneedle", scope: "global" });
+      expect(lonely(plain).length).toBeGreaterThan(0);
+      expect(lonely(plain).every((r) => r.role === "user")).toBe(true);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("recall from cards matches a metadata-only card by its title, within the filters", async () => {
+    const h = makeFakeHarness();
+    const { deps, store, cleanup } = await makeRecallDeps(h, TEST_LIMITS);
+    try {
+      const at = Date.now() - 3_000;
+      const base = store.getCard("s-project-2")!;
+      store.upsertCard({
+        ...base,
+        sessionId: "s-meta-only",
+        rootId: "s-meta-only",
+        parentId: null,
+        title: "Quokka migration plan",
+        summaryHead: "",
+        outcomeHead: "",
+        nlSummary: "",
+        inventory: "",
+        files: [],
+        tools: [],
+        errors: [],
+        distillState: "metadata",
+        distilledThrough: null,
+        timeCreated: at,
+        timeUpdated: at,
+      });
+      store.setMeta("cards_rev", String(Number(store.getMeta("cards_rev") ?? 0) + 1));
+      const { source } = countingUnavailable();
+      const drill = createDrill({ source, gate: deps.gate, limits: TEST_LIMITS });
+      const recall = search(source, true, TEST_LIMITS, { ...deps, drill });
+      const quokka = (out: SearchOutput) =>
+        out.results.filter((r) => r.sessionID === "s-meta-only");
+
+      const plain = await runTool<SearchOutput>(recall, { query: "Quokka", scope: "global" });
+      expect(quokka(plain).map((r) => r.partType)).toEqual(["title"]);
+      // A title claims no message role or text type.
+      for (const narrowing of [{ role: "user" }, { type: "text" }, { authorship: "human" }]) {
+        const out = await runTool<SearchOutput>(recall, {
+          query: "Quokka",
+          scope: "global",
+          ...narrowing,
+        });
+        expect(quokka(out), JSON.stringify(narrowing)).toEqual([]);
+      }
     } finally {
       cleanup();
     }

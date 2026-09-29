@@ -3119,7 +3119,13 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
         // routes rank, filter and group those exactly as drilled parts.
         // Results are card-quality; coverage.source and a warning say why.
         const sourceUnavailable = source.unavailable;
-        const activeDrill = sourceUnavailable === undefined ? drill : createCardDrill(cards);
+        const activeDrill =
+          sourceUnavailable === undefined
+            ? drill
+            : createCardDrill(cards, {
+                filters,
+                authorshipNarrowed: authorshipFilter !== undefined,
+              });
         if (sourceUnavailable !== undefined) {
           normalized.warnings.push(
             `${unavailableHistoryError(sourceUnavailable)}. Results come from the session cards only (title, first statement, last answer, summary)${deepMode ? "; the deep sweep was skipped" : ""}; message content cannot be read until it is available.`,
