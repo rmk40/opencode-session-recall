@@ -48,6 +48,8 @@ const LEASE_TTL_MS = 30_000;
 const HEARTBEAT_MS = 10_000;
 /** Bound process-lifetime state retained for malformed legacy sessions. */
 const MAX_QUARANTINED_SESSIONS = 1_000;
+/** With `yieldBetween`, long store sweeps pause after this many writes. */
+const YIELD_EVERY_WRITES = 50;
 
 // ── Shared shapes ────────────────────────────────────────────────────────────
 
@@ -114,14 +116,56 @@ export type DistillStatus = {
  * - `removal`: content was compacted or removed; the next re-distill must be
  *   full, never an append onto a changed transcript.
  * - `deleted`: the session is gone; drop its card and rows.
- * - `meta`: title/directory/project changed; re-distill picks the new
- *   metadata up (the v1 mapper never emits it).
+ * - `meta`: title/directory/project changed. With a `patch` the card's
+ *   metadata is patched in place ({@link Store.patchCardMeta}); without one
+ *   the session is re-distilled. The v1 mapper never emits it.
  */
 export type DistillSignal =
   | { type: "turn-ended"; sessionID: string }
   | { type: "removal"; sessionID: string }
   | { type: "deleted"; sessionID: string }
-  | { type: "meta"; sessionID: string };
+  | { type: "meta"; sessionID: string; patch?: SessionMetaPatch };
+
+/** Session metadata a `meta` signal carries. */
+export type SessionMetaPatch = { title?: string; directory?: string; projectId?: string };
+
+/** A session's tail as a host sees it before a distill: an opaque cursor the
+ *  card stores ({@link Card.distillCursor}), and whether the tail was settled
+ *  (no assistant, shell or compaction still running). */
+export type DistillCheckpoint = { cursor: string; settled: boolean };
+
+/**
+ * How a session changed since a stored checkpoint:
+ * - `fresh`: nothing past the checkpoint, and it was settled;
+ * - `grown`: rows were appended after it (an append is safe);
+ * - `rewritten`: the checkpoint row is gone (revert), changed in place, was
+ *   unsettled, or there is no usable checkpoint; only a full distill is safe.
+ */
+export type TailChange = "fresh" | "grown" | "rewritten";
+
+/** The store's `meta` table as a poll sees it; writes are dropped unless this
+ *  process holds the lease. */
+export type PollMeta = {
+  get(key: string): string | undefined;
+  set(key: string, value: string): void;
+};
+
+/**
+ * Host-side freshness for a host whose events are only a latency hint (v2:
+ * `history/v2-sync.ts`). With it the distiller checkpoints each session's
+ * tail, trusts a card only while its tail is unchanged, polls for changes
+ * while holding the lease, re-reads unsettled tails on every poll, and
+ * removes cards whose session no longer exists at the end of a cold pass.
+ */
+export type DistillSync = {
+  checkpoint(sessionID: string): Promise<DistillCheckpoint | null>;
+  compare(sessionID: string, stored: string | null | undefined): Promise<TailChange>;
+  /** Of `ids`, those the host no longer has. */
+  missing(ids: string[]): Promise<string[]>;
+  /** One poll: signals for sessions that changed since its watermarks. */
+  poll(meta: PollMeta): Promise<DistillSignal[]>;
+  readonly pollIntervalMs: number;
+};
 
 export type Distiller = {
   start(): void;
@@ -172,6 +216,12 @@ export type DistillerOptions = {
   /** Called (while holding the lease) after an incremental re-distill lands, so
    *  the summarizer can queue a content-hash-gated re-summarize of that session. */
   onSessionDistilled?: (sessionId: string) => void;
+  /** Host-side freshness (v2). Absent on v1, whose behavior it never changes. */
+  sync?: DistillSync;
+  /** Awaited between sessions and inside long store sweeps, so a large pass
+   *  never holds the event loop (v2 shares it with the whole service).
+   *  Absent: no extra yields. */
+  yieldBetween?: () => Promise<void>;
 };
 
 // ── Small text helpers ───────────────────────────────────────────────────────
@@ -637,6 +687,12 @@ export function createDistiller(options: DistillerOptions): Distiller {
   /** Sessions that saw a removal-shaped event since their last full distill, so
    *  the next re-distill takes the full path rather than appending. */
   const removalSince = new Set<string>();
+  const sync = options.sync;
+  const pause = options.yieldBetween;
+  /** Sessions last distilled against an unsettled tail; every poll re-reads
+   *  them even when no new row arrived. */
+  const unsettled = new Set<string>();
+  let pollTimer: Timer | undefined;
 
   /** Cancellable inter-page politeness sleep. The timers are tracked so
    *  quiesce() can cancel them: an untracked setTimeout with a long
@@ -800,6 +856,40 @@ export function createDistiller(options: DistillerOptions): Distiller {
     return { messages: collected, reached };
   }
 
+  /** The session's tail before a distill (sync hosts only). Taken BEFORE the
+   *  message fetch, so rows landing during the fetch make the stored cursor
+   *  look stale (a redundant re-distill) rather than current (a missed one). */
+  async function fetchCheckpoint(sessionID: string): Promise<DistillCheckpoint | null> {
+    if (!sync) return null;
+    return gate.runBackground(() => {
+      if (stopped || !leaseHeld) return Promise.resolve(null);
+      return sync.checkpoint(sessionID);
+    });
+  }
+
+  async function tailChange(
+    sessionID: string,
+    stored: string | null | undefined,
+  ): Promise<TailChange> {
+    if (!sync) return "grown";
+    return gate.runBackground(() => {
+      if (stopped || !leaseHeld) return Promise.resolve<TailChange>("rewritten");
+      return sync.compare(sessionID, stored);
+    });
+  }
+
+  /** Stamp a derived card with its checkpoint (sync hosts only; v1 cards keep
+   *  their exact shape). */
+  function withCheckpoint(card: Card, checkpoint: DistillCheckpoint | null): Card {
+    return sync ? { ...card, distillCursor: checkpoint?.cursor ?? null } : card;
+  }
+
+  function noteSettled(sessionID: string, checkpoint: DistillCheckpoint | null): void {
+    if (!sync) return;
+    if (checkpoint && !checkpoint.settled) unsettled.add(sessionID);
+    else unsettled.delete(sessionID);
+  }
+
   // ── Root / family ──
 
   function parentChainOf(session: DistillSessionMeta): Map<string, string | null> {
@@ -842,10 +932,11 @@ export function createDistiller(options: DistillerOptions): Distiller {
     bumpCardsRev();
   }
 
-  function recomputeAllRootRollups(): void {
+  async function recomputeAllRootRollups(): Promise<void> {
     // One authoritative ownership read for the whole rollup sweep (see
     // recomputeRootRollup); per-row checks would multiply SQLite reads for
-    // no additional safety.
+    // no additional safety. A host that yields mid-sweep re-checks after each
+    // pause instead.
     if (!ownsLease()) return;
     const rootCards = new Map<string, Card>();
     const childrenByRoot = new Map<string, Card[]>();
@@ -861,10 +952,21 @@ export function createDistiller(options: DistillerOptions): Distiller {
         else childrenByRoot.set(card.rootId, [card]);
       }
     }
+    let written = 0;
+    let paused = false;
     for (const [rootId, root] of rootCards) {
       const rollup = buildRollup(childrenByRoot.get(rootId) ?? []);
       if (rollup.length > 0 || root.familyRollup.length > 0) {
-        store.upsertCard({ ...root, familyRollup: rollup });
+        if (pause && ++written % YIELD_EVERY_WRITES === 0) {
+          await pause();
+          if (stopped || !ownsLease()) return;
+          paused = true;
+        }
+        // After a pause a card may have been re-distilled; never write the
+        // stale snapshot over it.
+        const base = paused ? store.getCard(rootId) : root;
+        if (!base) continue;
+        store.upsertCard({ ...base, familyRollup: rollup });
         bumpCardsRev();
       }
     }
@@ -873,6 +975,7 @@ export function createDistiller(options: DistillerOptions): Distiller {
   // ── Distill one session ──
 
   async function distillFull(session: DistillSessionMeta): Promise<void> {
+    const checkpoint = await fetchCheckpoint(session.id);
     const messages = await fetchSessionMessages(session.id, caps.ftsRowsPerSession);
     // Cheap flag check before parentChainOf touches the store: a detached
     // continuation (the fetch settled after dispose's bounded wait) must not
@@ -889,8 +992,9 @@ export function createDistiller(options: DistillerOptions): Distiller {
     // callback ever runs; the resumed fetch must not replace the new holder's
     // rows. One leaseStatus() read per write batch.
     if (stopped || !ownsLease()) return;
-    store.replaceSessionParts(session.id, rows, card);
+    store.replaceSessionParts(session.id, rows, withCheckpoint(card, checkpoint));
     bumpCardsRev();
+    noteSettled(session.id, checkpoint);
   }
 
   async function distillAppend(session: DistillSessionMeta, oldCard: Card): Promise<void> {
@@ -899,6 +1003,7 @@ export function createDistiller(options: DistillerOptions): Distiller {
       await distillFull(session);
       return;
     }
+    const tail = await fetchCheckpoint(session.id);
     const { messages: newMessages, reached } = await fetchNewMessages(session.id, checkpoint);
     // Authoritative ownership check before the append write (see distillFull);
     // only synchronous derivation sits between here and appendSessionParts.
@@ -910,54 +1015,74 @@ export function createDistiller(options: DistillerOptions): Distiller {
       await distillFull(session);
       return;
     }
-    if (newMessages.length === 0) return; // nothing appended; card stays current
+    if (newMessages.length === 0) {
+      // Nothing appended. A sync host still refreshes the card's metadata and
+      // checkpoint, or the cold pass would keep finding it stale.
+      if (sync) {
+        store.upsertCard(
+          withCheckpoint(
+            {
+              ...oldCard,
+              title: session.title,
+              directory: session.directory,
+              projectId: session.projectId,
+              timeUpdated: session.timeUpdated,
+            },
+            tail,
+          ),
+        );
+        bumpCardsRev();
+        noteSettled(session.id, tail);
+      }
+      return;
+    }
 
     const chrono = sortChronological(newMessages);
     const walk = walkMessages(chrono, checkpoint);
     const rootId = resolveRootId(session.id, parentChainOf(session));
     const boundary = { checkpointMessageId: checkpoint, firstNewMessageId: chrono[0]!.info.id };
 
-    store.appendSessionParts(
-      session.id,
-      walk.rows,
-      caps.ftsRowsPerSession,
-      boundary,
-      (allRows) => ({
-        sessionId: session.id,
-        parentId: session.parentId,
-        rootId,
-        title: session.title,
-        slug: session.slug,
-        directory: session.directory,
-        projectId: session.projectId,
-        agent: session.agent,
-        model: session.model,
-        timeCreated: session.timeCreated,
-        timeUpdated: session.timeUpdated,
-        partCount: oldCard.partCount + walk.partCount,
-        retainedChars: allRows.reduce((sum, row) => sum + row.raw.length, 0),
-        summaryHead: oldCard.summaryHead || walk.firstUserHead,
-        outcomeHead: walk.lastTextHead || oldCard.outcomeHead,
-        inventory: deriveInventory(allRows, caps.inventoryTokens),
-        files: mergeKeepLast(oldCard.files, walk.files, FILES_CAP),
-        tools: mergeKeepFirst(oldCard.tools, walk.tools, TOOLS_CAP),
-        errors: mergeKeepFirst(oldCard.errors, walk.errors, ERRORS_CAP),
-        familyRollup: oldCard.familyRollup,
-        distillState: "full",
-        distilledThrough: walk.newestMessageId ?? checkpoint,
-        // Clear any persisted vector: the append changed the inventory and
-        // heads the embedding is derived from, so a carried-over vector would be
-        // stale. Null forces the semantic layer to recompute on the next load,
-        // matching a full re-distill (deriveCard also stores a null embedding).
-        embedding: null,
-        embeddingGen: null,
-        // Preserved by the store's card upsert (excluded from its UPDATE SET);
-        // these values apply only to a first insert.
-        nlSummary: "",
-        summaryHash: "",
-      }),
+    store.appendSessionParts(session.id, walk.rows, caps.ftsRowsPerSession, boundary, (allRows) =>
+      withCheckpoint(
+        {
+          sessionId: session.id,
+          parentId: session.parentId,
+          rootId,
+          title: session.title,
+          slug: session.slug,
+          directory: session.directory,
+          projectId: session.projectId,
+          agent: session.agent,
+          model: session.model,
+          timeCreated: session.timeCreated,
+          timeUpdated: session.timeUpdated,
+          partCount: oldCard.partCount + walk.partCount,
+          retainedChars: allRows.reduce((sum, row) => sum + row.raw.length, 0),
+          summaryHead: oldCard.summaryHead || walk.firstUserHead,
+          outcomeHead: walk.lastTextHead || oldCard.outcomeHead,
+          inventory: deriveInventory(allRows, caps.inventoryTokens),
+          files: mergeKeepLast(oldCard.files, walk.files, FILES_CAP),
+          tools: mergeKeepFirst(oldCard.tools, walk.tools, TOOLS_CAP),
+          errors: mergeKeepFirst(oldCard.errors, walk.errors, ERRORS_CAP),
+          familyRollup: oldCard.familyRollup,
+          distillState: "full",
+          distilledThrough: walk.newestMessageId ?? checkpoint,
+          // Clear any persisted vector: the append changed the inventory and
+          // heads the embedding is derived from, so a carried-over vector would be
+          // stale. Null forces the semantic layer to recompute on the next load,
+          // matching a full re-distill (deriveCard also stores a null embedding).
+          embedding: null,
+          embeddingGen: null,
+          // Preserved by the store's card upsert (excluded from its UPDATE SET);
+          // these values apply only to a first insert.
+          nlSummary: "",
+          summaryHash: "",
+        },
+        tail,
+      ),
     );
     bumpCardsRev();
+    noteSettled(session.id, tail);
   }
 
   // ── Cold pass ──
@@ -1013,9 +1138,19 @@ export function createDistiller(options: DistillerOptions): Distiller {
         // for its current updated time is skipped. (A watermark fast-skip is
         // unsafe under concurrency > 1 — a slow newer session that fails could be
         // skipped past by faster older ones — so it is deliberately not used.)
+        if (pause) {
+          await pause();
+          if (stopped || !leaseHeld) return;
+        }
         const existing = store.getCard(session.id);
-        const upToDate =
+        let upToDate =
           existing?.distillState === "full" && existing.timeUpdated === session.timeUpdated;
+        // A sync host also needs the tail unchanged: v2 session times do not
+        // move on assistant output.
+        if (upToDate && sync) {
+          upToDate = (await tailChange(session.id, existing?.distillCursor)) === "fresh";
+          if (stopped || !leaseHeld) return;
+        }
         if (!upToDate) {
           if (quarantined.get(session.id) === session.timeUpdated) {
             examined++;
@@ -1024,7 +1159,9 @@ export function createDistiller(options: DistillerOptions): Distiller {
           }
 
           let messages: HistoryMessage[];
+          let checkpoint: DistillCheckpoint | null;
           try {
+            checkpoint = await fetchCheckpoint(session.id);
             messages = await fetchSessionMessages(session.id, caps.ftsRowsPerSession);
           } catch (error) {
             if (!(error instanceof MalformedSessionError)) throw error;
@@ -1068,8 +1205,9 @@ export function createDistiller(options: DistillerOptions): Distiller {
           // the cached flag — and skip it, counting the session as not
           // distilled.
           if (stopped || !ownsLease()) return;
-          store.replaceSessionParts(session.id, rows, card);
+          store.replaceSessionParts(session.id, rows, withCheckpoint(card, checkpoint));
           bumpCardsRev();
+          noteSettled(session.id, checkpoint);
           distilled++;
           distilledCount = distilled; // status counts only sessions actually distilled
         }
@@ -1086,7 +1224,16 @@ export function createDistiller(options: DistillerOptions): Distiller {
         coldPassState = "idle";
         return;
       }
-      recomputeAllRootRollups();
+      if (sync) await reconcileDeletions();
+      if (stopped || !ownsLease()) {
+        coldPassState = "idle";
+        return;
+      }
+      await recomputeAllRootRollups();
+      if (stopped || !ownsLease()) {
+        coldPassState = "idle";
+        return;
+      }
       coldPassState = "done";
       logMsg(
         `cold pass done (${distilled} distilled / ${examined} examined / ${knownCount} known)`,
@@ -1100,6 +1247,25 @@ export function createDistiller(options: DistillerOptions): Distiller {
       // re-arm on a backoff while we still hold the lease.
       scheduleColdPassRetry();
     }
+  }
+
+  /** Drop cards whose session the host no longer has (sync hosts only; safe
+   *  because such a store is only ever written from that one source). */
+  async function reconcileDeletions(): Promise<void> {
+    if (!sync) return;
+    const ids = store.allCards().map((card) => card.sessionId);
+    const gone = await gate.runBackground(() => {
+      if (stopped || !leaseHeld) return Promise.resolve<string[]>([]);
+      return sync.missing(ids);
+    });
+    let removed = 0;
+    for (const id of gone) {
+      if (stopped || !leaseHeld) return;
+      if (pause && removed > 0 && removed % YIELD_EVERY_WRITES === 0) await pause();
+      handleDeleted(id);
+      removed++;
+    }
+    if (removed > 0) logMsg(`cold pass removed ${removed} card(s) of deleted sessions`);
   }
 
   function quarantine(session: DistillSessionMeta, error: unknown): void {
@@ -1197,11 +1363,29 @@ export function createDistiller(options: DistillerOptions): Distiller {
       if (session && isSummarizerTitle(session.title)) return;
       if (session) {
         const existing = store.getCard(sessionID);
+        let rewritten = false;
+        if (sync && existing) {
+          const change = await tailChange(sessionID, existing.distillCursor);
+          if (stopped || !leaseHeld) return;
+          if (
+            change === "fresh" &&
+            !hadRemoval &&
+            existing.distillState === "full" &&
+            existing.timeUpdated === session.timeUpdated &&
+            existing.title === session.title &&
+            existing.directory === session.directory
+          ) {
+            succeeded = true; // nothing changed since the card was written
+            return;
+          }
+          rewritten = change === "rewritten";
+        }
         const canAppend =
           existing != null &&
           existing.distilledThrough != null &&
           existing.partCount > appendThresholdParts &&
-          !hadRemoval;
+          !hadRemoval &&
+          !rewritten;
         if (canAppend && existing) await distillAppend(session, existing);
         else await distillFull(session);
         if (stopped || !leaseHeld) return;
@@ -1232,7 +1416,68 @@ export function createDistiller(options: DistillerOptions): Distiller {
     }
     removalSince.delete(sessionID);
     quarantined.delete(sessionID);
+    unsettled.delete(sessionID);
     if (rootId && rootId !== sessionID) recomputeRootRollup(rootId);
+  }
+
+  function handleMeta(sessionID: string, patch: SessionMetaPatch): void {
+    if (!ownsLease()) return; // authoritative: this path writes immediately
+    // patchCardMeta bumps cards_rev itself; an unknown session has no card to
+    // patch and is picked up by the next distill.
+    store.patchCardMeta(sessionID, patch);
+  }
+
+  // ── Poll (sync hosts) ──
+
+  function schedulePoll(): void {
+    if (!sync || stopped || !leaseHeld) return;
+    clearTimer(pollTimer);
+    pollTimer = setTimeout(() => {
+      pollTimer = undefined;
+      void runPoll().finally(schedulePoll);
+    }, sync.pollIntervalMs);
+  }
+
+  async function runPoll(): Promise<void> {
+    if (!sync || stopped || !leaseHeld) return;
+    const meta: PollMeta = {
+      get: (key) => store.getMeta(key),
+      set: (key, value) => {
+        if (!stopped && ownsLease()) store.setMeta(key, value);
+      },
+    };
+    try {
+      const signals = await gate.runBackground(() => {
+        if (stopped || !leaseHeld) return Promise.resolve<DistillSignal[]>([]);
+        return sync.poll(meta);
+      });
+      if (stopped || !leaseHeld) return;
+      for (const signal of signals) dispatch(signal);
+      // Unsettled tails are re-read even when no row arrived.
+      for (const sessionID of unsettled) scheduleReDistill(sessionID);
+    } catch (error) {
+      lastError = errmsg(error);
+      logMsg(`poll failed: ${lastError}`);
+    }
+  }
+
+  function dispatch(signal: DistillSignal): void {
+    switch (signal.type) {
+      case "turn-ended":
+        scheduleReDistill(signal.sessionID);
+        break;
+      case "meta":
+        if (signal.patch) handleMeta(signal.sessionID, signal.patch);
+        else scheduleReDistill(signal.sessionID);
+        break;
+      case "removal":
+        removalSince.add(signal.sessionID);
+        scheduleReDistill(signal.sessionID);
+        break;
+      case "deleted":
+        handleDeleted(signal.sessionID);
+        break;
+    }
   }
 
   // ── Lease management ──
@@ -1252,6 +1497,8 @@ export function createDistiller(options: DistillerOptions): Distiller {
         // Log who took it (build/gen) — the incident was an old build holding the
         // lease forever, invisible until someone hunted processes.
         leaseHeld = false;
+        clearTimer(pollTimer);
+        pollTimer = undefined;
         const taker = store.leaseStatus();
         logMsg(
           taker && taker.holder && taker.holder !== instanceId
@@ -1278,6 +1525,7 @@ export function createDistiller(options: DistillerOptions): Distiller {
       leaseHeld = true;
       logMsg(`lease acquired (build ${build}, gen ${gen})`);
       scheduleHeartbeat();
+      schedulePoll();
       if (limits.coldPass && coldPassState === "idle") void startColdPass();
     } else {
       leaseHeld = false;
@@ -1299,6 +1547,8 @@ export function createDistiller(options: DistillerOptions): Distiller {
       leaseHeld = false;
       clearTimer(heartbeatTimer);
       heartbeatTimer = undefined;
+      clearTimer(pollTimer);
+      pollTimer = undefined;
       if (!stopped) scheduleLeaseRetry();
     }
     return owned;
@@ -1309,8 +1559,10 @@ export function createDistiller(options: DistillerOptions): Distiller {
     stopped = true;
     clearTimer(leaseRetryTimer);
     clearTimer(coldPassRetryTimer);
+    clearTimer(pollTimer);
     leaseRetryTimer = undefined;
     coldPassRetryTimer = undefined;
+    pollTimer = undefined;
     for (const timer of debounceTimers.values()) clearTimeout(timer);
     debounceTimers.clear();
     pendingRerun.clear();
@@ -1360,19 +1612,7 @@ export function createDistiller(options: DistillerOptions): Distiller {
 
     onEvent(signal: DistillSignal): void {
       if (stopped) return;
-      switch (signal.type) {
-        case "turn-ended":
-        case "meta":
-          scheduleReDistill(signal.sessionID);
-          break;
-        case "removal":
-          removalSince.add(signal.sessionID);
-          scheduleReDistill(signal.sessionID);
-          break;
-        case "deleted":
-          handleDeleted(signal.sessionID);
-          break;
-      }
+      dispatch(signal);
     },
 
     status(): DistillStatus {
