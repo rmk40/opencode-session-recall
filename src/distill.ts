@@ -1,8 +1,7 @@
 import type { Part } from "@opencode-ai/sdk/v2";
 import { errmsg, DISCOVERY_LIMIT, type Limits } from "./types.js";
 import { compareMessages, type HistoryMessage, type HistorySession } from "./history/model.js";
-import { MalformedSessionError, type HistorySource, type MessagePage } from "./history/source.js";
-import { fetchMessagePage } from "./history/v1.js";
+import { MalformedSessionError, type HistorySource } from "./history/source.js";
 import type { Card, FamilyRollup, LeaseInfo, PartTextRow, Store } from "./store.js";
 import type { FetchGate } from "./fetch-gate.js";
 import { isSelfTool, toolNameMatches, isSummarizerTitle } from "./extract.js";
@@ -553,13 +552,6 @@ export function deriveCard(input: DeriveCardInput): DerivedCard {
   };
   return { card, rows };
 }
-
-// ── Paginated fetch ──────────────────────────────────────────────────────────
-
-// The bounded page primitive lives in the v1 history adapter; re-exported here
-// so existing importers keep one stable path.
-export { fetchMessagePage };
-export type { MessagePage };
 
 // ── The distiller ────────────────────────────────────────────────────────────
 

@@ -2,10 +2,6 @@ import { errmsg } from "./types.js";
 import { compareMessages, type HistoryMessage } from "./history/model.js";
 import type { HistorySource } from "./history/source.js";
 
-// Re-export the bounded page primitive so the browse tools have a single
-// pagination entry point (they never call the unpaginated `session.messages`).
-export { fetchMessagePage } from "./distill.js";
-
 /**
  * Bounded message-window fetch.
  *

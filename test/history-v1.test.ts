@@ -1,8 +1,15 @@
 import { describe, expect, it } from "vitest";
 import type { OpencodeClient } from "@opencode-ai/sdk/v2";
-import { createV1HistorySource } from "../src/history/v1.js";
+import { createV1HistorySource, fetchMessagePage } from "../src/history/v1.js";
 import { MalformedSessionError } from "../src/history/source.js";
-import { makeFakeHarness, session, PROJECT_DIR } from "./helpers.js";
+import {
+  apiFailure,
+  bundle,
+  makeFakeHarness,
+  session,
+  userMessage,
+  PROJECT_DIR,
+} from "./helpers.js";
 
 /** A client whose `session.get` / `session.message` return a scripted body. */
 function scripted(body: unknown): OpencodeClient {
@@ -192,5 +199,96 @@ describe("v1 history source", () => {
       ok: false,
       reason: "not-found",
     });
+  });
+});
+
+// ── fetchMessagePage ─────────────────────────────────────────────────────────
+
+describe("fetchMessagePage", () => {
+  function clientReturning(
+    impl: (p: { sessionID: string; limit?: number; before?: string }) => unknown,
+  ): {
+    client: OpencodeClient;
+    calls: Array<{ sessionID: string; limit?: number; before?: string }>;
+  } {
+    const calls: Array<{ sessionID: string; limit?: number; before?: string }> = [];
+    const client = {
+      session: {
+        messages: async (p: { sessionID: string; limit?: number; before?: string }) => {
+          calls.push(p);
+          return impl(p);
+        },
+      },
+    } as unknown as OpencodeClient;
+    return { client, calls };
+  }
+
+  it("always sends limit and returns items plus the X-Next-Cursor value", async () => {
+    const { client, calls } = clientReturning(() => ({
+      data: [bundle(userMessage("m1", "s1", 1), [])],
+      response: { headers: new Headers({ "X-Next-Cursor": "CUR1" }) },
+    }));
+    const page = await fetchMessagePage(client, { sessionID: "s1", limit: 50 });
+    expect(calls[0]!.limit).toBe(50);
+    expect(page.items).toHaveLength(1);
+    expect(page.nextCursor).toBe("CUR1");
+  });
+
+  it("reads the cursor header case-insensitively", async () => {
+    const { client } = clientReturning(() => ({
+      data: [],
+      response: { headers: new Headers({ "x-next-cursor": "lower" }) },
+    }));
+    expect((await fetchMessagePage(client, { sessionID: "s", limit: 10 })).nextCursor).toBe(
+      "lower",
+    );
+  });
+
+  it("is null-safe on missing response, headers, or header", async () => {
+    const noResponse = clientReturning(() => ({ data: [] })).client;
+    expect(
+      (await fetchMessagePage(noResponse, { sessionID: "s", limit: 5 })).nextCursor,
+    ).toBeNull();
+    const noHeaders = clientReturning(() => ({ data: [], response: {} })).client;
+    expect((await fetchMessagePage(noHeaders, { sessionID: "s", limit: 5 })).nextCursor).toBeNull();
+    const noCursor = clientReturning(() => ({
+      data: [],
+      response: { headers: new Headers() },
+    })).client;
+    expect((await fetchMessagePage(noCursor, { sessionID: "s", limit: 5 })).nextCursor).toBeNull();
+  });
+
+  it("sends before only when provided", async () => {
+    const { client, calls } = clientReturning(() => ({
+      data: [],
+      response: { headers: new Headers() },
+    }));
+    await fetchMessagePage(client, { sessionID: "s", limit: 25 });
+    expect("before" in calls[0]!).toBe(false);
+    await fetchMessagePage(client, { sessionID: "s", limit: 25, before: "cur" });
+    expect(calls[1]!.before).toBe("cur");
+  });
+
+  it("throws on an SDK error", async () => {
+    const { client } = clientReturning(() => ({ error: apiFailure("boom") }));
+    await expect(fetchMessagePage(client, { sessionID: "s", limit: 5 })).rejects.toThrow("boom");
+  });
+
+  it("treats a successful non-array body as an empty page by default (query path)", async () => {
+    // Documented decision: a `{}` response (no data field) means "empty page,
+    // ok:true" for recall_messages/recall_context/recall_get/drill. Only the
+    // distiller opts into strict (below) so its quarantine can distinguish
+    // malformed from empty.
+    const { client } = clientReturning(() => ({}));
+    const page = await fetchMessagePage(client, { sessionID: "s", limit: 5 });
+    expect(page.items).toEqual([]);
+    expect(page.nextCursor).toBeNull();
+  });
+
+  it("throws MalformedSessionError on a successful non-array body under strict", async () => {
+    const { client } = clientReturning(() => ({ data: { messages: "not-an-array" } }));
+    await expect(
+      fetchMessagePage(client, { sessionID: "s", limit: 5, strict: true }),
+    ).rejects.toThrow("successful message response was not an array");
   });
 });
