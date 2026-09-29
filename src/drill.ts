@@ -104,6 +104,7 @@ export type DrillOutput = {
   hits: Bm25Hit[];
   /** The drilled candidate pools the hits were scored over (coverage counts). */
   pools: DrilledPool[];
+  /** See {@link DrillPoolsOutput.drilledSessions}. */
   drilledSessions: string[];
   budgetExhausted: boolean;
   loadErrors: string[];
@@ -111,6 +112,14 @@ export type DrillOutput = {
 
 export type DrillPoolsOutput = {
   pools: DrilledPool[];
+  /**
+   * The targets that were searched, in drill order. The two drills differ:
+   * the history drill lists every target whose history loaded, even if its
+   * filters then left no candidate; the card drill (`card-drill.ts`, used
+   * when the history is unavailable) lists only targets whose card offered
+   * at least one candidate, since a card-less target was not searched at
+   * all. Callers report `sessionsSearched` from it either way.
+   */
   drilledSessions: string[];
   budgetExhausted: boolean;
   loadErrors: string[];

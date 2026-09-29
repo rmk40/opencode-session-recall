@@ -66,6 +66,12 @@ All notable changes to this project are documented here. This project follows
   missing; `recall_sessions` adds the same note to card-backed listings
   (with an `indexing` field). Before, the card counts alone read as
   complete while older sessions were not indexed yet.
+- The v1 cold pass now yields to the event loop between sessions, inside
+  a large session's card derivation, and every 50 family-rollup writes,
+  so a big history no longer holds the host's loop for long stretches.
+  After a rollup pause the root's card is re-read from the store before
+  it is written, so a card re-distilled during the pause is never
+  overwritten with the older copy. Cards and results are unchanged.
 - Plugin log lines now go through an internal log sink (`src/log.ts`)
   instead of calling `console.log` directly. v1 output is unchanged: the
   same `[recall] ...` lines reach the console, and there is no new option.
