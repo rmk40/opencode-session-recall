@@ -141,17 +141,28 @@ see the current numbers.
 ## The derived store rebuilds itself; don't hand-migrate it
 
 The card + slim-FTS store lives at `~/.cache/opencode-session-recall/store-v1.db`
-(the filename is fixed at `store-v1.db` regardless of schema; `storePath` overrides
-the whole path). It is derived state, never authoritative: safe to delete at any
-time, and it rebuilds in the background on the next run. `store.ts` stamps
-`schema_version` in the `meta` table (currently `SCHEMA_VERSION = 3`). On open: a
-matching stamp is used as-is; a v1 or v2 stamp is migrated **additively in place**
-(`migrateV1ToV2` adds the summary columns, `migrateV2ToV3` adds `embedding_gen`, with no data loss and no
-re-distill); an absent stamp or a foreign layout is dropped and
-rebuilt; a **newer** stamp makes `openStore` return null so the plugin degrades to
-cards-lite rather than misreading a format it doesn't understand. So the migration
-story for a schema change is: add a `v(N-1)→vN` additive step when you can, bump
+for the v1 host (the filename is fixed at `store-v1.db` regardless of schema;
+`defaultStorePath(host)` gives the v2 host `store-opencode-v2.db`; `storePath`
+overrides the whole path). It is derived state, never authoritative: safe to delete
+at any time, and it rebuilds in the background on the next run. `store.ts` stamps
+`schema_version` in the `meta` table (currently `SCHEMA_VERSION = 4`). On open: a
+matching stamp is used as-is; a v1, v2 or v3 stamp is migrated **additively in
+place** (`migrateV1ToV2` adds the summary columns, `migrateV2ToV3` adds
+`embedding_gen`, `migrateV3ToV4` adds `distill_cursor` and stamps
+`store_host = 'opencode-v1'`, with no data loss and no re-distill); an absent stamp
+or a foreign layout is dropped and rebuilt; a **newer** stamp makes `openStore`
+refuse (`{ ok: false, reason: "newer" }`) so the plugin degrades to cards-lite
+rather than misreading a format it doesn't understand. So the migration story for a
+schema change is: add a `v(N-1)→vN` additive step when you can, bump
 `SCHEMA_VERSION`, and ship. Old in-place stores upgrade, foreign ones rebuild.
+
+Schema 4 adds the **host fence**. `openStore(db, host, { source })` compares the
+opener's host with `meta.store_host` (schema 1-3 implies `opencode-v1`) and its
+source with `meta.source_db` (the v2 host's `opencode.db` path; absent on both sides
+for v1). A mismatch refuses with `host-mismatch` or `source-mismatch` **before any
+migration**, so a v2 opener never upgrades a v1 store. Refusals never rebuild or
+write: two hosts pointed at one file would otherwise wipe each other on every start.
+The reset is manual: quit opencode, delete the store file, restart.
 
 Several opencode processes run one plugin instance each and share the file,
 coordinated by a single `distill_lease` row in `meta` (holder, heartbeat, 30s TTL,
@@ -175,16 +186,16 @@ scar, not a style preference: `rep4` changed the projection without a schema bum
 it slipped past the store's version fence. A rep3 build and a rep4 build shared one
 store, raced the global `semantic_model` stamp, and each cleared and rewrote every
 vector to its own representation on a loop. The schema bump fences the older build out
-of the lease and all writes (a newer stamp makes its `openStore` return null, so that
+of the lease and all writes (a newer stamp makes its `openStore` refuse, so that
 process degrades to cards-lite); the per-row `embedding_gen` guard
 (`embedding_gen IS NULL OR embedding_gen <= gen`, plus a wholesale reject of any
 lower-`gen` write, so an old build can never downgrade a newer vector) is the belt
 for same-schema drift. Bump both together.
 
 Mixed builds are diagnosable, not silent: the lease and every `coverage.semantic`
-carry a `pluginVersion` build tag (`schema{N}.gen{M}`, derived from `SCHEMA_VERSION`
-and `EMBED_REPRESENTATION`), so one lease read or one tool response shows which build
-wrote what.
+carry a `pluginVersion` build tag (`schema{N}.gen{M}.{host}`, from `pluginBuild(host)`
+in `store.ts`, derived from `SCHEMA_VERSION`, `EMBED_REPRESENTATION` and the host), so
+one lease read or one tool response shows which build and host wrote what.
 
 ## The summarizer only runs while holding the distill lease
 
