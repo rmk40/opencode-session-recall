@@ -297,6 +297,43 @@ describe("runtime registry, cross-build state", () => {
   });
 });
 
+describe("runtime registry, failed creation", () => {
+  it("logs a failed creation once and reports it as failed, not pending", async () => {
+    const logs: string[] = [];
+    const control = makeFactory(identity);
+    const factory: RuntimeFactory<Fake> = {
+      ...control.factory,
+      create: async () => {
+        throw new Error("store exploded");
+      },
+    };
+    const a = attachRuntime(key(), factory, {}, (m) => logs.push(m));
+    expect(a.failed()).toBe(false); // still pending
+    await vi.advanceTimersByTimeAsync(0);
+    expect(await a.ready(10)).toBeUndefined();
+    expect(a.failed()).toBe(true);
+    expect(logs).toEqual(["runtime creation failed: store exploded"]);
+    await a.detach();
+    expect(a.failed()).toBe(false);
+  });
+
+  it("logs a failed path resolution the same way", async () => {
+    const logs: string[] = [];
+    const control = makeFactory(identity);
+    const factory: RuntimeFactory<Fake> = {
+      ...control.factory,
+      resolve: async () => {
+        throw new Error("no home directory");
+      },
+    };
+    const a = attachRuntime(key(), factory, {}, (m) => logs.push(m));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(a.failed()).toBe(true);
+    expect(logs).toEqual(["runtime creation failed: no home directory"]);
+    await a.detach();
+  });
+});
+
 describe("event id dedupe", () => {
   it("passes each id once and forgets the oldest past its size", () => {
     const fresh = createIdDedupe(2);

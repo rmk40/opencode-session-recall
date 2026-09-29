@@ -13,6 +13,7 @@ import { NUDGE_BASE_TEXT, NUDGE_SENTINEL } from "../hooks/system-nudge.js";
 import { v2ToolContext } from "./tool-io.js";
 import {
   buildToolSet,
+  FAILED_REASON,
   startingToolSet,
   v2ToolInfo,
   type ToolName,
@@ -322,6 +323,14 @@ async function wire(
     global: parsed.global,
     ephemeral: parsed.ephemeral,
   });
+  let failed: ToolSet | undefined;
+  const failedTools = (): ToolSet => {
+    failed ??= startingToolSet(
+      { limits: parsed.limits, global: parsed.global, ephemeral: parsed.ephemeral },
+      FAILED_REASON,
+    );
+    return failed;
+  };
   let live: { runtime: V2Runtime; tools: ToolSet } | undefined;
   const liveTools = (runtime: V2Runtime): ToolSet => {
     if (live?.runtime !== runtime) {
@@ -358,9 +367,10 @@ async function wire(
       // The host validated `input` against the zod schema; the tools still
       // coerce defensively (ctx.tool.list() callers bypass validation).
       const args = (input ?? {}) as Parameters<ToolSet[ToolName]["execute"]>[0];
+      const standIn = attachment.failed() ? failedTools() : starting;
       const result = runtime
         ? await runtime.track(liveTools(runtime)[name].execute(args, toolContext))
-        : await starting[name].execute(args, toolContext);
+        : await standIn[name].execute(args, toolContext);
       return { content: typeof result === "string" ? result : JSON.stringify(result) };
     } catch (error) {
       return errorContent(errmsg(error));

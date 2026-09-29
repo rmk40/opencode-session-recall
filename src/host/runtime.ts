@@ -1,4 +1,4 @@
-import { settleWithin } from "../types.js";
+import { errmsg, settleWithin } from "../types.js";
 import { registry } from "./registry.js";
 
 /**
@@ -77,6 +77,9 @@ export type Attachment<R> = {
   ready(timeoutMs: number): Promise<R | undefined>;
   /** The runtime if it is already created, without waiting. */
   current(): R | undefined;
+  /** Whether creation has settled without a runtime (resolving the paths or
+   *  building the runtime threw), as opposed to still being in progress. */
+  failed(): boolean;
   /** Release this instance's reference. Resolves once the runtime's dispose
    *  finished or {@link DETACH_WAIT_MS} passed. Idempotent. */
   detach(): Promise<void>;
@@ -88,6 +91,8 @@ type Core<R> = {
   retired: boolean;
   value: Promise<R | undefined>;
   settled?: R;
+  /** Set when building the runtime threw (logged once). */
+  failed?: boolean;
   /** Runtime-shaping options of the creating instance (first writer wins). */
   shape: Record<string, unknown>;
   dispose: (runtime: R) => Promise<void>;
@@ -100,6 +105,8 @@ type Slot<R> = {
   /** Resolves to the core this slot attached to (undefined if init failed). */
   core: Promise<Core<R> | undefined>;
   resolved?: Core<R>;
+  /** Set when the slot's init threw before reaching a core (logged once). */
+  initFailed?: boolean;
   /** Shapes of the instances attached before the core was known. */
   pendingShapes: Array<{ shape: Record<string, unknown>; log: (message: string) => void }>;
 };
@@ -226,7 +233,11 @@ export function attachRuntime<R>(
     slot = created;
     state.slots.set(syncKey, created as Slot<unknown>);
     nextMacrotask(() => {
-      void initSlot(state, key, created, factory, shape).then(settle, () => settle(undefined));
+      void initSlot(state, key, created, factory, shape, log).then(settle, (error: unknown) => {
+        created.initFailed = true;
+        log(`runtime creation failed: ${errmsg(error)}`);
+        settle(undefined);
+      });
     });
   }
   const own = slot;
@@ -254,6 +265,10 @@ export function attachRuntime<R>(
     },
     current() {
       return detached ? undefined : coreNow()?.settled;
+    },
+    failed() {
+      if (detached) return false;
+      return own.initFailed === true || coreNow()?.failed === true;
     },
     detach() {
       if (detachPromise) return detachPromise;
@@ -283,6 +298,7 @@ async function initSlot<R>(
   slot: Slot<R>,
   factory: RuntimeFactory<R>,
   shape: Record<string, unknown>,
+  log: (message: string) => void,
 ): Promise<Core<R> | undefined> {
   // Every instance detached before creation began: nothing to build.
   if (slot.refs <= 0) return undefined;
@@ -311,7 +327,11 @@ async function initSlot<R>(
       const runtime = await factory.create(identity);
       created.settled = runtime;
       return runtime;
-    })().catch(() => undefined);
+    })().catch((error: unknown) => {
+      created.failed = true;
+      log(`runtime creation failed: ${errmsg(error)}`);
+      return undefined;
+    });
     core = created;
     state.cores.set(realKey, created as Core<unknown>);
   }

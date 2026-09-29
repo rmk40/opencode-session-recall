@@ -47,6 +47,11 @@ export function buildToolSet(o: ToolSetInputs): ToolSet {
  *  2 s, then answer from the degraded path). */
 export const STARTING_REASON = "the recall runtime is still starting; try again shortly";
 
+/** The error a tool reports once the runtime's creation has failed (as
+ *  opposed to still being in progress). */
+export const FAILED_REASON =
+  "the recall runtime failed to start; set RECALL_DEBUG=1 and see ~/.cache/opencode-session-recall/recall.log";
+
 /** One empty, degraded card runtime shared by every instance's starting
  *  tools: it holds no state, reads nothing and never refreshes, so sharing it
  *  needs no per-instance dispose. */
@@ -61,15 +66,20 @@ function startingCards(): CardsRuntime {
 /**
  * The tools over a stand-in that reads nothing: registered descriptions and
  * schemas come from here (the runtime is built after `setup` returns), and a
- * call that finds no runtime within the wait answers through it.
+ * call that finds no runtime within the wait answers through it, with
+ * `reason` ({@link STARTING_REASON} while creation is pending,
+ * {@link FAILED_REASON} once it failed).
  */
-export function startingToolSet(o: {
-  limits: Limits;
-  global: boolean;
-  ephemeral: boolean;
-}): ToolSet {
+export function startingToolSet(
+  o: {
+    limits: Limits;
+    global: boolean;
+    ephemeral: boolean;
+  },
+  reason: string = STARTING_REASON,
+): ToolSet {
   const gate = createFetchGate({ concurrency: 1 });
-  const source = createUnavailableSource("v2-sqlite", STARTING_REASON);
+  const source = createUnavailableSource("v2-sqlite", reason);
   const cards = startingCards();
   const drill = createDrill({ source, gate, limits: o.limits });
   return buildToolSet({
