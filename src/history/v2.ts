@@ -259,6 +259,40 @@ function placeholderData(
   return { type: "user", data: { text: note } };
 }
 
+/** Longest identity field (agent, model id/provider/variant) read in SQL. */
+const IDENTITY_FIELD_CHARS = 512;
+
+/** One string field of a row's JSON, read inside SQLite: NULL unless the data
+ *  is valid JSON and the field is a string (nested CASE, since `json_type`
+ *  rejects malformed JSON and AND does not short-circuit reliably). */
+function jsonTextField(path: string): string {
+  return `CASE WHEN json_valid(data) THEN
+    CASE WHEN json_type(data, '${path}') = 'text'
+      THEN substr(json_extract(data, '${path}'), 1, ${IDENTITY_FIELD_CHARS}) END END`;
+}
+
+/** An assistant or compaction row's identity as bounded scalars, so a row
+ *  whose body is never loaded still attributes like a loaded one. */
+const IDENTITY_COLUMNS = `${jsonTextField("$.agent")} AS id_agent,
+  ${jsonTextField("$.model.id")} AS id_model,
+  ${jsonTextField("$.model.providerID")} AS id_provider,
+  ${jsonTextField("$.model.variant")} AS id_variant`;
+
+/** The identity columns as the JSON shape the projector reads. */
+function identityData(row: Row): { agent?: string; model?: Record<string, string> } {
+  const out: { agent?: string; model?: Record<string, string> } = {};
+  const agent = asString(row.id_agent);
+  if (agent) out.agent = agent;
+  const id = asString(row.id_model);
+  if (id) {
+    const model: Record<string, string> = { id, providerID: asString(row.id_provider) ?? "" };
+    const variant = asString(row.id_variant);
+    if (variant !== null) model.variant = variant;
+    out.model = model;
+  }
+  return out;
+}
+
 type SessionRecord = { row: V2SessionRow; fork: boolean };
 
 function asString(value: SqlValue | undefined): string | null {
@@ -502,9 +536,7 @@ export function createV2HistorySource(db: ReadOnlyDb, opts: V2SourceOptions = {}
       await pause();
       const row = read("next assistant", () =>
         db.get(
-          `SELECT seq,
-             CASE WHEN json_valid(data) THEN json_extract(data, '$.agent') END AS agent,
-             CASE WHEN json_valid(data) THEN json_extract(data, '$.model') END AS model
+          `SELECT seq, ${IDENTITY_COLUMNS}
            FROM session_message
            WHERE session_id = ? AND type = 'assistant' AND seq > ?
            ORDER BY seq ASC LIMIT ?`,
@@ -514,7 +546,7 @@ export function createV2HistorySource(db: ReadOnlyDb, opts: V2SourceOptions = {}
       if (row) {
         after = identityOf({
           row: { ...toMessageRow(row), type: "assistant" },
-          data: { agent: row.agent, model: row.model },
+          data: identityData(row),
         });
       }
     }
@@ -545,16 +577,37 @@ export function createV2HistorySource(db: ReadOnlyDb, opts: V2SourceOptions = {}
     strict: boolean,
   ): Promise<HistoryMessage[]> {
     const decoded: Array<Extract<DecodedRow, { ok: true }>> = [];
+    const unloaded: Array<Extract<DecodedRow, { ok: true }>> = [];
     for (let i = 0; i < rows.length; i++) {
       if (i > 0 && i % ROWS_PER_YIELD === 0) await pause();
-      const d = decodeBody(rows[i]!);
+      const row = rows[i]!;
+      const d = decodeBody(row);
       if (d.ok) {
         decoded.push(d);
+        // An oversized assistant or compaction lost its identity with its
+        // body; recover it below so it attributes like the loaded row would.
+        if (row.data === null && (d.row.type === "assistant" || d.row.type === "compaction")) {
+          unloaded.push(d);
+        }
         continue;
       }
       if (strict) throw new MalformedSessionError(d.reason);
       const { type, data } = placeholderData(d.row.type, malformedNote(d.reason));
       decoded.push({ ok: true, row: { ...d.row, type, data: "" }, data });
+    }
+    if (unloaded.length > 0) {
+      await pause();
+      const seqs = unloaded.map((d) => d.row.seq);
+      const found = read("oversized identity", () =>
+        db.all(
+          `SELECT seq, ${IDENTITY_COLUMNS} FROM session_message
+           WHERE session_id = ? AND seq IN (${seqs.map(() => "?").join(", ")})
+           ORDER BY seq DESC LIMIT ?`,
+          [session.id, ...seqs, seqs.length],
+        ),
+      );
+      const bySeq = new Map(found.map((row) => [asNumber(row.seq), identityData(row)]));
+      for (const d of unloaded) Object.assign(d.data, bySeq.get(d.row.seq) ?? {});
     }
     const who = await identities(decoded, session.id, session);
     const fallback = resolveIdentity([], session);

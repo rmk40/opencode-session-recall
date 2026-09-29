@@ -585,6 +585,36 @@ describe("v2 history source", () => {
     expect(partText(page.items[0])).toMatch(/message omitted/);
   });
 
+  it("gives an oversized assistant its real identity on pages and in point reads", async () => {
+    const t = await fresh();
+    session(t, "ses_id", {
+      agent: "sess-agent",
+      model: JSON.stringify({ id: "sess-model", providerID: "sp" }),
+    });
+    const user = message(t, "ses_id", "user", text("question"));
+    const big = message(t, "ses_id", "assistant", {
+      ...reply("w".repeat(5_000)),
+      agent: "review",
+      model: { id: "m-big", providerID: "pb", variant: "high" },
+    });
+    const { source } = await capped(t);
+    const page = await source.messagePage({ sessionID: "ses_id", limit: 10 });
+    expect(page.items.map((m) => m.info.id)).toEqual([big, user]);
+    const expected = { agent: "review", model: { modelID: "m-big", providerID: "pb" } };
+    expect(page.items[1]!.info).toMatchObject(expected);
+    expect(page.items[0]!.info).toMatchObject({
+      agent: "review",
+      modelID: "m-big",
+      providerID: "pb",
+    });
+    expect(partText(page.items[0])).toMatch(/message omitted/);
+
+    const point = await source.getMessage("ses_id", user);
+    expect(point.ok && point.value.info).toMatchObject(expected);
+    const bigPoint = await source.getMessage("ses_id", big);
+    expect(bigPoint.ok && bigPoint.value.info).toMatchObject({ agent: "review", modelID: "m-big" });
+  });
+
   it("treats oversized non-content rows as absent in point reads, like pages", async () => {
     const t = await fresh();
     session(t, "ses_nc");
