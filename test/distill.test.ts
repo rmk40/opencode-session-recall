@@ -294,6 +294,30 @@ describe("distillFields", () => {
     ).toEqual([]);
   });
 
+  it("treats v2 tool names exactly like their v1 counterparts", () => {
+    // No extraction rule keys on bash/task/apply_patch or skill's `name`:
+    // commands come from any tool's `command` input, and only read/skill
+    // are special-cased. So v2's shell/subagent/patch and skill `id` need
+    // no new bases.
+    const pairs: Array<[string, string, Record<string, unknown>]> = [
+      ["bash", "shell", { command: "npm test", workdir: "/w" }],
+      ["task", "subagent", { description: "d", prompt: "p", subagent_type: "explore" }],
+      ["apply_patch", "patch", { patchText: "*** Begin Patch" }],
+    ];
+    for (const [v1Name, v2Name, input] of pairs) {
+      const strip = (fields: ReturnType<typeof distillFields>) =>
+        fields.map((f) => [f.field, f.text]);
+      expect(
+        strip(distillFields(completedToolPart("p", "s", "m", v2Name, input, "out"))),
+        v2Name,
+      ).toEqual(strip(distillFields(completedToolPart("p", "s", "m", v1Name, input, "out"))));
+    }
+    // skill: v1 input { name }, v2 input { id }; both stay reference material.
+    for (const input of [{ name: "tuistory" }, { id: "tuistory" }]) {
+      expect(distillFields(completedToolPart("p", "s", "m", "skill", input, "body"))).toEqual([]);
+    }
+  });
+
   it("excludes a Code Mode execute part that called a recall tool", () => {
     const viaRecall = executeToolPart("p1", "s1", "m1", ["plugin.recall"], "prior");
     const other = executeToolPart("p2", "s1", "m1", ["context7.query-docs"], "docs");
@@ -500,9 +524,7 @@ describe("deriveCard", () => {
 
   it("strips the v2 subagent prompt prefix from the summary head only", () => {
     const prompt = "You are a subagent spawned by another session.\nAudit the parser module";
-    const messages = [
-      bundle(userMessage("m1", "s1", 1000), [textPart("p1", "s1", "m1", prompt)]),
-    ];
+    const messages = [bundle(userMessage("m1", "s1", 1000), [textPart("p1", "s1", "m1", prompt)])];
     const { card, rows } = deriveCard(deriveInput("s1", messages, { parentId: "root" }));
     expect(card.summaryHead).toBe("Audit the parser module");
     // The indexed statement keeps the verbatim text.
