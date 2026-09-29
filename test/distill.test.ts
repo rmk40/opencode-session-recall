@@ -498,6 +498,33 @@ describe("deriveCard", () => {
     expect(card.familyRollup).toEqual([]);
   });
 
+  it("strips the v2 subagent prompt prefix from the summary head only", () => {
+    const prompt = "You are a subagent spawned by another session.\nAudit the parser module";
+    const messages = [
+      bundle(userMessage("m1", "s1", 1000), [textPart("p1", "s1", "m1", prompt)]),
+    ];
+    const { card, rows } = deriveCard(deriveInput("s1", messages, { parentId: "root" }));
+    expect(card.summaryHead).toBe("Audit the parser module");
+    // The indexed statement keeps the verbatim text.
+    expect(rows[0]!.raw).toBe(prompt);
+
+    // A bare prefix leaves no head; the next statement supplies it.
+    const bare = [
+      bundle(userMessage("m1", "s1", 1000), [
+        textPart("p1", "s1", "m1", "You are a subagent spawned by another session.\n"),
+        textPart("p2", "s1", "m1", "second statement"),
+      ]),
+    ];
+    expect(deriveCard(deriveInput("s1", bare)).card.summaryHead).toBe("second statement");
+    // Only the exact prefix, at the start, is removed.
+    const inner = [
+      bundle(userMessage("m1", "s1", 1000), [
+        textPart("p1", "s1", "m1", "Note: You are a subagent spawned by another session.\nX"),
+      ]),
+    ];
+    expect(deriveCard(deriveInput("s1", inner)).card.summaryHead).toContain("Note: You are");
+  });
+
   it("sets distilled_through to the newest message id and derives the heads", () => {
     const messages = [
       bundle(userMessage("m1", "s1", 1000), [

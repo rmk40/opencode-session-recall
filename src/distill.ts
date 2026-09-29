@@ -8,7 +8,7 @@ import type { FetchGate } from "./fetch-gate.js";
 import { isSelfToolPart, toolNameMatches, isSummarizerTitle } from "./extract.js";
 import { tokenize } from "./normalize.js";
 import { extractCodeTokens } from "./query.js";
-import { isDigestToken, DIGEST_HEAD_CHARS } from "./digest.js";
+import { isDigestToken, DIGEST_HEAD_CHARS, stripSubagentPrefix } from "./digest.js";
 import { containsErrorPattern } from "./bm25.js";
 
 /**
@@ -366,8 +366,9 @@ function walkMessages(chrono: HistoryMessage[], prevForFirst: string | null): Wa
     if (!firstUserHead && msg.info.role === "user") {
       for (const part of msg.parts) {
         const text = statementText(part);
-        if (text) {
-          firstUserHead = text.slice(0, DIGEST_HEAD_CHARS);
+        const head = text ? stripSubagentPrefix(text) : "";
+        if (head) {
+          firstUserHead = head.slice(0, DIGEST_HEAD_CHARS);
           break;
         }
       }
