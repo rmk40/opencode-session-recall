@@ -32,12 +32,10 @@ import type {
  *   role is known (user), but not its part type (a text or a subtask) nor its
  *   authorship (typed, delegated or injected). It is offered with no filter,
  *   or with `role: "user"` alone.
- * - `outcomeHead` is the text of the last message with any text, of either
- *   role; `nlSummary` is written by the summarizer, not by anyone in the
- *   session. Both are offered only when no role, type, tool or authorship
- *   filter is set, labeled `assistant` as a best guess (the last text is
- *   usually the answer). An outcome equal to the summary head (the session
- *   has no answer yet) is not offered at all.
+ * - `outcomeHead` (the text of the last message with any text, of either
+ *   role) and `nlSummary` (written by the summarizer, not by anyone in the
+ *   session) are never offered: a message candidate must carry a role, and
+ *   the card does not record one for either.
  * - The session title is always its own candidate (source `title`, as the
  *   normal pipeline emits title hits), so a metadata-only card can still match
  *   by title. It is dated by the card's last update and is subject to the
@@ -95,31 +93,12 @@ function cardCandidates(
   if (!card) return [];
   const { filters } = narrow;
   const messageID = card.distilledThrough ?? `${card.sessionId}:card`;
-  const unnarrowed =
-    filters.role === "all" &&
-    filters.type === "all" &&
-    !filters.toolName &&
-    !narrow.authorshipNarrowed;
   const summaryAllowed =
     (filters.role === "all" || filters.role === "user") &&
     filters.type === "all" &&
     !filters.toolName &&
     !narrow.authorshipNarrowed;
   const fields: CardField[] = [];
-  // Newest first, as a fetched pool is.
-  if (unnarrowed) {
-    fields.push({ key: "nl", text: card.nlSummary, role: "assistant", time: card.timeUpdated });
-    // In a session whose last text is its first request (no answer yet), the
-    // outcome repeats the summary; skip it rather than label it an answer.
-    if (card.outcomeHead !== card.summaryHead) {
-      fields.push({
-        key: "outcome",
-        text: card.outcomeHead,
-        role: "assistant",
-        time: card.timeUpdated,
-      });
-    }
-  }
   if (summaryAllowed) {
     fields.push({ key: "summary", text: card.summaryHead, role: "user", time: card.timeCreated });
   }

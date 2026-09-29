@@ -3115,7 +3115,7 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
         // An unreadable history source (v2: opencode.db unavailable) cannot be
         // drilled or swept. The selected sessions are still searched, through
         // their cards: the card drill builds each session's pool from its
-        // title, first statement, last answer and summary, and the ordinary
+        // title and first request, and the ordinary
         // routes rank, filter and group those exactly as drilled parts.
         // Results are card-quality; coverage.source and a warning say why.
         const sourceUnavailable = source.unavailable;
@@ -3129,7 +3129,7 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
         if (sourceUnavailable !== undefined) {
           if (deepMode) pushUnique(normalized.limitedBy, "deep");
           normalized.warnings.push(
-            `${unavailableHistoryError(sourceUnavailable)}. Results come from the session cards only (title, first statement, last answer, summary)${deepMode ? "; the deep sweep was skipped" : ""}; message content cannot be read until it is available.`,
+            `${unavailableHistoryError(sourceUnavailable)}. Results come from the session cards only (title and first request)${deepMode ? "; the deep sweep was skipped" : ""}; message content cannot be read until it is available.`,
           );
         }
 

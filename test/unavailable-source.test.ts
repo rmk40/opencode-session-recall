@@ -180,6 +180,35 @@ describe("unavailable history source", () => {
     }
   });
 
+  it("recall from cards never labels a user message as an answer", async () => {
+    const h = makeFakeHarness();
+    // Two distinct user requests and no answer: the card's outcome head is
+    // the second request, which must not come back as assistant output.
+    const asked = session("s-two-asks", "Walrus plans", PROJECT_DIR, Date.now() - 5_000);
+    h.sessions.push(asked);
+    h.globalSessions.push(globalSessionFrom(asked));
+    h.messagesBySession[asked.id] = [
+      bundle(userMessage("m-a1", asked.id, Date.now() - 6_000), [
+        textPart("p-a1", asked.id, "m-a1", "walrusneedle first request"),
+      ]),
+      bundle(userMessage("m-a2", asked.id, Date.now() - 5_500), [
+        textPart("p-a2", asked.id, "m-a2", "walrusneedle second request, still unanswered"),
+      ]),
+    ];
+    const { deps, cleanup } = await makeRecallDeps(h, TEST_LIMITS);
+    try {
+      const { source } = countingUnavailable();
+      const drill = createDrill({ source, gate: deps.gate, limits: TEST_LIMITS });
+      const recall = search(source, true, TEST_LIMITS, { ...deps, drill });
+      const out = await runTool<SearchOutput>(recall, { query: "walrusneedle", scope: "global" });
+      const mine = out.results.filter((r) => r.sessionID === asked.id);
+      expect(mine.length).toBeGreaterThan(0);
+      expect(mine.some((r) => r.role === "assistant")).toBe(false);
+    } finally {
+      cleanup();
+    }
+  });
+
   it("recall from cards matches a metadata-only card by its title, within the filters", async () => {
     const h = makeFakeHarness();
     const { deps, store, cleanup } = await makeRecallDeps(h, TEST_LIMITS);
