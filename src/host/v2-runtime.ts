@@ -19,7 +19,7 @@ import {
 } from "../cards.js";
 import { createLiteRefresh, type LiteRefreshController } from "../lite-refresh.js";
 import { createDrill, type Drill } from "../drill.js";
-import { createDistiller, type Distiller } from "../distill.js";
+import { coldPassProgress, createDistiller, type Distiller } from "../distill.js";
 import type { HistorySession } from "../history/model.js";
 import { createUnavailableSource, type HistorySource } from "../history/source.js";
 import { createV2HistorySource, openOpencodeDb } from "../history/v2.js";
@@ -373,9 +373,10 @@ async function createV2Runtime(
     semantic,
     ...(options.ephemeral && { mode: "ephemeral" as const }),
     ...(liteRefreshHook && { maybeRefresh: () => liteRefreshHook.maybeRefresh() }),
+    indexing: () => coldPassProgress(distiller.status()),
   };
   const enrichment: SessionEnrichment | undefined = store
-    ? { cards: () => store.allCards() }
+    ? { cards: () => store.allCards(), indexing: () => coldPassProgress(distiller.status()) }
     : undefined;
 
   const freshEvent = createIdDedupe();

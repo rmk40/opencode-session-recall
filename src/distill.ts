@@ -110,6 +110,15 @@ export type DeriveCardInput = {
  *  to {@link Store.replaceSessionParts}. */
 export type DerivedCard = { card: Card; rows: PartTextRow[] };
 
+/** A distiller status as cold-pass progress: only while a pass runs. */
+export function coldPassProgress(
+  status: DistillStatus,
+): { examined: number; known: number } | undefined {
+  return status.coldPass === "running"
+    ? { examined: status.examinedCount, known: status.knownCount }
+    : undefined;
+}
+
 export type DistillStatus = {
   leaseHeld: boolean;
   coldPass: "idle" | "running" | "done";

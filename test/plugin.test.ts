@@ -351,6 +351,50 @@ describe("plugin entry", () => {
     expect(sqliteLifecycle.postCloseCalls).toBe(0);
   });
 
+  it("reports cold-pass progress in recall coverage while the pass runs (v1 wiring)", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "recall-plugin-indexing-"));
+    try {
+      // Discovery finds two sessions; their message fetch never settles, so
+      // the cold pass stays running.
+      const listed = [1, 2].map((i) => ({
+        id: `s${i}`,
+        title: `Session ${i}`,
+        directory: PROJECT_DIR,
+        time: { created: 1, updated: 2 + i },
+      }));
+      createOpencodeClient
+        .mockImplementationOnce((options: unknown) => ({
+          ...(options as object),
+          session: {
+            messages: vi.fn(() => new Promise(() => {})),
+            list: vi.fn(async () => ({ data: listed })),
+          },
+        }))
+        .mockImplementationOnce((options: unknown) => ({
+          ...(options as object),
+          experimental: { session: { list: vi.fn(async () => ({ data: listed })) } },
+        }));
+      const hooks = await server(ctx({ fetch: vi.fn() }), {
+        storePath: join(dir, "recall.db"),
+        coldPass: true,
+      });
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      const out = JSON.parse(
+        (await mustTool(hooks.tool?.recall).execute(
+          { query: "anything", scope: "global" },
+          makeContext().ctx,
+        )) as string,
+      );
+      expect(out.coverage.cards.indexing).toEqual({ examined: 0, known: 2 });
+      expect(out.warnings).toContain(
+        "Indexing in progress: 0 of 2 sessions indexed so far; older history may be missing.",
+      );
+      await hooks.dispose?.();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
   it("dispose completes within its bound when a distiller SDK request never settles", async () => {
     // The host awaits dispose as a shutdown finalizer with no timeout of its
     // own; a never-settling in-flight fetch must not hang shutdown forever.

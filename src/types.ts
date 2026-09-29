@@ -159,6 +159,10 @@ export type SearchCoverage = {
     full: number;
     storeRecency: number;
     degraded: boolean;
+    /** Present while the distiller's cold pass is running: how many of the
+     *  sessions it discovered it has examined so far (`known` is 0 until
+     *  discovery finishes). Cards for the rest may be missing or stale. */
+    indexing?: IndexingProgress;
   };
   /** Present only when the semantic layer is configured on. `ready` is the
    *  embedder load state, `model` the configured model id, `weight` the blend
@@ -403,6 +407,19 @@ export type SessionItem = {
   distilled?: boolean;
 };
 
+/** A running cold pass's progress (see {@link IndexingStatus}). */
+export type IndexingProgress = { examined: number; known: number };
+
+/** Reads the cold pass's progress: undefined unless a pass is running. */
+export type IndexingStatus = () => IndexingProgress | undefined;
+
+/** The warning for a query answered while the cold pass is still running. */
+export function indexingWarning(progress: IndexingProgress): string {
+  return progress.known > 0
+    ? `Indexing in progress: ${progress.examined} of ${progress.known} sessions indexed so far; older history may be missing.`
+    : "Indexing in progress: sessions are still being discovered; older history may be missing.";
+}
+
 export type SessionsOutput = {
   ok: true;
   sessions: SessionItem[];
@@ -419,6 +436,9 @@ export type SessionsOutput = {
    *  filter that could only be applied within the newest-limit window because no
    *  card store was available to resolve older sessions authoritatively. */
   note?: string;
+  /** Present while the distiller's cold pass is running (see
+   *  `SearchCoverage.cards.indexing`); the note then says so too. */
+  indexing?: IndexingProgress;
 };
 
 export type ErrorOutput = {

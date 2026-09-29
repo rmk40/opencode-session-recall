@@ -57,6 +57,12 @@ All notable changes to this project are documented here. This project follows
 
 ### Changed
 
+- While the background cold pass is still indexing, `recall` responses carry
+  `coverage.cards.indexing` (`{ examined, known }`) and a warning that says
+  how many sessions are indexed so far and that older history may be
+  missing; `recall_sessions` adds the same note to card-backed listings
+  (with an `indexing` field). Before, the card counts alone read as
+  complete while older sessions were not indexed yet.
 - Plugin log lines now go through an internal log sink (`src/log.ts`)
   instead of calling `console.log` directly. v1 output is unchanged: the
   same `[recall] ...` lines reach the console, and there is no new option.

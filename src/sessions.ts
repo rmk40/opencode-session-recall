@@ -9,6 +9,8 @@ import {
   type SessionsOutput,
   type ErrorOutput,
   type Limits,
+  type IndexingStatus,
+  indexingWarning,
 } from "./types.js";
 import type { Card } from "./store.js";
 import { isSummarizerTitle } from "./extract.js";
@@ -21,6 +23,8 @@ import { unavailableHistoryError, type HistorySource } from "./history/source.js
  *  fetch. Undefined in degraded mode (no store), where listings stay bare. */
 export type SessionEnrichment = {
   cards(): Card[];
+  /** The cold pass's progress while it runs (see SearchDeps.indexing). */
+  indexing?: IndexingStatus;
 };
 
 const SESSION_DIGEST_CHARS = 160;
@@ -64,6 +68,14 @@ export function sessions(
   limits: Limits,
   enrichment?: SessionEnrichment,
 ): ToolDefinition {
+  /** A card-backed listing made while the cold pass runs may be missing
+   *  sessions: say so, with the pass's progress. */
+  const withIndexing = (out: SessionsOutput): SessionsOutput => {
+    const progress = enrichment?.indexing?.();
+    if (!progress) return out;
+    const warning = indexingWarning(progress);
+    return { ...out, indexing: progress, note: out.note ? `${out.note} ${warning}` : warning };
+  };
   return tool({
     description: `List session metadata: titles, directories, timestamps, archival state, plus (when a distilled card exists) a content digest, top files/tools, and a family rollup for roots. Use only for recent-session browsing, finding a session ID/title/timeframe, or recency checks. Not content search; for topical discovery use recall. To recover cancelled or interrupted subagents (Task tool returned "Task cancelled" with no task_id), call this with parentID:"current" — the listing is live and does not depend on the search index.`,
     args: {
@@ -238,7 +250,7 @@ export function sessions(
             ...(resolvedParent && { parentID: resolvedParent, childCount: selected.length }),
             note: `${unavailable}. This listing comes from the card index, which may lag the live history.`,
           };
-          return JSON.stringify(out);
+          return JSON.stringify(withIndexing(out));
         }
 
         // ── Children branch: live parent/child lookup, index-free ──
@@ -380,7 +392,7 @@ export function sessions(
               returned: selected.length,
               scope,
             };
-            return JSON.stringify(out);
+            return JSON.stringify(withIndexing(out));
           }
         }
 
@@ -484,7 +496,7 @@ export function sessions(
               }
             : {}),
         };
-        return JSON.stringify(out);
+        return JSON.stringify(withIndexing(out));
       } catch (e) {
         const err: ErrorOutput = { ok: false, error: errmsg(e) };
         return JSON.stringify(err);

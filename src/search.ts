@@ -19,6 +19,8 @@ import {
   type EvidenceClass,
   type ResultSource,
   type ResultWhy,
+  type IndexingStatus,
+  indexingWarning,
   DISCOVERY_LIMIT,
 } from "./types.js";
 import {
@@ -92,6 +94,9 @@ export type SearchDeps = {
    *  query entry (search tool and card-tier hook path) so the metadata
    *  snapshot lazily self-heals. See lite-refresh.ts. */
   maybeRefresh?: () => void;
+  /** The cold pass's progress while it runs (both hosts wire the distiller
+   *  here); absent means no pass is known to be running. */
+  indexing?: IndexingStatus;
 };
 
 /** Wall-clock budget for the synchronous literal/regex scan loops (ms). Bounds
@@ -3148,6 +3153,7 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
           JSON.stringify({ ok: false, error: "aborted" } satisfies ErrorOutput);
 
         const cardsCoverage = cards.coverage();
+        const indexing = deps.indexing?.();
         // Semantic diagnostics: static status from the card runtime (ready,
         // model, weight, vector count), always present when semantic is
         // configured on; `contributed` is filled per route in finish() from the
@@ -3171,6 +3177,10 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
               ? "Ephemeral mode (configured): session cards are metadata-quality; content matches come from live drill, not a persistent index."
               : "Cards are metadata-only (card store unavailable); content search is degraded.",
           );
+        } else if (indexing) {
+          // A running cold pass: the card counts alone read as complete while
+          // older sessions are not even carded yet.
+          normalized.warnings.push(indexingWarning(indexing));
         } else if (cardsCoverage.fullCards < cardsCoverage.totalCards) {
           normalized.warnings.push(
             "The card store is still distilling; some sessions are metadata-only until it completes.",
@@ -3274,6 +3284,7 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
               full: cardsCoverage.fullCards,
               storeRecency: cardsCoverage.storeRecency,
               degraded: cardsCoverage.degraded,
+              ...(indexing && { indexing }),
             },
             ...(semanticStatus && { semantic: { ...semanticStatus, contributed: 0 } }),
             ...(sourceUnavailable !== undefined && {
