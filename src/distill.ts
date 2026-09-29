@@ -1398,7 +1398,9 @@ export function createDistiller(options: DistillerOptions): Distiller {
             messages = await fetchSessionMessages(session.id, caps.ftsRowsPerSession);
             ({ checkpoint, moved } = await bracketCheckpoint(session.id, before));
           } catch (error) {
-            // Any error but a data-shape one (MalformedSessionError, below).
+            // Every error except MalformedSessionError (quarantined below)
+            // takes this path: not only host or transport failures, but any
+            // other throw from the fetch or checkpoint reads too.
             if (!(error instanceof MalformedSessionError)) {
               if (stopped || !leaseHeld) throw error;
               if (!retry) {
@@ -1426,13 +1428,11 @@ export function createDistiller(options: DistillerOptions): Distiller {
               );
               examined++;
               examinedCount = examined;
-              examinedCount = examined;
               recordProgress(session.timeUpdated);
               return;
             }
             quarantine(session, error);
             examined++;
-            examinedCount = examined;
             examinedCount = examined;
             recordProgress(session.timeUpdated);
             return;
@@ -1483,7 +1483,6 @@ export function createDistiller(options: DistillerOptions): Distiller {
           distilledCount = distilled; // status counts only sessions actually distilled
         }
         examined++;
-        examinedCount = examined;
         examinedCount = examined;
         recordProgress(session.timeUpdated);
       };
