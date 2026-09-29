@@ -128,6 +128,30 @@ describe("projectMessage", () => {
     expect(formatMsg(msg).message).toMatchObject({ role: "user", agent: "plan", model: "m-user" });
   });
 
+  it("user: attached skills become completed skill tool parts after the text", () => {
+    const msg = project(
+      "user",
+      {
+        text: "use the skill",
+        skills: [
+          { id: "sk_1", name: "tuistory", text: "skill body" },
+          { id: "sk_2", name: "bare" },
+        ],
+      },
+      "msg_s",
+    )!;
+    expect(msg.parts.map((p) => [p.id, p.type])).toEqual([
+      ["msg_s:t", "text"],
+      ["msg_s:s0", "tool"],
+      ["msg_s:s1", "tool"],
+    ]);
+    expect(msg.parts[1]).toMatchObject({
+      tool: "skill",
+      state: { status: "completed", input: { id: "sk_1", name: "tuistory" }, output: "skill body" },
+    });
+    expect(msg.parts[2]).toMatchObject({ state: { output: "" } });
+  });
+
   it("user: an empty text emits no text part", () => {
     expect(project("user", { text: "", time: { created: 1 } })!.parts).toEqual([]);
   });
@@ -256,6 +280,27 @@ describe("projectMessage", () => {
     expect(isSelfToolPart(part)).toBe(true);
   });
 
+  it("assistant tool running: keeps only toolCalls from metadata", () => {
+    const msg = project("assistant", {
+      content: [
+        tool("execute", {
+          status: "running",
+          input: { code: "x" },
+          metadata: { toolCalls: [{ tool: "srv.recall", status: "running" }], other: 1 },
+        }),
+      ],
+    })!;
+    const part = msg.parts[0]!;
+    expect(part).toMatchObject({
+      state: {
+        status: "running",
+        metadata: { toolCalls: [{ tool: "srv.recall", status: "running" }] },
+      },
+    });
+    expect(JSON.stringify(part)).not.toContain("other");
+    expect(isSelfToolPart(part)).toBe(true);
+  });
+
   it("assistant tool cleared marker: pruned, empty output, out of every index", () => {
     const msg = project("assistant", {
       content: [
@@ -372,9 +417,11 @@ describe("authorship over projected parts", () => {
       text: "hi",
       files: [{ mime: "a/b" }],
       agents: [{ name: "x" }],
+      skills: [{ id: "sk", name: "s", text: "skill body" }],
     })!;
     expect(user.parts.map((p) => classify(p, "user", null))).toEqual([
       "human",
+      "injected",
       "injected",
       "injected",
     ]);

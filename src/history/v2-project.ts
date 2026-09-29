@@ -314,8 +314,16 @@ function assistantContentPart(
         case "streaming":
           // The input is a partial JSON string; never parsed.
           return toolPart(base, callID, name, { status: "pending", input: {}, raw: "" });
-        case "running":
-          return toolPart(base, callID, name, { status: "running", input, time: { start } });
+        case "running": {
+          // Like completed and error: only `toolCalls` survives from metadata.
+          const toolCalls = obj(state.metadata).toolCalls;
+          return toolPart(base, callID, name, {
+            status: "running",
+            input,
+            ...(Array.isArray(toolCalls) ? { metadata: { toolCalls } } : {}),
+            time: { start },
+          });
+        }
         case "completed":
           return toolPart(
             base,
@@ -454,6 +462,23 @@ export function projectMessage(
       });
       arr(data.agents).forEach((agent, i) => {
         parts.push({ ...at(`a${i}`), type: "agent", name: str(obj(agent).name) });
+      });
+      // Skills attached to the prompt: a completed `skill` tool part each, the
+      // shape of the standalone `skill` message type, so the skill text is
+      // searchable and classified as injected, not typed.
+      arr(data.skills).forEach((skill, i) => {
+        const sk = obj(skill);
+        const created = row.time_created;
+        parts.push(
+          toolPart(at(`s${i}`), `${row.id}:s${i}`, "skill", {
+            status: "completed",
+            input: { id: str(sk.id), name: str(sk.name) },
+            output: str(sk.text),
+            title: "",
+            metadata: {},
+            time: { start: created, end: created },
+          }),
+        );
       });
       return { info: userInfo(row, identity), parts };
     }
