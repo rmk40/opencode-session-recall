@@ -1,4 +1,4 @@
-import { openSqliteReadOnly, type Row, type SqlValue, type SqliteDb } from "../sqlite.js";
+import { openSqliteReadOnly, type ReadOnlyDb, type Row, type SqlValue } from "../sqlite.js";
 import type { HistoryMessage, HistorySession } from "./model.js";
 import {
   assertBoundedLimit,
@@ -85,7 +85,7 @@ export type V2SchemaCheck = { ok: true; migration: string | null } | { ok: false
  * recorded for diagnostics only: an unknown id never refuses, so an opencode
  * patch release that adds a migration does not strand users.
  */
-export function checkV2Schema(db: SqliteDb): V2SchemaCheck {
+export function checkV2Schema(db: ReadOnlyDb): V2SchemaCheck {
   const missing: string[] = [];
   try {
     for (const [table, columns] of Object.entries(REQUIRED_COLUMNS)) {
@@ -102,7 +102,7 @@ export function checkV2Schema(db: SqliteDb): V2SchemaCheck {
 }
 
 /** The newest applied opencode migration id, or null when unreadable. */
-function newestMigration(db: SqliteDb): string | null {
+function newestMigration(db: ReadOnlyDb): string | null {
   try {
     const row = db.get("SELECT id FROM migration ORDER BY id DESC LIMIT 1");
     return typeof row?.id === "string" ? row.id : null;
@@ -112,7 +112,7 @@ function newestMigration(db: SqliteDb): string | null {
 }
 
 export type OpencodeDbOpen =
-  | { ok: true; db: SqliteDb; migration: string | null }
+  | { ok: true; db: ReadOnlyDb; migration: string | null }
   | { ok: false; reason: string };
 
 /** Open `opencode.db` read-only and check its schema. The handle is closed
@@ -225,7 +225,7 @@ const MESSAGE_META_COLUMNS = "id, session_id, type, seq, time_created, time_upda
  * loads the value inside SQLite. `length(data)` would count characters, which
  * undercounts multibyte text.
  */
-function byteLengthSql(db: SqliteDb): string {
+function byteLengthSql(db: ReadOnlyDb): string {
   try {
     db.get("SELECT octet_length('x') AS n");
     return "octet_length(data)";
@@ -317,7 +317,7 @@ function assertListLimit(limit: unknown): asserts limit is number {
   }
 }
 
-export function createV2HistorySource(db: SqliteDb, opts: V2SourceOptions = {}): HistorySource {
+export function createV2HistorySource(db: ReadOnlyDb, opts: V2SourceOptions = {}): HistorySource {
   const projectID = opts.projectID;
   const byteCeiling = opts.pageByteCeiling ?? DEFAULT_PAGE_BYTE_CEILING;
   const pause = opts.yieldBetween ?? macrotask;

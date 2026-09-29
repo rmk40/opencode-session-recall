@@ -1,5 +1,5 @@
 import { afterAll, describe, expect, it } from "vitest";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openSqlite, openSqliteReadOnly } from "../src/sqlite.js";
@@ -24,9 +24,13 @@ describe("openSqliteReadOnly", () => {
     const opened = await openSqliteReadOnly(path);
     if (!opened.ok) throw new Error(opened.reason);
     expect(opened.db.get("SELECT v FROM t")).toEqual({ v: "kept" });
-    expect(() => opened.db.run("INSERT INTO t (v) VALUES ('x')")).toThrow();
-    expect(() => opened.db.exec("CREATE TABLE u (x)")).toThrow();
+    // The handle exposes no write method at all ...
+    expect(Object.keys(opened.db).sort()).toEqual(["all", "close", "get"]);
+    // ... and a write smuggled through a row-returning statement is refused.
+    expect(() => opened.db.get("INSERT INTO t (v) VALUES ('x') RETURNING id")).toThrow();
+    expect(() => opened.db.all("CREATE TABLE u (x)")).toThrow();
     expect(opened.db.get("PRAGMA query_only")).toEqual({ query_only: 1 });
+    expect(opened.db.all("SELECT v FROM t")).toEqual([{ v: "kept" }]);
     opened.db.close();
   });
 
@@ -36,7 +40,9 @@ describe("openSqliteReadOnly", () => {
     expect(opened.ok).toBe(false);
     if (!opened.ok) expect(opened.reason).toContain(path);
     // Read-only never creates the file.
+    expect(existsSync(path)).toBe(false);
     expect((await openSqliteReadOnly(path)).ok).toBe(false);
+    expect(existsSync(path)).toBe(false);
   });
 
   it("reports a non-database file on the probe", async () => {
@@ -45,6 +51,16 @@ describe("openSqliteReadOnly", () => {
     const opened = await openSqliteReadOnly(path);
     expect(opened).toMatchObject({ ok: false });
     if (!opened.ok) expect(opened.reason).toMatch(/cannot (open|read)/);
+  });
+
+  it("falls back to the default busy timeout for a non-finite value", async () => {
+    const path = await seeded("busy.db");
+    for (const busyTimeoutMs of [Number.NaN, Number.POSITIVE_INFINITY]) {
+      const opened = await openSqliteReadOnly(path, { busyTimeoutMs });
+      if (!opened.ok) throw new Error(opened.reason);
+      expect(opened.db.get("PRAGMA busy_timeout")).toEqual({ timeout: 500 });
+      opened.db.close();
+    }
   });
 
   it("rejects :memory: and an empty path by name", async () => {

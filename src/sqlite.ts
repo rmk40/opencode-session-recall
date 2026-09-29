@@ -189,9 +189,14 @@ export async function openSqlite(path: string): Promise<SqliteDb | null> {
   }
 }
 
+/** A read-only handle: statements that return rows, and close. No `exec`,
+ *  `run` or `tx`, in the type or on the object, so a write cannot even be
+ *  attempted by accident (and `query_only` refuses one sent through `get`). */
+export type ReadOnlyDb = Pick<SqliteDb, "get" | "all" | "close">;
+
 /** The outcome of {@link openSqliteReadOnly}: a verified read-only handle, or
  *  why the file cannot be read. */
-export type ReadOnlyOpenResult = { ok: true; db: SqliteDb } | { ok: false; reason: string };
+export type ReadOnlyOpenResult = { ok: true; db: ReadOnlyDb } | { ok: false; reason: string };
 
 /** How long a read waits on a lock before failing. Short on purpose: a WAL
  *  reader almost never waits, and a stalled read would stall the host. */
@@ -247,7 +252,11 @@ export async function openSqliteReadOnly(
     return { ok: false, reason: `cannot open ${path}: ${describeError(error)}` };
   }
 
-  const busy = Math.max(0, Math.floor(opts.busyTimeoutMs ?? READ_ONLY_BUSY_TIMEOUT_MS));
+  const requested = opts.busyTimeoutMs ?? READ_ONLY_BUSY_TIMEOUT_MS;
+  // A non-finite value (NaN, Infinity) would interpolate as invalid SQL.
+  const busy = Number.isFinite(requested)
+    ? Math.max(0, Math.floor(requested))
+    : READ_ONLY_BUSY_TIMEOUT_MS;
   try {
     db.exec("PRAGMA query_only = 1");
     db.exec(`PRAGMA busy_timeout = ${busy}`);
@@ -260,5 +269,5 @@ export async function openSqliteReadOnly(
     }
     return { ok: false, reason: `cannot read ${path}: ${describeError(error)}` };
   }
-  return { ok: true, db };
+  return { ok: true, db: { get: db.get, all: db.all, close: db.close } };
 }

@@ -9,7 +9,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { GlobalSession, Part, Session } from "@opencode-ai/sdk/v2";
-import { openSqlite, type SqlValue, type SqliteDb } from "../src/sqlite.js";
+import { openSqlite, type ReadOnlyDb, type SqlValue, type SqliteDb } from "../src/sqlite.js";
 import { compareMessages, type HistoryMessage } from "../src/history/model.js";
 import { CLEARED_TOOL_OUTPUT } from "../src/history/v2-project.js";
 
@@ -277,7 +277,12 @@ export function writeV1Corpus(
 
 // ── LIMIT spy ────────────────────────────────────────────────────────────────
 
-/** Whether a statement reads `session_message` without a bound LIMIT. */
+/**
+ * Whether a statement reads `session_message` without a bound LIMIT. The
+ * pattern is anchored at the END of the statement: `LIMIT ?` must be the last
+ * clause, so a LIMIT inside a subquery or CTE does not count, and the bound is
+ * then the last parameter, which {@link limitSpy} checks is a positive integer.
+ */
 export function violatesLimitRule(sql: string): boolean {
   return /\bsession_message\b/i.test(sql) && !/\bLIMIT\s+\?\s*$/i.test(sql.trim());
 }
@@ -287,7 +292,7 @@ export function violatesLimitRule(sql: string): boolean {
  * `LIMIT ?` with a positive integer bound throws.
  * `statements` records every statement for assertions.
  */
-export function limitSpy(inner: SqliteDb): SqliteDb & { statements: string[] } {
+export function limitSpy(inner: ReadOnlyDb): ReadOnlyDb & { statements: string[] } {
   const statements: string[] = [];
   const check = (sql: string, params: SqlValue[] = []): void => {
     statements.push(sql);
@@ -300,14 +305,6 @@ export function limitSpy(inner: SqliteDb): SqliteDb & { statements: string[] } {
   };
   return {
     statements,
-    exec: (sql) => {
-      check(sql);
-      inner.exec(sql);
-    },
-    run: (sql, params) => {
-      check(sql, params);
-      return inner.run(sql, params);
-    },
     get: (sql, params) => {
       check(sql, params);
       return inner.get(sql, params);
@@ -316,7 +313,6 @@ export function limitSpy(inner: SqliteDb): SqliteDb & { statements: string[] } {
       check(sql, params);
       return inner.all(sql, params);
     },
-    tx: (fn) => inner.tx(fn),
     close: () => inner.close(),
   };
 }
