@@ -269,6 +269,16 @@ describe("fetchMessagePage", () => {
     expect(calls[1]!.before).toBe("cur");
   });
 
+  it("rejects a limit that is not a positive integer, before any request", async () => {
+    const { client, calls } = clientReturning(() => ({ data: [] }));
+    for (const limit of [0, -1, 1.5, Number.NaN, undefined]) {
+      await expect(
+        fetchMessagePage(client, { sessionID: "s", limit: limit as number }),
+      ).rejects.toThrow("message page limit must be a positive integer");
+    }
+    expect(calls).toEqual([]);
+  });
+
   it("throws on an SDK error", async () => {
     const { client } = clientReturning(() => ({ error: apiFailure("boom") }));
     await expect(fetchMessagePage(client, { sessionID: "s", limit: 5 })).rejects.toThrow("boom");

@@ -81,7 +81,8 @@ function readNextCursor(response: unknown): string | null {
  * triggers the legacy full-session fetch (the incident path) and `before`
  * without `limit` is a 400. The next-page cursor rides the `X-Next-Cursor`
  * header; the body is the `{ info, parts }` array. Throws on an SDK error so the
- * caller's try/catch handles fetch failures uniformly.
+ * caller's try/catch handles fetch failures uniformly, and rejects a limit that
+ * is not a positive integer before any request.
  *
  * A successful response whose body is not an array is ambiguous: the query path
  * (browse/context/drill) treats it as a deliberate "empty page, ok:true" — a
@@ -93,6 +94,9 @@ export async function fetchMessagePage(
   client: OpencodeClient,
   opts: { sessionID: string; limit: number; before?: string; strict?: boolean },
 ): Promise<MessagePage> {
+  // Checked here, in the primitive, so no caller can reach the unbounded fetch
+  // by passing a limit the type allows but the host treats as absent.
+  assertBoundedLimit(opts.limit);
   const params =
     opts.before != null
       ? { sessionID: opts.sessionID, limit: opts.limit, before: opts.before }
@@ -196,7 +200,6 @@ export function createV1HistorySource(clients: V1Clients): HistorySource {
     },
 
     async messagePage(o): Promise<MessagePage> {
-      assertBoundedLimit(o.limit);
       return fetchMessagePage(scoped, o);
     },
 
