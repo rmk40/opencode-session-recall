@@ -56,10 +56,7 @@ function makeSpyGate(): { gate: FetchGate; queries: () => number } {
 describe("recall_sessions", () => {
   it("lists project sessions with schema defaults", async () => {
     const h = makeFakeHarness();
-    const out = await runTool<SessionsOutput>(
-      sessionsTool(h.client, h.unscoped, true, TEST_LIMITS),
-      {},
-    );
+    const out = await runTool<SessionsOutput>(sessionsTool(h.source, true, TEST_LIMITS), {});
 
     expect(out).toMatchObject({ ok: true, returned: 2, scope: "project" });
     expect(out.sessions.map((s) => s.id)).toEqual(["s-current", "s-project-2"]);
@@ -68,10 +65,10 @@ describe("recall_sessions", () => {
 
   it("lists global sessions, normalizes blank search, and exposes archived/project metadata", async () => {
     const h = makeFakeHarness();
-    const out = await runTool<SessionsOutput>(
-      sessionsTool(h.client, h.unscoped, true, TEST_LIMITS),
-      { scope: "global", search: "   " },
-    );
+    const out = await runTool<SessionsOutput>(sessionsTool(h.source, true, TEST_LIMITS), {
+      scope: "global",
+      search: "   ",
+    });
 
     expect(h.calls.globalList).toEqual([{ search: undefined, limit: 20 }]);
     expect(out.sessions.map((s) => s.id)).toEqual(["s-other", "s-current", "s-project-2"]);
@@ -81,25 +78,20 @@ describe("recall_sessions", () => {
 
   it("filters titles and handles disabled global/list errors", async () => {
     const filtered = makeFakeHarness();
-    const match = await runTool<SessionsOutput>(
-      sessionsTool(filtered.client, filtered.unscoped, true, TEST_LIMITS),
-      { search: "Checkout" },
-    );
+    const match = await runTool<SessionsOutput>(sessionsTool(filtered.source, true, TEST_LIMITS), {
+      search: "Checkout",
+    });
     expect(match.sessions.map((s) => s.id)).toEqual(["s-project-2"]);
 
-    const disabled = await runTool<ErrorOutput>(
-      sessionsTool(filtered.client, filtered.unscoped, false, TEST_LIMITS),
-      { scope: "global" },
-    );
+    const disabled = await runTool<ErrorOutput>(sessionsTool(filtered.source, false, TEST_LIMITS), {
+      scope: "global",
+    });
     expect(disabled.error).toContain("Global scope disabled");
 
     const errored = makeFakeHarness({
       projectListError: "database unavailable",
     });
-    const out = await runTool<ErrorOutput>(
-      sessionsTool(errored.client, errored.unscoped, true, TEST_LIMITS),
-      {},
-    );
+    const out = await runTool<ErrorOutput>(sessionsTool(errored.source, true, TEST_LIMITS), {});
     expect(out.error).toContain("Failed to list sessions: database unavailable");
   });
 });
@@ -443,10 +435,7 @@ describe("recall_context", () => {
 describe("recall_sessions defensive args", () => {
   it("survives raw MCP-bypass args (undefined scope/limit default to project)", async () => {
     const h = makeFakeHarness();
-    const out = await runToolRaw<SessionsOutput>(
-      sessionsTool(h.client, h.unscoped, true, TEST_LIMITS),
-      {},
-    );
+    const out = await runToolRaw<SessionsOutput>(sessionsTool(h.source, true, TEST_LIMITS), {});
     expect(out.ok).toBe(true);
     expect(out.scope).toBe("project");
     expect(Array.isArray(out.sessions)).toBe(true);
@@ -457,10 +446,11 @@ describe("recall_sessions defensive args", () => {
     // MCP host. optionalString() must drop them (no .trim() on a non-string) so
     // the listing succeeds unfiltered rather than throwing.
     const h = makeFakeHarness();
-    const out = await runToolRaw<SessionsOutput>(
-      sessionsTool(h.client, h.unscoped, true, TEST_LIMITS),
-      { scope: "global", since: 42, until: {} },
-    );
+    const out = await runToolRaw<SessionsOutput>(sessionsTool(h.source, true, TEST_LIMITS), {
+      scope: "global",
+      since: 42,
+      until: {},
+    });
     expect(out.ok).toBe(true);
     // Non-string bounds were ignored, so every listed session came through.
     expect(out.sessions.length).toBeGreaterThan(0);
@@ -472,10 +462,9 @@ describe("recall_sessions enrichment", () => {
     const h = makeFakeHarness();
 
     // No enrichment source (no store wired) → bare listings, ever.
-    const cold = await runTool<SessionsOutput>(
-      sessionsTool(h.client, h.unscoped, true, TEST_LIMITS),
-      { scope: "global" },
-    );
+    const cold = await runTool<SessionsOutput>(sessionsTool(h.source, true, TEST_LIMITS), {
+      scope: "global",
+    });
     expect(cold.sessions.every((s) => s.digest === undefined)).toBe(true);
     expect(cold.sessions.every((s) => s.files === undefined && s.tools === undefined)).toBe(true);
 
@@ -486,7 +475,7 @@ describe("recall_sessions enrichment", () => {
     try {
       const enrichment = { cards: () => store.allCards() };
       const warm = await runTool<SessionsOutput>(
-        sessionsTool(h.client, h.unscoped, true, TEST_LIMITS, enrichment),
+        sessionsTool(h.source, true, TEST_LIMITS, enrichment),
         { scope: "global" },
       );
       const current = warm.sessions.find((s) => s.id === "s-current");
@@ -510,7 +499,7 @@ describe("recall_sessions enrichment", () => {
       // s-other is the newest global session (updated now-500); a tight `since`
       // keeps only the freshest, an `until` in the future keeps all.
       const recent = await runTool<SessionsOutput>(
-        sessionsTool(h.client, h.unscoped, true, TEST_LIMITS, enrichment),
+        sessionsTool(h.source, true, TEST_LIMITS, enrichment),
         { scope: "global", since: "1h" },
       );
       // All fixture sessions are within the last hour, so since:1h keeps them.
@@ -518,7 +507,7 @@ describe("recall_sessions enrichment", () => {
 
       // A future-only lower bound (very small window) drops everything.
       const none = await runTool<SessionsOutput>(
-        sessionsTool(h.client, h.unscoped, true, TEST_LIMITS, enrichment),
+        sessionsTool(h.source, true, TEST_LIMITS, enrichment),
         { scope: "global", until: "10w" },
       );
       // until:10w = updated <= now-10w → all fixture sessions are newer → none.
@@ -549,7 +538,7 @@ describe("recall_sessions enrichment", () => {
       // A tiny limit means the list path would return only the (excluded) newest
       // page — the card path still surfaces the older match.
       const out = await runTool<SessionsOutput>(
-        sessionsTool(h.client, h.unscoped, true, TEST_LIMITS, enrichment),
+        sessionsTool(h.source, true, TEST_LIMITS, enrichment),
         { scope: "global", until: "30d", limit: 2 },
       );
       expect(out.sessions.map((s) => s.id)).toContain("s-old");
@@ -562,10 +551,10 @@ describe("recall_sessions enrichment", () => {
   it("notes the newest-window caveat when filtering without a card store (degraded)", async () => {
     const h = makeFakeHarness();
     // No enrichment → the time filter can only apply within the list's page.
-    const out = await runTool<SessionsOutput>(
-      sessionsTool(h.client, h.unscoped, true, TEST_LIMITS),
-      { scope: "global", since: "7d" },
-    );
+    const out = await runTool<SessionsOutput>(sessionsTool(h.source, true, TEST_LIMITS), {
+      scope: "global",
+      since: "7d",
+    });
     expect(out.ok).toBe(true);
     expect(out.note).toBeDefined();
     expect(out.note).toMatch(/newest/i);
@@ -601,7 +590,7 @@ describe("recall_sessions children branch", () => {
     });
     const { ctx, metadata } = makeContext();
     const out = await runTool<SessionsOutput>(
-      sessionsTool(h.client, h.unscoped, true, TEST_LIMITS),
+      sessionsTool(h.source, true, TEST_LIMITS),
       { parentID: PARENT },
       ctx,
     );
@@ -622,10 +611,10 @@ describe("recall_sessions children branch", () => {
 
   it("ignores the global-disabled error when parentID is set (the !parentID conjunct)", async () => {
     const h = makeFakeHarness({ children: {} });
-    const out = await runTool<SessionsOutput>(
-      sessionsTool(h.client, h.unscoped, false, TEST_LIMITS),
-      { scope: "global", parentID: PARENT },
-    );
+    const out = await runTool<SessionsOutput>(sessionsTool(h.source, false, TEST_LIMITS), {
+      scope: "global",
+      parentID: PARENT,
+    });
     expect(out.ok).toBe(true);
     expect(out.scope).toBe("children");
   });
@@ -639,7 +628,7 @@ describe("recall_sessions children branch", () => {
         ],
       },
     });
-    const tool = sessionsTool(h.client, h.unscoped, true, TEST_LIMITS);
+    const tool = sessionsTool(h.source, true, TEST_LIMITS);
     const out = await runTool<SessionsOutput>(tool, { parentID: "current" });
     expect(out).toMatchObject({ ok: true, scope: "children", parentID: "s-current" });
     expect(out.sessions.map((s) => s.id)).toEqual(["ses-kid"]);
@@ -661,37 +650,33 @@ describe("recall_sessions children branch", () => {
 
   it("treats a divergent non-array children payload as an empty list", async () => {
     const h = makeFakeHarness({ childrenNonArray: true });
-    const out = await runTool<SessionsOutput>(
-      sessionsTool(h.client, h.unscoped, true, TEST_LIMITS),
-      { parentID: PARENT },
-    );
+    const out = await runTool<SessionsOutput>(sessionsTool(h.source, true, TEST_LIMITS), {
+      parentID: PARENT,
+    });
     expect(out).toMatchObject({ ok: true, scope: "children", childCount: 0, returned: 0 });
     expect(out.sessions).toEqual([]);
   });
 
   it("returns ok with an empty list and childCount 0 for a parent with no children", async () => {
     const h = makeFakeHarness({ children: {} });
-    const out = await runTool<SessionsOutput>(
-      sessionsTool(h.client, h.unscoped, true, TEST_LIMITS),
-      { parentID: PARENT },
-    );
+    const out = await runTool<SessionsOutput>(sessionsTool(h.source, true, TEST_LIMITS), {
+      parentID: PARENT,
+    });
     expect(out).toMatchObject({ ok: true, scope: "children", childCount: 0, returned: 0 });
     expect(out.sessions).toEqual([]);
   });
 
   it("maps an SDK error return and a throw to distinct error shapes", async () => {
     const errored = makeFakeHarness({ childrenError: "endpoint unavailable" });
-    const errOut = await runTool<ErrorOutput>(
-      sessionsTool(errored.client, errored.unscoped, true, TEST_LIMITS),
-      { parentID: PARENT },
-    );
+    const errOut = await runTool<ErrorOutput>(sessionsTool(errored.source, true, TEST_LIMITS), {
+      parentID: PARENT,
+    });
     expect(errOut.error).toBe("Failed to list children: endpoint unavailable");
 
     const thrown = makeFakeHarness({ childrenThrows: true });
-    const thrownOut = await runTool<ErrorOutput>(
-      sessionsTool(thrown.client, thrown.unscoped, true, TEST_LIMITS),
-      { parentID: PARENT },
-    );
+    const thrownOut = await runTool<ErrorOutput>(sessionsTool(thrown.source, true, TEST_LIMITS), {
+      parentID: PARENT,
+    });
     // The existing catch yields the bare message, without the prefix —
     // intentionally consistent with how the tool treats other throws.
     expect(thrownOut.error).toBe(`children failed: ${PARENT}`);
@@ -708,10 +693,10 @@ describe("recall_sessions children branch", () => {
         ],
       },
     });
-    const out = await runTool<SessionsOutput>(
-      sessionsTool(h.client, h.unscoped, true, TEST_LIMITS),
-      { parentID: PARENT, limit: 2 },
-    );
+    const out = await runTool<SessionsOutput>(sessionsTool(h.source, true, TEST_LIMITS), {
+      parentID: PARENT,
+      limit: 2,
+    });
     expect(out.sessions.map((s) => s.id)).toEqual(["ses-new", "ses-mid"]);
     expect(out.childCount).toBe(3);
     expect(out.returned).toBe(2);
@@ -737,10 +722,9 @@ describe("recall_sessions children branch", () => {
         ],
       },
     });
-    const out = await runTool<SessionsOutput>(
-      sessionsTool(h.client, h.unscoped, true, TEST_LIMITS),
-      { parentID: PARENT },
-    );
+    const out = await runTool<SessionsOutput>(sessionsTool(h.source, true, TEST_LIMITS), {
+      parentID: PARENT,
+    });
     expect(out.sessions.map((s) => s.id)).toEqual(["ses-direct"]);
     expect(out.childCount).toBe(1);
   });
@@ -770,7 +754,7 @@ describe("recall_sessions children branch", () => {
         ],
       },
     });
-    const tool = sessionsTool(h.client, h.unscoped, true, TEST_LIMITS);
+    const tool = sessionsTool(h.source, true, TEST_LIMITS);
 
     const bySearch = await runTool<SessionsOutput>(tool, { parentID: PARENT, search: "batch" });
     expect(bySearch.sessions.map((s) => s.id)).toEqual(["ses-batch-b", "ses-batch-a"]);
@@ -825,7 +809,7 @@ describe("recall_sessions children branch", () => {
     try {
       const enrichment = { cards: () => store.allCards() };
       const out = await runTool<SessionsOutput>(
-        sessionsTool(h.client, h.unscoped, true, TEST_LIMITS, enrichment),
+        sessionsTool(h.source, true, TEST_LIMITS, enrichment),
         { parentID: PARENT },
       );
       const byId = new Map(out.sessions.map((s) => [s.id, s]));
@@ -852,7 +836,7 @@ describe("recall_sessions children branch", () => {
     const h = makeFakeHarness({ children: { [PARENT]: [child] } });
     const enrichment = { cards: () => cardsLiteFromSessions([child]) };
     const out = await runTool<SessionsOutput>(
-      sessionsTool(h.client, h.unscoped, true, TEST_LIMITS, enrichment),
+      sessionsTool(h.source, true, TEST_LIMITS, enrichment),
       { parentID: PARENT },
     );
     expect(out.sessions[0]?.distilled).toBe(false);
@@ -868,10 +852,9 @@ describe("recall_sessions children branch", () => {
         ],
       },
     });
-    const out = await runTool<SessionsOutput>(
-      sessionsTool(h.client, h.unscoped, true, TEST_LIMITS),
-      { parentID: PARENT },
-    );
+    const out = await runTool<SessionsOutput>(sessionsTool(h.source, true, TEST_LIMITS), {
+      parentID: PARENT,
+    });
     expect(out.sessions).toHaveLength(2);
     expect(out.sessions.every((s) => s.distilled === false)).toBe(true);
   });
@@ -881,7 +864,7 @@ describe("recall_sessions children branch", () => {
     const { store, cleanup } = await makeRecallDeps(h);
     try {
       const warm = await runTool<SessionsOutput>(
-        sessionsTool(h.client, h.unscoped, true, TEST_LIMITS, { cards: () => store.allCards() }),
+        sessionsTool(h.source, true, TEST_LIMITS, { cards: () => store.allCards() }),
         { scope: "global" },
       );
       expect(warm.sessions.length).toBeGreaterThan(0);
@@ -890,7 +873,7 @@ describe("recall_sessions children branch", () => {
       expect(warm.childCount).toBeUndefined();
 
       const lite = await runTool<SessionsOutput>(
-        sessionsTool(h.client, h.unscoped, true, TEST_LIMITS, {
+        sessionsTool(h.source, true, TEST_LIMITS, {
           cards: () => cardsLiteFromSessions(h.globalSessions),
         }),
         { scope: "global" },
@@ -913,10 +896,9 @@ describe("recall_sessions children branch", () => {
       },
     });
     // PARENT is not the caller's session, so decision 2's withholding applies.
-    const out = await runTool<SessionsOutput>(
-      sessionsTool(h.client, h.unscoped, false, TEST_LIMITS),
-      { parentID: PARENT },
-    );
+    const out = await runTool<SessionsOutput>(sessionsTool(h.source, false, TEST_LIMITS), {
+      parentID: PARENT,
+    });
     expect(out.sessions.map((s) => s.id)).toEqual(["ses-here"]);
     expect(out.childCount).toBe(1);
     expect(out.note).toMatch(/1 child session .*withheld/);
@@ -935,10 +917,9 @@ describe("recall_sessions children branch", () => {
         ],
       },
     });
-    const out = await runTool<SessionsOutput>(
-      sessionsTool(h.client, h.unscoped, true, TEST_LIMITS),
-      { parentID: PARENT },
-    );
+    const out = await runTool<SessionsOutput>(sessionsTool(h.source, true, TEST_LIMITS), {
+      parentID: PARENT,
+    });
     expect(out.sessions.map((s) => s.id)).toEqual(["ses-tie-a", "ses-tie-b"]);
   });
 
@@ -958,10 +939,9 @@ describe("recall_sessions children branch", () => {
         ],
       },
     });
-    const out = await runTool<SessionsOutput>(
-      sessionsTool(h.client, h.unscoped, false, TEST_LIMITS),
-      { parentID: "current" },
-    );
+    const out = await runTool<SessionsOutput>(sessionsTool(h.source, false, TEST_LIMITS), {
+      parentID: "current",
+    });
     expect(out.sessions.map((s) => s.id)).toEqual(["ses-worktree"]);
     expect(out.note).toBeUndefined();
   });
@@ -985,10 +965,9 @@ describe("recall_sessions children branch", () => {
         ],
       },
     });
-    const out = await runTool<SessionsOutput>(
-      sessionsTool(h.client, h.unscoped, false, TEST_LIMITS),
-      { parentID: "s-current" },
-    );
+    const out = await runTool<SessionsOutput>(sessionsTool(h.source, false, TEST_LIMITS), {
+      parentID: "s-current",
+    });
     expect(out.sessions.map((s) => s.id)).toEqual(["ses-worktree"]);
     expect(out.note).toBeUndefined();
   });
@@ -1002,10 +981,9 @@ describe("recall_sessions children branch", () => {
         ],
       },
     });
-    const out = await runTool<SessionsOutput>(
-      sessionsTool(h.client, h.unscoped, true, TEST_LIMITS),
-      { parentID: PARENT },
-    );
+    const out = await runTool<SessionsOutput>(sessionsTool(h.source, true, TEST_LIMITS), {
+      parentID: PARENT,
+    });
     expect(out.sessions.map((s) => s.id)).toEqual(["ses-elsewhere"]);
     expect(out.childCount).toBe(1);
     expect(out.note).toBeUndefined();
@@ -1038,10 +1016,10 @@ describe("recall_sessions children branch", () => {
         ],
       },
     });
-    const out = await runTool<SessionsOutput>(
-      sessionsTool(h.client, h.unscoped, false, TEST_LIMITS),
-      { parentID: PARENT, since: "1h" },
-    );
+    const out = await runTool<SessionsOutput>(sessionsTool(h.source, false, TEST_LIMITS), {
+      parentID: PARENT,
+      since: "1h",
+    });
     expect(out.sessions).toEqual([]);
     expect(out.childCount).toBe(0);
     // Only ses-foreign passed the summarizer and time filters to reach the
@@ -1059,7 +1037,7 @@ describe("recall_sessions children branch", () => {
       },
     });
     const out = await runTool<SessionsOutput>(
-      sessionsTool(h.client, h.unscoped, false, TEST_LIMITS),
+      sessionsTool(h.source, false, TEST_LIMITS),
       { parentID: PARENT },
       makeContext({ directory: undefined }).ctx,
     );
@@ -1077,7 +1055,7 @@ describe("recall_sessions children branch", () => {
         ],
       },
     });
-    const tool = sessionsTool(h.client, h.unscoped, true, TEST_LIMITS);
+    const tool = sessionsTool(h.source, true, TEST_LIMITS);
 
     // All other args omitted — every default must be applied defensively.
     const out = await runToolRaw<SessionsOutput>(tool, { parentID: "current" });
@@ -1118,7 +1096,7 @@ describe("recall_sessions staleness fallback", () => {
       h.sessions.push(fresh);
       const enrichment = { cards: () => store.allCards() };
       const out = await runTool<SessionsOutput>(
-        sessionsTool(h.client, h.unscoped, true, TEST_LIMITS, enrichment),
+        sessionsTool(h.source, true, TEST_LIMITS, enrichment),
         { since: "1h" },
       );
       // The live list was consulted (the card answer would have been empty).
@@ -1146,7 +1124,7 @@ describe("recall_sessions staleness fallback", () => {
     try {
       const enrichment = { cards: () => store.allCards() };
       const out = await runTool<SessionsOutput>(
-        sessionsTool(h.client, h.unscoped, true, TEST_LIMITS, enrichment),
+        sessionsTool(h.source, true, TEST_LIMITS, enrichment),
         { since: "1h" },
       );
       expect(h.calls.projectList).toHaveLength(1);
@@ -1174,7 +1152,7 @@ describe("recall_sessions staleness fallback", () => {
       h.sessions.push(fresh);
       const enrichment = { cards: () => store.allCards() };
       const out = await runTool<SessionsOutput>(
-        sessionsTool(h.client, h.unscoped, true, TEST_LIMITS, enrichment),
+        sessionsTool(h.source, true, TEST_LIMITS, enrichment),
         { since: "1h", search: "debugging" },
       );
       expect(out.sessions.map((s) => s.id)).toContain("ses-fresh");
@@ -1202,7 +1180,7 @@ describe("recall_sessions staleness fallback", () => {
       h.sessions.push(fresh);
       const enrichment = { cards: () => store.allCards() };
       const out = await runTool<SessionsOutput>(
-        sessionsTool(h.client, h.unscoped, true, TEST_LIMITS, enrichment),
+        sessionsTool(h.source, true, TEST_LIMITS, enrichment),
         { since: "1h" },
       );
       // The fallback fired despite the fresh worker card.
@@ -1222,7 +1200,7 @@ describe("recall_sessions staleness fallback", () => {
       // Window bounded so nothing matches, but since (2h ago) is older than the
       // fresh fixture cards — the emptiness is the caller's bounds, not lag.
       const out = await runTool<SessionsOutput>(
-        sessionsTool(h.client, h.unscoped, true, TEST_LIMITS, enrichment),
+        sessionsTool(h.source, true, TEST_LIMITS, enrichment),
         { scope: "global", since: "2h", until: "1h" },
       );
       expect(out.sessions).toEqual([]);
@@ -1242,7 +1220,7 @@ describe("recall_sessions staleness fallback", () => {
       const watermark = Math.max(...store.allCards().map((c) => c.timeUpdated));
       // Force zero matches via a search that matches nothing; since === watermark.
       const out = await runTool<SessionsOutput>(
-        sessionsTool(h.client, h.unscoped, true, TEST_LIMITS, enrichment),
+        sessionsTool(h.source, true, TEST_LIMITS, enrichment),
         { scope: "global", since: new Date(watermark).toISOString(), search: "no-such-title" },
       );
       expect(out.sessions).toEqual([]);
@@ -1264,7 +1242,7 @@ describe("recall_sessions staleness fallback", () => {
     try {
       const enrichment = { cards: () => store.allCards() };
       const out = await runTool<SessionsOutput>(
-        sessionsTool(h.client, h.unscoped, true, TEST_LIMITS, enrichment),
+        sessionsTool(h.source, true, TEST_LIMITS, enrichment),
         { scope: "project", since: "1h" },
       );
       // In-scope (project) watermark is 3 days stale even though a foreign
@@ -1281,7 +1259,7 @@ describe("recall_sessions staleness fallback", () => {
     const h = makeFakeHarness();
     const enrichment = { cards: () => [] };
     const out = await runTool<SessionsOutput>(
-      sessionsTool(h.client, h.unscoped, true, TEST_LIMITS, enrichment),
+      sessionsTool(h.source, true, TEST_LIMITS, enrichment),
       { since: "1h" },
     );
     expect(h.calls.projectList).toHaveLength(1);
@@ -1295,7 +1273,7 @@ describe("recall_sessions staleness fallback", () => {
     // every since call — decision 8 counts ALL states, so no fallback.
     const enrichment = { cards: () => cardsLiteFromSessions(h.globalSessions) };
     const out = await runTool<SessionsOutput>(
-      sessionsTool(h.client, h.unscoped, true, TEST_LIMITS, enrichment),
+      sessionsTool(h.source, true, TEST_LIMITS, enrichment),
       { scope: "global", since: "1h", search: "no-such-title" },
     );
     expect(out.sessions).toEqual([]);
@@ -1316,7 +1294,7 @@ describe("recall_sessions staleness fallback", () => {
       // since:1h is newer than until:2h — an inverted, self-empty window. The
       // emptiness is the caller's bounds even though the store is stale.
       const out = await runTool<SessionsOutput>(
-        sessionsTool(h.client, h.unscoped, true, TEST_LIMITS, enrichment),
+        sessionsTool(h.source, true, TEST_LIMITS, enrichment),
         { since: "1h", until: "2h" },
       );
       expect(out.sessions).toEqual([]);
@@ -1335,7 +1313,7 @@ describe("recall_sessions staleness fallback", () => {
       // until:10w → all fixture sessions are newer → zero, and only a lower
       // bound can signal index lag.
       const out = await runTool<SessionsOutput>(
-        sessionsTool(h.client, h.unscoped, true, TEST_LIMITS, enrichment),
+        sessionsTool(h.source, true, TEST_LIMITS, enrichment),
         { scope: "global", until: "10w" },
       );
       expect(out.sessions).toEqual([]);

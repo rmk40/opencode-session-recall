@@ -449,7 +449,7 @@ const server: Plugin = async (ctx, options) => {
 
   return {
     tool: {
-      recall_sessions: guardTool(sessions(client, unscoped, global, limits, enrichment)),
+      recall_sessions: guardTool(sessions(source, global, limits, enrichment)),
       recall: guardTool(search(client, unscoped, global, limits, deps)),
       recall_get: guardTool(get(source, gate)),
       recall_context: guardTool(context(source, gate, limits)),

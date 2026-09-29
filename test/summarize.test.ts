@@ -12,6 +12,7 @@ import { cardRecall } from "../src/hooks/card-recall.js";
 import { isSummarizerTitle, SUMMARIZER_SENTINEL } from "../src/extract.js";
 import { parseQuery } from "../src/query.js";
 import { sessions } from "../src/sessions.js";
+import { createV1HistorySource } from "../src/history/v1.js";
 import {
   createSummarizer,
   parseModelId,
@@ -287,7 +288,8 @@ describe("summarizer worker-session exclusion", () => {
       fullCard("worker", { title: SUMMARIZER_SENTINEL, timeUpdated: Date.now() - 500 }),
     );
     const dummy = {} as unknown as OpencodeClient;
-    const tool = sessions(dummy, dummy, true, TEST_LIMITS, { cards: () => store.allCards() });
+    const source = createV1HistorySource({ scoped: dummy, unscoped: dummy });
+    const tool = sessions(source, true, TEST_LIMITS, { cards: () => store.allCards() });
     const { ctx } = makeContext();
     const raw = await tool.execute(
       { scope: "global", since: "30d" } as Parameters<typeof tool.execute>[0],
@@ -732,7 +734,8 @@ describe("nl_summary consumption", () => {
     );
     store.writeSummary("s1", "LLM summary about widgets.", "h1");
     const dummy = {} as unknown as OpencodeClient;
-    const tool = sessions(dummy, dummy, true, TEST_LIMITS, { cards: () => store.allCards() });
+    const source = createV1HistorySource({ scoped: dummy, unscoped: dummy });
+    const tool = sessions(source, true, TEST_LIMITS, { cards: () => store.allCards() });
     const { ctx } = makeContext();
     const raw = await tool.execute(
       { scope: "global", since: "30d" } as Parameters<typeof tool.execute>[0],

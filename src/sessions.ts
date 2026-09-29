@@ -1,5 +1,4 @@
 import { tool, type ToolDefinition, type ToolContext } from "@opencode-ai/plugin";
-import type { OpencodeClient } from "@opencode-ai/sdk/v2";
 import {
   errmsg,
   optionalString,
@@ -12,6 +11,7 @@ import {
 } from "./types.js";
 import type { Card } from "./store.js";
 import { isSummarizerTitle } from "./extract.js";
+import type { HistorySource } from "./history/source.js";
 
 /** Card-backed enrichment for the sessions browser: a snapshot of all cards the
  *  distiller has built. `session.list` stays the authoritative listing; when a
@@ -58,8 +58,7 @@ function sameProject(cardDir: string, callerDir: string | undefined): boolean {
 }
 
 export function sessions(
-  client: OpencodeClient,
-  unscoped: OpencodeClient,
+  source: HistorySource,
   global: boolean,
   limits: Limits,
   enrichment?: SessionEnrichment,
@@ -193,11 +192,11 @@ export function sessions(
             };
             return JSON.stringify(err);
           }
-          const result = await client.session.children({ sessionID: resolvedParent });
-          if (result.error) {
+          const result = await source.listChildren(resolvedParent);
+          if (!result.ok) {
             const err: ErrorOutput = {
               ok: false,
-              error: `Failed to list children: ${errmsg(result.error)}`,
+              error: `Failed to list children: ${result.error}`,
             };
             return JSON.stringify(err);
           }
@@ -210,8 +209,8 @@ export function sessions(
           const scopeExempt = global || resolvedParent === currentSessionID;
           let withheld = 0;
           // Defensive: a divergent server payload (non-array data without an
-          // error) is treated as an empty child list, not a raw TypeError.
-          const rows = Array.isArray(result.data) ? result.data : [];
+          // error) arrives as an empty child list, not a raw TypeError.
+          const rows = result.items;
           const selected = rows
             .filter((row) => {
               // Direct children only — the output contract holds even if the
@@ -325,55 +324,51 @@ export function sessions(
         const items: SessionItem[] = [];
 
         if (scope === "global") {
-          const result = await unscoped.experimental.session.list({ search, limit });
-          if (result.error) {
+          const result = await source.listSessions({ scope: "global", search, limit });
+          if (!result.ok) {
             const err: ErrorOutput = {
               ok: false,
-              error: `Failed to list sessions: ${errmsg(result.error)}`,
+              error: `Failed to list sessions: ${result.error}`,
             };
             return JSON.stringify(err);
           }
-          if (result.data) {
-            for (const s of result.data) {
-              if (isSummarizerTitle(s.title)) continue;
-              if (!passesTime(s.time.updated)) continue;
-              items.push(
-                enrich({
-                  id: s.id,
-                  title: s.title,
-                  directory: s.directory,
-                  project: s.project
-                    ? { name: s.project.name, worktree: s.project.worktree }
-                    : undefined,
-                  time: { created: s.time.created, updated: s.time.updated },
-                  archived: s.time.archived != null,
-                }),
-              );
-            }
+          for (const s of result.items) {
+            if (isSummarizerTitle(s.title)) continue;
+            if (!passesTime(s.time.updated)) continue;
+            items.push(
+              enrich({
+                id: s.id,
+                title: s.title,
+                directory: s.directory,
+                project: s.project
+                  ? { name: s.project.name, worktree: s.project.worktree }
+                  : undefined,
+                time: { created: s.time.created, updated: s.time.updated },
+                archived: s.time.archived != null,
+              }),
+            );
           }
         } else {
-          const result = await client.session.list({ search, limit });
-          if (result.error) {
+          const result = await source.listSessions({ scope: "project", search, limit });
+          if (!result.ok) {
             const err: ErrorOutput = {
               ok: false,
-              error: `Failed to list sessions: ${errmsg(result.error)}`,
+              error: `Failed to list sessions: ${result.error}`,
             };
             return JSON.stringify(err);
           }
-          if (result.data) {
-            for (const s of result.data) {
-              if (isSummarizerTitle(s.title)) continue;
-              if (!passesTime(s.time.updated)) continue;
-              items.push(
-                enrich({
-                  id: s.id,
-                  title: s.title,
-                  directory: s.directory,
-                  time: { created: s.time.created, updated: s.time.updated },
-                  archived: s.time.archived != null,
-                }),
-              );
-            }
+          for (const s of result.items) {
+            if (isSummarizerTitle(s.title)) continue;
+            if (!passesTime(s.time.updated)) continue;
+            items.push(
+              enrich({
+                id: s.id,
+                title: s.title,
+                directory: s.directory,
+                time: { created: s.time.created, updated: s.time.updated },
+                archived: s.time.archived != null,
+              }),
+            );
           }
         }
 
