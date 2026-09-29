@@ -8,6 +8,36 @@ All notable changes to this project are documented here. This project follows
 
 ### Added
 
+- **opencode v2 support.** The same package now runs on opencode 2.0.x
+  (checked against 2.0.18) as well as opencode v1 (1.3.4 and later). One
+  default export serves both: v1 calls `server()`, v2 calls `setup()`,
+  and `setup` stays inert under v1. On v2:
+  - The five tools, `nudge` and `primary` work as on v1. `primary` hides
+    the tools from sessions that have a parent session and refuses them
+    there. Tool calls show no custom titles, since v2 has no channel for
+    them.
+  - History is read from opencode's own `opencode.db`, strictly read-only,
+    because v2's plugin API cannot page sessions. The file is found the
+    way opencode finds it; the new `opencodeDbPath` option overrides it.
+  - The index lives in its own store, `store-opencode-v2.db`, stamped with
+    the host and the database it was built from. One process runtime
+    serves every location and indexes every project; `global: false`
+    limits queries, not indexing.
+  - A poll keeps the index fresh with no events: new messages within
+    about 30 seconds, renames and other metadata-only changes within
+    about 5 minutes. Each card checkpoints its session's tail, so a
+    streaming, rewritten or reverted session is re-read rather than
+    appended to.
+  - When `opencode.db` cannot be read, responses say why in
+    `coverage.source`, `recall` answers from the session cards alone,
+    and the message-reading tools return the reason as their error.
+  - `autoRecall`, `compactionRecall` and `summaries` are not available yet;
+    enabling one logs a line and changes nothing.
+  - Plugin output goes to `~/.cache/opencode-session-recall/recall.log`
+    when `RECALL_DEBUG=1` is set, since v2 discards plugin console output.
+  - The `@opencode-ai/plugin` peer dependency is now optional (and at
+    least 1.3.4), so a v2-only install needs no v1 package.
+
 - **`authorship` filter on `recall`**: ask for what a human actually typed.
   `role: "user"` is a transport fact, not an authorship one — a survey of this
   machine's corpus (`docs/surveys/user-role-authorship.sql`) found only ~51% of
@@ -30,8 +60,8 @@ All notable changes to this project are documented here. This project follows
 - Plugin log lines now go through an internal log sink (`src/log.ts`)
   instead of calling `console.log` directly. v1 output is unchanged: the
   same `[recall] ...` lines reach the console, and there is no new option.
-  The sink is groundwork for opencode v2, which discards plugin console
-  output.
+  On opencode v2, which discards plugin console output, the same lines go
+  to a debug log file instead (see the v2 entry under Added).
 - **The store moves to schema 4.** An existing `store-v1.db` upgrades in
   place on first open, keeping every card, index row, vector and summary, and
   gains a `card.distill_cursor` column that stays empty under opencode v1 (it
