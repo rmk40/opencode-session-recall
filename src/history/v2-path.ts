@@ -61,7 +61,12 @@ export function resolveOpencodeDbPath(input: OpencodeDbPathInput): OpencodeDbPat
   const dataRoot =
     env.XDG_DATA_HOME || (input.home ? path.join(input.home, ".local", "share") : undefined);
   if (dataRoot === undefined) {
-    // Only an absolute filename is resolvable without a data directory.
+    // Only an absolute filename is resolvable without a data directory. The
+    // check is POSIX-only: on Windows with no home directory and no
+    // XDG_DATA_HOME, an absolute `OPENCODE_DB` such as `C:\data\opencode.db`
+    // is reported as unresolvable here, although opencode's `path.resolve`
+    // would accept it. That needs all three conditions at once; the
+    // `opencodeDbPath` option overrides it.
     if (filename.startsWith("/")) return { ok: true, path: path.resolve(filename) };
     return {
       ok: false,

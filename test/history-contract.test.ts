@@ -802,6 +802,22 @@ describe("v2 history source", () => {
     expect((await ids("DONE")).length).toBe(1);
   });
 
+  it("rejects a missing or non-positive listing limit before reading", async () => {
+    const t = await fresh();
+    session(t, "ses_l");
+    const { source, spy } = await open(t, "prj");
+    const before = spy.statements.length;
+    for (const scope of ["project", "global"] as const) {
+      for (const limit of [0, -1, 1.5, Number.NaN, undefined]) {
+        await expect(
+          source.listSessions({ scope, limit: limit as number }),
+          `${scope} ${String(limit)}`,
+        ).rejects.toThrow(/session list limit must be a positive integer/);
+      }
+    }
+    expect(spy.statements.length).toBe(before);
+  });
+
   it("a facade without a project id rejects project scope but serves the rest", async () => {
     const t = await fresh();
     session(t, "ses_g");

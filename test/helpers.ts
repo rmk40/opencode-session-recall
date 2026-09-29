@@ -356,9 +356,13 @@ function encodeCursor(index: number): string {
   return Buffer.from(String(index)).toString("base64url");
 }
 
-/** Decode a fake cursor. A cursor this shim never issued rejects, as the real
- *  server does (`packages/opencode/src/server/routes/instance/httpapi/
- *  handlers/session.ts` answers BadRequest), rather than restarting at 0. */
+/** Decode a fake cursor. A cursor that does not decode rejects rather than
+ *  restarting at 0, as the real v1 server's does: the `messages` handler in
+ *  opencode's `packages/opencode/src/server/routes/instance/httpapi/handlers/
+ *  session.ts` (origin/dev 7945de2) answers 400 BadRequest when
+ *  `MessageV2.cursor.decode` throws. The real cursor is a base64url JSON
+ *  keyset position, so a well-formed one pages from that position; this
+ *  shim's cursor is an index, and an out-of-range one yields an empty page. */
 function decodeCursor(cursor: string | undefined): number {
   if (!cursor) return 0;
   const decoded = /^[A-Za-z0-9_-]+$/.test(cursor)

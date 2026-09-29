@@ -673,11 +673,14 @@ function formatExpandedMsg(
   findMatch?: MatchFinder,
 ): MessageItem {
   const item = formatMsg(msg);
-  // formatMsg maps parts one to one, so index i is the source of item part i.
+  // Pair each formatted part with its source part by id, not position, so the
+  // self-recall redaction cannot mis-pair if formatMsg ever drops a part.
+  // (Today it maps one to one, so the pairing is the same either way.)
+  const sources = new Map(msg.parts.map((part) => [part.id, part]));
   return {
     ...item,
-    parts: item.parts.map((part, i) => {
-      const source = msg.parts[i];
+    parts: item.parts.map((part) => {
+      const source = sources.get(part.id);
       return truncateExpandedPart(
         part,
         budget,
