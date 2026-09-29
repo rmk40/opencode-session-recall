@@ -24,9 +24,11 @@ const boundaries = [
   {
     // The v1 history adapter is wired in by the v1 entry only; the core reads
     // history through the HistorySource seam and never depends on an adapter.
-    // (A future host/v1 entry module joins the exemption list.)
+    // `**/history/v1.js` catches the path from any depth (./, ../, ../../);
+    // `./v1.js` covers siblings inside src/history/. (A future host/v1 entry
+    // module joins the exemption list.)
     pattern: {
-      group: ["./history/v1.js", "../history/v1.js", "./v1.js"],
+      group: ["**/history/v1.js", "./v1.js"],
       message:
         "Only the v1 entry may import the v1 history adapter; read history through HistorySource.",
     },
