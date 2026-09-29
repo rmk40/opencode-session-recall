@@ -352,14 +352,16 @@ function encodeCursor(index: number): string {
   return Buffer.from(String(index)).toString("base64url");
 }
 
+/** Decode a fake cursor. A cursor this shim never issued rejects, as the real
+ *  server does (`packages/opencode/src/server/routes/instance/httpapi/
+ *  handlers/session.ts` answers BadRequest), rather than restarting at 0. */
 function decodeCursor(cursor: string | undefined): number {
   if (!cursor) return 0;
-  try {
-    const value = Number(Buffer.from(cursor, "base64url").toString("utf8"));
-    return Number.isFinite(value) && value >= 0 ? Math.floor(value) : 0;
-  } catch {
-    return 0;
-  }
+  const decoded = /^[A-Za-z0-9_-]+$/.test(cursor)
+    ? Buffer.from(cursor, "base64url").toString("utf8")
+    : "";
+  if (!/^\d+$/.test(decoded)) throw new Error(`Invalid message cursor: ${cursor}`);
+  return Number(decoded);
 }
 
 /** Slice one newest-first page from a chronological (oldest-first) bundle list. */
