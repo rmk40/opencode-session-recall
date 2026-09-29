@@ -5,6 +5,7 @@ import { join } from "node:path";
 import {
   createDistiller,
   type Distiller,
+  type DistillSignal,
   type DistillSync,
   type PollMeta,
 } from "../src/distill.js";
@@ -353,6 +354,18 @@ describe("v2 distiller freshness", () => {
   });
 });
 
+/** One poll as the distiller runs it: dispatch (here: return) the signals,
+ *  then commit the watermarks. */
+async function pollOnce(
+  sync: ReturnType<typeof createV2Sync>,
+  meta: PollMeta,
+): Promise<DistillSignal[]> {
+  const result = await sync.poll(meta);
+  expect(result.failures).toEqual([]);
+  result.commit();
+  return result.signals;
+}
+
 describe("v2 poll queries", () => {
   function memoryMeta(): PollMeta & { values: Map<string, string> } {
     const values = new Map<string, string>();
@@ -371,7 +384,7 @@ describe("v2 poll queries", () => {
     const sync = createV2Sync(reader, { sessionScanEveryMs: 0, yieldBetween: async () => {} });
     const meta = memoryMeta();
     meta.set(SESSION_WATERMARK_KEY, String(at - 10_000));
-    const signals = await sync.poll(meta);
+    const signals = await pollOnce(sync, meta);
     const metaIds = signals.filter((s) => s.type === "meta").map((s) => s.sessionID);
     expect(metaIds.sort()).toEqual(["ses_idle", "ses_null"]);
   });
@@ -390,12 +403,12 @@ describe("v2 poll queries", () => {
     });
     const meta = memoryMeta();
     meta.set(POLL_WATERMARK_KEY, String(at - 5_000));
-    const first = await sync.poll(meta);
+    const first = await pollOnce(sync, meta);
     expect(first.map((s) => s.sessionID)).toEqual(["ses_a"]);
     // A full page keeps the watermark and records its position.
     expect(meta.values.get(POLL_WATERMARK_KEY)).toBe(String(at - 5_000));
     expect(meta.values.get(POLL_CURSOR_KEY)).toBe(JSON.stringify([at - 3_000, "ses_a"]));
-    const second = await sync.poll(meta);
+    const second = await pollOnce(sync, meta);
     expect(second.map((s) => s.sessionID)).toEqual(["ses_b"]);
     expect(meta.values.get(POLL_WATERMARK_KEY)).toBe(String(at - 1_000));
     expect(meta.values.get(POLL_CURSOR_KEY)).toBe("");
@@ -411,7 +424,7 @@ describe("v2 poll queries", () => {
   ): Promise<string[]> {
     const seen = new Set<string>();
     for (let i = 0; i < max && want.some((id) => !seen.has(id)); i++) {
-      for (const signal of await sync.poll(meta)) {
+      for (const signal of await pollOnce(sync, meta)) {
         if (signal.type === type) seen.add(signal.sessionID);
       }
     }
@@ -466,6 +479,87 @@ describe("v2 poll queries", () => {
     expect(await sync.compare("ses_k", cp?.cursor)).toBe("grown");
   });
 
+  it("keeps draining a window from its position after downtime clamps the watermark", async () => {
+    const at = Date.now();
+    for (const id of ["ses_a", "ses_b", "ses_c"]) addSession(id, at - 120_000);
+    addRow("ses_a", "user", user("a", at - 60_000), at - 60_000);
+    addRow("ses_b", "user", user("b", at - 40_000), at - 40_000);
+    addRow("ses_c", "user", user("c", at - 1_000), at - 1_000);
+    // A window was mid-drain (after ses_a) when the service went down; the
+    // lookback now clamps the watermark past ses_b.
+    const sync = createV2Sync(reader, {
+      maxLookbackMs: 10_000,
+      overlapMs: 0,
+      sessionScanEveryMs: 1e12,
+      now: () => at,
+      yieldBetween: async () => {},
+    });
+    const meta = memoryMeta();
+    meta.set(POLL_WATERMARK_KEY, String(at - 90_000));
+    meta.set(POLL_CURSOR_KEY, JSON.stringify([at - 60_000, "ses_a"]));
+    const signals = await pollOnce(sync, meta);
+    expect(signals.map((s) => s.sessionID)).toEqual(["ses_b", "ses_c"]);
+  });
+
+  it("commits nothing until told to, and isolates a failing session scan", async () => {
+    const at = Date.now();
+    addSession("ses_a", at - 20_000);
+    addRow("ses_a", "user", user("a", at - 2_000), at - 2_000);
+    // A reader whose session_v2 scan throws; the message poll still works.
+    const failingScan: ReadOnlyDb = {
+      ...reader,
+      all: (sql, params) => {
+        if (/FROM session_v2/.test(sql) && /ORDER BY r/.test(sql)) throw new Error("scan broke");
+        return reader.all(sql, params);
+      },
+    };
+    const sync = createV2Sync(failingScan, {
+      overlapMs: 0,
+      sessionScanEveryMs: 0,
+      now: () => at,
+      yieldBetween: async () => {},
+    });
+    const meta = memoryMeta();
+    meta.set(POLL_WATERMARK_KEY, String(at - 5_000));
+    meta.set(SESSION_WATERMARK_KEY, String(at - 5_000));
+    const result = await sync.poll(meta);
+    expect(result.signals.map((s) => s.sessionID)).toEqual(["ses_a"]);
+    expect(result.failures).toEqual(["session scan: scan broke"]);
+    // Not yet committed: a crash before dispatch would re-read the window.
+    expect(meta.values.get(POLL_WATERMARK_KEY)).toBe(String(at - 5_000));
+    result.commit();
+    expect(meta.values.get(POLL_WATERMARK_KEY)).toBe(String(at - 2_000));
+    // The failed scan's window did not move.
+    expect(meta.values.get(SESSION_WATERMARK_KEY)).toBe(String(at - 5_000));
+  });
+
+  it("fails a full page that ends on a row without a key instead of repeating it", async () => {
+    // Unreachable with the real schema; forced here through the reader.
+    const keyless: ReadOnlyDb = {
+      ...reader,
+      all: (sql, params) =>
+        /FROM session_message/.test(sql) && /GROUP BY session_id/.test(sql)
+          ? [
+              { session_id: null, t: null },
+              { session_id: "ses_x", t: 1 },
+            ]
+          : reader.all(sql, params),
+    };
+    const sync = createV2Sync(keyless, {
+      pollSessionLimit: 1,
+      sessionScanEveryMs: 1e12,
+      yieldBetween: async () => {},
+    });
+    const meta = memoryMeta();
+    meta.set(POLL_WATERMARK_KEY, "1000");
+    const result = await sync.poll(meta);
+    expect(result.signals).toEqual([]);
+    expect(result.failures[0]).toMatch(/ended on a row without a key/);
+    result.commit();
+    expect(meta.values.get(POLL_WATERMARK_KEY)).toBe("1000");
+    expect(meta.values.get(POLL_CURSOR_KEY)).toBeUndefined();
+  });
+
   it("applies the overlap once on a first poll with no watermark", async () => {
     const at = Date.now();
     addSession("ses_old", at - 20_000);
@@ -479,7 +573,7 @@ describe("v2 poll queries", () => {
       now: () => at,
       yieldBetween: async () => {},
     });
-    const signals = await sync.poll(memoryMeta());
+    const signals = await pollOnce(sync, memoryMeta());
     expect(signals.map((s) => s.sessionID)).toEqual(["ses_new"]);
   });
 });

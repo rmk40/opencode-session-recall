@@ -168,13 +168,26 @@ export type PollMeta = {
  * while holding the lease, re-reads unsettled tails on every poll, and
  * removes cards whose session no longer exists at the end of a cold pass.
  */
+/**
+ * One poll's outcome. `commit` persists the watermarks and keyset positions
+ * the poll advanced; the distiller calls it only after dispatching `signals`,
+ * so a crash or a lost lease in between re-reads the window instead of
+ * skipping it. A window that failed contributes no signals and nothing to
+ * commit, and is named in `failures`; the other window's work stands.
+ */
+export type PollResult = {
+  signals: DistillSignal[];
+  commit(): void;
+  failures: string[];
+};
+
 export type DistillSync = {
   checkpoint(sessionID: string): Promise<DistillCheckpoint | null>;
   compare(sessionID: string, stored: string | null | undefined): Promise<TailChange>;
   /** Of `ids`, those the host no longer has. */
   missing(ids: string[]): Promise<string[]>;
   /** One poll: signals for sessions that changed since its watermarks. */
-  poll(meta: PollMeta): Promise<DistillSignal[]>;
+  poll(meta: PollMeta): Promise<PollResult>;
   readonly pollIntervalMs: number;
 };
 
@@ -1671,12 +1684,18 @@ export function createDistiller(options: DistillerOptions): Distiller {
       },
     };
     try {
-      const signals = await gate.runBackground(() => {
-        if (stopped || !leaseHeld) return Promise.resolve<DistillSignal[]>([]);
+      const result = await gate.runBackground(() => {
+        if (stopped || !leaseHeld) return Promise.resolve<PollResult | null>(null);
         return sync.poll(meta);
       });
-      if (stopped || !leaseHeld) return;
-      for (const signal of signals) dispatch(signal);
+      if (!result || stopped || !leaseHeld) return;
+      for (const signal of result.signals) dispatch(signal);
+      // Only now that every signal is dispatched may the windows move on.
+      result.commit();
+      for (const failure of result.failures) {
+        lastError = failure;
+        logMsg(`poll failed: ${failure}`);
+      }
       // Unsettled tails are re-read even when no row arrived.
       for (const sessionID of unsettled) scheduleReDistill(sessionID);
     } catch (error) {

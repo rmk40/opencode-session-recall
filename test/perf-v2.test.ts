@@ -295,7 +295,9 @@ describe.skipIf(!ENABLED)("perf: v2 event-loop stalls", () => {
         meta.set(SESSION_CURSOR_KEY, "");
         probe.reset();
         const pollStart = performance.now();
-        const signals = await sync.poll(meta);
+        const polled = await sync.poll(meta);
+        polled.commit();
+        const signals = polled.signals;
         results.pollMaxSliceMs = probe.max();
         results.pollTotalMs = performance.now() - pollStart;
         results.pollSignals = signals.length;

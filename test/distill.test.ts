@@ -2003,10 +2003,12 @@ describe("sync-host re-distill fan-out", () => {
       checkpoint: async () => null,
       compare: async () => "rewritten",
       missing: async () => [],
-      poll: async (): Promise<DistillSignal[]> => {
-        if (polled) return [];
+      poll: async () => {
+        const signals: DistillSignal[] = polled
+          ? []
+          : graph.sessions.map((s) => ({ type: "turn-ended", sessionID: s.id }));
         polled = true;
-        return graph.sessions.map((s) => ({ type: "turn-ended", sessionID: s.id }));
+        return { signals, commit: () => {}, failures: [] };
       },
       pollIntervalMs: 5,
     };
@@ -2056,7 +2058,7 @@ describe("sync-host unsettled retries", () => {
       checkpoint: async () => ({ cursor: "tail", settled: false }),
       compare: async () => "rewritten",
       missing: async () => [],
-      poll: async () => [],
+      poll: async () => ({ signals: [], commit: () => {}, failures: [] }),
       pollIntervalMs: 3,
     };
     const { db, store } = await freshStore();

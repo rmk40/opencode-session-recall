@@ -4,6 +4,7 @@ import type {
   DistillSignal,
   DistillSync,
   PollMeta,
+  PollResult,
   TailChange,
 } from "../distill.js";
 
@@ -34,6 +35,10 @@ import type {
  *   the watermark moves only once the window is drained. So a page that
  *   fills up (more changed sessions than the page limit, or many sharing one
  *   timestamp inside the overlap) always moves forward on the next poll.
+ *   Each window reads one page per turn: the message window one page per
+ *   poll, the session scan one page per `sessionScanEveryMs`. A poll returns
+ *   its watermark updates for the distiller to commit after it dispatched
+ *   the signals, and a failing window is isolated from the other.
  *
  * Every `session_message` statement binds `LIMIT ?`, reads happen one
  * statement at a time with a macrotask between them, and nothing here writes
@@ -289,6 +294,17 @@ export function createV2Sync(db: ReadOnlyDb, opts: V2SyncOptions = {}): DistillS
    * position clears. Every poll therefore moves forward, even when one
    * timestamp is shared by more rows than a page holds.
    */
+  type Page = { rows: Row[]; commit: Array<[string, string]> };
+
+  /**
+   * One page of a window: rows whose key `k` is past `mark - overlap` and past
+   * the persisted keyset position, ordered by `(k, id)`. A full page records
+   * its last key and leaves the watermark alone; a short page means the
+   * window is drained, so the watermark moves to the newest key seen and the
+   * position clears. Every poll therefore moves forward, even when one
+   * timestamp is shared by more rows than a page holds. The updates are
+   * returned, not written: the caller commits them after dispatch.
+   */
   async function page(
     meta: PollMeta,
     keys: { mark: string; pos: string },
@@ -296,84 +312,116 @@ export function createV2Sync(db: ReadOnlyDb, opts: V2SyncOptions = {}): DistillS
     limit: number,
     query: (lower: number, pos: KeysetPos | null, limit: number) => Row[],
     keyOf: (row: Row) => { t: number | null; id: string | null },
-  ): Promise<Row[]> {
+  ): Promise<Page> {
     const mark = watermark(meta, keys.mark, at);
     const pos = parsePos(meta.get(keys.pos));
+    // A clamped watermark (after long downtime) must not outrun a window that
+    // is still being drained: keep reading from the persisted position.
+    const lower = pos ? Math.min(mark - overlapMs, pos.t) : mark - overlapMs;
     await pause();
     // One row past the page tells a full page from a drained window.
-    const fetched = query(mark - overlapMs, pos, limit + 1);
+    const fetched = query(lower, pos, limit + 1);
     const rows = fetched.slice(0, limit);
     const last = rows.length > 0 ? keyOf(rows[rows.length - 1]!) : undefined;
-    if (fetched.length > limit && last && last.t !== null && last.id !== null) {
-      meta.set(keys.pos, JSON.stringify([last.t, last.id]));
-      return rows;
+    if (fetched.length > limit) {
+      // Unreachable: the message key is max(time_created) of a non-empty group
+      // (NOT NULL column) with a NOT NULL session_id, and the scan key is
+      // coalesced with a primary-key id. Should it ever happen, the window
+      // cannot be resumed or declared drained, so fail it rather than repeat
+      // or skip rows.
+      if (!last || last.t === null || last.id === null) {
+        throw new Error(`poll page for ${keys.mark} ended on a row without a key`);
+      }
+      return { rows, commit: [[keys.pos, JSON.stringify([last.t, last.id])]] };
     }
     const newest = last?.t ?? pos?.t ?? null;
-    meta.set(keys.mark, String(Math.max(mark, newest ?? mark)));
-    meta.set(keys.pos, "");
-    return rows;
+    return {
+      rows,
+      commit: [
+        [keys.mark, String(Math.max(mark, newest ?? mark))],
+        [keys.pos, ""],
+      ],
+    };
   }
 
-  async function poll(meta: PollMeta): Promise<DistillSignal[]> {
+  async function poll(meta: PollMeta): Promise<PollResult> {
     const signals: DistillSignal[] = [];
+    const updates: Array<[string, string]> = [];
+    const failures: string[] = [];
     const at = now();
 
     // New messages, through the time_created index.
-    const changed = await page(
-      meta,
-      { mark: POLL_WATERMARK_KEY, pos: POLL_CURSOR_KEY },
-      at,
-      pollSessionLimit,
-      (lower, pos, n) =>
-        db.all(
-          `SELECT session_id, max(time_created) AS t FROM session_message
-           WHERE time_created > ? GROUP BY session_id
-           ${pos ? "HAVING max(time_created) > ? OR (max(time_created) = ? AND session_id > ?)" : ""}
-           ORDER BY t ASC, session_id ASC LIMIT ?`,
-          pos ? [lower, pos.t, pos.t, pos.id, n] : [lower, n],
-        ),
-      (row) => ({ t: num(row.t), id: str(row.session_id) }),
-    );
-    for (const row of changed) {
-      const id = str(row.session_id);
-      if (id) signals.push({ type: "turn-ended", sessionID: id });
+    try {
+      const changed = await page(
+        meta,
+        { mark: POLL_WATERMARK_KEY, pos: POLL_CURSOR_KEY },
+        at,
+        pollSessionLimit,
+        (lower, pos, n) =>
+          db.all(
+            `SELECT session_id, max(time_created) AS t FROM session_message
+             WHERE time_created > ? GROUP BY session_id
+             ${pos ? "HAVING max(time_created) > ? OR (max(time_created) = ? AND session_id > ?)" : ""}
+             ORDER BY t ASC, session_id ASC LIMIT ?`,
+            pos ? [lower, pos.t, pos.t, pos.id, n] : [lower, n],
+          ),
+        (row) => ({ t: num(row.t), id: str(row.session_id) }),
+      );
+      for (const row of changed.rows) {
+        const id = str(row.session_id);
+        if (id) signals.push({ type: "turn-ended", sessionID: id });
+      }
+      updates.push(...changed.commit);
+    } catch (error) {
+      failures.push(`message poll: ${error instanceof Error ? error.message : String(error)}`);
     }
 
     // Metadata-only changes, through a bounded scan of session_v2.
     if (at - lastScanAt >= sessionScanEveryMs) {
       lastScanAt = at;
-      const expr = recency();
-      const sessions = await page(
-        meta,
-        { mark: SESSION_WATERMARK_KEY, pos: SESSION_CURSOR_KEY },
-        at,
-        sessionScanLimit,
-        (lower, pos, n) =>
-          db.all(
-            `SELECT id, title, directory, project_id, ${expr} AS r FROM session_v2
-             WHERE ${expr} > ?
-             ${pos ? `AND (${expr} > ? OR (${expr} = ? AND id > ?))` : ""}
-             ORDER BY r ASC, id ASC LIMIT ?`,
-            pos ? [lower, pos.t, pos.t, pos.id, n] : [lower, n],
-          ),
-        (row) => ({ t: num(row.r), id: str(row.id) }),
-      );
-      for (const row of sessions) {
-        const id = str(row.id);
-        if (!id) continue;
-        signals.push({
-          type: "meta",
-          sessionID: id,
-          patch: {
-            title: str(row.title) ?? "",
-            ...(str(row.directory) !== null && { directory: str(row.directory) ?? "" }),
-            ...(str(row.project_id) !== null && { projectId: str(row.project_id) ?? "" }),
-          },
-        });
-        signals.push({ type: "turn-ended", sessionID: id });
+      try {
+        const expr = recency();
+        const sessions = await page(
+          meta,
+          { mark: SESSION_WATERMARK_KEY, pos: SESSION_CURSOR_KEY },
+          at,
+          sessionScanLimit,
+          (lower, pos, n) =>
+            db.all(
+              `SELECT id, title, directory, project_id, ${expr} AS r FROM session_v2
+               WHERE ${expr} > ?
+               ${pos ? `AND (${expr} > ? OR (${expr} = ? AND id > ?))` : ""}
+               ORDER BY r ASC, id ASC LIMIT ?`,
+              pos ? [lower, pos.t, pos.t, pos.id, n] : [lower, n],
+            ),
+          (row) => ({ t: num(row.r), id: str(row.id) }),
+        );
+        for (const row of sessions.rows) {
+          const id = str(row.id);
+          if (!id) continue;
+          signals.push({
+            type: "meta",
+            sessionID: id,
+            patch: {
+              title: str(row.title) ?? "",
+              ...(str(row.directory) !== null && { directory: str(row.directory) ?? "" }),
+              ...(str(row.project_id) !== null && { projectId: str(row.project_id) ?? "" }),
+            },
+          });
+          signals.push({ type: "turn-ended", sessionID: id });
+        }
+        updates.push(...sessions.commit);
+      } catch (error) {
+        failures.push(`session scan: ${error instanceof Error ? error.message : String(error)}`);
       }
     }
-    return signals;
+    return {
+      signals,
+      failures,
+      commit: () => {
+        for (const [key, value] of updates) meta.set(key, value);
+      },
+    };
   }
 
   return { checkpoint, compare, missing, poll, pollIntervalMs };
