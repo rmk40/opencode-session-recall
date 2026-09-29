@@ -695,6 +695,11 @@ export function createDistiller(options: DistillerOptions): Distiller {
   let coldPassPromise: Promise<void> | undefined;
   const inFlight = new Map<string, Promise<void>>();
   const pendingRerun = new Set<string>();
+  /** Sync hosts only: sessions waiting for a re-distill slot. A poll can
+   *  signal hundreds of sessions at once; at most `distillConcurrency`
+   *  re-distills run at a time and the rest wait here, in signal order. */
+  const reDistillQueue = new Set<string>();
+  const reDistillWidth = Math.max(1, Math.floor(limits.distillConcurrency));
   const quarantined = new Map<string, number>();
   let stopPromise: Promise<void> | undefined;
   /** Sessions that saw a removal-shaped event since their last full distill, so
@@ -1386,11 +1391,27 @@ export function createDistiller(options: DistillerOptions): Distiller {
       pendingRerun.add(sessionID); // coalesce: run once more after the in-flight pass
       return;
     }
+    // A sync host bounds incremental re-distills (v1 keeps its unbounded,
+    // event-paced behavior).
+    if (sync && inFlight.size >= reDistillWidth) {
+      reDistillQueue.add(sessionID);
+      return;
+    }
     const running = runReDistill(sessionID).finally(() => {
       inFlight.delete(sessionID);
       if (!stopped && pendingRerun.delete(sessionID)) scheduleReDistill(sessionID);
+      drainReDistillQueue();
     });
     inFlight.set(sessionID, running);
+  }
+
+  function drainReDistillQueue(): void {
+    while (!stopped && leaseHeld && reDistillQueue.size > 0 && inFlight.size < reDistillWidth) {
+      const next = reDistillQueue.values().next().value;
+      if (next === undefined) return;
+      reDistillQueue.delete(next);
+      startReDistill(next);
+    }
   }
 
   async function runReDistill(sessionID: string): Promise<void> {
@@ -1464,6 +1485,7 @@ export function createDistiller(options: DistillerOptions): Distiller {
     removalSince.delete(sessionID);
     quarantined.delete(sessionID);
     unsettled.delete(sessionID);
+    reDistillQueue.delete(sessionID);
     if (rootId && rootId !== sessionID) recomputeRootRollup(rootId);
   }
 
@@ -1613,6 +1635,7 @@ export function createDistiller(options: DistillerOptions): Distiller {
     for (const timer of debounceTimers.values()) clearTimeout(timer);
     debounceTimers.clear();
     pendingRerun.clear();
+    reDistillQueue.clear();
     // Wake any inter-page politeness sleep immediately: with a long
     // distillDelayMs those timers would otherwise keep the runtime alive past
     // dispose. The woken fetch loop bails on its stopped check.

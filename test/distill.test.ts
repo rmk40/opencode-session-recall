@@ -14,6 +14,8 @@ import {
   resolveRootId,
   type DeriveCardInput,
   type DistillSessionMeta,
+  type DistillSignal,
+  type DistillSync,
 } from "../src/distill.js";
 import type { HistorySource } from "../src/history/source.js";
 import { createV1HistorySource } from "../src/history/v1.js";
@@ -1835,6 +1837,69 @@ describe("incremental", () => {
 });
 
 // ── Degraded mode ────────────────────────────────────────────────────────────
+
+describe("sync-host re-distill fan-out", () => {
+  it("runs at most distillConcurrency re-distills at once for a 500-session poll", async () => {
+    const graph: Graph = { sessions: [], messagesBySession: {} };
+    for (let i = 0; i < 500; i++) {
+      const id = `s${i}`;
+      graph.sessions.push(session(id, `Session ${i}`, PROJECT_DIR, 1_000 + i));
+      graph.messagesBySession[id] = [
+        bundle(userMessage(`m${i}`, id, 100), [textPart(`p${i}`, id, `m${i}`, `text ${i}`)]),
+      ];
+    }
+    const { source: inner } = makeDistillFake(graph);
+    // Count re-distills from their first read (the session lookup) to their
+    // last (the message page), which is held briefly so they overlap.
+    let active = 0;
+    let peak = 0;
+    let finished = 0;
+    const source: HistorySource = {
+      ...inner,
+      getSession: async (id, o) => {
+        active++;
+        peak = Math.max(peak, active);
+        return inner.getSession(id, o);
+      },
+      messagePage: async (o) => {
+        await new Promise((resolve) => setTimeout(resolve, 2));
+        const page = await inner.messagePage(o);
+        active--;
+        finished++;
+        return page;
+      },
+    };
+    let polled = false;
+    const sync: DistillSync = {
+      checkpoint: async () => null,
+      compare: async () => "rewritten",
+      missing: async () => [],
+      poll: async (): Promise<DistillSignal[]> => {
+        if (polled) return [];
+        polled = true;
+        return graph.sessions.map((s) => ({ type: "turn-ended", sessionID: s.id }));
+      },
+      pollIntervalMs: 5,
+    };
+    const { db, store } = await freshStore();
+    const distiller = createDistiller({
+      source,
+      store,
+      // A wide gate, so only the distiller's own bound can hold concurrency down.
+      gate: createFetchGate({ concurrency: 1_000 }),
+      limits: { ...TEST_LIMITS, coldPass: false, distillConcurrency: 3 },
+      instanceId: "fanout",
+      sync,
+      idleDebounceMs: 1,
+    });
+    distiller.start();
+    await waitFor(() => finished === 500, 10_000);
+    expect(peak).toBeGreaterThan(1);
+    expect(peak).toBeLessThanOrEqual(3);
+    await distiller.stop();
+    db.close();
+  });
+});
 
 describe("null store", () => {
   it("is a clean no-op with no lease and idle status", () => {
