@@ -56,6 +56,8 @@ import type { Store, FtsHit, Card } from "./store.js";
 import type { FetchGate } from "./fetch-gate.js";
 import { fetchMessageWindow, type FetchRunner } from "./fetch-window.js";
 import type { HistoryMessage } from "./history/model.js";
+import type { HistorySource } from "./history/source.js";
+import { createV1HistorySource } from "./history/v1.js";
 
 /** The embedder as the search path consumes it: the cache-facing surface plus
  *  the init error, so the one-time "unavailable" warning can explain why. */
@@ -1217,6 +1219,7 @@ const MAX_EXPAND_CONTEXT_FETCH = 200;
 async function expandSearchResults(
   results: SearchResult[],
   client: OpencodeClient,
+  source: HistorySource,
   gate: FetchGate,
   limits: Limits,
   mode: ExpandMode,
@@ -1290,7 +1293,7 @@ async function expandSearchResults(
     }
 
     const win = await fetchMessageWindow(
-      client,
+      source,
       {
         sessionID: result.sessionID,
         messageID: result.messageID,
@@ -1766,6 +1769,8 @@ export function search(
   deps: SearchDeps,
 ): ToolDefinition {
   const { cards, drill, store, gate, mode, maybeRefresh } = deps;
+  // Interim: this tool still takes clients until its own seam commit.
+  const source = createV1HistorySource({ scoped: client, unscoped });
   return tool({
     description: `Search prior opencode conversations by message/tool-output content. Primary history-discovery tool; prefer over recall_sessions for topical discovery (titles only).
 
@@ -3271,6 +3276,7 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
           const expansion = await expandSearchResults(
             final,
             client,
+            source,
             gate,
             limits,
             expandMode,

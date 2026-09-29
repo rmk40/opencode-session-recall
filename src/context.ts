@@ -10,6 +10,7 @@ import {
 } from "./types.js";
 import { formatMsg } from "./extract.js";
 import { fetchMessageWindow } from "./fetch-window.js";
+import { createV1HistorySource } from "./history/v1.js";
 import type { FetchGate } from "./fetch-gate.js";
 
 /** Never fetch more than this many messages while locating a context window —
@@ -17,6 +18,8 @@ import type { FetchGate } from "./fetch-gate.js";
 const MAX_CONTEXT_FETCH = 200;
 
 export function context(client: OpencodeClient, gate: FetchGate, limits: Limits): ToolDefinition {
+  // Interim: this tool still takes a client until its own seam commit.
+  const source = createV1HistorySource({ scoped: client, unscoped: client });
   return tool({
     description: `Get messages around a recall hit to see what was asked before, what happened after, and whether the approach worked. Use recall_get for only the single message.
 
@@ -67,7 +70,7 @@ If memory exists, store only durable findings surfaced here; skip ephemeral deta
           Math.max(nb + na + 1, Math.min(25, limits.maxMessages)),
         );
         const window = await fetchMessageWindow(
-          client,
+          source,
           {
             sessionID,
             messageID,

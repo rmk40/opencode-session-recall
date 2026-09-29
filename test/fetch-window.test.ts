@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import type { OpencodeClient } from "@opencode-ai/sdk/v2";
 import { fetchMessageWindow } from "../src/fetch-window.js";
+import type { HistorySource } from "../src/history/source.js";
+import { createV1HistorySource } from "../src/history/v1.js";
 import {
   bundle,
   messagesResponse,
@@ -12,8 +14,8 @@ import {
 
 type MessageBundle = FakeHarness["messagesBySession"][string][number];
 
-function fakeClient(all: MessageBundle[]): OpencodeClient {
-  return {
+function fakeSource(all: MessageBundle[]): HistorySource {
+  const client = {
     session: {
       messages: async (p: { sessionID: string; limit?: number; before?: string }) => {
         const { items, nextCursor } = paginateBundles(all, p.limit ?? all.length, p.before);
@@ -21,6 +23,7 @@ function fakeClient(all: MessageBundle[]): OpencodeClient {
       },
     },
   } as unknown as OpencodeClient;
+  return createV1HistorySource({ scoped: client, unscoped: client });
 }
 
 describe("fetchMessageWindow cap adherence", () => {
@@ -34,7 +37,7 @@ describe("fetchMessageWindow cap adherence", () => {
       ]),
     );
 
-    const win = await fetchMessageWindow(fakeClient(all), {
+    const win = await fetchMessageWindow(fakeSource(all), {
       sessionID: "s",
       messageID: "m-0",
       before: 5,
@@ -57,7 +60,7 @@ describe("fetchMessageWindow cap adherence", () => {
       ]),
     );
 
-    const win = await fetchMessageWindow(fakeClient(all), {
+    const win = await fetchMessageWindow(fakeSource(all), {
       sessionID: "s",
       messageID: "m-249", // newest
       before: 2,

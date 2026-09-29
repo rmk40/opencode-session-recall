@@ -1,7 +1,6 @@
-import type { OpencodeClient } from "@opencode-ai/sdk/v2";
 import { errmsg } from "./types.js";
-import { fetchMessagePage } from "./distill.js";
 import { compareMessages, type HistoryMessage } from "./history/model.js";
+import type { HistorySource } from "./history/source.js";
 
 // Re-export the bounded page primitive so the browse tools have a single
 // pagination entry point (they never call the unpaginated `session.messages`).
@@ -59,12 +58,12 @@ export type MessageWindowOptions = {
 
 /**
  * Fetch a bounded window of messages around `messageID`. Pages newest-first via
- * {@link fetchMessagePage} (always with a `limit`) until the target plus
+ * {@link HistorySource.messagePage} (always with a `limit`) until the target plus
  * `before` older neighbors are covered, the session ends, or the message cap is
  * reached — never an unbounded fetch.
  */
 export async function fetchMessageWindow(
-  client: OpencodeClient,
+  source: HistorySource,
   opts: MessageWindowOptions,
   run: FetchRunner = directRunner,
 ): Promise<MessageWindow> {
@@ -84,7 +83,7 @@ export async function fetchMessageWindow(
     let page;
     try {
       page = await run(() =>
-        fetchMessagePage(client, { sessionID: opts.sessionID, limit, before: cursor }),
+        source.messagePage({ sessionID: opts.sessionID, limit, before: cursor }),
       );
     } catch (error) {
       loadError = errmsg(error);
