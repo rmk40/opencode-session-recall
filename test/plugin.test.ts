@@ -378,13 +378,20 @@ describe("plugin entry", () => {
         storePath: join(dir, "recall.db"),
         coldPass: true,
       });
-      await new Promise((resolve) => setTimeout(resolve, 50));
-      const out = JSON.parse(
-        (await mustTool(hooks.tool?.recall).execute(
-          { query: "anything", scope: "global" },
-          makeContext().ctx,
-        )) as string,
-      );
+      const recall = async () =>
+        JSON.parse(
+          (await mustTool(hooks.tool?.recall).execute(
+            { query: "anything", scope: "global" },
+            makeContext().ctx,
+          )) as string,
+        );
+      // Poll until discovery has finished, rather than sleeping a fixed time.
+      let out = await recall();
+      for (const start = Date.now(); out.coverage.cards.indexing?.known !== 2; ) {
+        if (Date.now() - start > 10_000) throw new Error("discovery never finished");
+        await new Promise((resolve) => setTimeout(resolve, 5));
+        out = await recall();
+      }
       expect(out.coverage.cards.indexing).toEqual({ examined: 0, known: 2 });
       expect(out.warnings).toContain(
         "Indexing in progress: 0 of 2 sessions checked so far; older history may be missing.",
