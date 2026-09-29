@@ -696,6 +696,21 @@ function readStampedIdentity(db: SqliteDb): { host?: string; source?: string } {
 }
 
 /**
+ * The host and source a store file is stamped with, read without migrating,
+ * rebuilding or writing anything (a missing `meta` table reads as no stamp).
+ * Lets an opener learn which exact source string {@link openStore} would
+ * accept before it opens the store. Never throws: an unreadable file reads
+ * as no stamp.
+ */
+export function peekStoreIdentity(db: SqliteDb): { host?: string; source?: string } {
+  try {
+    return readStampedIdentity(db);
+  } catch {
+    return {};
+  }
+}
+
+/**
  * The host fence for a store at a known schema version. A pre-fence store
  * (`legacy`, schema 1-3) implies {@link LEGACY_HOST}; a v4 store must carry an
  * exact host stamp (a missing or unknown one is refused, never guessed). Source

@@ -2,6 +2,7 @@ import { createFetchGate, type FetchGate } from "../fetch-gate.js";
 import { openSqlite, type ReadOnlyDb, type SqliteDb } from "../sqlite.js";
 import {
   openStore,
+  peekStoreIdentity,
   defaultStorePath,
   pluginBuild,
   SEMANTIC_MODEL_KEY,
@@ -132,6 +133,62 @@ async function realFilePath(path: string): Promise<string> {
   }
 }
 
+/** A file's logical path: its real directory plus its name, for a file that
+ *  cannot itself be canonicalized (missing, or unreadable under a runtime
+ *  whose realpath opens the file). `fallback` when the directory cannot be
+ *  resolved either. */
+async function logicalFilePath<F>(path: string, fallback: F): Promise<string | F> {
+  try {
+    const p = await loadPath();
+    const resolved = p.resolve(path);
+    const dir = await tryRealPath(p.dirname(resolved));
+    return dir === null ? fallback : p.resolve(dir, p.basename(resolved));
+  } catch {
+    return fallback;
+  }
+}
+
+/** Whether a file exists, without creating it (opening SQLite would). */
+async function fileExists(path: string): Promise<boolean> {
+  try {
+    const fs = await loadFs();
+    await fs.promises.stat(path);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The card-only fallback for a source path that cannot be canonicalized:
+ * open an EXISTING store, but only when its stamped `source_db` names the
+ * same file (both compared as real directory plus name). The store is opened
+ * with the stamped string as its source identity, so the exact-string fence
+ * matches and nothing is stamped; the caller must not distill into it.
+ * Null (and nothing created or written) in every other case.
+ */
+async function openStampedStore(
+  storePath: string,
+  located: string,
+): Promise<{ db: SqliteDb; store: Store; stamped: string } | null> {
+  if (storePath === ":memory:") return null;
+  const logical = await logicalFilePath(located, null);
+  if (logical === null || !(await fileExists(storePath))) return null;
+  const db = await openSqlite(storePath);
+  if (!db) return null;
+  const stamped = peekStoreIdentity(db);
+  if (
+    stamped.host === STORE_HOST &&
+    stamped.source !== undefined &&
+    (await logicalFilePath(stamped.source, stamped.source)) === logical
+  ) {
+    const opened = openStore(db, { host: STORE_HOST, source: stamped.source });
+    if (opened.ok) return { db, store: opened.store, stamped: stamped.source };
+  }
+  closeQuietly(db);
+  return null;
+}
+
 /** Close a handle, swallowing errors (a failed close must not reject dispose). */
 function closeQuietly(db: Pick<SqliteDb, "close"> | null): void {
   try {
@@ -241,13 +298,26 @@ async function createV2Runtime(
   // canonicalized, means no store: the file is not even opened, so nothing
   // is stamped with a spelling a later run would refuse. (So an unresolvable
   // source, `:memory:` or an empty override, loses the card tier as well;
-  // see createUnavailableSource.)
+  // see createUnavailableSource.) One exception keeps the card tier when
+  // opencode.db is missing or unreadable: an existing store stamped for the
+  // same file is opened for cards only, never stamped or distilled into.
   let store: Store | null = null;
   let db: SqliteDb | null = null;
+  /** The store was opened read-for-cards through the stamped source. */
+  let cardsOnly = false;
   if (identity.store !== null && identity.source !== null && identity.sourceCanonical !== true) {
-    log(
-      `opencode database path ${identity.source} could not be canonicalized; running degraded without a store`,
-    );
+    const fallback = await openStampedStore(identity.store, identity.source);
+    if (fallback) {
+      ({ db, store } = fallback);
+      cardsOnly = true;
+      log(
+        `opencode database path ${identity.source} could not be canonicalized; serving cards from the store stamped for ${fallback.stamped}, without distilling`,
+      );
+    } else {
+      log(
+        `opencode database path ${identity.source} could not be canonicalized; running degraded without a store`,
+      );
+    }
   } else if (identity.store !== null && identity.source !== null) {
     db = await openSqlite(identity.store);
     if (db) {
@@ -346,8 +416,9 @@ async function createV2Runtime(
   const macrotask = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0));
   const distiller = createDistiller({
     source: globalSource,
-    // No history, no distilling: the distiller does not start.
-    store: opencodeDb ? store : null,
+    // No history, no distilling: the distiller does not start. Nor for a
+    // store opened for cards only: its source path is not canonical.
+    store: opencodeDb && !cardsOnly ? store : null,
     gate,
     limits,
     instanceId,

@@ -31,6 +31,9 @@ All notable changes to this project are documented here. This project follows
   - When `opencode.db` cannot be read, responses say why in
     `coverage.source`, `recall` answers from the session cards alone,
     and the message-reading tools return the reason as their error.
+    That holds when the file is missing or its path cannot be resolved
+    too: a store stamped for the same file is opened for its cards,
+    without being re-stamped or distilled into.
   - `autoRecall`, `compactionRecall` and `summaries` are not available yet;
     enabling one logs a line and changes nothing.
   - Plugin output goes to `~/.cache/opencode-session-recall/recall.log`
