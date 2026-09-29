@@ -510,6 +510,20 @@ describe("v2 tools and hooks", () => {
     expect((out.results as Array<{ sessionID: string }>)[0]?.sessionID).toBe("ses_a");
   });
 
+  it("wires the distiller's indexing progress into recall", async () => {
+    const h = host();
+    await setup(h);
+    const runtime = await runtimeOf(h);
+    expect(runtime.deps.indexing?.()).toBeUndefined();
+    vi.spyOn(runtime.distiller, "indexing").mockReturnValue({ examined: 1, known: 5 });
+    const out = await call(h, "recall", { query: "orchidneedle", scope: "global" }, "ses_new");
+    expect((out.coverage as { cards: { indexing?: unknown } }).cards.indexing).toEqual({
+      examined: 1,
+      known: 5,
+    });
+    expect((out.warnings as string[]).some((w) => w.startsWith("Indexing in progress"))).toBe(true);
+  });
+
   it("ephemeral mode serves cards-lite from session_v2 and drills content live", async () => {
     const h = host({ options: { mode: "ephemeral" } });
     await setup(h);

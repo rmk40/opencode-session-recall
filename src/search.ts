@@ -94,8 +94,8 @@ export type SearchDeps = {
    *  query entry (search tool and card-tier hook path) so the metadata
    *  snapshot lazily self-heals. See lite-refresh.ts. */
   maybeRefresh?: () => void;
-  /** The cold pass's progress while it runs (both hosts wire the distiller
-   *  here); absent means no pass is known to be running. */
+  /** The cold pass's progress while it builds an incomplete store (both
+   *  hosts wire `Distiller.indexing` here); absent means none to report. */
   indexing?: IndexingStatus;
 };
 

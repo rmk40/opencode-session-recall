@@ -159,9 +159,11 @@ export type SearchCoverage = {
     full: number;
     storeRecency: number;
     degraded: boolean;
-    /** Present while the distiller's cold pass is running: how many of the
-     *  sessions it discovered it has examined so far (`known` is 0 until
-     *  discovery finishes). Cards for the rest may be missing or stale. */
+    /** Present while the distiller's cold pass is building a store that is
+     *  not complete yet (no pass has completed on it, and it has fewer cards
+     *  than sessions): how many of the sessions it discovered it has checked
+     *  so far (`known` is 0 until discovery finishes). Cards for the rest may
+     *  be missing. A re-verify pass over a complete store reports nothing. */
     indexing?: IndexingProgress;
   };
   /** Present only when the semantic layer is configured on. `ready` is the
@@ -410,7 +412,8 @@ export type SessionItem = {
 /** A running cold pass's progress (see {@link IndexingStatus}). */
 export type IndexingProgress = { examined: number; known: number };
 
-/** Reads the cold pass's progress: undefined unless a pass is running. */
+/** Reads the cold pass's progress: undefined unless a pass is building an
+ *  incomplete store (see `Distiller.indexing`). */
 export type IndexingStatus = () => IndexingProgress | undefined;
 
 /** The warning for a query answered while the cold pass is still running. */
@@ -436,8 +439,8 @@ export type SessionsOutput = {
    *  filter that could only be applied within the newest-limit window because no
    *  card store was available to resolve older sessions authoritatively. */
   note?: string;
-  /** Present while the distiller's cold pass is running (see
-   *  `SearchCoverage.cards.indexing`); the note then says so too. */
+  /** Present while the distiller's cold pass is building an incomplete store
+   *  (see `SearchCoverage.cards.indexing`); the note then says so too. */
   indexing?: IndexingProgress;
 };
 

@@ -1,5 +1,5 @@
 import type { Part } from "@opencode-ai/sdk/v2";
-import { errmsg, DISCOVERY_LIMIT, type Limits } from "./types.js";
+import { errmsg, DISCOVERY_LIMIT, type IndexingProgress, type Limits } from "./types.js";
 import { compareMessages, type HistoryMessage, type HistorySession } from "./history/model.js";
 import { MalformedSessionError, type HistorySource } from "./history/source.js";
 import type { Card, FamilyRollup, LeaseInfo, PartTextRow, Store } from "./store.js";
@@ -124,14 +124,9 @@ export type DeriveCardInput = {
  *  to {@link Store.replaceSessionParts}. */
 export type DerivedCard = { card: Card; rows: PartTextRow[] };
 
-/** A distiller status as cold-pass progress: only while a pass runs. */
-export function coldPassProgress(
-  status: DistillStatus,
-): { examined: number; known: number } | undefined {
-  return status.coldPass === "running"
-    ? { examined: status.examinedCount, known: status.knownCount }
-    : undefined;
-}
+/** Meta key stamped `"1"` when a cold pass first completes on a store. A
+ *  rebuild drops `meta`, so a rebuilt store starts without it. */
+export const COLD_PASS_COMPLETE_KEY = "coldpass_complete";
 
 export type DistillStatus = {
   leaseHeld: boolean;
@@ -247,6 +242,17 @@ export type Distiller = {
   stop(): Promise<void>;
   onEvent(signal: DistillSignal): void;
   status(): DistillStatus;
+  /**
+   * The cold pass's progress, for queries to report, while the store is
+   * really incomplete: a pass is running, no pass has ever completed on this
+   * store ({@link COLD_PASS_COMPLETE_KEY}), and it knows of more sessions
+   * than the store has cards (while it is still discovering: only while the
+   * store has no card at all). Undefined otherwise, so a re-verify pass over
+   * a complete store on every restart reports nothing. Only the lease holder
+   * runs a cold pass, so only it ever reports progress; other processes
+   * answering from the same store report none.
+   */
+  indexing(): IndexingProgress | undefined;
 };
 
 export type DistillerOptions = {
@@ -814,9 +820,12 @@ export function createDistiller(options: DistillerOptions): Distiller {
       async stop() {},
       onEvent() {},
       status: noopStatus,
+      indexing: () => undefined,
     };
   }
   const store: Store = options.store;
+  /** Whether a cold pass has ever completed on this store (any process). */
+  let indexComplete = store.getMeta(COLD_PASS_COMPLETE_KEY) === "1";
 
   const log = options.log;
   const now = options.now ?? Date.now;
@@ -1395,6 +1404,8 @@ export function createDistiller(options: DistillerOptions): Distiller {
     examinedCount = 0;
     knownCount = 0;
     lastError = undefined;
+    // Another process may have completed a pass since this one last looked.
+    indexComplete ||= store.getMeta(COLD_PASS_COMPLETE_KEY) === "1";
     logMsg("cold pass started");
     /** Sessions whose fetch failed this pass, retried once at its end. Also
      *  what an outage abort charges a strike to (see the catch below). */
@@ -1611,6 +1622,10 @@ export function createDistiller(options: DistillerOptions): Distiller {
         return;
       }
       coldPassState = "done";
+      if (!indexComplete) {
+        indexComplete = true;
+        store.setMeta(COLD_PASS_COMPLETE_KEY, "1"); // lease verified just above
+      }
       logMsg(
         `cold pass done (${distilled} distilled / ${examined} examined / ${knownCount} known)`,
       );
@@ -2071,6 +2086,13 @@ export function createDistiller(options: DistillerOptions): Distiller {
     onEvent(signal: DistillSignal): void {
       if (stopped) return;
       dispatch(signal);
+    },
+
+    indexing(): IndexingProgress | undefined {
+      if (coldPassState !== "running" || indexComplete) return undefined;
+      const cards = store.cardCount();
+      if (knownCount === 0) return cards === 0 ? { examined: 0, known: 0 } : undefined;
+      return knownCount > cards ? { examined: examinedCount, known: knownCount } : undefined;
     },
 
     status(): DistillStatus {

@@ -23,7 +23,8 @@ import { unavailableHistoryError, type HistorySource } from "./history/source.js
  *  fetch. Undefined in degraded mode (no store), where listings stay bare. */
 export type SessionEnrichment = {
   cards(): Card[];
-  /** The cold pass's progress while it runs (see SearchDeps.indexing). */
+  /** The cold pass's progress while it builds an incomplete store (see
+   *  SearchDeps.indexing). */
   indexing?: IndexingStatus;
 };
 

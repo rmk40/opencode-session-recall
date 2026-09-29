@@ -7,6 +7,7 @@ import { openSqlite, type Row, type SqliteDb } from "../src/sqlite.js";
 import { type Card, type Store } from "../src/store.js";
 import { createFetchGate, type FetchGate } from "../src/fetch-gate.js";
 import {
+  COLD_PASS_COMPLETE_KEY,
   createDistiller,
   type Distiller,
   deriveCard,
@@ -2520,5 +2521,156 @@ describe("null store", () => {
       skippedCount: 0,
       failingCount: 0,
     });
+  });
+});
+
+describe("cold-pass progress reporting", () => {
+  /** A yieldBetween that holds the pass while `held` is true. */
+  function holdable(): { pause: () => Promise<void>; hold: (on: boolean) => void } {
+    let held = false;
+    let waiters: Array<() => void> = [];
+    return {
+      pause: () =>
+        held ? new Promise<void>((resolve) => waiters.push(resolve)) : Promise.resolve(),
+      hold: (on) => {
+        held = on;
+        if (!on) {
+          for (const wake of waiters) wake();
+          waiters = [];
+        }
+      },
+    };
+  }
+
+  function twoSessions(): Graph {
+    return {
+      sessions: [session("s1", "One", PROJECT_DIR, 2000), session("s2", "Two", PROJECT_DIR, 1000)],
+      messagesBySession: {
+        s1: [bundle(userMessage("m1", "s1", 100), [textPart("p1", "s1", "m1", "one")])],
+        s2: [bundle(userMessage("m2", "s2", 100), [textPart("p2", "s2", "m2", "two")])],
+      },
+    };
+  }
+
+  it("reports progress on a first build, stamps completion, and stays quiet on a warm restart", async () => {
+    const graph = twoSessions();
+    const { source } = makeDistillFake(graph);
+    const { db, store } = await freshStore();
+    const gate = holdable();
+    const make = (instanceId: string) =>
+      createDistiller({
+        source,
+        store,
+        gate: makeSpyGate().gate,
+        limits: { ...TEST_LIMITS, distillConcurrency: 1 },
+        instanceId,
+        yieldBetween: gate.pause,
+        log: () => {},
+      });
+
+    gate.hold(true);
+    const first = make("first-build");
+    first.start();
+    await waitFor(() => first.status().knownCount === 2);
+    expect(first.indexing()).toEqual({ examined: 0, known: 2 });
+    gate.hold(false);
+    await waitFor(() => first.status().coldPass === "done");
+    expect(first.indexing()).toBeUndefined();
+    expect(store.getMeta(COLD_PASS_COMPLETE_KEY)).toBe("1");
+    await first.stop();
+
+    // A restart re-verifies the complete store: running, but nothing to report.
+    gate.hold(true);
+    const warm = make("warm-restart");
+    warm.start();
+    await waitFor(() => warm.status().knownCount === 2);
+    expect(warm.status().coldPass).toBe("running");
+    expect(warm.indexing()).toBeUndefined();
+    gate.hold(false);
+    await warm.stop();
+    db.close();
+  });
+
+  it("reports nothing over an unstamped store that already has every card", async () => {
+    // A store from before the completion stamp: the card count shows it is
+    // complete, even while discovery is still running.
+    const graph = twoSessions();
+    const { source } = makeDistillFake(graph);
+    const { db, store } = await freshStore();
+    const built = createDistiller({
+      source,
+      store,
+      gate: makeSpyGate().gate,
+      limits: TEST_LIMITS,
+      instanceId: "prebuilt",
+      log: () => {},
+    });
+    built.start();
+    await waitFor(() => built.status().coldPass === "done");
+    await built.stop();
+    db.run("DELETE FROM meta WHERE key = ?", [COLD_PASS_COMPLETE_KEY]);
+
+    let releaseDiscovery!: () => void;
+    const discovering = new Promise<void>((resolve) => (releaseDiscovery = resolve));
+    const gate = holdable();
+    gate.hold(true);
+    const restarted = createDistiller({
+      source,
+      store,
+      gate: makeSpyGate().gate,
+      limits: { ...TEST_LIMITS, distillConcurrency: 1 },
+      instanceId: "unstamped",
+      discover: async () => {
+        await discovering;
+        const listing = await source.listSessions({ scope: "project", limit: 100 });
+        if (!listing.ok) throw new Error(listing.error);
+        return listing.items;
+      },
+      yieldBetween: gate.pause,
+      log: () => {},
+    });
+    restarted.start();
+    await waitFor(() => restarted.status().coldPass === "running");
+    expect(restarted.indexing()).toBeUndefined(); // discovering, cards present
+    releaseDiscovery();
+    await waitFor(() => restarted.status().knownCount === 2);
+    expect(restarted.indexing()).toBeUndefined(); // 2 known, 2 cards
+    gate.hold(false);
+    await restarted.stop();
+    db.close();
+  });
+
+  it("starts a later pass's progress from zero, not the last pass's counts", async () => {
+    const graph = twoSessions();
+    // s2 fails its fetch and its retry, so a follow-up pass runs.
+    const { source } = makeDistillFake(graph, { failTimes: { s2: 2 } });
+    const { db, store } = await freshStore();
+    let discoveries = 0;
+    let releaseSecond!: () => void;
+    const second = new Promise<void>((resolve) => (releaseSecond = resolve));
+    const listing = await source.listSessions({ scope: "project", limit: 100 });
+    if (!listing.ok) throw new Error(listing.error);
+    const distiller = createDistiller({
+      source,
+      store,
+      gate: makeSpyGate().gate,
+      limits: { ...TEST_LIMITS, distillConcurrency: 1 },
+      instanceId: "second-pass",
+      coldPassRetryMs: 5,
+      discover: async () => {
+        if (++discoveries === 2) await second;
+        return listing.items;
+      },
+      log: () => {},
+    });
+    distiller.start();
+    await waitFor(() => discoveries === 2);
+    expect(distiller.status().coldPass).toBe("running");
+    expect(distiller.status().examinedCount).toBe(0);
+    expect(distiller.status().knownCount).toBe(0);
+    releaseSecond();
+    await waitFor(() => distiller.status().coldPass === "done");
+    await distiller.stop();
+    db.close();
   });
 });

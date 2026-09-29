@@ -26,7 +26,7 @@ import { createLiteRefresh, type LiteRefreshController } from "../lite-refresh.j
 import { createDrill } from "../drill.js";
 import type { HistorySession } from "../history/model.js";
 import { v1EventToSignal } from "../history/v1-events.js";
-import { coldPassProgress, createDistiller } from "../distill.js";
+import { createDistiller } from "../distill.js";
 import { createSummarizer, type Summarizer } from "../summarize.js";
 import { parseOptions } from "../options.js";
 import { consoleSink, createLogger } from "../log.js";
@@ -308,12 +308,12 @@ export const server: Plugin = async (ctx, options) => {
     // path must keep its existing behavior and wording.
     ...(ephemeral && { mode: "ephemeral" as const }),
     ...(liteRefreshHook && { maybeRefresh: () => liteRefreshHook.maybeRefresh() }),
-    indexing: () => coldPassProgress(distiller.status()),
+    indexing: () => distiller.indexing(),
   };
   // recall_sessions serves the card store directly when it exists (digest, top
   // files/tools, family rollups); degraded mode leaves listings bare.
   const enrichment: SessionEnrichment | undefined = store
-    ? { cards: () => store.allCards(), indexing: () => coldPassProgress(distiller.status()) }
+    ? { cards: () => store.allCards(), indexing: () => distiller.indexing() }
     : undefined;
 
   const guardTool = (definition: ToolDefinition): ToolDefinition => ({

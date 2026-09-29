@@ -164,6 +164,9 @@ async function expectCardOnlyAnswers(h: FakeV2Host): Promise<void> {
   expect(
     (recall.warnings as string[]).some((w) => /Results come from the session cards only/.test(w)),
   ).toBe(true);
+  // No distiller runs on a cards-only store, so there is no progress to report.
+  expect(runtime.deps.indexing?.()).toBeUndefined();
+  expect((recall.coverage as { cards: { indexing?: unknown } }).cards.indexing).toBeUndefined();
 
   const listed = await call(h, "recall_sessions", { scope: "project" });
   expect(listed.ok).toBe(true);
