@@ -1,4 +1,4 @@
-import type { OpencodeClient } from "@opencode-ai/sdk/v2";
+import { createOpencodeClient, type OpencodeClient } from "@opencode-ai/sdk/v2";
 import { errmsg } from "../types.js";
 import type { HistoryMessage, HistorySession } from "./model.js";
 import {
@@ -17,6 +17,47 @@ import {
  * message pages); `unscoped` reaches every project (global listings and the
  * global lookup retry).
  */
+
+/** The two v1 SDK clients the history source reads through. */
+export type V1Clients = { scoped: OpencodeClient; unscoped: OpencodeClient };
+
+/**
+ * Build the scoped and unscoped v2-vintage SDK clients from the v1 plugin
+ * context. The host hands the plugin a default-vintage client; its in-process
+ * fetch transport is extracted from the client's internals and reused, so no
+ * request leaves the process. `scoped` keeps the caller's directory header;
+ * `unscoped` drops it to reach every project. Throws when the internals are
+ * not where they are expected (the plugin cannot run without a transport).
+ */
+export function createV1Clients(ctx: { client: unknown; directory: string }): V1Clients {
+  // Extract the in-process fetch from the v1 client's internals.
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- SDK internals not typed
+  const inner = (ctx.client as any)._client;
+  if (!inner?.getConfig)
+    throw new Error(
+      "opencode-session-recall: SDK internals changed — cannot extract fetch transport",
+    );
+  const cfg = inner.getConfig();
+  if (!cfg.fetch) throw new Error("opencode-session-recall: SDK client has no custom fetch");
+
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  const { "x-opencode-directory": _, ...rest } = (cfg.headers ?? {}) as Record<string, string>;
+
+  const scoped = createOpencodeClient({
+    baseUrl: cfg.baseUrl,
+    fetch: cfg.fetch,
+    headers: cfg.headers,
+    directory: ctx.directory,
+  });
+
+  const unscoped = createOpencodeClient({
+    baseUrl: cfg.baseUrl,
+    fetch: cfg.fetch,
+    headers: rest,
+  });
+
+  return { scoped, unscoped };
+}
 
 /** Read `X-Next-Cursor` from a fields-style response's fetch `Response`, case-
  *  insensitively (native `Headers.get` folds case) and defensively (a missing
@@ -112,10 +153,7 @@ function toListing(resp: SdkResponse): Listing<HistorySession> {
   return { ok: true, items: Array.isArray(resp.data) ? (resp.data as HistorySession[]) : [] };
 }
 
-export function createV1HistorySource(clients: {
-  scoped: OpencodeClient;
-  unscoped: OpencodeClient;
-}): HistorySource {
+export function createV1HistorySource(clients: V1Clients): HistorySource {
   const { scoped, unscoped } = clients;
   const clientFor = (scope: SessionScope): OpencodeClient =>
     scope === "global" ? unscoped : scoped;

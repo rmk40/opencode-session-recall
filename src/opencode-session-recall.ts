@@ -1,5 +1,4 @@
 import type { Plugin, ToolDefinition } from "@opencode-ai/plugin";
-import { createOpencodeClient, type Session } from "@opencode-ai/sdk/v2";
 import { sessions, type SessionEnrichment } from "./sessions.js";
 import { search, DISCOVERY_LIMIT, type SearchDeps, type SemanticSearchConfig } from "./search.js";
 import { get } from "./get.js";
@@ -23,7 +22,8 @@ import { EMBED_REPRESENTATION } from "./embedding-text.js";
 import { createCardsRuntime, cardsLiteFromSessions, type CardSource } from "./cards.js";
 import { createLiteRefresh, type LiteRefreshController } from "./lite-refresh.js";
 import { createDrill } from "./drill.js";
-import { createV1HistorySource } from "./history/v1.js";
+import { createV1Clients, createV1HistorySource } from "./history/v1.js";
+import type { HistorySession } from "./history/model.js";
 import { createDistiller } from "./distill.js";
 import { createSummarizer, parseModelId, type Summarizer } from "./summarize.js";
 import {
@@ -188,31 +188,9 @@ const server: Plugin = async (ctx, options) => {
     deepCharsPerQuery: clamp(opts.deepCharsPerQuery, DEFAULTS.deepCharsPerQuery),
   };
 
-  // Extract the in-process fetch from the v1 client's internals.
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- SDK internals not typed
-  const inner = (ctx.client as any)._client;
-  if (!inner?.getConfig)
-    throw new Error(
-      "opencode-session-recall: SDK internals changed — cannot extract fetch transport",
-    );
-  const cfg = inner.getConfig();
-  if (!cfg.fetch) throw new Error("opencode-session-recall: SDK client has no custom fetch");
-
-  // eslint-disable-next-line @typescript-eslint/no-unused-vars
-  const { "x-opencode-directory": _, ...rest } = (cfg.headers ?? {}) as Record<string, string>;
-
-  const client = createOpencodeClient({
-    baseUrl: cfg.baseUrl,
-    fetch: cfg.fetch,
-    headers: cfg.headers,
-    directory: ctx.directory,
-  });
-
-  const unscoped = createOpencodeClient({
-    baseUrl: cfg.baseUrl,
-    fetch: cfg.fetch,
-    headers: rest,
-  });
+  // Every history read goes through `source`; the scoped client itself is
+  // still handed to the summarizer, which prompts worker sessions with it.
+  const { scoped: client, unscoped } = createV1Clients(ctx);
   const source = createV1HistorySource({ scoped: client, unscoped });
 
   // Opt-in, local-only semantic layer. Off by default; any failure to load the
@@ -247,12 +225,13 @@ const server: Plugin = async (ctx, options) => {
   // Session discovery for the distiller cold pass: global scope reads the
   // unscoped experimental list, otherwise the directory-scoped list. Always
   // sends an explicit limit (the server defaults to 100 rows).
-  const discover = async (): Promise<Session[]> => {
-    const resp = global
-      ? await unscoped.experimental.session.list({ limit: DISCOVERY_LIMIT })
-      : await client.session.list({ limit: DISCOVERY_LIMIT });
-    if (resp.error) throw new Error(errmsg(resp.error));
-    return Array.isArray(resp.data) ? (resp.data as Session[]) : [];
+  const discover = async (): Promise<HistorySession[]> => {
+    const listing = await source.listSessions({
+      scope: global ? "global" : "project",
+      limit: DISCOVERY_LIMIT,
+    });
+    if (!listing.ok) throw new Error(listing.error);
+    return listing.items;
   };
 
   // ── Card store (Tier 0) ──
