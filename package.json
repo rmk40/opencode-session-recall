@@ -63,7 +63,12 @@
   },
   "license": "MIT",
   "peerDependencies": {
-    "@opencode-ai/plugin": ">=1.2.0"
+    "@opencode-ai/plugin": ">=1.3.4"
+  },
+  "peerDependenciesMeta": {
+    "@opencode-ai/plugin": {
+      "optional": true
+    }
   },
   "dependencies": {
     "@opencode-ai/sdk": "^1.3.2",
