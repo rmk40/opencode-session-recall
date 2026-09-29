@@ -11,7 +11,8 @@
  * `FsLike` is the superset of everything the callers touch: {@link defaultStorePath}
  * in `store.ts` uses only `promises.mkdir`, the semantic embedder uses the
  * read/write/rename/stat surface too, and the debug log file sink (`log.ts`)
- * adds `appendFile`. One shared shape satisfies all of them.
+ * adds `appendFile`, and the v2 host's identity resolution adds `realpath`.
+ * One shared shape satisfies all of them.
  */
 
 export type FsLike = {
@@ -22,11 +23,14 @@ export type FsLike = {
     rename(from: string, to: string): Promise<void>;
     stat(path: string): Promise<{ size: number }>;
     appendFile(path: string, data: string): Promise<void>;
+    realpath(path: string): Promise<string>;
   };
 };
 export type PathLike = {
   join(...parts: string[]): string;
   resolve(...parts: string[]): string;
+  dirname(path: string): string;
+  basename(path: string): string;
 };
 export type OsLike = { homedir(): string };
 

@@ -37,6 +37,9 @@ export type RawOptions = {
   /** Override the card-store file path (default
    *  `~/.cache/opencode-session-recall/store-v1.db`). */
   storePath?: string;
+  /** opencode v2 only: read history from this database file instead of the
+   *  one opencode itself resolves (`OPENCODE_DB`, the channel, XDG). */
+  opencodeDbPath?: string;
   /** Enable the opt-in, local-only semantic layer. Default: false. */
   semantic?: boolean;
   /** Blend weight for the semantic signal, clamped to [0.05, 0.95]. Default: 0.35. */
@@ -59,6 +62,8 @@ export type ResolvedOptions = {
   ephemeral: boolean;
   /** The configured store path; always undefined in ephemeral mode (no store). */
   storePath: string | undefined;
+  /** v2 only: the configured `opencode.db` override. */
+  opencodeDbPath: string | undefined;
   /** The semantic layer's model and blend weight when it is enabled; always
    *  undefined in ephemeral mode. */
   semantic: { model: string; weight: number } | undefined;
@@ -172,6 +177,7 @@ export function parseOptions(raw: unknown): ResolvedOptions {
     compactionRecall: opts.compactionRecall === true,
     ephemeral,
     storePath: ephemeral ? undefined : optionalString(opts.storePath),
+    opencodeDbPath: optionalString(opts.opencodeDbPath),
     semantic,
     summaries,
     limits,
