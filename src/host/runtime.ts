@@ -164,6 +164,14 @@ function noteShape<R>(
   }
 }
 
+function isThenable(value: unknown): value is PromiseLike<unknown> {
+  return (
+    value !== null &&
+    (typeof value === "object" || typeof value === "function") &&
+    typeof (value as { then?: unknown }).then === "function"
+  );
+}
+
 /** Run `fn` on the next macrotask. */
 function nextMacrotask(fn: () => void): void {
   setTimeout(fn, 0);
@@ -279,6 +287,8 @@ async function initSlot<R>(
   // Every instance detached before creation began: nothing to build.
   if (slot.refs <= 0) return undefined;
   const identity = await factory.resolve();
+  // Every instance detached while the paths resolved: still nothing to build.
+  if (slot.refs <= 0) return undefined;
   const realKey = realKeyOf(key, identity);
   let core = state.cores.get(realKey) as Core<R> | undefined;
   if (!core || core.retired) {
@@ -293,8 +303,10 @@ async function initSlot<R>(
     };
     created.value = (async () => {
       if (identity.store !== null) {
-        const previous = runtimeRegistry().retiring.get(identity.store);
-        if (previous) await settleWithin(previous, RETIRE_WAIT_MS);
+        // The retiring map is shared across builds, so validate what another
+        // build left there before awaiting it: only a thenable is waited on.
+        const previous: unknown = runtimeRegistry().retiring.get(identity.store);
+        if (isThenable(previous)) await settleWithin(Promise.resolve(previous), RETIRE_WAIT_MS);
       }
       const runtime = await factory.create(identity);
       created.settled = runtime;
@@ -306,7 +318,7 @@ async function initSlot<R>(
   core.refs += slot.refs;
   slot.resolved = core;
   for (const pending of slot.pendingShapes.splice(0)) noteShape(core, pending.shape, pending.log);
-  // Every instance detached while the paths resolved.
+  // Defensive: a core left with no references is retired, never kept.
   if (core.refs <= 0 && !core.retired) void retire(state, core);
   return core;
 }

@@ -3,7 +3,12 @@ import { mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import entry from "../src/opencode-session-recall.js";
-import { eventResubscribe, instanceOf, PRIMARY_ONLY_ERROR } from "../src/host/v2.js";
+import {
+  eventResubscribe,
+  instanceOf,
+  PRIMARY_ONLY_ERROR,
+  setV2LogSinkForTests,
+} from "../src/host/v2.js";
 import { NUDGE_BASE_TEXT, NUDGE_SENTINEL, NUDGE_TEXT } from "../src/hooks/system-nudge.js";
 import { unavailableHistoryError } from "../src/history/source.js";
 import { STARTING_REASON } from "../src/host/v2-tools.js";
@@ -253,6 +258,25 @@ describe("v2 setup", () => {
       expect(onEvent.mock.calls.map(([event]) => event.id)).toEqual(["evt_before", "evt_after"]);
     } finally {
       eventResubscribe.delaysMs = [1_000, 5_000, 30_000];
+    }
+  });
+
+  it("logs once per process when ctx.app.channel is missing, and flushes the log on cleanup", async () => {
+    const lines: string[] = [];
+    const flush = vi.fn(async () => {});
+    setV2LogSinkForTests(Object.assign((line: string) => void lines.push(line), { flush }));
+    try {
+      const a = host();
+      const b = host({ directory: "/workspace/other", projectID: "prj_other" });
+      for (const h of [a, b]) (h.ctx as { app?: unknown }).app = {};
+      const cleanupA = await setup(a);
+      await setup(b);
+      const fallback = lines.filter((line) => line.includes("ctx.app.channel is missing"));
+      expect(fallback).toHaveLength(1);
+      await cleanupA();
+      expect(flush).toHaveBeenCalled();
+    } finally {
+      setV2LogSinkForTests(undefined);
     }
   });
 

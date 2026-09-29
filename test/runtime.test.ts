@@ -10,6 +10,7 @@ import {
   type RuntimeFactory,
   type RuntimeKey,
 } from "../src/host/runtime.js";
+import { registry } from "../src/host/registry.js";
 
 type Fake = { id: number; identity: ResolvedIdentity };
 
@@ -259,6 +260,40 @@ describe("runtime registry", () => {
     // Detach is idempotent.
     await c.detach();
     expect(control.disposed).toHaveLength(2);
+  });
+});
+
+describe("runtime registry, cross-build state", () => {
+  it("ignores a non-thenable another build left in the retiring map", async () => {
+    const control = makeFactory(identity);
+    // Put something that is not a promise where a retiring dispose would be.
+    const a = attachRuntime(key(), control.factory, {}, () => {});
+    await vi.advanceTimersByTimeAsync(0);
+    await a.detach();
+    const runtimes = registry().runtimes as { retiring: Map<string, unknown> };
+    runtimes.retiring.set(identity.store!, { stale: true });
+    const b = attachRuntime(key({ buildId: "build-b" }), control.factory, {}, () => {});
+    await vi.advanceTimersByTimeAsync(0);
+    expect(control.created).toHaveLength(2);
+    expect(b.current()).toBe(control.created[1]);
+    await b.detach();
+  });
+
+  it("creates nothing when the only instance detaches while paths resolve", async () => {
+    let finishResolve!: (identity: ResolvedIdentity) => void;
+    const control = makeFactory(identity);
+    const factory: RuntimeFactory<Fake> = {
+      ...control.factory,
+      resolve: () => new Promise((resolve) => (finishResolve = resolve)),
+    };
+    const a = attachRuntime(key(), factory, {}, () => {});
+    await vi.advanceTimersByTimeAsync(0); // resolve() is now pending
+    await a.detach();
+    finishResolve(identity);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(control.created).toHaveLength(0);
+    expect(a.current()).toBeUndefined();
+    expect(await a.ready(10)).toBeUndefined();
   });
 });
 

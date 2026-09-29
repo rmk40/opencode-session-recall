@@ -6,7 +6,7 @@ import type {
   V2ToolContext,
   V2ToolResult,
 } from "./opencode-v2-types.js";
-import { createFileSink, createLogger, type Logger } from "../log.js";
+import { createFileSink, createLogger, type FileSink, type Logger } from "../log.js";
 import { parseOptions, type ResolvedOptions } from "../options.js";
 import { errmsg, settleWithin, TOOLS, type ErrorOutput } from "../types.js";
 import { NUDGE_BASE_TEXT, NUDGE_SENTINEL } from "../hooks/system-nudge.js";
@@ -70,11 +70,25 @@ export const PRIMARY_ONLY_ERROR =
 
 /** The v2 log: a file sink (v2 discards plugin console output), opt-in via
  *  `RECALL_DEBUG=1`. Created lazily so a v1 process never builds one. */
+let v2Sink: FileSink | undefined;
 let v2Logger: Logger | undefined;
+function v2LogSink(): FileSink {
+  v2Sink ??= createFileSink({ host: "opencode-v2" });
+  return v2Sink;
+}
 export function v2Log(message: string): void {
-  v2Logger ??= createLogger(createFileSink({ host: "opencode-v2" }));
+  v2Logger ??= createLogger(v2LogSink());
   v2Logger(message);
 }
+/** Test hook: route the v2 log through `sink` (undefined restores the file). */
+export function setV2LogSinkForTests(sink: FileSink | undefined): void {
+  v2Sink = sink;
+  v2Logger = undefined;
+}
+/** Bound on flushing queued log lines during an instance cleanup. */
+const LOG_FLUSH_WAIT_MS = 500;
+/** Whether the missing-channel fallback was logged (once per process). */
+let channelFallbackLogged = false;
 
 function isFunction(value: unknown): boolean {
   return typeof value === "function";
@@ -230,7 +244,12 @@ async function start(ctx: V2PluginContext): Promise<V2Cleanup> {
     store: parsed.ephemeral ? "none" : (parsed.storePath ?? "default"),
     source: parsed.opencodeDbPath ?? "default",
   };
-  const channel = typeof ctx.app?.channel === "string" ? ctx.app.channel : "latest";
+  let channel = "latest";
+  if (typeof ctx.app?.channel === "string") channel = ctx.app.channel;
+  else if (!channelFallbackLogged) {
+    channelFallbackLogged = true;
+    v2Log('ctx.app.channel is missing; assuming "latest" to locate opencode.db');
+  }
   const attachment = attachRuntime(
     key,
     v2RuntimeFactory({ options, channel, log: v2Log }),
@@ -292,6 +311,11 @@ async function wire(
   pumpEvents(ctx, instance, events.signal);
 
   // ── Tools ──
+  // The registered descriptions and schemas come from this instance's own
+  // options. `mode` is part of the runtime key, so it always matches the
+  // runtime; limits are first-writer-wins, so an instance joining a runtime
+  // with other limits advertises its own values while executing with the
+  // runtime's (its differing keys are logged once when it attaches).
   const starting = startingToolSet({
     limits: parsed.limits,
     global: parsed.global,
@@ -349,6 +373,9 @@ async function wire(
       events.abort();
       // Bounded (runtime.ts): never holds a location reload for long.
       await attachment.detach();
+      // Queued debug-log lines (RECALL_DEBUG) reach the file before the
+      // location goes; bounded, since the file may be slow or gone.
+      await settleWithin(v2LogSink().flush(), LOG_FLUSH_WAIT_MS);
     } catch (error) {
       v2Log(`cleanup failed: ${errmsg(error)}`);
     }

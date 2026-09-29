@@ -7,7 +7,7 @@ import { get } from "../get.js";
 import { context } from "../context.js";
 import { messages } from "../messages.js";
 import { createFetchGate, type FetchGate } from "../fetch-gate.js";
-import { createCardsRuntime } from "../cards.js";
+import { createCardsRuntime, type CardsRuntime } from "../cards.js";
 import { createDrill } from "../drill.js";
 import { createUnavailableSource, type HistorySource } from "../history/source.js";
 import { TOOLS, type Limits } from "../types.js";
@@ -47,6 +47,17 @@ export function buildToolSet(o: ToolSetInputs): ToolSet {
  *  2 s, then answer from the degraded path). */
 export const STARTING_REASON = "the recall runtime is still starting; try again shortly";
 
+/** One empty, degraded card runtime shared by every instance's starting
+ *  tools: it holds no state, reads nothing and never refreshes, so sharing it
+ *  needs no per-instance dispose. */
+let sharedStartingCards: CardsRuntime | undefined;
+function startingCards(): CardsRuntime {
+  sharedStartingCards ??= createCardsRuntime({
+    source: { getCards: () => [], revision: () => undefined, degraded: true },
+  });
+  return sharedStartingCards;
+}
+
 /**
  * The tools over a stand-in that reads nothing: registered descriptions and
  * schemas come from here (the runtime is built after `setup` returns), and a
@@ -59,9 +70,7 @@ export function startingToolSet(o: {
 }): ToolSet {
   const gate = createFetchGate({ concurrency: 1 });
   const source = createUnavailableSource("v2-sqlite", STARTING_REASON);
-  const cards = createCardsRuntime({
-    source: { getCards: () => [], revision: () => undefined, degraded: true },
-  });
+  const cards = startingCards();
   const drill = createDrill({ source, gate, limits: o.limits });
   return buildToolSet({
     source,
