@@ -103,12 +103,15 @@ export function runtimeShape(options: V2RuntimeOptions): Record<string, unknown>
   };
 }
 
-async function realPathOf(path: string): Promise<string> {
+/** The canonical path of an existing file or directory, or null when it
+ *  cannot be resolved (it does not exist, or is not accessible). No fallback:
+ *  a caller that stamps the result must know it is canonical. */
+async function tryRealPath(path: string): Promise<string | null> {
   try {
     const fs = await loadFs();
     return await fs.promises.realpath(path);
   } catch {
-    return path;
+    return null;
   }
 }
 
@@ -119,7 +122,8 @@ async function realFilePath(path: string): Promise<string> {
   try {
     const p = await loadPath();
     const resolved = p.resolve(path);
-    return p.resolve(await realPathOf(p.dirname(resolved)), p.basename(resolved));
+    const dir = (await tryRealPath(p.dirname(resolved))) ?? p.dirname(resolved);
+    return p.resolve(dir, p.basename(resolved));
   } catch {
     return path;
   }
@@ -149,16 +153,25 @@ export function v2RuntimeFactory(inputs: V2RuntimeInputs): RuntimeFactory<V2Runt
         channel: inputs.channel,
         override: options.opencodeDbPath,
       });
+      // Read through the canonical path when there is one; otherwise the
+      // located path may still be read, but create() will not stamp a store
+      // with it (a later canonical spelling would refuse it forever).
       let source: string | null = null;
-      if (located.ok) source = await realPathOf(located.path);
-      else sourceProblem = located.reason;
+      let sourceCanonical = false;
+      if (located.ok) {
+        const real = await tryRealPath(located.path);
+        source = real ?? located.path;
+        sourceCanonical = real !== null;
+      } else {
+        sourceProblem = located.reason;
+      }
 
       let store: string | null = null;
       if (!options.ephemeral) {
         const configured = options.storePath ?? (await defaultStorePath(STORE_HOST));
         if (configured) store = await realFilePath(configured);
       }
-      return { store, source };
+      return { store, source, sourceCanonical };
     },
 
     create: (identity) => createV2Runtime(identity, inputs, sourceProblem),
@@ -221,10 +234,16 @@ async function createV2Runtime(
   // ── Derived store ──
   // Stamped with the real source path, so a store built from another
   // opencode.db refuses (`source-mismatch`) instead of being reconciled
-  // against the wrong history. No source path at all means no store.
+  // against the wrong history. No source path, or one that could not be
+  // canonicalized, means no store: the file is not even opened, so nothing
+  // is stamped with a spelling a later run would refuse.
   let store: Store | null = null;
   let db: SqliteDb | null = null;
-  if (identity.store !== null && identity.source !== null) {
+  if (identity.store !== null && identity.source !== null && identity.sourceCanonical !== true) {
+    log(
+      `opencode database path ${identity.source} could not be canonicalized; running degraded without a store`,
+    );
+  } else if (identity.store !== null && identity.source !== null) {
     db = await openSqlite(identity.store);
     if (db) {
       const opened = openStore(db, { host: STORE_HOST, source: identity.source });

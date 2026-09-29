@@ -52,8 +52,15 @@ export type RuntimeKey = {
 };
 
 /** Real paths, resolved inside the deferred init. `null` means none (no
- *  store in ephemeral mode, or no resolvable source file). */
-export type ResolvedIdentity = { store: string | null; source: string | null };
+ *  store in ephemeral mode, or no resolvable source file). `sourceCanonical`
+ *  is false when `source` is the path as located because it could not be
+ *  canonicalized (typically: `opencode.db` does not exist yet); such a path
+ *  may be read, but never stamped into a store. */
+export type ResolvedIdentity = {
+  store: string | null;
+  source: string | null;
+  sourceCanonical?: boolean;
+};
 
 /** How a runtime is built and torn down; supplied by the attaching instance
  *  (the first instance of a slot supplies the one that runs). */
