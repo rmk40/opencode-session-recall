@@ -107,7 +107,7 @@ describe("recall_sessions", () => {
 describe("recall_messages", () => {
   it("returns one bounded newest-first page with a continuation cursor", async () => {
     const h = makeFakeHarness();
-    const tool = messagesTool(h.client, gate, TEST_LIMITS);
+    const tool = messagesTool(h.source, gate, TEST_LIMITS);
     const out = await runTool<MessagesOutput>(tool, { limit: 2 });
 
     // Newest-first, always with an explicit limit (never a whole-session fetch).
@@ -130,7 +130,7 @@ describe("recall_messages", () => {
   it("filters the returned page by role and query", async () => {
     const h = makeFakeHarness();
     // A page large enough to cover the small session, then filter within it.
-    const filtered = await runTool<MessagesOutput>(messagesTool(h.client, gate, TEST_LIMITS), {
+    const filtered = await runTool<MessagesOutput>(messagesTool(h.source, gate, TEST_LIMITS), {
       role: "user",
       query: "checkout",
       limit: 50,
@@ -143,14 +143,14 @@ describe("recall_messages", () => {
 
   it("normalizes blank query and handles missing/error/empty sessions", async () => {
     const blank = makeFakeHarness();
-    const blankOut = await runTool<MessagesOutput>(messagesTool(blank.client, gate, TEST_LIMITS), {
+    const blankOut = await runTool<MessagesOutput>(messagesTool(blank.source, gate, TEST_LIMITS), {
       query: "   ",
       limit: 50,
     });
     expect(blankOut.pagination.returned).toBe(6);
 
     const missing = await runTool<ErrorOutput>(
-      messagesTool(blank.client, gate, TEST_LIMITS),
+      messagesTool(blank.source, gate, TEST_LIMITS),
       {},
       makeContext({ sessionID: "" }).ctx,
     );
@@ -160,7 +160,7 @@ describe("recall_messages", () => {
       messageErrors: { "s-current": "Unauthorized" },
     });
     const errorOut = await runTool<ErrorOutput>(
-      messagesTool(errored.client, gate, TEST_LIMITS),
+      messagesTool(errored.source, gate, TEST_LIMITS),
       {},
     );
     expect(errorOut.error).toContain("Unauthorized");
@@ -169,7 +169,7 @@ describe("recall_messages", () => {
     // query path is deliberately lenient (only the distiller opts into strict).
     const noData = makeFakeHarness({ noMessageData: new Set(["s-current"]) });
     const noDataOut = await runTool<MessagesOutput>(
-      messagesTool(noData.client, gate, TEST_LIMITS),
+      messagesTool(noData.source, gate, TEST_LIMITS),
       {},
     );
     expect(noDataOut.ok).toBe(true);
@@ -181,7 +181,7 @@ describe("recall_messages", () => {
     // undefined, the old code did `role !== "all"` → true → filtered everything
     // out. Coercion restores the defaults AND still passes a limit under strict.
     const h = makeFakeHarness();
-    const out = await runToolRaw<MessagesOutput>(messagesTool(h.client, gate, TEST_LIMITS), {
+    const out = await runToolRaw<MessagesOutput>(messagesTool(h.source, gate, TEST_LIMITS), {
       sessionID: "s-current",
     });
     expect(out.ok).toBe(true);
@@ -193,7 +193,7 @@ describe("recall_messages", () => {
     // A Zod-bypassed non-string cursor must coerce to undefined (first page),
     // never reach the SDK as a bad `before`, and never throw.
     const h = makeFakeHarness();
-    const out = await runToolRaw<MessagesOutput>(messagesTool(h.client, gate, TEST_LIMITS), {
+    const out = await runToolRaw<MessagesOutput>(messagesTool(h.source, gate, TEST_LIMITS), {
       sessionID: "s-current",
       cursor: 123,
     });
@@ -206,7 +206,7 @@ describe("recall_messages", () => {
   it("routes its fetches through the shared gate", async () => {
     const h = makeFakeHarness();
     const { gate: spy, queries } = makeSpyGate();
-    await runTool<MessagesOutput>(messagesTool(h.client, spy, TEST_LIMITS), { limit: 2 });
+    await runTool<MessagesOutput>(messagesTool(h.source, spy, TEST_LIMITS), { limit: 2 });
     // The page fetch (and the session.get) must go through gate.runQuery.
     expect(queries()).toBeGreaterThan(0);
   });
@@ -215,7 +215,7 @@ describe("recall_messages", () => {
 describe("recall_get", () => {
   it("returns formatted full messages with model, pruned, and tool-state details", async () => {
     const h = makeFakeHarness();
-    const tool = getTool(h.client, gate);
+    const tool = getTool(h.source, gate);
 
     const user = await runTool<MessageOutput>(tool, {
       sessionID: "s-current",
@@ -260,7 +260,7 @@ describe("recall_get", () => {
 
   it("handles not-found, returned errors, and context lookup failures", async () => {
     const h = makeFakeHarness();
-    const notFound = await runTool<ErrorOutput>(getTool(h.client, gate), {
+    const notFound = await runTool<ErrorOutput>(getTool(h.source, gate), {
       sessionID: "s-current",
       messageID: "missing",
     });
@@ -269,7 +269,7 @@ describe("recall_get", () => {
     const noData = makeFakeHarness({
       noSingleMessageData: new Set(["s-current:m-current-1"]),
     });
-    const noDataOut = await runTool<ErrorOutput>(getTool(noData.client, gate), {
+    const noDataOut = await runTool<ErrorOutput>(getTool(noData.source, gate), {
       sessionID: "s-current",
       messageID: "m-current-1",
     });
@@ -278,14 +278,14 @@ describe("recall_get", () => {
     const errored = makeFakeHarness({
       messageLookupErrors: { "s-current:m-current-1": "message API failed" },
     });
-    const errorOut = await runTool<ErrorOutput>(getTool(errored.client, gate), {
+    const errorOut = await runTool<ErrorOutput>(getTool(errored.source, gate), {
       sessionID: "s-current",
       messageID: "m-current-1",
     });
     expect(errorOut.error).toContain("message API failed");
 
     const noContext = makeFakeHarness({ getThrows: new Set(["s-current"]) });
-    const ok = await runTool<MessageOutput>(getTool(noContext.client, gate), {
+    const ok = await runTool<MessageOutput>(getTool(noContext.source, gate), {
       sessionID: "s-current",
       messageID: "m-current-1",
     });
@@ -297,7 +297,7 @@ describe("recall_get", () => {
   it("routes its fetches through the shared gate", async () => {
     const h = makeFakeHarness();
     const { gate: spy, queries } = makeSpyGate();
-    await runTool<MessageOutput>(getTool(h.client, spy), {
+    await runTool<MessageOutput>(getTool(h.source, spy), {
       sessionID: "s-current",
       messageID: "m-current-1",
     });
@@ -309,7 +309,7 @@ describe("recall_get", () => {
 describe("recall_context", () => {
   it("returns centered windows, window:0, and asymmetric before/after slices", async () => {
     const h = makeFakeHarness();
-    const tool = contextTool(h.client, gate, TEST_LIMITS);
+    const tool = contextTool(h.source, gate, TEST_LIMITS);
 
     const around = await runTool<ContextOutput>(tool, {
       sessionID: "s-current",
@@ -343,7 +343,7 @@ describe("recall_context", () => {
 
   it("sets boundary hasMore flags at the first and last message", async () => {
     const h = makeFakeHarness();
-    const tool = contextTool(h.client, gate, TEST_LIMITS);
+    const tool = contextTool(h.source, gate, TEST_LIMITS);
 
     const first = await runTool<ContextOutput>(tool, {
       sessionID: "s-current",
@@ -366,7 +366,7 @@ describe("recall_context", () => {
 
   it("handles message-not-found, returned errors, and no-data errors", async () => {
     const h = makeFakeHarness();
-    const notFound = await runTool<ErrorOutput>(contextTool(h.client, gate, TEST_LIMITS), {
+    const notFound = await runTool<ErrorOutput>(contextTool(h.source, gate, TEST_LIMITS), {
       sessionID: "s-current",
       messageID: "missing",
     });
@@ -375,14 +375,14 @@ describe("recall_context", () => {
     const errored = makeFakeHarness({
       messageErrors: { "s-current": "Unauthorized" },
     });
-    const errorOut = await runTool<ErrorOutput>(contextTool(errored.client, gate, TEST_LIMITS), {
+    const errorOut = await runTool<ErrorOutput>(contextTool(errored.source, gate, TEST_LIMITS), {
       sessionID: "s-current",
       messageID: "m-current-1",
     });
     expect(errorOut.error).toContain("Unauthorized");
 
     const noData = makeFakeHarness({ noMessageData: new Set(["s-current"]) });
-    const noDataOut = await runTool<ErrorOutput>(contextTool(noData.client, gate, TEST_LIMITS), {
+    const noDataOut = await runTool<ErrorOutput>(contextTool(noData.source, gate, TEST_LIMITS), {
       sessionID: "s-current",
       messageID: "m-current-1",
     });
@@ -391,7 +391,7 @@ describe("recall_context", () => {
 
   it("survives raw MCP-bypass args (undefined window must not break slice bounds)", async () => {
     const h = makeFakeHarness();
-    const out = await runToolRaw<ContextOutput>(contextTool(h.client, gate, TEST_LIMITS), {
+    const out = await runToolRaw<ContextOutput>(contextTool(h.source, gate, TEST_LIMITS), {
       sessionID: "s-current",
       messageID: "m-current-3",
     });
@@ -411,7 +411,7 @@ describe("recall_context", () => {
       ]),
     );
 
-    const out = await runTool<ContextOutput>(contextTool(h.client, gate, TEST_LIMITS), {
+    const out = await runTool<ContextOutput>(contextTool(h.source, gate, TEST_LIMITS), {
       sessionID: "s-big",
       messageID: "mb-59",
       window: 1,
@@ -430,7 +430,7 @@ describe("recall_context", () => {
   it("routes its fetches through the shared gate", async () => {
     const h = makeFakeHarness();
     const { gate: spy, queries } = makeSpyGate();
-    await runTool<ContextOutput>(contextTool(h.client, spy, TEST_LIMITS), {
+    await runTool<ContextOutput>(contextTool(h.source, spy, TEST_LIMITS), {
       sessionID: "s-current",
       messageID: "m-current-3",
       window: 1,

@@ -451,9 +451,9 @@ const server: Plugin = async (ctx, options) => {
     tool: {
       recall_sessions: guardTool(sessions(client, unscoped, global, limits, enrichment)),
       recall: guardTool(search(client, unscoped, global, limits, deps)),
-      recall_get: guardTool(get(client, gate)),
-      recall_context: guardTool(context(client, gate, limits)),
-      recall_messages: guardTool(messages(client, gate, limits)),
+      recall_get: guardTool(get(source, gate)),
+      recall_context: guardTool(context(source, gate, limits)),
+      recall_messages: guardTool(messages(source, gate, limits)),
     },
     event: async ({ event }) => {
       if (disposed) return;

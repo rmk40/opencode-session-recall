@@ -1,5 +1,5 @@
 import { tool, type ToolDefinition, type ToolContext } from "@opencode-ai/plugin";
-import type { OpencodeClient, Part } from "@opencode-ai/sdk/v2";
+import type { Part } from "@opencode-ai/sdk/v2";
 import {
   errmsg,
   optionalString,
@@ -10,7 +10,7 @@ import {
   type Limits,
 } from "./types.js";
 import { formatMsg, searchable, matches } from "./extract.js";
-import { fetchMessagePage } from "./fetch-window.js";
+import type { HistorySource } from "./history/source.js";
 import type { FetchGate } from "./fetch-gate.js";
 
 function msgMatches(msg: { parts: Array<Part> }, query: string): boolean {
@@ -22,7 +22,7 @@ function msgMatches(msg: { parts: Array<Part> }, query: string): boolean {
   return false;
 }
 
-export function messages(client: OpencodeClient, gate: FetchGate, limits: Limits): ToolDefinition {
+export function messages(source: HistorySource, gate: FetchGate, limits: Limits): ToolDefinition {
   return tool({
     description: `Browse a known session's messages, newest first, one bounded page at a time. Pass cursor from a prior page's nextCursor to continue. Optional role/query filter the returned page. Use after you know the session; for topical discovery across sessions use recall first.`,
     args: {
@@ -70,7 +70,7 @@ export function messages(client: OpencodeClient, gate: FetchGate, limits: Limits
         // Always a bounded page (limit + cursor), through the shared gate —
         // never an unpaginated fetch and never outside the concurrency budget.
         const page = await gate.runQuery(() =>
-          fetchMessagePage(client, { sessionID: sid, limit, before: cursor }),
+          source.messagePage({ sessionID: sid, limit, before: cursor }),
         );
 
         let items = page.items; // newest-first
@@ -81,10 +81,10 @@ export function messages(client: OpencodeClient, gate: FetchGate, limits: Limits
         let title: string | undefined;
         let directory: string | undefined;
         try {
-          const sess = await gate.runQuery(() => client.session.get({ sessionID: sid }));
-          if (sess.data) {
-            title = sess.data.title;
-            directory = sess.data.directory;
+          const sess = await gate.runQuery(() => source.getSession(sid, { scope: "project" }));
+          if (sess.ok) {
+            title = sess.value.title;
+            directory = sess.value.directory;
           }
         } catch {
           // Cross-project session

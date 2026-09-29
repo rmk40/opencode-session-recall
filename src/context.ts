@@ -1,5 +1,4 @@
 import { tool, type ToolDefinition, type ToolContext } from "@opencode-ai/plugin";
-import type { OpencodeClient } from "@opencode-ai/sdk/v2";
 import {
   errmsg,
   coerceInt,
@@ -10,16 +9,14 @@ import {
 } from "./types.js";
 import { formatMsg } from "./extract.js";
 import { fetchMessageWindow } from "./fetch-window.js";
-import { createV1HistorySource } from "./history/v1.js";
+import type { HistorySource } from "./history/source.js";
 import type { FetchGate } from "./fetch-gate.js";
 
 /** Never fetch more than this many messages while locating a context window —
  *  the safety valve that keeps an old target in a giant session bounded. */
 const MAX_CONTEXT_FETCH = 200;
 
-export function context(client: OpencodeClient, gate: FetchGate, limits: Limits): ToolDefinition {
-  // Interim: this tool still takes a client until its own seam commit.
-  const source = createV1HistorySource({ scoped: client, unscoped: client });
+export function context(source: HistorySource, gate: FetchGate, limits: Limits): ToolDefinition {
   return tool({
     description: `Get messages around a recall hit to see what was asked before, what happened after, and whether the approach worked. Use recall_get for only the single message.
 
@@ -102,10 +99,12 @@ If memory exists, store only durable findings surfaced here; skip ephemeral deta
         let title: string | undefined;
         let directory: string | undefined;
         try {
-          const sess = await gate.runQuery(() => client.session.get({ sessionID: sessionID }));
-          if (sess.data) {
-            title = sess.data.title;
-            directory = sess.data.directory;
+          const sess = await gate.runQuery(() =>
+            source.getSession(sessionID, { scope: "project" }),
+          );
+          if (sess.ok) {
+            title = sess.value.title;
+            directory = sess.value.directory;
           }
         } catch {
           // Cross-project session
