@@ -28,7 +28,7 @@
     "test": "vitest run",
     "test:typecheck": "tsc -p tsconfig.test.json --noEmit",
     "typecheck": "tsc --noEmit",
-    "compile": "tsup src/opencode-session-recall.ts --format esm --external bun:sqlite && tsc --emitDeclarationOnly --outDir dist",
+    "compile": "tsup src/opencode-session-recall.ts --format esm --external bun:sqlite --clean && tsc --emitDeclarationOnly --outDir dist",
     "check": "npm run format:check && npm run lint && npm run test:typecheck && npm run test && npm run typecheck && npm run compile",
     "check:clean": "git diff --quiet && git diff --cached --quiet",
     "ci": "npm run check",
@@ -74,6 +74,7 @@
   "devDependencies": {
     "@eslint/js": "^10.0.1",
     "@opencode-ai/plugin": "^1.18.23",
+    "@opencode/plugin": "2.0.18",
     "@types/node": "^25.6.0",
     "eslint": "^10.2.0",
     "husky": "^9.1.7",

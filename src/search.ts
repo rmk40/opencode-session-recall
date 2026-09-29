@@ -56,7 +56,11 @@ import type { Store, FtsHit, Card } from "./store.js";
 import type { FetchGate } from "./fetch-gate.js";
 import { fetchMessageWindow, type FetchRunner } from "./fetch-window.js";
 import type { HistoryMessage } from "./history/model.js";
-import type { HistorySource, SessionScope } from "./history/source.js";
+import {
+  unavailableHistoryError,
+  type HistorySource,
+  type SessionScope,
+} from "./history/source.js";
 
 /** The embedder as the search path consumes it: the cache-facing surface plus
  *  the init error, so the one-time "unavailable" warning can explain why. */
@@ -3107,6 +3111,20 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
           excludeCurrent && currentSessionID && (store ? store.getCard(currentSessionID) : true),
         );
         drillTargets = drillTargets.filter((t) => t.sessionId !== excludeSessionID);
+        // An unreadable history source (v2: opencode.db unavailable) skips the
+        // drill and the deep sweep outright; the card tier above still ran and
+        // coverage.source names the reason.
+        const sourceUnavailable = source.unavailable;
+        if (sourceUnavailable !== undefined) {
+          if (drillTargets.length > 0) {
+            skippedByReason.sourceUnavailable =
+              (skippedByReason.sourceUnavailable ?? 0) + drillTargets.length;
+          }
+          drillTargets = [];
+          normalized.warnings.push(
+            `${unavailableHistoryError(sourceUnavailable)}. Content search (drill and deep) was skipped; recall_sessions still lists the indexed sessions.`,
+          );
+        }
 
         const drillInput = {
           sessions: drillTargets,
@@ -3247,6 +3265,9 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
               degraded: cardsCoverage.degraded,
             },
             ...(semanticStatus && { semantic: { ...semanticStatus, contributed: 0 } }),
+            ...(sourceUnavailable !== undefined && {
+              source: { kind: source.kind, available: false as const, reason: sourceUnavailable },
+            }),
           };
           const searchedSessions = drilledSessions.map(
             (id) => searchedMeta.get(id) ?? { id, title: "", directory: "" },

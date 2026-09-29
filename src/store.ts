@@ -100,8 +100,8 @@ const ACCEPTED_PRAGMAS = "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;";
 // Current-version (v4) DDL for a fresh store; older stores reach the same shape
 // through the additive migrations below. No `prefix=` index: anchors are matched
 // as exact quoted phrases, so prefix indexes would be write/disk cost with no
-// query to serve them. `distill_cursor` is the v2 host's per-session checkpoint;
-// the v1 lane leaves it NULL and no card read or write touches it yet.
+// query to serve them. `distill_cursor` is the v2 host's per-session checkpoint
+// ({@link Card.distillCursor}); the v1 lane leaves it NULL.
 const DDL = `
 CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL) WITHOUT ROWID;
 
@@ -199,6 +199,11 @@ export type Card = {
    *  version) the current `nlSummary` was produced from; "" when unsummarized.
    *  The summarizer skips a card whose recomputed hash still matches. */
   summaryHash: string;
+  /** The v2 host's per-session distill checkpoint (opaque to the store): the
+   *  tail the card was distilled against, so the next pass can tell appended
+   *  rows from a rewritten tail. Absent/null on v1 and on a card written
+   *  without one (the upsert then stores NULL, which reads as "not fresh"). */
+  distillCursor?: string | null;
 };
 
 /** One slim-index row to be written for a session (session id comes from the
@@ -311,6 +316,15 @@ export type Store = {
    */
   writeSummary(sessionId: string, summary: string, hash: string): void;
   deleteSession(sessionId: string): void;
+  /**
+   * Patch a card's session metadata in place (title, directory, project) and
+   * bump `cards_rev`, without touching its content. Returns false when no card
+   * exists. Used by a host's metadata signals (v2 renames and moves).
+   */
+  patchCardMeta(
+    sessionId: string,
+    patch: { title?: string; directory?: string; projectId?: string },
+  ): boolean;
   replaceSessionParts(sessionId: string, rows: PartTextRow[], card: Card): void;
   /**
    * Append new slim-index rows to a session's existing rows, enforce the
@@ -405,6 +419,7 @@ const CARD_COLUMNS = [
   "embedding_gen",
   "nl_summary",
   "summary_hash",
+  "distill_cursor",
 ] as const;
 
 // Columns the card upsert must NEVER overwrite: they are owned by a separate
@@ -508,6 +523,8 @@ function rowToCard(row: Row): Card {
     embeddingGen: asNullableNumber(row.embedding_gen),
     nlSummary: asString(row.nl_summary),
     summaryHash: asString(row.summary_hash),
+    // Omitted when NULL, so a v1 card reads back exactly as it was written.
+    ...(typeof row.distill_cursor === "string" && { distillCursor: row.distill_cursor }),
   };
 }
 
@@ -539,6 +556,7 @@ function cardValues(card: Card): SqlValue[] {
     card.embeddingGen,
     card.nlSummary,
     card.summaryHash,
+    card.distillCursor ?? null,
   ];
 }
 
@@ -898,6 +916,21 @@ class SqliteStore implements Store {
       this.evictFts(sessionId);
       this.db.run("DELETE FROM part_text WHERE session_id=?", [sessionId]);
       this.db.run("DELETE FROM card WHERE session_id=?", [sessionId]);
+    });
+  }
+
+  patchCardMeta(
+    sessionId: string,
+    patch: { title?: string; directory?: string; projectId?: string },
+  ): boolean {
+    return this.db.tx(() => {
+      const { changes } = this.db.run(
+        "UPDATE card SET title=coalesce(?, title), directory=coalesce(?, directory), project_id=coalesce(?, project_id) WHERE session_id=?",
+        [patch.title ?? null, patch.directory ?? null, patch.projectId ?? null, sessionId],
+      );
+      if (changes === 0) return false;
+      this.setMeta("cards_rev", String((Number(this.getMeta("cards_rev")) || 0) + 1));
+      return true;
     });
   }
 

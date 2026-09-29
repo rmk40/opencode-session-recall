@@ -12,7 +12,7 @@ import {
 } from "./types.js";
 import type { Card } from "./store.js";
 import { isSummarizerTitle } from "./extract.js";
-import type { HistorySource } from "./history/source.js";
+import { unavailableHistoryError, type HistorySource } from "./history/source.js";
 
 /** Card-backed enrichment for the sessions browser: a snapshot of all cards the
  *  distiller has built. `session.list` stays the authoritative listing; when a
@@ -179,6 +179,68 @@ export function sessions(
       };
 
       try {
+        // ── Unreadable history source: serve from the card index ──
+        // v2 with opencode.db unavailable: no listing can be read live, but a
+        // card store from an earlier run still knows the sessions. Without
+        // cards there is nothing to list.
+        if (source.unavailable !== undefined) {
+          const unavailable = unavailableHistoryError(source.unavailable);
+          if (!allCards || allCards.length === 0) {
+            const err: ErrorOutput = { ok: false, error: unavailable };
+            return JSON.stringify(err);
+          }
+          const currentSessionID = optionalString(ctx.sessionID);
+          const resolvedParent =
+            parentID && parentID.toLowerCase() === "current" ? currentSessionID : parentID;
+          if (parentID && !resolvedParent) {
+            const err: ErrorOutput = {
+              ok: false,
+              error: 'parentID:"current" requires a current session, but none is available',
+            };
+            return JSON.stringify(err);
+          }
+          const searchLower = search?.toLowerCase();
+          const callerDir = normalizeDir(optionalString(ctx.directory));
+          const inScope = (card: Card): boolean => {
+            if (resolvedParent) {
+              if (card.parentId !== resolvedParent) return false;
+              return global || resolvedParent === currentSessionID
+                ? true
+                : sameProject(card.directory, callerDir);
+            }
+            return scope === "global" ? true : sameProject(card.directory, callerDir);
+          };
+          const selected = allCards
+            .filter(
+              (card) =>
+                !isSummarizerTitle(card.title) &&
+                passesTime(card.timeUpdated) &&
+                inScope(card) &&
+                (!searchLower || card.title.toLowerCase().includes(searchLower)),
+            )
+            .sort(
+              (a, b) => b.timeUpdated - a.timeUpdated || a.sessionId.localeCompare(b.sessionId),
+            );
+          const items = selected.slice(0, limit).map((card) =>
+            enrich({
+              id: card.sessionId,
+              title: card.title,
+              directory: card.directory,
+              time: { created: card.timeCreated, updated: card.timeUpdated },
+              archived: false,
+            }),
+          );
+          const out: SessionsOutput = {
+            ok: true,
+            sessions: items,
+            returned: items.length,
+            scope: resolvedParent ? "children" : scope,
+            ...(resolvedParent && { parentID: resolvedParent, childCount: selected.length }),
+            note: `${unavailable}. This listing comes from the card index, which may lag the live history.`,
+          };
+          return JSON.stringify(out);
+        }
+
         // ── Children branch: live parent/child lookup, index-free ──
         // Recovers subagent sessions (cancelled or in-flight) that the card
         // index has not caught up to. Ignores `scope`; direct children only.

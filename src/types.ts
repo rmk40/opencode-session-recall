@@ -174,6 +174,9 @@ export type SearchCoverage = {
     representation: number;
     pluginVersion?: string;
   };
+  /** Present only when the history source cannot read history (v2:
+   *  `opencode.db` unavailable): drill and deep were skipped for `reason`. */
+  source?: { kind: "v1-http" | "v2-sqlite"; available: false; reason: string };
   /** Present only for a deep sweep: how much of the scoped session set the sweep
    *  actually covered. `sessionsCovered` were fully swept, `sessionsPartial`
    *  stopped mid-session on a budget, `sessionsRemaining` were never reached,

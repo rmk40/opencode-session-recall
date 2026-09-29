@@ -22,17 +22,20 @@ const boundaries = [
     exempt: ["src/history/v1.ts"],
   },
   {
-    // The v1 history adapter is wired in by the v1 entry only; the core reads
+    // The v1 history adapter is wired in by the v1 host entry only, and there
+    // through a dynamic import; the core reads
     // history through the HistorySource seam and never depends on an adapter.
     // `**/history/v1.js` catches the path from any depth (./, ../, ../../);
-    // `./v1.js` covers siblings inside src/history/. (A future host/v1 entry
-    // module joins the exemption list.)
+    // `./v1.js` covers siblings inside src/history/. no-restricted-imports does
+    // not check dynamic import(), so src/host/v1.ts's lazy
+    // `await import("../history/v1.js")` needs no exemption, while any static
+    // import of the adapter fails lint.
     pattern: {
       group: ["**/history/v1.js", "./v1.js"],
       message:
-        "Only the v1 entry may import the v1 history adapter; read history through HistorySource.",
+        "Only src/host/v1.ts may import the v1 history adapter (lazily); read history through HistorySource.",
     },
-    exempt: ["src/opencode-session-recall.ts", "src/history/v1.ts"],
+    exempt: ["src/history/v1.ts"],
   },
   {
     // The plugin package is v1-host only and absent from a v2-only install.
@@ -82,6 +85,49 @@ function restrictedImports(files) {
   });
 }
 
+/**
+ * Dynamic-import boundaries: no-restricted-imports sees static imports only,
+ * so a literal `import("...")` is checked here with no-restricted-syntax, one
+ * block per exemption set (same replacement rule as above).
+ */
+const dynamicBoundaries = [
+  {
+    // A literal dynamic import("node:fs") outside the two runtime-aware files.
+    selector: {
+      selector: "ImportExpression[source.value=/^(node|bun):/]",
+      message:
+        "Only src/sqlite.ts and src/node-import.ts may import node:/bun: modules; use the loaders in src/node-import.ts.",
+    },
+    exempt: ["src/sqlite.ts", "src/node-import.ts"],
+  },
+  {
+    // The v1 adapter owns the SDK value import; only the v1 host entry loads
+    // it, lazily, so a v2 host never evaluates it.
+    selector: {
+      selector: "ImportExpression[source.value=/(^|\\/)history\\/v1\\.js$/]",
+      message: "Only src/host/v1.ts may load the v1 history adapter.",
+    },
+    exempt: ["src/host/v1.ts"],
+  },
+];
+
+function restrictedDynamicImports(files) {
+  const exemptSets = new Map([["", []]]);
+  for (const { exempt } of dynamicBoundaries) {
+    for (const file of exempt) exemptSets.set(file, [file]);
+  }
+  return [...exemptSets.values()].map((exemptFiles) => {
+    const selectors = dynamicBoundaries
+      .filter(({ exempt }) => !exemptFiles.some((file) => exempt.includes(file)))
+      .map(({ selector }) => selector);
+    return {
+      files: exemptFiles.length > 0 ? exemptFiles : files,
+      ignores: exemptFiles.length > 0 ? [] : [...exemptSets.keys()].filter(Boolean),
+      rules: { "no-restricted-syntax": ["error", ...selectors] },
+    };
+  });
+}
+
 export default tseslint.config(
   eslint.configs.recommended,
   ...tseslint.configs.recommended,
@@ -89,20 +135,5 @@ export default tseslint.config(
     ignores: ["dist/", "node_modules/"],
   },
   ...restrictedImports(["src/**/*.ts"]),
-  {
-    // no-restricted-imports sees static imports only; also catch a literal
-    // dynamic import("node:fs") outside the two runtime-aware files.
-    files: ["src/**/*.ts"],
-    ignores: ["src/sqlite.ts", "src/node-import.ts"],
-    rules: {
-      "no-restricted-syntax": [
-        "error",
-        {
-          selector: "ImportExpression[source.value=/^(node|bun):/]",
-          message:
-            "Only src/sqlite.ts and src/node-import.ts may import node:/bun: modules; use the loaders in src/node-import.ts.",
-        },
-      ],
-    },
-  },
+  ...restrictedDynamicImports(["src/**/*.ts"]),
 );
