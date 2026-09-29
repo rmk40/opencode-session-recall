@@ -520,7 +520,11 @@ export function createV2HistorySource(db: SqliteDb, opts: V2SourceOptions = {}):
         where.push("s.project_id = ?");
         params.push(projectID);
       } else {
-        // Mirrors v1's global listing, which hides archived sessions.
+        // Mirrors the v1 server: `listGlobal` in opencode's
+        // packages/opencode/src/session/session.ts (origin/dev) adds
+        // `isNull(time_archived)` unless `input.archived` is set, and the plugin
+        // never sets it; the project listing (`Session.list`) has no such
+        // filter, so project scope keeps archived sessions here too.
         where.push("s.time_archived IS NULL");
       }
       if (o.search) {

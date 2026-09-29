@@ -64,6 +64,8 @@ describe("recall_sessions", () => {
   });
 
   it("lists global sessions, normalizes blank search, and exposes archived/project metadata", async () => {
+    // The fake's global list includes an archived session, which the real v1
+    // server's `listGlobal` would hide; this checks the tool's mapping only.
     const h = makeFakeHarness();
     const out = await runTool<SessionsOutput>(sessionsTool(h.source, true, TEST_LIMITS), {
       scope: "global",

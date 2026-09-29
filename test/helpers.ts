@@ -502,6 +502,10 @@ export function makeFixture(now = Date.now()): {
   ];
 
   const sessions = [current, projectTwo];
+  // Diverges from the real v1 server on purpose (existing tests rely on it):
+  // the real global listing (`listGlobal`, opencode session.ts) hides archived
+  // sessions, but this fixture's global list includes the archived
+  // `projectTwo`. The v2 source follows the real server.
   const globalSessions = [other, current, projectTwo].map(globalSessionFrom);
   const messagesBySession = {
     [current.id]: currentMessages,
