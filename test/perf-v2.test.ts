@@ -9,7 +9,9 @@
  * large synthetic opencode v2 database (thousands of small sessions, a few
  * 4,000-row sessions, and some multi-megabyte rows, including rows over the
  * page byte ceiling), then measures the longest gap a `setInterval(0)` probe
- * sees during a full v2 cold pass, one poll cycle, and a `listSessions` call.
+ * sees during a full v2 cold pass, one poll cycle, a `listSessions` call, and
+ * an append re-distill of a 4,000-row session (distillAppend derives the merged
+ * card synchronously inside the store transaction, over every retained row).
  * Budget: no slice over 50 ms.
  *
  * When the budget fails the report names the slowest synchronous calls it
@@ -22,7 +24,9 @@
  * transaction (32 to 46 ms), which stays whole for per-session atomicity;
  * the derivation yields cooperatively (deriveCardCooperative). The poll
  * peaks near 3 ms and listSessions under 12 ms. Before the cooperative
- * derivation the cold pass peaked at 93 to 153 ms.
+ * derivation the cold pass peaked at 93 to 153 ms. The append of 200 rows to
+ * a 4,002-part session peaks at 37.6 ms, set by its one appendSessionParts
+ * transaction (35.7 ms); the whole append takes about 106 ms.
  */
 import { describe, expect, it } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
@@ -52,6 +56,7 @@ const BIG_SESSIONS = 3;
 const BIG_SESSION_ROWS = 4_000;
 const LOADED_HUGE_ROW_BYTES = 3 * 1024 * 1024; // under the 4 MiB page ceiling
 const OVERSIZED_ROW_BYTES = 6 * 1024 * 1024; // over it: a placeholder
+const APPEND_ROWS = 200;
 
 type SlowCall = { what: string; ms: number };
 
@@ -170,7 +175,7 @@ const sentence = (i: number, n = 12) =>
   Array.from({ length: n }, (_, k) => words[(i + k * 7) % words.length]).join(" ");
 
 describe.skipIf(!ENABLED)("perf: v2 event-loop stalls", () => {
-  it(`cold pass, one poll and listSessions never block the loop over ${BUDGET_MS} ms`, async () => {
+  it(`cold pass, one poll, listSessions and an append never block the loop over ${BUDGET_MS} ms`, async () => {
     const v2 = await makeV2Db();
     const storeDir = mkdtempSync(join(tmpdir(), "recall-perf-v2-"));
     try {
@@ -179,22 +184,22 @@ describe.skipIf(!ENABLED)("perf: v2 event-loop stalls", () => {
       const at = Date.now();
       let seq = 0;
       const w = v2.db;
+      const add = (sid: string, type: string, data: unknown, t: number) => {
+        w.run(
+          `INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data)
+           VALUES (?, ?, ?, ?, ?, ?, ?)`,
+          [`msg_${++seq}`, sid, type, seq, t, t, JSON.stringify(data)],
+        );
+      };
+      const user = (text: string, t: number) => ({ text, time: { created: t } });
+      const reply = (text: string, t: number) => ({
+        agent: "build",
+        model: { id: "m", providerID: "p" },
+        content: [{ type: "text", text }],
+        time: { created: t, completed: t + 1 },
+      });
       w.tx(() => {
         insertProject(w, { id: "prj", worktree: "/workspace/perf" });
-        const add = (sid: string, type: string, data: unknown, t: number) => {
-          w.run(
-            `INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data)
-             VALUES (?, ?, ?, ?, ?, ?, ?)`,
-            [`msg_${++seq}`, sid, type, seq, t, t, JSON.stringify(data)],
-          );
-        };
-        const user = (text: string, t: number) => ({ text, time: { created: t } });
-        const reply = (text: string, t: number) => ({
-          agent: "build",
-          model: { id: "m", providerID: "p" },
-          content: [{ type: "text", text }],
-          time: { created: t, completed: t + 1 },
-        });
         for (let i = 0; i < SMALL_SESSIONS; i++) {
           const sid = `ses_small_${i}`;
           // The newest RECENT_SESSIONS fall inside the poll's window below.
@@ -252,6 +257,7 @@ describe.skipIf(!ENABLED)("perf: v2 event-loop stalls", () => {
       const sync = createV2Sync(reader, { pollIntervalMs: 3_600_000 });
       const probe = stallProbe();
       let coldWorst = { from: 0, to: 0 };
+      let appendWorst = { from: 0, to: 0 };
       const results: Record<string, number> = {};
       try {
         // ── Cold pass ──
@@ -310,6 +316,57 @@ describe.skipIf(!ENABLED)("perf: v2 event-loop stalls", () => {
         results.listTotalMs = performance.now() - listStart;
         results.listed = listing.ok ? listing.items.length : -1;
         results.cards = store.allCards().length;
+
+        // ── Append re-distill of a big session ──
+        // distillAppend derives the merged card synchronously inside the
+        // store transaction (over every retained row), so it gets its own
+        // measurement. ses_big_0 is far over appendThresholdParts; the new
+        // rows are settled, so the tail compares as appended.
+        const appendSid = "ses_big_0";
+        const partsBefore = store.getCard(appendSid)?.partCount ?? 0;
+        const appendAt = at + 60_000;
+        w.tx(() => {
+          for (let r = 0; r < APPEND_ROWS; r++) {
+            const rt = appendAt + r;
+            if (r % 2 === 0) add(appendSid, "user", user(sentence(r), rt), rt);
+            else add(appendSid, "assistant", reply(sentence(r, 60), rt), rt);
+          }
+          w.run("UPDATE session_v2 SET time_updated = ? WHERE id = ?", [
+            appendAt + APPEND_ROWS,
+            appendSid,
+          ]);
+        });
+        let appendCalls = 0;
+        const appendParts = store.appendSessionParts.bind(store);
+        store.appendSessionParts = (...args) => {
+          appendCalls++;
+          return appendParts(...args);
+        };
+        const appender = createDistiller({
+          source,
+          store,
+          gate: createFetchGate({ concurrency: DEFAULTS.concurrency }),
+          limits: { ...DEFAULTS, coldPass: false, distillDelayMs: 0 },
+          instanceId: "perf-v2-append",
+          sync,
+          idleDebounceMs: 1,
+          yieldBetween: () => new Promise((resolve) => setTimeout(resolve, 0)),
+          log: () => {},
+        });
+        appender.start();
+        probe.reset();
+        const appendStart = performance.now();
+        appender.onEvent({ type: "turn-ended", sessionID: appendSid });
+        while ((store.getCard(appendSid)?.partCount ?? 0) <= partsBefore) {
+          if (performance.now() - appendStart > 60_000) throw new Error("append did not land");
+          await new Promise((resolve) => setTimeout(resolve, 5));
+        }
+        results.appendMaxSliceMs = probe.max();
+        appendWorst = probe.worst();
+        results.appendTotalMs = performance.now() - appendStart;
+        results.appendCalls = appendCalls;
+        results.appendPartsBefore = partsBefore;
+        await appender.stop();
       } finally {
         probe.stop();
         reader.close();
@@ -333,11 +390,17 @@ describe.skipIf(!ENABLED)("perf: v2 event-loop stalls", () => {
         "calls around the worst cold-pass stall (ms relative to its start):",
         JSON.stringify(slow.around(coldWorst)),
       );
+      console.log(
+        "calls around the worst append stall (ms relative to its start):",
+        JSON.stringify(slow.around(appendWorst)),
+      );
 
       expect(results.cards).toBe(SMALL_SESSIONS + BIG_SESSIONS);
       expect(results.coldPassMaxSliceMs).toBeLessThan(BUDGET_MS);
       expect(results.pollMaxSliceMs).toBeLessThan(BUDGET_MS);
       expect(results.listMaxSliceMs).toBeLessThan(BUDGET_MS);
+      expect(results.appendCalls).toBe(1);
+      expect(results.appendMaxSliceMs).toBeLessThan(BUDGET_MS);
     } finally {
       v2.cleanup();
       rmSync(storeDir, { recursive: true, force: true });
