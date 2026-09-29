@@ -321,6 +321,22 @@ describe("v2 tools and hooks", () => {
     expect(parsed).toMatchObject({ value: { scope: "project" } });
   });
 
+  it("re-adds the same five working tools when the host replays its transforms", async () => {
+    const h = host();
+    await setup(h);
+    await runtimeOf(h);
+    const first = new Map(h.tools);
+    h.rebuildTools();
+    expect([...h.tools.keys()].sort()).toEqual([...TOOLS].sort());
+    for (const [name, tool] of h.tools) {
+      expect(tool.description).toBe(first.get(name)?.description);
+      expect(tool.options).toEqual({ codemode: false });
+    }
+    const out = await call(h, "recall_sessions", { scope: "project" });
+    expect(out.ok).toBe(true);
+    expect((out.sessions as Array<{ id: string }>).map((s) => s.id)).toContain("ses_a");
+  });
+
   it("answers from opencode.db through the instance's project facade", async () => {
     const h = host();
     await setup(h);
