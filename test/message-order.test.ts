@@ -45,6 +45,11 @@ function sourceFiles(dir: string): string[] {
     .map((file) => join(dir, file));
 }
 
+/** A part-less message carrying a v2 `seq`. */
+function seqd(info: HistoryMessage["info"], seq: number): HistoryMessage {
+  return { info: { ...info, seq }, parts: [] };
+}
+
 describe("message ordering", () => {
   it("orders by time.created, then id", () => {
     const early = bundle(userMessage("m-b", "s", 100), []);
@@ -52,6 +57,21 @@ describe("message ordering", () => {
     const tieHigh = bundle(assistantMessage("m-c", "s", 200), []);
     const sorted: HistoryMessage[] = [tieHigh, early, tieLow].sort(compareMessages);
     expect(sorted.map((m) => m.info.id)).toEqual(["m-b", "m-a", "m-c"]);
+  });
+
+  it("orders by seq when both messages carry it, even against time", () => {
+    // A v2 retry rewrites the assistant's time.created past its successor.
+    const retried = seqd(assistantMessage("m-a", "s", 900), 2);
+    const next = seqd(userMessage("m-b", "s", 500), 3);
+    const first = seqd(userMessage("m-z", "s", 100), 1);
+    const sorted = [next, retried, first].sort(compareMessages);
+    expect(sorted.map((m) => m.info.id)).toEqual(["m-z", "m-a", "m-b"]);
+  });
+
+  it("falls back to time, then id, when only one message carries seq", () => {
+    const withSeq = seqd(userMessage("m-b", "s", 200), 1);
+    const without = bundle(userMessage("m-a", "s", 100), []);
+    expect([withSeq, without].sort(compareMessages).map((m) => m.info.id)).toEqual(["m-a", "m-b"]);
   });
 
   it("detects a hand-rolled chronological comparator", () => {
