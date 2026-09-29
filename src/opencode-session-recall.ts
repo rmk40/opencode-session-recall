@@ -26,16 +26,9 @@ import { createV1Clients, createV1HistorySource } from "./history/v1.js";
 import type { HistorySession } from "./history/model.js";
 import { v1EventToSignal } from "./history/v1-events.js";
 import { createDistiller } from "./distill.js";
-import { createSummarizer, parseModelId, type Summarizer } from "./summarize.js";
-import {
-  TOOLS,
-  DEFAULTS,
-  optionalString,
-  errmsg,
-  settleWithin,
-  type ErrorOutput,
-  type Limits,
-} from "./types.js";
+import { createSummarizer, type Summarizer } from "./summarize.js";
+import { parseOptions } from "./options.js";
+import { TOOLS, errmsg, settleWithin, type ErrorOutput } from "./types.js";
 
 /** Per-phase bound on dispose()'s awaited waits. The host awaits dispose as a
  *  shutdown finalizer with no timeout of its own, so a never-settling in-flight
@@ -58,12 +51,6 @@ function pluginLog(message: string): void {
   }
 }
 
-/** Opt-in semantic layer defaults (plugin options, off unless enabled). */
-const DEFAULT_SEMANTIC_MODEL = "minishlab/potion-base-8M";
-const DEFAULT_SEMANTIC_WEIGHT = 0.35;
-const MIN_SEMANTIC_WEIGHT = 0.05;
-const MAX_SEMANTIC_WEIGHT = 0.95;
-
 /**
  * Plugin build tag — recorded in the distill lease and surfaced in
  * `coverage.semantic.pluginVersion`, so a store shared by mixed-version processes
@@ -81,71 +68,22 @@ const MAX_SEMANTIC_WEIGHT = 0.95;
  */
 const PLUGIN_BUILD = `schema${SCHEMA_VERSION}.gen${EMBED_REPRESENTATION}`;
 
-type Options = {
-  primary?: boolean;
-  global?: boolean;
-  /** `"ephemeral"` runs the plugin with no persistent store and zero disk
-   *  artifacts: cards are metadata-only (built live from the session list),
-   *  content recall comes from drill/deep at query time, and the semantic
-   *  layer is forced off (its embedder writes model weights to the cache dir).
-   *  Anything else (including absence) is persistent mode. */
-  mode?: "persistent" | "ephemeral";
-  /** Inject a system-prompt reminder to use recall (R1a). Default: true. */
-  nudge?: boolean;
-  /** Run gated automatic recall on each user message (R1b). Default: false. */
-  autoRecall?: boolean;
-  /** Preserve durable findings into the compaction summary (R1c). Default: false. */
-  compactionRecall?: boolean;
-  /** Deprecated no-op: the card store persists across processes, so there is
-   *  nothing to prewarm. Retained so existing configs do not error. */
-  prewarm?: boolean;
-  /** Override the card-store file path (default
-   *  `~/.cache/opencode-session-recall/store-v1.db`). */
-  storePath?: string;
-  /** Enable the opt-in, local-only semantic layer. Default: false. */
-  semantic?: boolean;
-  /** Blend weight for the semantic signal, clamped to [0.05, 0.95]. Default: 0.35. */
-  semanticWeight?: number;
-  /** HuggingFace model id for static embeddings. Default: minishlab/potion-base-8M. */
-  semanticModel?: string;
-  /** Opt-in Path B LLM card summaries (off by default; spends the user's tokens).
-   *  `model` is required as "providerID/modelID" — no model disables it. `agent`
-   *  optionally prompts as a restricted opencode agent (the enforced tool block). */
-  summaries?: { enabled?: boolean; model?: string; agent?: string; maxPromptsPerPass?: number };
-} & Partial<Limits>;
-
 const server: Plugin = async (ctx, options) => {
-  const opts = (options ?? {}) as Options;
-  const primary = opts.primary !== false;
-  const global = opts.global !== false;
-  const nudge = opts.nudge !== false;
-  const autoRecallEnabled = opts.autoRecall === true;
-  const compactionRecallEnabled = opts.compactionRecall === true;
-  // Hand-coerced like every other option (options carry no Zod schema — the
-  // value arrives as untyped JSON): only the literal string "ephemeral"
-  // enables the mode; anything else — including a typo — is persistent, with a
-  // one-time log line as the tell.
-  const modeRaw: unknown = opts.mode;
-  const ephemeral = modeRaw === "ephemeral";
-  if (!ephemeral && typeof modeRaw === "string" && modeRaw !== "" && modeRaw !== "persistent") {
-    pluginLog(`unrecognized mode ${JSON.stringify(modeRaw)}; running in persistent mode`);
-  }
-  if (ephemeral) {
-    if (optionalString(opts.storePath)) {
-      pluginLog("ephemeral mode: storePath is ignored (no store is opened)");
-    }
-    if (opts.semantic === true) {
-      pluginLog(
-        "ephemeral mode: semantic is forced off (the embedder caches model weights on disk)",
-      );
-    }
-    if (opts.summaries?.enabled === true) {
-      pluginLog("ephemeral mode: summaries are inert (they require the persistent store)");
-    }
-    if (opts.compactionRecall === true) {
-      pluginLog("ephemeral mode: compactionRecall is inert (it reads the persistent store)");
-    }
-  }
+  const {
+    primary,
+    global,
+    nudge,
+    autoRecall: autoRecallEnabled,
+    compactionRecall: compactionRecallEnabled,
+    ephemeral,
+    storePath: configuredStorePath,
+    semantic: semanticOptions,
+    summaries: summariesOptions,
+    limits,
+    warnings,
+  } = parseOptions(options);
+  for (const warning of warnings) pluginLog(warning);
+
   let disposed = false;
   let disposePromise: Promise<void> | undefined;
   const operations = new Set<Promise<unknown>>();
@@ -157,36 +95,6 @@ const server: Plugin = async (ctx, options) => {
       () => operations.delete(operation),
     );
     return operation;
-  };
-
-  const clamp = (val: number | undefined, fallback: number, min = 1) =>
-    Math.max(min, Math.floor(val ?? fallback));
-
-  const limits: Limits = {
-    concurrency: clamp(opts.concurrency, DEFAULTS.concurrency),
-    maxSessions: clamp(opts.maxSessions, DEFAULTS.maxSessions),
-    maxResults: clamp(opts.maxResults, DEFAULTS.maxResults),
-    maxSessionList: clamp(opts.maxSessionList, DEFAULTS.maxSessionList),
-    maxMessages: clamp(opts.maxMessages, DEFAULTS.maxMessages),
-    maxWindow: clamp(opts.maxWindow, DEFAULTS.maxWindow),
-    defaultWidth: clamp(opts.defaultWidth, DEFAULTS.defaultWidth, 50),
-    cacheMaxChars: clamp(opts.cacheMaxChars, DEFAULTS.cacheMaxChars),
-    distillConcurrency: clamp(opts.distillConcurrency, DEFAULTS.distillConcurrency),
-    distillDelayMs: Math.max(0, Math.floor(opts.distillDelayMs ?? DEFAULTS.distillDelayMs)),
-    ftsRowsPerSession: clamp(opts.ftsRowsPerSession, DEFAULTS.ftsRowsPerSession),
-    inventoryTokens: clamp(opts.inventoryTokens, DEFAULTS.inventoryTokens),
-    coldPass: opts.coldPass !== false,
-    drillSessions: clamp(opts.drillSessions, DEFAULTS.drillSessions),
-    // Reserved semantic slots: min 0 (0 disables the reservation), never more
-    // than the drill fan-out itself.
-    semanticSlots: Math.min(
-      clamp(opts.drillSessions, DEFAULTS.drillSessions),
-      Math.max(0, Math.floor(opts.semanticSlots ?? DEFAULTS.semanticSlots)),
-    ),
-    drillPageMessages: clamp(opts.drillPageMessages, DEFAULTS.drillPageMessages),
-    drillCharsPerSession: clamp(opts.drillCharsPerSession, DEFAULTS.drillCharsPerSession),
-    drillCharsPerQuery: clamp(opts.drillCharsPerQuery, DEFAULTS.drillCharsPerQuery),
-    deepCharsPerQuery: clamp(opts.deepCharsPerQuery, DEFAULTS.deepCharsPerQuery),
   };
 
   // Every history read goes through `source`; the scoped client itself is
@@ -204,19 +112,15 @@ const server: Plugin = async (ctx, options) => {
   // Ephemeral force-disables the semantic layer: SemanticEmbedder.init() runs
   // BEFORE the store block and eagerly writes model weights under the cache
   // dir, which would violate the mode's zero-artifact contract.
-  if (opts.semantic === true && !ephemeral) {
+  if (semanticOptions) {
     try {
       const { SemanticEmbedder } = await import("./semantic/embedder.js");
-      const model = optionalString(opts.semanticModel) ?? DEFAULT_SEMANTIC_MODEL;
+      const model = semanticOptions.model;
       const embedder = new SemanticEmbedder(model);
       // Idempotent: start loading and keep the promise so the card runtime can
       // run its first embed pass the moment the model is ready.
       semanticReady = embedder.init();
-      const weight =
-        typeof opts.semanticWeight === "number" && Number.isFinite(opts.semanticWeight)
-          ? Math.max(MIN_SEMANTIC_WEIGHT, Math.min(MAX_SEMANTIC_WEIGHT, opts.semanticWeight))
-          : DEFAULT_SEMANTIC_WEIGHT;
-      semantic = { embedder, weight };
+      semantic = { embedder, weight: semanticOptions.weight };
       semanticModel = model;
     } catch {
       // Plain cache, no semantic.
@@ -245,7 +149,7 @@ const server: Plugin = async (ctx, options) => {
   let store: Store | null = null;
   let db: SqliteDb | null = null;
   if (!ephemeral) {
-    const storePath = optionalString(opts.storePath) ?? (await defaultStorePath());
+    const storePath = configuredStorePath ?? (await defaultStorePath());
     if (storePath) {
       db = await openSqlite(storePath);
       if (db) store = openStore(db);
@@ -347,26 +251,13 @@ const server: Plugin = async (ctx, options) => {
       if (!disposed) summarizer?.queue(sessionId);
     },
   });
-  if (store && opts.summaries?.enabled === true) {
-    const model = optionalString(opts.summaries.model);
-    const parsed = model ? parseModelId(model) : undefined;
-    if (parsed) {
-      const maxPromptsPerPass =
-        typeof opts.summaries.maxPromptsPerPass === "number" &&
-        Number.isFinite(opts.summaries.maxPromptsPerPass) &&
-        opts.summaries.maxPromptsPerPass > 0
-          ? Math.floor(opts.summaries.maxPromptsPerPass)
-          : undefined;
-      const agent = optionalString(opts.summaries.agent);
+  if (store && summariesOptions) {
+    if (summariesOptions.config) {
       summarizer = createSummarizer({
         client,
         store,
         gate,
-        config: {
-          ...parsed,
-          ...(agent != null && { agent }),
-          ...(maxPromptsPerPass != null && { maxPromptsPerPass }),
-        },
+        config: summariesOptions.config,
         ownerToken: instanceId,
         leaseHeld: () => distiller.ownsLease(),
         log: pluginLog,
