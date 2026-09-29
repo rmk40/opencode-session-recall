@@ -29,6 +29,8 @@ import { createFetchGate } from "../../src/fetch-gate.js";
 import { createDistiller, type Distiller } from "../../src/distill.js";
 import { createCardsRuntime, cardsLiteFromSessions } from "../../src/cards.js";
 import { createDrill } from "../../src/drill.js";
+import type { HistorySource } from "../../src/history/source.js";
+import { createV1HistorySource } from "../../src/history/v1.js";
 import { search, type SearchDeps, type SemanticSearchConfig } from "../../src/search.js";
 import { makeEvalCorpus, type EvalCorpus } from "./corpus.js";
 
@@ -43,6 +45,7 @@ export const EVAL_SEMANTIC_MODEL = "eval/fake-embedder";
 export function makeEvalClients(corpus: EvalCorpus = makeEvalCorpus()): {
   client: OpencodeClient;
   unscoped: OpencodeClient;
+  source: HistorySource;
 } {
   const matchTitle = <T extends { title: string }>(items: T[], search?: string): T[] =>
     search ? items.filter((s) => s.title.toLowerCase().includes(search.toLowerCase())) : items;
@@ -86,9 +89,12 @@ export function makeEvalClients(corpus: EvalCorpus = makeEvalCorpus()): {
     },
   };
 
+  const scopedClient = client as unknown as OpencodeClient;
+  const unscopedClient = unscoped as unknown as OpencodeClient;
   return {
-    client: client as unknown as OpencodeClient,
-    unscoped: unscoped as unknown as OpencodeClient,
+    client: scopedClient,
+    unscoped: unscopedClient,
+    source: createV1HistorySource({ scoped: scopedClient, unscoped: unscopedClient }),
   };
 }
 

@@ -20,6 +20,8 @@ import { createFetchGate, type FetchGate } from "../src/fetch-gate.js";
 import { createCardsRuntime, cardsLiteFromSessions } from "../src/cards.js";
 import { createDrill } from "../src/drill.js";
 import type { SearchDeps, SemanticSearchConfig } from "../src/search.js";
+import type { HistorySource } from "../src/history/source.js";
+import { createV1HistorySource } from "../src/history/v1.js";
 
 export const PROJECT_DIR = "/workspace/project";
 export const OTHER_DIR = "/workspace/other";
@@ -107,6 +109,9 @@ export type FakeOptions = {
 export type FakeHarness = {
   client: OpencodeClient;
   unscoped: OpencodeClient;
+  /** The v1 history source over the two fake clients (so `calls` still
+   *  records every host read). */
+  source: HistorySource;
   calls: FakeCalls;
   sessions: Session[];
   globalSessions: GlobalSession[];
@@ -592,9 +597,12 @@ export function makeFakeHarness(options: FakeOptions = {}): FakeHarness {
     },
   };
 
+  const scopedClient = client as unknown as OpencodeClient;
+  const unscopedClient = unscoped as unknown as OpencodeClient;
   return {
-    client: client as unknown as OpencodeClient,
-    unscoped: unscoped as unknown as OpencodeClient,
+    client: scopedClient,
+    unscoped: unscopedClient,
+    source: createV1HistorySource({ scoped: scopedClient, unscoped: unscopedClient }),
     calls,
     ...fixture,
   };

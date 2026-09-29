@@ -15,6 +15,8 @@ import {
   type DeriveCardInput,
   type DistillSessionMeta,
 } from "../src/distill.js";
+import type { HistorySource } from "../src/history/source.js";
+import { createV1HistorySource } from "../src/history/v1.js";
 import {
   apiFailure,
   assistantMessage,
@@ -73,7 +75,7 @@ function makeDistillFake(
     /** session.get returns the v2 404 body (`name: "NotFoundError"`). */
     metadataNotFound?: Set<string>;
   } = {},
-): { client: OpencodeClient; sdk: SdkCalls } {
+): { client: OpencodeClient; source: HistorySource; sdk: SdkCalls } {
   const sdk: SdkCalls = { list: 0, get: 0, messages: [] };
   const threw = new Set<string>();
   const client = {
@@ -120,7 +122,7 @@ function makeDistillFake(
       },
     },
   } as unknown as OpencodeClient;
-  return { client, sdk };
+  return { client, source: createV1HistorySource({ scoped: client, unscoped: client }), sdk };
 }
 
 function makeSpyGate(): { gate: FetchGate; background: () => number } {
