@@ -45,6 +45,7 @@ import { smartSnippet, truncatePreservingMatch } from "./snippet.js";
 import { compileRegex, regexFirstIndex, regexSnippet } from "./regex.js";
 import { classifyQuery } from "./route.js";
 import type { CardsRuntime, CardHit, CardFilters, CardRankFilters, RankStats } from "./cards.js";
+import { createCardDrill } from "./card-drill.js";
 import {
   encodeDeepCursor,
   decodeDeepCursor,
@@ -3111,18 +3112,17 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
           excludeCurrent && currentSessionID && (store ? store.getCard(currentSessionID) : true),
         );
         drillTargets = drillTargets.filter((t) => t.sessionId !== excludeSessionID);
-        // An unreadable history source (v2: opencode.db unavailable) skips the
-        // drill and the deep sweep outright; the card tier above still ran and
-        // coverage.source names the reason.
+        // An unreadable history source (v2: opencode.db unavailable) cannot be
+        // drilled or swept. The selected sessions are still searched, through
+        // their cards: the card drill builds each session's pool from its
+        // title, first statement, last answer and summary, and the ordinary
+        // routes rank, filter and group those exactly as drilled parts.
+        // Results are card-quality; coverage.source and a warning say why.
         const sourceUnavailable = source.unavailable;
+        const activeDrill = sourceUnavailable === undefined ? drill : createCardDrill(cards);
         if (sourceUnavailable !== undefined) {
-          if (drillTargets.length > 0) {
-            skippedByReason.sourceUnavailable =
-              (skippedByReason.sourceUnavailable ?? 0) + drillTargets.length;
-          }
-          drillTargets = [];
           normalized.warnings.push(
-            `${unavailableHistoryError(sourceUnavailable)}. Content search (drill and deep) was skipped; recall_sessions still lists the indexed sessions.`,
+            `${unavailableHistoryError(sourceUnavailable)}. Results come from the session cards only (title, first statement, last answer, summary)${deepMode ? "; the deep sweep was skipped" : ""}; message content cannot be read until it is available.`,
           );
         }
 
@@ -3450,7 +3450,7 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
           count > 0 ? `, ${count} load error${count !== 1 ? "s" : ""}` : "";
 
         // ── Deep sweep route (exhaustive, tool-output-inclusive, budgeted) ──
-        if (deepMode) {
+        if (deepMode && sourceUnavailable === undefined) {
           // The page offset belongs to ONE session (deepCursor.current). The
           // resume rebuild can drop that session (worker/bounds/current-session
           // guards, excludeSessionID), shifting a different session into slot 0
@@ -3461,7 +3461,7 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
             deepCursor?.current && drillTargets[0]?.sessionId === deepCursor.current
               ? { before: deepCursor.before }
               : undefined;
-          const deepResult = await drill.deep({
+          const deepResult = await activeDrill.deep({
             sessions: drillTargets,
             query: queryMeta,
             filter: (candidate: Candidate) => candidateEligible(candidate, filters),
@@ -3544,7 +3544,7 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
 
         // ── Route: literal ──
         if (matchMode === "literal") {
-          const drilled = await drill.pools({ ...drillInput, mode: smartMode });
+          const drilled = await activeDrill.pools({ ...drillInput, mode: smartMode });
           if (ctx.abort.aborted) return abortedOutput();
           const outCtx = buildOutputContext(
             drilled.drilledSessions,
@@ -3573,7 +3573,7 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
 
         // ── Route: regex ──
         if (matchMode === "regex" && regex) {
-          const drilled = await drill.pools({ ...drillInput, mode: smartMode });
+          const drilled = await activeDrill.pools({ ...drillInput, mode: smartMode });
           if (ctx.abort.aborted) return abortedOutput();
           const outCtx = buildOutputContext(
             drilled.drilledSessions,
@@ -3602,7 +3602,7 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
         }
 
         // ── Route: smart / fuzzy (tier-2 drilled BM25 rerank) ──
-        const drilled = await drill.drill({ ...drillInput, mode: smartMode });
+        const drilled = await activeDrill.drill({ ...drillInput, mode: smartMode });
         if (ctx.abort.aborted) return abortedOutput();
         const outCtx = buildOutputContext(
           drilled.drilledSessions,

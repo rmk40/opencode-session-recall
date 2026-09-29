@@ -48,8 +48,9 @@ export interface HistorySource {
   /**
    * Set when this source cannot read history at all (v2: `opencode.db` is
    * missing, unreadable, in memory, or has an unknown schema), to the reason.
-   * Every read then fails with {@link unavailableHistoryError}; `recall` skips
-   * its drill and deep sweep and `recall_sessions` serves from cards.
+   * Every read then fails with {@link unavailableHistoryError}; `recall`
+   * answers from the session cards (see `card-drill.ts`) instead of drilling
+   * or sweeping, and `recall_sessions` serves from cards.
    */
   readonly unavailable?: string;
   /**

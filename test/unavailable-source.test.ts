@@ -65,7 +65,7 @@ describe("unavailable history source", () => {
     await expect(source.messagePage({ sessionID: "s", limit: 5 })).rejects.toThrow(ERROR);
   });
 
-  it("recall keeps the card tier, skips drill and deep, and names the reason", async () => {
+  it("recall answers from the cards, reads nothing, and names the reason", async () => {
     const h = makeFakeHarness();
     const { deps, cleanup } = await makeRecallDeps(h, TEST_LIMITS);
     try {
@@ -74,24 +74,65 @@ describe("unavailable history source", () => {
       const drill = createDrill({ source, gate, limits: TEST_LIMITS });
       const recall = search(source, true, TEST_LIMITS, { ...deps, gate, drill });
       for (const args of [
-        { query: "rateLimit checkout", scope: "global" },
-        // A deep sweep needs an explicit scope.
-        { query: "rateLimit checkout", deep: true, sessions: ["s-current", "s-project-2"] },
+        { query: "rateLimit", scope: "global" },
+        { query: "rateLimit checkout", scope: "global", match: "smart" },
+        // A deep sweep cannot run; the scoped sessions are searched by card.
+        { query: "rateLimit", deep: true, sessions: ["s-current", "s-project-2"] },
       ]) {
         const out = await runTool<SearchOutput>(recall, args);
-        expect(out.ok).toBe(true);
-        expect(out.results).toEqual([]);
+        expect(out.ok, JSON.stringify(args)).toBe(true);
+        expect(out.results.length, JSON.stringify(args)).toBeGreaterThan(0);
+        // Every result is card-derived: a card field or the session title.
+        for (const result of out.results) {
+          expect(result.partID).toMatch(/:card:|:title$/);
+        }
         expect(out.coverage?.source).toEqual({
           kind: "v2-sqlite",
           available: false,
           reason: REASON,
         });
-        // The card tier found sessions; each was skipped for the reason.
-        expect(out.coverage?.skippedByReason?.sourceUnavailable).toBeGreaterThan(0);
         expect(out.coverage?.cards?.total).toBeGreaterThan(0);
-        expect(out.warnings?.some((w) => w.startsWith(ERROR))).toBe(true);
+        expect(out.warnings?.some((w) => w.startsWith(ERROR) && /session cards only/.test(w))).toBe(
+          true,
+        );
       }
       expect(reads()).toBe(0);
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("recall from cards keeps scope and eligibility filters", async () => {
+    const h = makeFakeHarness();
+    const { deps, cleanup } = await makeRecallDeps(h, TEST_LIMITS);
+    try {
+      const { source } = countingUnavailable();
+      const drill = createDrill({ source, gate: deps.gate, limits: TEST_LIMITS });
+      const recall = search(source, true, TEST_LIMITS, { ...deps, drill });
+      // "walkthrough" matches only the other project's card.
+      const global = await runTool<SearchOutput>(recall, {
+        query: "walkthrough",
+        scope: "global",
+      });
+      expect(global.results.some((r) => r.directory === OTHER_DIR)).toBe(true);
+      const project = await runTool<SearchOutput>(recall, {
+        query: "walkthrough",
+        scope: "project",
+      });
+      expect(project.results).toEqual([]);
+      const userOnly = await runTool<SearchOutput>(recall, {
+        query: "rateLimit",
+        scope: "global",
+        role: "user",
+      });
+      expect(userOnly.results.length).toBeGreaterThan(0);
+      expect(userOnly.results.every((r) => r.role === "user")).toBe(true);
+      const assistantOnly = await runTool<SearchOutput>(recall, {
+        query: "rateLimit",
+        scope: "global",
+        role: "assistant",
+      });
+      expect(assistantOnly.results.every((r) => r.role === "assistant")).toBe(true);
     } finally {
       cleanup();
     }
