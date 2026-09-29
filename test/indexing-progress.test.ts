@@ -33,6 +33,23 @@ describe("cold-pass progress in responses", () => {
     }
   });
 
+  it("recall says the index is incomplete, not in progress, when no pass is running", async () => {
+    const h = makeFakeHarness();
+    const { deps, cleanup } = await makeRecallDeps(h, TEST_LIMITS);
+    try {
+      const stalled: IndexingProgress = { examined: 4, known: 40, stalled: true };
+      const recall = search(h.source, true, TEST_LIMITS, { ...deps, indexing: () => stalled });
+      const out = await runTool<SearchOutput>(recall, { query: "rateLimit", scope: "global" });
+      expect(out.coverage?.cards?.indexing).toEqual(stalled);
+      expect(out.warnings).toContain(
+        "Index incomplete: 4 of 40 sessions indexed, and indexing is not running right now; older history may be missing.",
+      );
+      expect(out.warnings?.some((w) => w.startsWith("Indexing in progress"))).toBeFalsy();
+    } finally {
+      cleanup();
+    }
+  });
+
   it("recall_sessions notes indexing progress on card-selected listings only", async () => {
     const h = makeFakeHarness();
     const { store, cleanup } = await makeRecallDeps(h, TEST_LIMITS);

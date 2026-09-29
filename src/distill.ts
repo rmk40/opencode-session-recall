@@ -127,6 +127,32 @@ export type DerivedCard = { card: Card; rows: PartTextRow[] };
 /** Meta key stamped `"1"` when a cold pass first completes on a store. A
  *  rebuild drops `meta`, so a rebuilt store starts without it. */
 export const COLD_PASS_COMPLETE_KEY = "coldpass_complete";
+/** Meta key where the lease holder shares its running cold pass's progress,
+ *  as JSON `{ examined, known, at }`, so every process sharing the store can
+ *  report it (see {@link Distiller.indexing}). */
+export const COLD_PASS_PROGRESS_KEY = "coldpass_progress";
+/** The holder writes {@link COLD_PASS_PROGRESS_KEY} at most this often. */
+export const PROGRESS_WRITE_MS = 2_000;
+/** Shared progress older than this is not a pass in progress: the store gap
+ *  is reported instead (`stalled`). The holder refreshes it at least every
+ *  heartbeat while a pass runs. */
+export const PROGRESS_STALE_MS = 5 * 60_000;
+
+/** Parse a {@link COLD_PASS_PROGRESS_KEY} value; undefined when malformed. */
+function parseSharedProgress(
+  raw: string | undefined,
+): { examined: number; known: number; at: number } | undefined {
+  if (!raw) return undefined;
+  try {
+    const value = JSON.parse(raw) as Record<string, unknown>;
+    const { examined, known, at } = value;
+    return typeof examined === "number" && typeof known === "number" && typeof at === "number"
+      ? { examined, known, at }
+      : undefined;
+  } catch {
+    return undefined;
+  }
+}
 
 export type DistillStatus = {
   leaseHeld: boolean;
@@ -244,13 +270,19 @@ export type Distiller = {
   status(): DistillStatus;
   /**
    * The cold pass's progress, for queries to report, while the store is
-   * really incomplete: a pass is running, no pass has ever completed on this
-   * store ({@link COLD_PASS_COMPLETE_KEY}), and it knows of more sessions
-   * than the store has cards (while it is still discovering: only while the
-   * store has no card at all). Undefined otherwise, so a re-verify pass over
-   * a complete store on every restart reports nothing. Only the lease holder
-   * runs a cold pass, so only it ever reports progress; other processes
-   * answering from the same store report none.
+   * really incomplete: no pass has ever completed on this store
+   * ({@link COLD_PASS_COMPLETE_KEY}) and more sessions are known than the
+   * store has cards. Undefined otherwise, so a re-verify pass over a complete
+   * store on every restart reports nothing.
+   *
+   * The lease holder with a pass running reports its own counts (while it is
+   * still discovering: only while the store has no card at all). Every other
+   * process, and a holder whose pass aborted and waits for its retry, reads
+   * the progress the holder shares in {@link COLD_PASS_PROGRESS_KEY}; when
+   * that is older than {@link PROGRESS_STALE_MS} nothing is indexing, and the
+   * store gap is reported as `stalled` (cards so far of the sessions known).
+   * Query-path cost: in-memory state, up to two meta reads and one card
+   * count; no lease read and no map scan.
    */
   indexing(): IndexingProgress | undefined;
 };
@@ -1415,6 +1447,7 @@ export function createDistiller(options: DistillerOptions): Distiller {
     try {
       const discovered = await discoverSessions();
       knownCount = discovered.length;
+      shareProgress(true);
       const liveUpdates = new Map(discovered.map((session) => [session.id, session.timeUpdated]));
       for (const [sessionId, timeUpdated] of quarantined) {
         // Deletions and updates both invalidate quarantine. An updated session is
@@ -1444,6 +1477,7 @@ export function createDistiller(options: DistillerOptions): Distiller {
         examined++;
         examinedCount = examined;
         recordProgress(session.timeUpdated);
+        shareProgress();
       };
 
       /** A failure this pass will not retry again: one strike, then either a
@@ -1647,6 +1681,9 @@ export function createDistiller(options: DistillerOptions): Distiller {
       if (outageAbort && !stopped && leaseHeld) {
         for (const session of failedThisPass) bumpFetchFailure(session.id);
       }
+      // Other processes keep reporting where the pass got to until the retry
+      // (or, past the staleness bound, the gap it left).
+      shareProgress(true);
       // A transient failure must not kill the pass for the process lifetime;
       // re-arm on a backoff while we still hold the lease.
       scheduleColdPassRetry();
@@ -1710,6 +1747,22 @@ export function createDistiller(options: DistillerOptions): Distiller {
         void startColdPass();
       }
     }, coldPassRetryMs);
+  }
+
+  /** Share this pass's progress in {@link COLD_PASS_PROGRESS_KEY}, at most
+   *  every {@link PROGRESS_WRITE_MS} unless `force`. Holder-only (the lease
+   *  is verified before the write), and never once the store is complete. */
+  let progressWrittenAt = Number.NEGATIVE_INFINITY;
+  function shareProgress(force = false): void {
+    if (stopped || !leaseHeld || indexComplete) return;
+    const t = now();
+    if (!force && t - progressWrittenAt < PROGRESS_WRITE_MS) return;
+    if (!ownsLease()) return;
+    progressWrittenAt = t;
+    store.setMeta(
+      COLD_PASS_PROGRESS_KEY,
+      JSON.stringify({ examined: examinedCount, known: knownCount, at: t }),
+    );
   }
 
   // Progress marker: the lowest `time_updated` processed so far this sweep,
@@ -1960,8 +2013,11 @@ export function createDistiller(options: DistillerOptions): Distiller {
     heartbeatTimer = setTimeout(() => {
       heartbeatTimer = undefined;
       if (finalized || !leaseHeld) return;
-      if (store.heartbeatLease(instanceId)) scheduleHeartbeat();
-      else {
+      if (store.heartbeatLease(instanceId)) {
+        // Keep shared progress fresh through a long stretch on one session.
+        if (coldPassState === "running") shareProgress();
+        scheduleHeartbeat();
+      } else {
         // Lost the lease (taken over): stop acting as holder and try to regain.
         // Log who took it (build/gen) — the incident was an old build holding the
         // lease forever, invisible until someone hunted processes.
@@ -2089,10 +2145,26 @@ export function createDistiller(options: DistillerOptions): Distiller {
     },
 
     indexing(): IndexingProgress | undefined {
-      if (coldPassState !== "running" || indexComplete) return undefined;
+      if (indexComplete) return undefined;
+      if (coldPassState === "running" && leaseHeld) {
+        const cards = store.cardCount();
+        if (knownCount === 0) return cards === 0 ? { examined: 0, known: 0 } : undefined;
+        return knownCount > cards ? { examined: examinedCount, known: knownCount } : undefined;
+      }
+      // Not running a pass here: what the holder shares, if the store is
+      // still incomplete. Completion is stamped by whichever process got there.
+      if (store.getMeta(COLD_PASS_COMPLETE_KEY) === "1") {
+        indexComplete = true;
+        return undefined;
+      }
+      const shared = parseSharedProgress(store.getMeta(COLD_PASS_PROGRESS_KEY));
+      if (!shared) return undefined;
       const cards = store.cardCount();
-      if (knownCount === 0) return cards === 0 ? { examined: 0, known: 0 } : undefined;
-      return knownCount > cards ? { examined: examinedCount, known: knownCount } : undefined;
+      if (shared.known <= cards) return undefined;
+      if (now() - shared.at > PROGRESS_STALE_MS) {
+        return { examined: cards, known: shared.known, stalled: true };
+      }
+      return { examined: shared.examined, known: shared.known };
     },
 
     status(): DistillStatus {

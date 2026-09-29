@@ -159,11 +159,13 @@ export type SearchCoverage = {
     full: number;
     storeRecency: number;
     degraded: boolean;
-    /** Present while the distiller's cold pass is building a store that is
-     *  not complete yet (no pass has completed on it, and it has fewer cards
-     *  than sessions): how many of the sessions it discovered it has checked
-     *  so far (`known` is 0 until discovery finishes). Cards for the rest may
-     *  be missing. A re-verify pass over a complete store reports nothing. */
+    /** Present while the store is not complete yet (no cold pass has
+     *  completed on it, and it has fewer cards than sessions): how many of
+     *  the sessions the pass discovered it has checked so far (`known` is 0
+     *  until discovery finishes). Every process sharing the store reports the
+     *  lease holder's pass. With `stalled`, no pass is making progress, and
+     *  `examined` counts the cards the store holds. Cards for the rest may be
+     *  missing. A re-verify pass over a complete store reports nothing. */
     indexing?: IndexingProgress;
   };
   /** Present only when the semantic layer is configured on. `ready` is the
@@ -409,8 +411,10 @@ export type SessionItem = {
   distilled?: boolean;
 };
 
-/** A running cold pass's progress (see {@link IndexingStatus}). */
-export type IndexingProgress = { examined: number; known: number };
+/** A cold pass's progress (see {@link IndexingStatus}). With `stalled`, no
+ *  pass is making progress right now: `examined` is then the cards the store
+ *  holds of the `known` sessions. */
+export type IndexingProgress = { examined: number; known: number; stalled?: true };
 
 /** Reads the cold pass's progress: undefined unless a pass is building an
  *  incomplete store (see `Distiller.indexing`). */
@@ -418,6 +422,9 @@ export type IndexingStatus = () => IndexingProgress | undefined;
 
 /** The warning for a query answered while the cold pass is still running. */
 export function indexingWarning(progress: IndexingProgress): string {
+  if (progress.stalled) {
+    return `Index incomplete: ${progress.examined} of ${progress.known} sessions indexed, and indexing is not running right now; older history may be missing.`;
+  }
   return progress.known > 0
     ? `Indexing in progress: ${progress.examined} of ${progress.known} sessions checked so far; older history may be missing.`
     : "Indexing in progress: sessions are still being discovered; older history may be missing.";

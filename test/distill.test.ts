@@ -8,6 +8,8 @@ import { type Card, type Store } from "../src/store.js";
 import { createFetchGate, type FetchGate } from "../src/fetch-gate.js";
 import {
   COLD_PASS_COMPLETE_KEY,
+  COLD_PASS_PROGRESS_KEY,
+  PROGRESS_STALE_MS,
   createDistiller,
   type Distiller,
   deriveCard,
@@ -2637,6 +2639,110 @@ describe("cold-pass progress reporting", () => {
     expect(restarted.indexing()).toBeUndefined(); // 2 known, 2 cards
     gate.hold(false);
     await restarted.stop();
+    db.close();
+  });
+
+  it("a process without the lease reports the holder's shared progress, then nothing", async () => {
+    const graph = twoSessions();
+    const { source } = makeDistillFake(graph);
+    const { db, store } = await freshStore();
+    const gate = holdable();
+    const make = (instanceId: string) =>
+      createDistiller({
+        source,
+        store,
+        gate: makeSpyGate().gate,
+        limits: { ...TEST_LIMITS, distillConcurrency: 1 },
+        instanceId,
+        yieldBetween: gate.pause,
+        leaseRetryMs: 60_000,
+        log: () => {},
+      });
+    gate.hold(true);
+    const holder = make("holder");
+    holder.start();
+    await waitFor(() => holder.status().knownCount === 2);
+    const other = make("other");
+    other.start(); // the lease is taken: this one only answers queries
+    expect(other.status().leaseHeld).toBe(false);
+    expect(other.indexing()).toEqual({ examined: 0, known: 2 });
+
+    gate.hold(false);
+    await waitFor(() => holder.status().coldPass === "done");
+    expect(other.indexing()).toBeUndefined();
+    await other.stop();
+    await holder.stop();
+    db.close();
+  });
+
+  it("reports stale shared progress as a stalled gap, not as a pass in progress", async () => {
+    const graph = twoSessions();
+    const { source } = makeDistillFake(graph);
+    const { db, store } = await freshStore();
+    const built = createDistiller({
+      source,
+      store,
+      gate: makeSpyGate().gate,
+      limits: TEST_LIMITS,
+      instanceId: "built",
+      log: () => {},
+    });
+    built.start();
+    await waitFor(() => built.status().coldPass === "done");
+    await built.stop();
+    // Two cards of five known sessions, and no completed pass.
+    db.run("DELETE FROM meta WHERE key = ?", [COLD_PASS_COMPLETE_KEY]);
+    const t = Date.now();
+    const reader = createDistiller({
+      source,
+      store,
+      gate: makeSpyGate().gate,
+      limits: { ...TEST_LIMITS, coldPass: false },
+      instanceId: "reader",
+      now: () => t,
+      log: () => {},
+    });
+    store.setMeta(COLD_PASS_PROGRESS_KEY, JSON.stringify({ examined: 1, known: 5, at: t - 1_000 }));
+    expect(reader.indexing()).toEqual({ examined: 1, known: 5 });
+    store.setMeta(
+      COLD_PASS_PROGRESS_KEY,
+      JSON.stringify({ examined: 1, known: 5, at: t - PROGRESS_STALE_MS - 1 }),
+    );
+    expect(reader.indexing()).toEqual({ examined: 2, known: 5, stalled: true });
+    // Once the store holds a card per known session, there is no gap.
+    store.setMeta(COLD_PASS_PROGRESS_KEY, JSON.stringify({ examined: 2, known: 2, at: t }));
+    expect(reader.indexing()).toBeUndefined();
+    await reader.stop();
+    db.close();
+  });
+
+  it("a holder whose pass aborted keeps reporting where it got to while the retry waits", async () => {
+    const graph: Graph = { sessions: [], messagesBySession: {} };
+    const failTimes: Record<string, number> = {};
+    for (let i = 0; i < 6; i++) {
+      const id = `s${i}`;
+      graph.sessions.push(session(id, id, PROJECT_DIR, 10_000 - i * 1000));
+      graph.messagesBySession[id] = [
+        bundle(userMessage(`m-${id}`, id, 100), [textPart(`p-${id}`, id, `m-${id}`, id)]),
+      ];
+      if (i < 5) failTimes[id] = 1; // the five newest fail once: an outage
+    }
+    const { source } = makeDistillFake(graph, { failTimes });
+    const { db, store } = await freshStore();
+    const distiller = createDistiller({
+      source,
+      store,
+      gate: makeSpyGate().gate,
+      limits: { ...TEST_LIMITS, distillConcurrency: 1 },
+      instanceId: "aborted",
+      coldPassRetryMs: 60_000,
+      log: () => {},
+    });
+    distiller.start();
+    await waitFor(() => distiller.status().lastError !== undefined);
+    expect(distiller.status().coldPass).toBe("idle");
+    expect(distiller.indexing()).toEqual({ examined: 0, known: 6 });
+    await distiller.stop();
     db.close();
   });
 
