@@ -897,6 +897,10 @@ describe("cards CRUD", () => {
     store.upsertCard(makeCard("s1", { title: "Renamed" }));
     expect(store.getCard("s1")?.title).toBe("Renamed");
     expect(store.allCards()).toHaveLength(1);
+
+    // cardSessionIds() lists the same sessions without loading the cards.
+    store.upsertCard(makeCard("s2"));
+    expect(store.cardSessionIds().sort()).toEqual(["s1", "s2"]);
     db.close();
   });
 

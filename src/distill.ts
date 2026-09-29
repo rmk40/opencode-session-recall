@@ -1542,7 +1542,7 @@ export function createDistiller(options: DistillerOptions): Distiller {
    *  because such a store is only ever written from that one source). */
   async function reconcileDeletions(): Promise<void> {
     if (!sync) return;
-    const ids = store.allCards().map((card) => card.sessionId);
+    const ids = store.cardSessionIds();
     const gone = await gate.runBackground(() => {
       if (stopped || !leaseHeld) return Promise.resolve<string[]>([]);
       return sync.missing(ids);

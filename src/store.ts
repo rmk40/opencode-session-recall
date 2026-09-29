@@ -260,6 +260,8 @@ export type Store = {
   upsertCard(card: Card): void;
   getCard(sessionId: string): Card | undefined;
   allCards(opts?: { withEmbeddings?: boolean }): Card[];
+  /** Every card's session id, without loading the cards. */
+  cardSessionIds(): string[];
   /**
    * Persist card vectors from a semantic embed pass at representation generation
    * `gen`, stamping the model that produced them ({@link SEMANTIC_MODEL_KEY}). One
@@ -844,6 +846,13 @@ class SqliteStore implements Store {
     const columns = opts?.withEmbeddings === true ? CARD_COLUMNS_ALL : CARD_COLUMNS_NO_EMBEDDING;
     const rows = this.db.all(`SELECT ${columns} FROM card ORDER BY time_updated DESC`);
     return rows.map(rowToCard);
+  }
+
+  cardSessionIds(): string[] {
+    return this.db
+      .all("SELECT session_id FROM card")
+      .map((row) => row.session_id)
+      .filter((id): id is string => typeof id === "string");
   }
 
   writeCardEmbeddings(
