@@ -85,8 +85,9 @@ export function setV2LogSinkForTests(sink: FileSink | undefined): void {
   v2Sink = sink;
   v2Logger = undefined;
 }
-/** Bound on flushing queued log lines during an instance cleanup. */
-const LOG_FLUSH_WAIT_MS = 500;
+/** One deadline for an instance cleanup: the runtime detach and the log
+ *  flush run concurrently under it. */
+export const CLEANUP_WAIT_MS = 3_000;
 /** Whether the missing-channel fallback was logged (once per process). */
 let channelFallbackLogged = false;
 
@@ -371,11 +372,13 @@ async function wire(
       if (instance.disposed) return;
       instance.disposed = true;
       events.abort();
-      // Bounded (runtime.ts): never holds a location reload for long.
-      await attachment.detach();
-      // Queued debug-log lines (RECALL_DEBUG) reach the file before the
-      // location goes; bounded, since the file may be slow or gone.
-      await settleWithin(v2LogSink().flush(), LOG_FLUSH_WAIT_MS);
+      // The runtime detach (itself bounded, runtime.ts) and flushing queued
+      // debug-log lines (RECALL_DEBUG) run together under one deadline, so a
+      // location reload waits at most CLEANUP_WAIT_MS however either behaves.
+      await settleWithin(
+        Promise.allSettled([attachment.detach(), v2LogSink().flush()]),
+        CLEANUP_WAIT_MS,
+      );
     } catch (error) {
       v2Log(`cleanup failed: ${errmsg(error)}`);
     }

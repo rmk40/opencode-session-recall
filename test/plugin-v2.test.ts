@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import entry from "../src/opencode-session-recall.js";
 import {
+  CLEANUP_WAIT_MS,
   eventResubscribe,
   instanceOf,
   PRIMARY_ONLY_ERROR,
@@ -526,6 +527,30 @@ describe("v2 tools and hooks", () => {
       expect(done).toBe(true);
     } finally {
       vi.useRealTimers();
+    }
+  });
+
+  it("bounds cleanup by one deadline when both the detach and the log flush hang", async () => {
+    const h = host();
+    const cleanup = await setup(h);
+    const runtime = await runtimeOf(h);
+    vi.spyOn(runtime, "dispose").mockReturnValue(new Promise<void>(() => {}));
+    const flush = vi.fn(() => new Promise<void>(() => {}));
+    setV2LogSinkForTests(Object.assign(() => {}, { flush }));
+    vi.useFakeTimers();
+    try {
+      let done = false;
+      const pending = Promise.resolve(cleanup()).then(() => (done = true));
+      await vi.advanceTimersByTimeAsync(CLEANUP_WAIT_MS - 1);
+      expect(done).toBe(false);
+      await vi.advanceTimersByTimeAsync(1);
+      await pending;
+      // Not 3 s for the detach and then another bound for the flush.
+      expect(done).toBe(true);
+      expect(flush).toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+      setV2LogSinkForTests(undefined);
     }
   });
 
