@@ -52,6 +52,11 @@ All notable changes to this project are documented here. This project follows
   subagent prompt prefix; under v1 it only affects sessions that happen to
   start with it, and an existing card's head changes only when its session
   is next distilled.
+- A message whose whole text is exactly one of the placeholders the v2
+  history source writes for a row it cannot load (for example
+  `[unavailable: data is not valid JSON]`) is no longer used as a session's
+  summary head or digest vocabulary. Under v1 this only reaches text
+  literally written in that shape.
 - `recall_sessions` still returns `{ ok: false }` when the server answers a
   session listing with a body that is not an array, but the error text is
   now `session listing response was not an array` instead of the runtime's

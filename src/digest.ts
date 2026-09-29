@@ -23,9 +23,18 @@ export function unavailableText(reason: string): string {
   return `${UNAVAILABLE_PREFIX}${reason}]`;
 }
 
-/** Whether `text` is a placeholder from {@link unavailableText}. */
+/**
+ * The exact placeholders the v2 source generates: an oversized row
+ * (`<n>-byte row over the <n>-byte cap`) and the decoder's two reasons.
+ * Matching only these shapes keeps the effect off ordinary text: a v1 (or v2)
+ * statement is skipped as a head only if it is literally one of them.
+ */
+const UNAVAILABLE_SHAPE =
+  /^\[unavailable: (?:\d+-byte row over the \d+-byte cap|data is not valid JSON|data is not an object)\]$/;
+
+/** Whether `text` is one of the placeholders from {@link unavailableText}. */
 export function isUnavailableText(text: string | undefined): boolean {
-  return text !== undefined && text.startsWith(UNAVAILABLE_PREFIX) && text.endsWith("]");
+  return text !== undefined && UNAVAILABLE_SHAPE.test(text);
 }
 
 /**

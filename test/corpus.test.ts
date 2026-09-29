@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { buildSessionDigest } from "../src/corpus.js";
-import { unavailableText } from "../src/digest.js";
+import { isUnavailableText, unavailableText } from "../src/digest.js";
+import { malformedNote, oversizedNote } from "../src/history/v2.js";
 import { buildCandidates } from "../src/candidates.js";
 import {
   PROJECT_DIR,
@@ -90,6 +91,25 @@ describe("buildSessionDigest", () => {
     ] as never);
     expect(digest.startsWith("Profile the thumbnail pipeline")).toBe(true);
     expect(digest).not.toContain("unavailable");
+  });
+
+  it("recognizes only the exact placeholder shapes the v2 source generates", () => {
+    for (const note of [
+      oversizedNote(5_242_880, 4_194_304),
+      malformedNote("message msg_1 data is not valid JSON"),
+      malformedNote("message msg_1 data is not an object"),
+    ]) {
+      expect(isUnavailableText(note), note).toBe(true);
+    }
+    // Ordinary text that merely looks similar keeps its head and digest credit.
+    for (const text of [
+      "[unavailable: the build server is down]",
+      "[unavailable: 12-byte row over the cap]",
+      "[unavailable: data is not valid JSON] and more",
+      "see [unavailable: data is not valid JSON]",
+    ]) {
+      expect(isUnavailableText(text), text).toBe(false);
+    }
   });
 
   it("gives no digest credit to read/skill tools or JSON pseudo-commands", () => {
