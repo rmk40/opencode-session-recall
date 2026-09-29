@@ -1,11 +1,11 @@
-import type { Event, Part } from "@opencode-ai/sdk/v2";
+import type { Part } from "@opencode-ai/sdk/v2";
 import { errmsg, DISCOVERY_LIMIT, type Limits } from "./types.js";
 import { compareMessages, type HistoryMessage, type HistorySession } from "./history/model.js";
 import { MalformedSessionError, type HistorySource, type MessagePage } from "./history/source.js";
 import { fetchMessagePage } from "./history/v1.js";
 import type { Card, FamilyRollup, LeaseInfo, PartTextRow, Store } from "./store.js";
 import type { FetchGate } from "./fetch-gate.js";
-import { isSelfTool, toolNameMatches, pruned, isSummarizerTitle } from "./extract.js";
+import { isSelfTool, toolNameMatches, isSummarizerTitle } from "./extract.js";
 import { tokenize } from "./normalize.js";
 import { extractCodeTokens } from "./query.js";
 import { isDigestToken, DIGEST_HEAD_CHARS } from "./digest.js";
@@ -108,6 +108,22 @@ export type DistillStatus = {
   lease?: LeaseInfo;
 };
 
+/**
+ * A host-neutral distiller trigger. Each host maps its own event stream onto
+ * these (v1: `history/v1-events.ts`):
+ * - `turn-ended`: the session went quiet; re-distill it (debounced).
+ * - `removal`: content was compacted or removed; the next re-distill must be
+ *   full, never an append onto a changed transcript.
+ * - `deleted`: the session is gone; drop its card and rows.
+ * - `meta`: title/directory/project changed; re-distill picks the new
+ *   metadata up (the v1 mapper never emits it).
+ */
+export type DistillSignal =
+  | { type: "turn-ended"; sessionID: string }
+  | { type: "removal"; sessionID: string }
+  | { type: "deleted"; sessionID: string }
+  | { type: "meta"; sessionID: string };
+
 export type Distiller = {
   start(): void;
   /** Stop accepting or scheduling work immediately, but keep renewing an
@@ -116,7 +132,7 @@ export type Distiller = {
   /** Whether this instance still owns a live lease, verified against the store. */
   ownsLease(): boolean;
   stop(): Promise<void>;
-  onEvent(event: Event): void;
+  onEvent(signal: DistillSignal): void;
   status(): DistillStatus;
 };
 
@@ -562,12 +578,6 @@ function toMeta(session: HistorySession): DistillSessionMeta {
     timeCreated: typeof time.created === "number" ? time.created : 0,
     timeUpdated: typeof time.updated === "number" ? time.updated : 0,
   };
-}
-
-/** A part.updated event is removal-shaped when the part signals pruning/
- *  compaction rather than ordinary streaming growth. */
-function isRemovalShapedPart(part: Part): boolean {
-  return part.type === "compaction" || pruned(part);
 }
 
 const noopStatus = (): DistillStatus => ({
@@ -1355,29 +1365,20 @@ export function createDistiller(options: DistillerOptions): Distiller {
       return stopPromise;
     },
 
-    onEvent(event: Event): void {
+    onEvent(signal: DistillSignal): void {
       if (stopped) return;
-      switch (event.type) {
-        case "session.idle":
-          scheduleReDistill(event.properties.sessionID);
+      switch (signal.type) {
+        case "turn-ended":
+        case "meta":
+          scheduleReDistill(signal.sessionID);
           break;
-        case "session.compacted":
-        case "message.removed":
-        case "message.part.removed":
-          removalSince.add(event.properties.sessionID);
-          scheduleReDistill(event.properties.sessionID);
+        case "removal":
+          removalSince.add(signal.sessionID);
+          scheduleReDistill(signal.sessionID);
           break;
-        case "message.part.updated":
-          if (isRemovalShapedPart(event.properties.part)) {
-            removalSince.add(event.properties.sessionID);
-            scheduleReDistill(event.properties.sessionID);
-          }
+        case "deleted":
+          handleDeleted(signal.sessionID);
           break;
-        case "session.deleted":
-          handleDeleted(event.properties.sessionID);
-          break;
-        default:
-          break; // session.updated + everything else: ignored
       }
     },
 

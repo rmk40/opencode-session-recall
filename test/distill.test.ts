@@ -8,6 +8,7 @@ import { openStore, type Card, type Store } from "../src/store.js";
 import { createFetchGate, type FetchGate } from "../src/fetch-gate.js";
 import {
   createDistiller,
+  type Distiller,
   deriveCard,
   distillFields,
   fetchMessagePage,
@@ -17,6 +18,7 @@ import {
 } from "../src/distill.js";
 import type { HistorySource } from "../src/history/source.js";
 import { createV1HistorySource } from "../src/history/v1.js";
+import { v1EventToSignal } from "../src/history/v1-events.js";
 
 /** A v1 history source over one fake client (tests that hand-roll a client). */
 const v1 = (client: OpencodeClient): HistorySource =>
@@ -232,6 +234,13 @@ const removedEvent = (sessionID: string): Event =>
   }) as Event;
 const deletedEvent = (s: Session): Event =>
   ({ type: "session.deleted", properties: { sessionID: s.id, info: s } }) as Event;
+
+/** Deliver a v1 bus event the way the plugin entry does: through the v1
+ *  mapper, dropping events the distiller ignores. */
+const feed = (distiller: Distiller, event: Event): void => {
+  const signal = v1EventToSignal(event);
+  if (signal) distiller.onEvent(signal);
+};
 
 const ftsSessions = (hits: { sessionId: string }[]): string[] => hits.map((h) => h.sessionId);
 
@@ -1299,7 +1308,7 @@ describe("cold pass", () => {
     const afterCold = Number(store.getMeta("cards_rev"));
     expect(afterCold).toBeGreaterThan(0);
 
-    distiller.onEvent(idleEvent("s1")); // an incremental re-distill bumps it again
+    feed(distiller, idleEvent("s1")); // an incremental re-distill bumps it again
     await waitFor(() => Number(store.getMeta("cards_rev")) > afterCold);
     distiller.stop();
     db.close();
@@ -1333,7 +1342,7 @@ describe("lease", () => {
     await new Promise((r) => setTimeout(r, 15));
     expect(distiller.status().leaseHeld).toBe(false);
 
-    distiller.onEvent(idleEvent("s1"));
+    feed(distiller, idleEvent("s1"));
     await new Promise((r) => setTimeout(r, 25)); // well past the debounce
 
     expect(store.allCards()).toEqual([]); // no cards written
@@ -1451,7 +1460,7 @@ describe("incremental", () => {
         textPart("p2", "s1", "m2", "fresh metadata transport marker"),
       ]),
     ];
-    distiller.onEvent(idleEvent("s1"));
+    feed(distiller, idleEvent("s1"));
     await waitFor(() => sdk.get === 1);
     await new Promise((resolve) => setTimeout(resolve, 10));
 
@@ -1464,7 +1473,7 @@ describe("incremental", () => {
 
     // A later idle event retries normally; the transport failure was neither
     // interpreted as deletion nor quarantined as malformed session data.
-    distiller.onEvent(idleEvent("s1"));
+    feed(distiller, idleEvent("s1"));
     await waitFor(() => store.getCard("s1")?.timeUpdated === 4000);
     expect(sdk.get).toBe(2);
     expect(store.getCard("s1")?.summaryHead).toContain("fresh metadata transport marker");
@@ -1507,7 +1516,7 @@ describe("incremental", () => {
     const preserved = store.getCard("s1");
     expect(preserved).toBeDefined();
 
-    distiller.onEvent(idleEvent("s1"));
+    feed(distiller, idleEvent("s1"));
     await waitFor(() => sdk.get === 1);
     await new Promise((resolve) => setTimeout(resolve, 10));
 
@@ -1541,7 +1550,7 @@ describe("incremental", () => {
     await waitFor(() => distiller.status().coldPass === "done");
 
     const before = sdk.messages.length;
-    for (let i = 0; i < 5; i++) distiller.onEvent(idleEvent("s1"));
+    for (let i = 0; i < 5; i++) feed(distiller, idleEvent("s1"));
     await waitFor(() => sdk.messages.length > before);
     await new Promise((r) => setTimeout(r, 40)); // let any stragglers land
 
@@ -1580,7 +1589,7 @@ describe("incremental", () => {
     graph.messagesBySession.s1 = [
       bundle(userMessage("m9", "s1", 5000), [textPart("p9", "s1", "m9", "freshmarker content")]),
     ];
-    distiller.onEvent(removedEvent("s1"));
+    feed(distiller, removedEvent("s1"));
     await waitFor(
       () => ftsSessions(store.ftsSearch({ strong: ["freshmarker"], weak: [] })).length > 0,
     );
@@ -1616,7 +1625,7 @@ describe("incremental", () => {
     await waitFor(() => distiller.status().coldPass === "done");
     expect(store.getCard("R")!.familyRollup.map((e) => e.sessionId)).toContain("C");
 
-    distiller.onEvent(deletedEvent(child));
+    feed(distiller, deletedEvent(child));
 
     expect(store.getCard("C")).toBeUndefined();
     expect(store.ftsSearch({ strong: ["uniquechildyy"], weak: [] })).toEqual([]);
@@ -1692,7 +1701,7 @@ describe("incremental", () => {
     graph.messagesBySession.s1 = [...initial, ...appended];
 
     const before = sdk.messages.length;
-    distiller.onEvent(idleEvent("s1"));
+    feed(distiller, idleEvent("s1"));
     await waitFor(() => store.getCard("s1")!.distilledThrough === "m7");
     const appendFetches = sdk.messages.length - before;
 
@@ -1738,7 +1747,7 @@ describe("incremental", () => {
     await waitFor(() => distiller.status().coldPass === "done");
 
     graph.messagesBySession.s1 = [...initial, ...appended];
-    distiller.onEvent(idleEvent("s1"));
+    feed(distiller, idleEvent("s1"));
     await waitFor(() => store.getCard("s1")!.distilledThrough === "m7");
 
     // A fresh full re-distill of the same 8-message state, same cap.
@@ -1796,7 +1805,7 @@ describe("null store", () => {
     });
     expect(() => {
       distiller.start();
-      distiller.onEvent(idleEvent("s1"));
+      feed(distiller, idleEvent("s1"));
       distiller.stop();
     }).not.toThrow();
     expect(distiller.status()).toEqual({

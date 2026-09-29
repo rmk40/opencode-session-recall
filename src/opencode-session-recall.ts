@@ -24,6 +24,7 @@ import { createLiteRefresh, type LiteRefreshController } from "./lite-refresh.js
 import { createDrill } from "./drill.js";
 import { createV1Clients, createV1HistorySource } from "./history/v1.js";
 import type { HistorySession } from "./history/model.js";
+import { v1EventToSignal } from "./history/v1-events.js";
 import { createDistiller } from "./distill.js";
 import { createSummarizer, parseModelId, type Summarizer } from "./summarize.js";
 import {
@@ -437,9 +438,10 @@ const server: Plugin = async (ctx, options) => {
     event: async ({ event }) => {
       if (disposed) return;
       // The plugin `event` hook is typed against the default SDK vintage; the
-      // distiller compiles against the v2 event union the live bus actually
+      // mapper compiles against the v2 event union the live bus actually
       // delivers. Bridge the vintage gap at this one boundary.
-      distiller.onEvent(event as unknown as Parameters<typeof distiller.onEvent>[0]);
+      const signal = v1EventToSignal(event as unknown as Parameters<typeof v1EventToSignal>[0]);
+      if (signal) distiller.onEvent(signal);
     },
     ...(nudgeHook && {
       "experimental.chat.system.transform": guardHook(nudgeHook),
