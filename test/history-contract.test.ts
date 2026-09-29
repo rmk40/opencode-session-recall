@@ -481,6 +481,42 @@ describe("v2 history source", () => {
     });
   });
 
+  it("attributes each user from its own predecessor switches, whatever the page holds", async () => {
+    const t = await fresh();
+    session(t, "ses_w", { agent: "sess-agent" });
+    const model = (id: string) => ({ model: { id, providerID: "p" }, time: { created: 0 } });
+    message(t, "ses_w", "agent-switched", { agent: "alpha", time: { created: 0 } });
+    // A run of model switches longer than one range read, before U1: the
+    // agent switch must not be crowded out by another type.
+    for (let i = 0; i < 70; i++) message(t, "ses_w", "model-switched", model(`m${i}`));
+    const u1 = message(t, "ses_w", "user", text("first prompt"));
+    // More than 64 agent switches between the two users on one page.
+    for (let i = 0; i < 70; i++) {
+      message(t, "ses_w", "agent-switched", { agent: `beta${i}`, time: { created: 0 } });
+      // One model switch in the range: read by the (untruncated) range query.
+      if (i === 35) message(t, "ses_w", "model-switched", model("m-mid"));
+    }
+    const u2 = message(t, "ses_w", "user", text("second prompt"));
+    const { source } = await open(t);
+
+    const page = await source.messagePage({ sessionID: "ses_w", limit: 10 });
+    expect(page.items.map((m) => m.info.id)).toEqual([u2, u1]);
+    const [second, first] = page.items;
+    expect(first!.info).toMatchObject({ agent: "alpha", model: { modelID: "m69" } });
+    expect(second!.info).toMatchObject({ agent: "beta69", model: { modelID: "m-mid" } });
+
+    const alone = await source.getMessage("ses_w", u1);
+    expect(alone.ok && alone.value.info).toMatchObject({
+      agent: "alpha",
+      model: { modelID: "m69" },
+    });
+    const both = await source.getMessage("ses_w", u2);
+    expect(both.ok && both.value.info).toMatchObject({
+      agent: "beta69",
+      model: { modelID: "m-mid" },
+    });
+  });
+
   it("round-trips its opaque cursor and rejects foreign ones", () => {
     expect(decodeV2Cursor(encodeV2Cursor(42))).toBe(42);
     expect(encodeV2Cursor(7)).toMatch(/^[A-Za-z0-9_-]+$/);

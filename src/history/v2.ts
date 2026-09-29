@@ -164,8 +164,11 @@ export type V2SourceOptions = {
 const DEFAULT_PAGE_BYTE_CEILING = 4 * 1024 * 1024;
 /** Children per parent read in one statement. */
 const CHILDREN_LIMIT = 1_000;
-/** Switch rows scanned to attribute a page's user rows. */
+/** Switch rows of one type read at once between a page's oldest and newest
+ *  user; a longer run falls back to one seek per user. */
 const SWITCH_SCAN_LIMIT = 64;
+
+type SwitchType = "agent-switched" | "model-switched";
 const NO_CURSOR_SEQ = Number.MAX_SAFE_INTEGER;
 
 const macrotask = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0));
@@ -291,10 +294,77 @@ export function createV2HistorySource(db: SqliteDb, opts: V2SourceOptions = {}):
     return rows.map((row) => projectSession(toSessionRecord(row).row));
   }
 
+  /** The latest parseable `type` switch row before `seq`, as a partial
+   *  identity: one index seek on (session_id, type, seq). */
+  async function switchBefore(
+    type: SwitchType,
+    sessionID: string,
+    seq: number,
+  ): Promise<Partial<UserIdentity> | undefined> {
+    await pause();
+    const row = read("switch", () =>
+      db.get(
+        `SELECT ${MESSAGE_COLUMNS} FROM session_message
+         WHERE session_id = ? AND type = ? AND seq < ? AND json_valid(data)
+         ORDER BY seq DESC LIMIT ?`,
+        [sessionID, type, seq, 1],
+      ),
+    );
+    if (!row) return undefined;
+    const decoded = decodeRow(toMessageRow(row));
+    return decoded.ok ? identityOf(decoded) : undefined;
+  }
+
+  /**
+   * For each user seq (ascending), the latest `type` switch before it,
+   * independent of which page the user row sits on. One seek resolves the
+   * oldest user; one bounded range read covers the switches between the
+   * oldest and newest user. If that range holds more than
+   * {@link SWITCH_SCAN_LIMIT} switches, each remaining user gets its own seek
+   * instead, so a burst of switches can never push a user's predecessor out
+   * of view.
+   */
+  async function latestSwitches(
+    type: SwitchType,
+    sessionID: string,
+    userSeqs: number[],
+  ): Promise<Map<number, Partial<UserIdentity> | undefined>> {
+    const out = new Map<number, Partial<UserIdentity> | undefined>();
+    const oldest = userSeqs[0]!;
+    const newest = userSeqs[userSeqs.length - 1]!;
+    out.set(oldest, await switchBefore(type, sessionID, oldest));
+    if (newest === oldest) return out;
+
+    await pause();
+    const range = read("switch range", () =>
+      db.all(
+        `SELECT ${MESSAGE_COLUMNS} FROM session_message
+         WHERE session_id = ? AND type = ? AND seq > ? AND seq < ? AND json_valid(data)
+         ORDER BY seq DESC LIMIT ?`,
+        [sessionID, type, oldest, newest, SWITCH_SCAN_LIMIT + 1],
+      ),
+    );
+    const truncated = range.length > SWITCH_SCAN_LIMIT;
+    const switches = range.map((row) => decodeRow(toMessageRow(row)));
+    for (const seq of userSeqs) {
+      if (seq === oldest) continue;
+      if (truncated) {
+        out.set(seq, await switchBefore(type, sessionID, seq));
+        continue;
+      }
+      // Newest first, so the first one below `seq` is its latest predecessor.
+      const hit = switches.find((d) => d.row.seq < seq);
+      out.set(seq, hit ? (hit.ok ? identityOf(hit) : undefined) : out.get(oldest));
+    }
+    return out;
+  }
+
   /**
    * Attribute user-role rows: each field from the latest
    * preceding agent/model switch, else the next assistant, else the session.
-   * Two bounded statements at most, both only when the rows include a user.
+   * The switch lookups are per user and independent of page size, so a page
+   * and `getMessage` attribute the same row the same way. Every statement is
+   * LIMIT-bound; none runs unless the rows include a user.
    */
   async function identities(
     decoded: Array<Extract<DecodedRow, { ok: true }>>,
@@ -304,20 +374,12 @@ export function createV2HistorySource(db: SqliteDb, opts: V2SourceOptions = {}):
     const out = new Map<string, UserIdentity>();
     const users = decoded.filter((d) => isUserRoleType(d.row.type));
     if (users.length === 0) return out;
-    const newestUser = Math.max(...users.map((d) => d.row.seq));
+    const userSeqs = [...new Set(users.map((d) => d.row.seq))].sort((a, b) => a - b);
+    const newestUser = userSeqs[userSeqs.length - 1]!;
     const newestRow = Math.max(...decoded.map((d) => d.row.seq));
 
-    await pause();
-    const switches = read("switches", () =>
-      db.all(
-        `SELECT ${MESSAGE_COLUMNS} FROM session_message
-         WHERE session_id = ? AND type IN ('agent-switched', 'model-switched') AND seq < ?
-         ORDER BY seq DESC LIMIT ?`,
-        [sessionID, newestUser, SWITCH_SCAN_LIMIT],
-      ),
-    )
-      .map((row) => decodeRow(toMessageRow(row)))
-      .filter((d): d is Extract<DecodedRow, { ok: true }> => d.ok);
+    const agents = await latestSwitches("agent-switched", sessionID, userSeqs);
+    const models = await latestSwitches("model-switched", sessionID, userSeqs);
 
     const assistants = decoded
       .filter((d) => d.row.type === "assistant")
@@ -346,17 +408,11 @@ export function createV2HistorySource(db: SqliteDb, opts: V2SourceOptions = {}):
 
     for (const user of users) {
       const seq = user.row.seq;
-      const agentSwitch = switches.find((s) => s.row.seq < seq && s.row.type === "agent-switched");
-      const modelSwitch = switches.find((s) => s.row.seq < seq && s.row.type === "model-switched");
       const next = assistants.find((a) => a.row.seq > seq);
       out.set(
         user.row.id,
         resolveIdentity(
-          [
-            agentSwitch && identityOf(agentSwitch),
-            modelSwitch && identityOf(modelSwitch),
-            next ? identityOf(next) : after,
-          ],
+          [agents.get(seq), models.get(seq), next ? identityOf(next) : after],
           session,
         ),
       );
