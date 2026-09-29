@@ -668,6 +668,8 @@ describe("truncateExpandedPart budgets", () => {
         error: "e".repeat(5_000),
       }),
       budget,
+      undefined,
+      false,
     );
     // Part consumed exactly the 6k part cap, not 12k+.
     expect(30_000 - budget.remaining).toBe(6_000);
@@ -681,7 +683,7 @@ describe("truncateExpandedPart budgets", () => {
 
   it("does not report the part cap for a single field cut by the field cap", () => {
     const budget: ExpansionBudget = { remaining: 30_000, truncated: false };
-    truncateExpandedPart(toolPart({ output: "o".repeat(10_000) }), budget);
+    truncateExpandedPart(toolPart({ output: "o".repeat(10_000) }), budget, undefined, false);
     expect(30_000 - budget.remaining).toBe(4_000);
     expect(budget.partCapped).toBeUndefined();
     expect(budget.truncated).toBe(true);
@@ -690,12 +692,14 @@ describe("truncateExpandedPart budgets", () => {
   it("caps oversized tool inputs and preserves small ones by identity", () => {
     const budget: ExpansionBudget = { remaining: 30_000, truncated: false };
     const smallInput = { command: "npm test" };
-    const small = truncateExpandedPart(toolPart({ input: smallInput }), budget);
+    const small = truncateExpandedPart(toolPart({ input: smallInput }), budget, undefined, false);
     expect(small.input).toBe(smallInput);
 
     const big = truncateExpandedPart(
       toolPart({ input: { filePath: "/x", content: "y".repeat(50_000) } }),
       budget,
+      undefined,
+      false,
     );
     expect(typeof big.input).toBe("string");
     expect((big.input as string).length).toBeLessThanOrEqual(2_000);
@@ -708,6 +712,8 @@ describe("truncateExpandedPart budgets", () => {
     truncateExpandedPart(
       toolPart({ input: { content: "z".repeat(5_000) }, output: "o".repeat(10_000) }),
       budget,
+      undefined,
+      false,
     );
     // Input consumed 2k of the 6k part budget; output gets the remaining 4k.
     expect(30_000 - budget.remaining).toBe(6_000);
@@ -717,16 +723,21 @@ describe("truncateExpandedPart budgets", () => {
     const budget: ExpansionBudget = { remaining: 30_000, truncated: false };
     const circular: Record<string, unknown> = {};
     circular.self = circular;
-    const out = truncateExpandedPart(toolPart({ input: circular }), budget);
+    const out = truncateExpandedPart(toolPart({ input: circular }), budget, undefined, false);
     expect(out.input).toBeUndefined();
 
-    const fn = truncateExpandedPart(toolPart({ input: (() => {}) as never }), budget);
+    const fn = truncateExpandedPart(
+      toolPart({ input: (() => {}) as never }),
+      budget,
+      undefined,
+      false,
+    );
     expect(fn.input).toBeUndefined();
   });
 
   it("attributes cuts to the global budget when it is smaller than the part cap", () => {
     const budget: ExpansionBudget = { remaining: 1_000, truncated: false };
-    truncateExpandedPart(toolPart({ output: "o".repeat(5_000) }), budget);
+    truncateExpandedPart(toolPart({ output: "o".repeat(5_000) }), budget, undefined, false);
     expect(budget.remaining).toBe(0);
     expect(budget.partCapped).toBeUndefined();
     expect(budget.truncated).toBe(true);

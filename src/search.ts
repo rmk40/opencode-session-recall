@@ -621,8 +621,10 @@ function truncateExpandedInput(value: unknown, budget: ExpansionBudget): unknown
 export function truncateExpandedPart(
   part: PartOutput,
   budget: ExpansionBudget,
-  findMatch?: MatchFinder,
-  selfTool = false,
+  findMatch: MatchFinder | undefined,
+  /** Whether the source part is one of our own recall tools (required, so a
+   *  new caller cannot forget the self-recall redaction). */
+  selfTool: boolean,
 ): PartOutput {
   // Never surface our own recall tool output inside expansion. Search matching
   // already excludes self-tool parts (searchableFields), but expansion formats
