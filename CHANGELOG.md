@@ -33,14 +33,19 @@ All notable changes to this project are documented here. This project follows
   The sink is groundwork for opencode v2, which discards plugin console
   output.
 - **The store moves to schema 4.** An existing `store-v1.db` upgrades in
-  place on first open, keeping every card, index row, vector and summary. The
-  store now records which opencode host writes it (`meta.store_host`), so a
-  store owned by another host is refused before any migration: the plugin
-  runs in the degraded metadata-only mode and logs one `store refused
-(<reason>)` line instead of rebuilding the file. Downgrade consequence: an
-  older plugin build (schema 3) sees the upgraded store as newer and runs
-  degraded. To downgrade cleanly, delete the store file; the older build
-  rebuilds it in the background.
+  place on first open, keeping every card, index row, vector and summary, and
+  gains a `card.distill_cursor` column that stays empty under opencode v1 (it
+  is reserved for the v2 host). The store now records which opencode host
+  writes it (`meta.store_host`), so a store owned by another host is refused
+  before any migration: the plugin runs in the degraded metadata-only mode and
+  logs one `store refused (<reason>)` line instead of rebuilding the file.
+  Downgrade consequence: an older plugin build (schema 3) sees the upgraded
+  store as newer and runs degraded. To downgrade cleanly or reset a refused
+  store, quit every opencode process sharing the store, delete the store
+  file, and restart; it rebuilds in the background.
+- The build tag in `coverage.semantic.pluginVersion` and in the distill
+  lease's `build` field now names the host: `schema4.gen4.opencode-v1`
+  instead of `schema3.gen4`.
 
 ## 2.3.0
 

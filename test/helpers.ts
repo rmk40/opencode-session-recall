@@ -54,6 +54,13 @@ type ApiFailure = { data: { message: string } };
 type MessageBundle = { info: Message; parts: Part[] };
 type MetadataCall = { title?: string; metadata?: Record<string, unknown> };
 
+/** Open a store as the v1 host, mapping any refusal to `null` (the shape the
+ *  v1 entry degrades on). Tests of the refusal reasons call `openStore`. */
+export function openV1Store(db: SqliteDb, opts?: StoreOptions): Store | null {
+  const opened = openStore(db, { host: "opencode-v1" }, opts);
+  return opened.ok ? opened.store : null;
+}
+
 // ── Strict no-limit enforcement ─────────────────────────────────────────────
 // The incident path was an unpaginated `session.messages({ sessionID })`. When
 // strict mode is on, the fake client throws on any no-limit call, and the
@@ -62,12 +69,6 @@ type MetadataCall = { title?: string; metadata?: Record<string, unknown> };
 // per suite via setStrictNoLimitMessages(true); the distiller/legacy fixtures
 // that intentionally exercise the no-limit full-return path opt out by leaving
 // it off.
-/** Open a store as the v1 host, mapping any refusal to `null` (the shape the
- *  v1 entry degrades on). Tests of the refusal reasons call `openStore`. */
-export function openV1Store(db: SqliteDb, opts?: StoreOptions): Store | null {
-  const opened = openStore(db, { host: "opencode-v1" }, opts);
-  return opened.ok ? opened.store : null;
-}
 
 export const UNBOUNDED_MESSAGES_ERROR = "unbounded session.messages() call without a limit";
 let strictNoLimitMessages = false;

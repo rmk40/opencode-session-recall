@@ -196,10 +196,14 @@ it slipped past the store's version fence. A rep3 build and a rep4 build shared 
 store, raced the global `semantic_model` stamp, and each cleared and rewrote every
 vector to its own representation on a loop. The schema bump fences the older build out
 of the lease and all writes (a newer stamp makes its `openStore` refuse, so that
-process degrades to cards-lite); the per-row `embedding_gen` guard
-(`embedding_gen IS NULL OR embedding_gen <= gen`, plus a wholesale reject of any
-lower-`gen` write, so an old build can never downgrade a newer vector) is the belt
-for same-schema drift. Bump both together.
+process degrades to cards-lite). The fence only reaches a build that **opens** the
+store after the bump: an older process whose connection is already open keeps its
+lease and keeps writing until it restarts. That is safe only because every migration
+is additive and every statement names its columns, so the old writes still fit the
+new layout; a non-additive schema change would need more than a stamp. The per-row
+`embedding_gen` guard (`embedding_gen IS NULL OR embedding_gen <= gen`, plus a
+wholesale reject of any lower-`gen` write, so an old build can never downgrade a
+newer vector) is the belt for same-schema drift. Bump both together.
 
 Mixed builds are diagnosable, not silent: the lease and every `coverage.semantic`
 carry a `pluginVersion` build tag (`schema{N}.gen{M}.{host}`, from `pluginBuild(host)`
