@@ -40,6 +40,37 @@ export function isSelfTool(toolName: string): boolean {
   return TOOLS.some((self) => toolNameMatches(toolName, self));
 }
 
+/** The v2 Code Mode tool: scripts other tools and records them in
+ *  `state.metadata.toolCalls` (opencode v2 `core/src/codemode/tool.ts`). */
+const CODE_MODE_TOOL = "execute";
+
+/**
+ * Whether a part is a call of one of OUR recall tools, directly or through
+ * Code Mode. The one predicate every self-recall exclusion routes through
+ * (extraction, the distiller, and expansion redaction), so recall never finds
+ * or re-surfaces its own output.
+ *
+ * The Code Mode case is defensive: our tools register with `codemode: false`,
+ * so v2's direct and Code Mode inventories are disjoint today
+ * (`core/src/tool.ts:234-240`). An `execute` part whose recorded tool calls
+ * include a recall tool counts as a self-tool part, so the rule holds if that
+ * ever changes. No v1 part has that shape, so v1 behavior is unchanged.
+ */
+export function isSelfToolPart(part: Part): boolean {
+  if (part.type !== "tool") return false;
+  if (isSelfTool(part.tool)) return true;
+  if (!toolNameMatches(part.tool, CODE_MODE_TOOL)) return false;
+  const metadata = (part.state as { metadata?: unknown }).metadata;
+  if (!metadata || typeof metadata !== "object") return false;
+  const calls = (metadata as { toolCalls?: unknown }).toolCalls;
+  if (!Array.isArray(calls)) return false;
+  return calls.some((call: unknown) => {
+    if (!call || typeof call !== "object") return false;
+    const tool = (call as { tool?: unknown }).tool;
+    return typeof tool === "string" && isSelfTool(tool);
+  });
+}
+
 /** Title sentinel marking the Path B summarizer's worker session. Bracketed so
  *  it is distinctive and unlikely to collide with a real session title. */
 export const SUMMARIZER_SENTINEL = "[recall-summarizer]";
@@ -125,7 +156,7 @@ export function searchable(part: Part): string[] {
 }
 
 export function searchableFields(part: Part): SearchableField[] {
-  if (part.type === "tool" && isSelfTool(part.tool)) return [];
+  if (isSelfToolPart(part)) return [];
   switch (part.type) {
     case "text":
       // Auto-recall injects synthetic <recall-auto> text parts that restate

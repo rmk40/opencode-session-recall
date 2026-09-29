@@ -4,10 +4,10 @@ import { compareMessages, type HistoryMessage, type HistorySession } from "./his
 import { MalformedSessionError, type HistorySource } from "./history/source.js";
 import type { Card, FamilyRollup, LeaseInfo, PartTextRow, Store } from "./store.js";
 import type { FetchGate } from "./fetch-gate.js";
-import { isSelfTool, toolNameMatches, isSummarizerTitle } from "./extract.js";
+import { isSelfToolPart, toolNameMatches, isSummarizerTitle } from "./extract.js";
 import { tokenize } from "./normalize.js";
 import { extractCodeTokens } from "./query.js";
-import { isDigestToken, DIGEST_HEAD_CHARS } from "./digest.js";
+import { isDigestToken, DIGEST_HEAD_CHARS, stripSubagentPrefix } from "./digest.js";
 import { containsErrorPattern } from "./bm25.js";
 
 /**
@@ -289,7 +289,7 @@ export function distillFields(part: Part): DistillField[] {
       return [{ class: "human-text", field: "text", text: cap(combined, TEXT_CAP) }];
     }
     case "tool": {
-      if (isSelfTool(part.tool)) return [];
+      if (isSelfToolPart(part)) return [];
       const input = toolInputObject(part);
       const out: DistillField[] = [];
       const command = stringField(input, "command");
@@ -365,8 +365,9 @@ function walkMessages(chrono: HistoryMessage[], prevForFirst: string | null): Wa
     if (!firstUserHead && msg.info.role === "user") {
       for (const part of msg.parts) {
         const text = statementText(part);
-        if (text) {
-          firstUserHead = text.slice(0, DIGEST_HEAD_CHARS);
+        const head = text ? stripSubagentPrefix(text) : "";
+        if (head) {
+          firstUserHead = head.slice(0, DIGEST_HEAD_CHARS);
           break;
         }
       }
@@ -375,7 +376,7 @@ function walkMessages(chrono: HistoryMessage[], prevForFirst: string | null): Wa
     if (text) lastTextHead = text.slice(0, DIGEST_HEAD_CHARS);
 
     for (const part of msg.parts) {
-      if (part.type !== "tool" || isSelfTool(part.tool)) continue;
+      if (part.type !== "tool" || isSelfToolPart(part)) continue;
       tools.push(part.tool);
       if (
         toolNameMatches(part.tool, "read") ||

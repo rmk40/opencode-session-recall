@@ -54,6 +54,26 @@ describe("buildSessionDigest", () => {
     expect(digest).toContain("wscat");
   });
 
+  it("drops the v2 subagent prompt prefix from the digest head", () => {
+    const digest = digestOf([
+      {
+        info: { id: "m1", role: "user", time: { created: 100 } },
+        parts: [
+          textPart(
+            "p1",
+            "s",
+            "m1",
+            "You are a subagent spawned by another session.\nMap the websocket module",
+          ),
+        ],
+      },
+    ] as never);
+    // The head is the prompt without the prefix; the prefix's words may still
+    // count as statement vocabulary after it.
+    expect(digest.startsWith("Map the websocket module ")).toBe(true);
+    expect(digest).not.toContain("You are a subagent");
+  });
+
   it("gives no digest credit to read/skill tools or JSON pseudo-commands", () => {
     const digest = digestOf([
       {

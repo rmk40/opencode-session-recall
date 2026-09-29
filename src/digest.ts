@@ -9,6 +9,21 @@
  */
 
 export const DIGEST_HEAD_CHARS = 200;
+
+/**
+ * The line opencode v2 prepends to a subagent's first prompt
+ * (`core/src/tool/plugin/subagent.ts:206-211`, `core/src/config/plugin/command.ts:110`).
+ * Session parentage already classifies that prompt as delegated, so the line
+ * carries no session identity; v1 never writes it.
+ */
+export const SUBAGENT_PROMPT_PREFIX = "You are a subagent spawned by another session.\n";
+
+/** A statement's head text with the v2 subagent prefix removed (exact match
+ *  only). Used where a session's first user statement becomes its summary
+ *  head: the card's `summaryHead` and the tier-2 session digest. */
+export function stripSubagentPrefix(text: string): string {
+  return text.startsWith(SUBAGENT_PROMPT_PREFIX) ? text.slice(SUBAGENT_PROMPT_PREFIX.length) : text;
+}
 export const DIGEST_MIN_TOKEN_LENGTH = 4;
 
 /** Clean word-like tokens with at least one letter; keeps JSON shards and

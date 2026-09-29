@@ -1,7 +1,7 @@
 import type { Candidate } from "./candidates.js";
 import { tokenize } from "./normalize.js";
 import { toolNameMatches } from "./extract.js";
-import { DIGEST_HEAD_CHARS, isDigestToken } from "./digest.js";
+import { DIGEST_HEAD_CHARS, isDigestToken, stripSubagentPrefix } from "./digest.js";
 
 /**
  * Session-digest derivation and the embedder surface — the two survivors of the
@@ -86,6 +86,8 @@ export function buildSessionDigest(candidates: Candidate[]): string {
     .slice(0, DIGEST_TOP_TOKENS)
     .map(([token]) => token);
 
-  const head = firstUserText ? firstUserText.rawText.slice(0, DIGEST_HEAD_CHARS) : "";
+  const head = firstUserText
+    ? stripSubagentPrefix(firstUserText.rawText).slice(0, DIGEST_HEAD_CHARS)
+    : "";
   return [head, top.join(" ")].filter(Boolean).join(" ").trim();
 }

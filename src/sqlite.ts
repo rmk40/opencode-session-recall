@@ -7,8 +7,9 @@
  * SQLite binding, and it does so exclusively through dynamic `import()` behind
  * variable specifiers so `src/` stays free of Node/Bun types (see AGENTS.md) and
  * so the bundler never tries to inline a native driver. Every open failure is
- * swallowed into a `null` return: a missing driver degrades the plugin to
- * ephemeral mode rather than throwing.
+ * swallowed: {@link openSqlite} returns `null` (a missing driver degrades the
+ * plugin to ephemeral mode rather than throwing), and {@link openSqliteReadOnly}
+ * returns `{ ok: false, reason }`.
  */
 
 export type SqlValue = string | number | bigint | null | Uint8Array;
@@ -51,7 +52,9 @@ type NodeDatabase = {
   prepare(sql: string): NodeStatement;
   close(): void;
 };
-type NodeSqliteModule = { DatabaseSync: new (path: string) => NodeDatabase };
+type NodeSqliteModule = {
+  DatabaseSync: new (path: string, options?: { readOnly?: boolean }) => NodeDatabase;
+};
 
 type BunStatement = {
   // Older Bun returned `undefined` from run(); we fall back to `changes()` then.
@@ -65,7 +68,7 @@ type BunDatabase = {
   close(): void;
 };
 type BunSqliteModule = {
-  Database: new (path: string, options: { create: boolean }) => BunDatabase;
+  Database: new (path: string, options: { create?: boolean; readonly?: boolean }) => BunDatabase;
 };
 
 const NODE_SQLITE: string = "node:sqlite";
@@ -184,4 +187,78 @@ export async function openSqlite(path: string): Promise<SqliteDb | null> {
   } catch {
     return null;
   }
+}
+
+/** The outcome of {@link openSqliteReadOnly}: a verified read-only handle, or
+ *  why the file cannot be read. */
+export type ReadOnlyOpenResult = { ok: true; db: SqliteDb } | { ok: false; reason: string };
+
+/** How long a read waits on a lock before failing. Short on purpose: a WAL
+ *  reader almost never waits, and a stalled read would stall the host. */
+const READ_ONLY_BUSY_TIMEOUT_MS = 500;
+
+/** A driver error as one line, with the SQLite code when the driver has one
+ *  (`bun:sqlite` sets `code`, `node:sqlite` sets `errstr`). */
+function describeError(error: unknown): string {
+  if (!(error instanceof Error)) return String(error);
+  const shaped = error as Error & { code?: unknown; errstr?: unknown };
+  const code =
+    typeof shaped.code === "string" && shaped.code.startsWith("SQLITE_")
+      ? shaped.code
+      : typeof shaped.errstr === "string"
+        ? shaped.errstr
+        : undefined;
+  return code && !error.message.includes(code) ? `${error.message} (${code})` : error.message;
+}
+
+/**
+ * Open another program's SQLite file strictly read-only: `bun:sqlite` with
+ * `{ readonly: true }` under Bun (the same SQLite build opencode writes with,
+ * so two libraries never hold POSIX locks on one file in one process), else
+ * `node:sqlite` with `{ readOnly: true }`. Then `PRAGMA query_only = 1`, a
+ * short `busy_timeout`, and a probe statement.
+ *
+ * The probe is load-bearing: Bun's constructor succeeds lazily and an
+ * unreadable file (a WAL database whose `-shm` cannot be created fails with
+ * `SQLITE_CANTOPEN`, a non-database file, a missing file) surfaces only on the
+ * first statement. `:memory:` is rejected by name: an in-memory database is a
+ * different, empty database, never the one another process uses. Never
+ * throws; every failure is a `{ ok: false, reason }`.
+ */
+export async function openSqliteReadOnly(
+  path: string,
+  opts: { busyTimeoutMs?: number } = {},
+): Promise<ReadOnlyOpenResult> {
+  if (path === ":memory:") {
+    return { ok: false, reason: "in-memory database (:memory:) has no file to read" };
+  }
+  if (path.trim() === "") return { ok: false, reason: "empty database path" };
+
+  let db: SqliteDb;
+  try {
+    if (typeof (globalThis as { Bun?: unknown }).Bun !== "undefined") {
+      const mod = (await import(BUN_SQLITE)) as unknown as BunSqliteModule;
+      db = makeSqliteDb(bunPrimitives(new mod.Database(path, { readonly: true })));
+    } else {
+      const mod = (await import(NODE_SQLITE)) as unknown as NodeSqliteModule;
+      db = makeSqliteDb(nodePrimitives(new mod.DatabaseSync(path, { readOnly: true })));
+    }
+  } catch (error) {
+    return { ok: false, reason: `cannot open ${path}: ${describeError(error)}` };
+  }
+
+  const busy = Math.max(0, Math.floor(opts.busyTimeoutMs ?? READ_ONLY_BUSY_TIMEOUT_MS));
+  try {
+    db.exec("PRAGMA query_only = 1");
+    db.exec(`PRAGMA busy_timeout = ${busy}`);
+    db.get("SELECT count(*) AS n FROM sqlite_master");
+  } catch (error) {
+    try {
+      db.close();
+    } catch {
+      // The probe's error is the one worth reporting.
+    }
+    return { ok: false, reason: `cannot read ${path}: ${describeError(error)}` };
+  }
+  return { ok: true, db };
 }

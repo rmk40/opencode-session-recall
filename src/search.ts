@@ -25,7 +25,7 @@ import {
   snippet,
   matches,
   formatMsg,
-  isSelfTool,
+  isSelfToolPart,
   isSummarizerTitle,
   evidenceClassFor,
 } from "./extract.js";
@@ -613,11 +613,16 @@ function truncateExpandedInput(value: unknown, budget: ExpansionBudget): unknown
   return `${serialized.slice(0, sliceLength)}${EXPANSION_TRUNCATED}`;
 }
 
-/** Exported for direct unit tests of the per-part budget mechanics. */
+/**
+ * Exported for direct unit tests of the per-part budget mechanics. `selfTool`
+ * is {@link isSelfToolPart} of the source part, decided by the caller because
+ * the formatted part no longer carries the tool metadata the predicate reads.
+ */
 export function truncateExpandedPart(
   part: PartOutput,
   budget: ExpansionBudget,
   findMatch?: MatchFinder,
+  selfTool = false,
 ): PartOutput {
   // Never surface our own recall tool output inside expansion. Search matching
   // already excludes self-tool parts (searchableFields), but expansion formats
@@ -625,7 +630,7 @@ export function truncateExpandedPart(
   // that recall's output. Redact the body but keep the part marker so message
   // structure/positioning is preserved. Explicit recall_get/recall_context are
   // unaffected — this only applies to recall's inline expansion.
-  if (part.type === "tool" && part.toolName && isSelfTool(part.toolName)) {
+  if (selfTool) {
     return {
       ...part,
       content: SELF_TOOL_REDACTED,
@@ -666,15 +671,18 @@ function formatExpandedMsg(
   findMatch?: MatchFinder,
 ): MessageItem {
   const item = formatMsg(msg);
+  // formatMsg maps parts one to one, so index i is the source of item part i.
   return {
     ...item,
-    parts: item.parts.map((part) =>
-      truncateExpandedPart(
+    parts: item.parts.map((part, i) => {
+      const source = msg.parts[i];
+      return truncateExpandedPart(
         part,
         budget,
         part.id === matchedPartID && findMatch ? findMatch : undefined,
-      ),
-    ),
+        source !== undefined && isSelfToolPart(source),
+      );
+    }),
   };
 }
 

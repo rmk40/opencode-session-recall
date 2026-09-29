@@ -10,6 +10,7 @@ import {
   format,
   formatMsg,
   isSelfTool,
+  isSelfToolPart,
   pruned,
   searchable,
   snippet,
@@ -35,6 +36,7 @@ import {
   assistantMessage,
   completedToolPart,
   errorToolPart,
+  executeToolPart,
   pendingToolPart,
   reasoningPart,
   runningToolPart,
@@ -169,6 +171,25 @@ describe("extract helpers", () => {
     for (const name of ["myrecall", "recallx", "precall", "recall_other", "bash", "read"]) {
       expect(isSelfTool(name), name).toBe(false);
     }
+  });
+
+  it("treats a Code Mode execute part that called a recall tool as a self-tool part", () => {
+    const viaRecall = executeToolPart("p", "s", "m", ["context7.query-docs", "x.recall"], "prior");
+    expect(isSelfToolPart(viaRecall)).toBe(true);
+    expect(searchable(viaRecall)).toEqual([]);
+
+    const other = executeToolPart("p", "s", "m", ["context7.query-docs"], "docs body");
+    expect(isSelfToolPart(other)).toBe(false);
+    expect(searchable(other)).toContain("docs body");
+
+    // Only the Code Mode tool's metadata counts; a direct recall stays self.
+    const notExecute = completedToolPart("p", "s", "m", "bash", {}, "out");
+    if (notExecute.type === "tool" && notExecute.state.status === "completed") {
+      notExecute.state.metadata = { toolCalls: [{ tool: "recall", status: "completed" }] };
+    }
+    expect(isSelfToolPart(notExecute)).toBe(false);
+    expect(isSelfToolPart(completedToolPart("p", "s", "m", "recall", {}, "prior"))).toBe(true);
+    expect(isSelfToolPart(textPart("p", "s", "m", "recall"))).toBe(false);
   });
 
   it("builds snippets and pruned flags at important boundaries", () => {

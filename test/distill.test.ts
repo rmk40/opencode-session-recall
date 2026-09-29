@@ -28,6 +28,7 @@ import {
   bundle,
   completedToolPart,
   errorToolPart,
+  executeToolPart,
   messagesResponse,
   paginateBundles,
   PROJECT_DIR,
@@ -295,6 +296,42 @@ describe("distillFields", () => {
     ).toEqual([]);
   });
 
+  it("treats v2 tool names exactly like their v1 counterparts", () => {
+    // No extraction rule keys on bash/task/apply_patch or skill's `name`:
+    // commands come from any tool's `command` input, and only read/skill
+    // are special-cased. So v2's shell/subagent/patch and skill `id` need
+    // no new bases.
+    const pairs: Array<[string, string, Record<string, unknown>]> = [
+      ["bash", "shell", { command: "npm test", workdir: "/w" }],
+      ["task", "subagent", { description: "d", prompt: "p", subagent_type: "explore" }],
+      ["apply_patch", "patch", { patchText: "*** Begin Patch" }],
+    ];
+    for (const [v1Name, v2Name, input] of pairs) {
+      const strip = (fields: ReturnType<typeof distillFields>) =>
+        fields.map((f) => [f.field, f.text]);
+      expect(
+        strip(distillFields(completedToolPart("p", "s", "m", v2Name, input, "out"))),
+        v2Name,
+      ).toEqual(strip(distillFields(completedToolPart("p", "s", "m", v1Name, input, "out"))));
+    }
+    // skill: v1 input { name }, v2 input { id }; both stay reference material.
+    for (const input of [{ name: "tuistory" }, { id: "tuistory" }]) {
+      expect(distillFields(completedToolPart("p", "s", "m", "skill", input, "body"))).toEqual([]);
+    }
+  });
+
+  it("excludes a Code Mode execute part that called a recall tool", () => {
+    const viaRecall = executeToolPart("p1", "s1", "m1", ["plugin.recall"], "prior");
+    const other = executeToolPart("p2", "s1", "m1", ["context7.query-docs"], "docs");
+    expect(distillFields(viaRecall)).toEqual([]);
+    expect(distillFields(other).length).toBeGreaterThan(0);
+
+    const messages = [bundle(assistantMessage("m1", "s1", 1_000), [viaRecall, other])];
+    const { card, rows } = deriveCard(deriveInput("s1", messages));
+    expect(card.tools).toEqual(["execute"]);
+    expect(rows.every((row) => !row.partId.startsWith("p1#"))).toBe(true);
+  });
+
   it("excludes only the synthetic recall-auto sentinel", () => {
     const auto = {
       ...textPart("p", "s", "m", "<recall-auto> restated terms"),
@@ -485,6 +522,31 @@ describe("deriveCard", () => {
       deriveInput("s1", [bundle(userMessage("m1", "s1", 1000), [textPart("p", "s1", "m1", "hi")])]),
     ).card;
     expect(card.familyRollup).toEqual([]);
+  });
+
+  it("strips the v2 subagent prompt prefix from the summary head only", () => {
+    const prompt = "You are a subagent spawned by another session.\nAudit the parser module";
+    const messages = [bundle(userMessage("m1", "s1", 1000), [textPart("p1", "s1", "m1", prompt)])];
+    const { card, rows } = deriveCard(deriveInput("s1", messages, { parentId: "root" }));
+    expect(card.summaryHead).toBe("Audit the parser module");
+    // The indexed statement keeps the verbatim text.
+    expect(rows[0]!.raw).toBe(prompt);
+
+    // A bare prefix leaves no head; the next statement supplies it.
+    const bare = [
+      bundle(userMessage("m1", "s1", 1000), [
+        textPart("p1", "s1", "m1", "You are a subagent spawned by another session.\n"),
+        textPart("p2", "s1", "m1", "second statement"),
+      ]),
+    ];
+    expect(deriveCard(deriveInput("s1", bare)).card.summaryHead).toBe("second statement");
+    // Only the exact prefix, at the start, is removed.
+    const inner = [
+      bundle(userMessage("m1", "s1", 1000), [
+        textPart("p1", "s1", "m1", "Note: You are a subagent spawned by another session.\nX"),
+      ]),
+    ];
+    expect(deriveCard(deriveInput("s1", inner)).card.summaryHead).toContain("Note: You are");
   });
 
   it("sets distilled_through to the newest message id and derives the heads", () => {
