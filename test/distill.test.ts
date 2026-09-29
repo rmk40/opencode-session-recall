@@ -1187,6 +1187,62 @@ describe("cold pass", () => {
     db.close();
   });
 
+  it("skips a session whose fetch keeps failing, so the pass reaches older sessions", async () => {
+    // The live v1 case: the host fails every read of one session (its project
+    // directory cannot boot), and the pass used to retry it forever.
+    const graph: Graph = {
+      sessions: [
+        session("s1", "One", PROJECT_DIR, 4000),
+        session("s2", "Two", PROJECT_DIR, 3000),
+        session("s3", "Three", PROJECT_DIR, 2000),
+        session("s4", "Four", PROJECT_DIR, 1000),
+      ],
+      messagesBySession: {
+        s1: [bundle(userMessage("m1", "s1", 100), [textPart("p1", "s1", "m1", "one content")])],
+        s2: [bundle(userMessage("m2", "s2", 100), [textPart("p2", "s2", "m2", "two content")])],
+        s3: [bundle(userMessage("m3", "s3", 100), [textPart("p3", "s3", "m3", "three content")])],
+        s4: [bundle(userMessage("m4", "s4", 100), [textPart("p4", "s4", "m4", "four content")])],
+      },
+    };
+    const { source: inner } = makeDistillFake(graph);
+    let s2Reads = 0;
+    const source: HistorySource = {
+      ...inner,
+      messagePage: async (o) => {
+        if (o.sessionID === "s2") {
+          s2Reads++;
+          throw new Error("SQLiteError: no such column: project_id");
+        }
+        return inner.messagePage(o);
+      },
+    };
+    const { db, store } = await freshStore();
+    const { gate } = makeSpyGate();
+    const logs: string[] = [];
+    const distiller = createDistiller({
+      source,
+      store,
+      gate,
+      limits: { ...TEST_LIMITS, distillConcurrency: 1 },
+      instanceId: "stuck-session",
+      coldPassRetryMs: 5,
+      log: (line) => logs.push(line),
+    });
+
+    distiller.start();
+    await waitFor(() => distiller.status().coldPass === "done");
+
+    for (const id of ["s1", "s3", "s4"]) expect(store.getCard(id)?.distillState).toBe("full");
+    expect(store.getCard("s2")).toBeUndefined();
+    // Two passes aborted on it (a passing outage still retries); the third
+    // skipped it and finished.
+    expect(s2Reads).toBe(3);
+    expect(store.getMeta("coldpass_cursor")).toBe("1000");
+    expect(logs.some((line) => line.includes("session s2 skipped for this cold pass"))).toBe(true);
+    distiller.stop();
+    db.close();
+  });
+
   it("recovers a concurrency-2 cold pass from a mid-pass failure via backoff retry", async () => {
     const graph: Graph = {
       sessions: [

@@ -62,6 +62,17 @@ All notable changes to this project are documented here. This project follows
   now `session listing response was not an array` instead of the runtime's
   own TypeError message (such as `result.data is not iterable`).
 
+### Fixed
+
+- **The cold pass no longer stalls on one session the host keeps failing
+  on.** If opencode could not serve a session (seen live on 1.18.33, where
+  booting that session's project directory failed with
+  `no such column: project_id`), every cold pass aborted on it and retried
+  it every 60 s, so older sessions were never indexed. A session whose fetch
+  fails in three consecutive passes is now skipped for the rest of that pass
+  with one log line; the pass finishes, and the session is still tried on
+  every later pass and when it changes.
+
 ## 2.3.0
 
 ### Added

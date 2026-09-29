@@ -56,6 +56,9 @@ const MAX_QUARANTINED_SESSIONS = 1_000;
 /** Consecutive failed re-distills before an unsettled session stops being
  *  re-read on every poll. */
 const MAX_UNSETTLED_FAILURES = 3;
+/** Consecutive cold passes a session's fetch may fail before a failure stops
+ *  aborting the pass and only skips that session. */
+const MAX_COLD_PASS_FETCH_FAILURES = 3;
 /** With `yieldBetween`, long store sweeps pause after this many writes. */
 const YIELD_EVERY_WRITES = 50;
 
@@ -709,6 +712,14 @@ export function createDistiller(options: DistillerOptions): Distiller {
   const reDistillFailures = new Map<string, number>();
   const reDistillWidth = Math.max(1, Math.floor(limits.distillConcurrency));
   const quarantined = new Map<string, number>();
+  /** Consecutive cold passes whose fetch of a session failed with a transport
+   *  error (not a data-shape one). Below the limit a failure aborts the pass,
+   *  which retries after `coldPassRetryMs` (the right answer for a passing
+   *  outage). At the limit the session is skipped instead, so one session the
+   *  host keeps failing on cannot hold the pass back from every older one; it
+   *  is still tried on every later pass and by events. FIFO-bounded like the
+   *  quarantine. */
+  const coldPassFetchFailures = new Map<string, number>();
   let stopPromise: Promise<void> | undefined;
   /** Sessions that saw a removal-shaped event since their last full distill, so
    *  the next re-distill takes the full path rather than appending. */
@@ -1224,12 +1235,30 @@ export function createDistiller(options: DistillerOptions): Distiller {
             messages = await fetchSessionMessages(session.id, caps.ftsRowsPerSession);
             ({ checkpoint, moved } = await bracketCheckpoint(session.id, before));
           } catch (error) {
-            if (!(error instanceof MalformedSessionError)) throw error;
+            if (!(error instanceof MalformedSessionError)) {
+              if (stopped || !leaseHeld) throw error;
+              const failures = (coldPassFetchFailures.get(session.id) ?? 0) + 1;
+              coldPassFetchFailures.delete(session.id);
+              coldPassFetchFailures.set(session.id, failures);
+              while (coldPassFetchFailures.size > MAX_QUARANTINED_SESSIONS) {
+                const oldest = coldPassFetchFailures.keys().next().value;
+                if (oldest === undefined) break;
+                coldPassFetchFailures.delete(oldest);
+              }
+              if (failures < MAX_COLD_PASS_FETCH_FAILURES) throw error;
+              logMsg(
+                `session ${session.id} skipped for this cold pass after ${failures} consecutive fetch failures: ${errmsg(error)}`,
+              );
+              examined++;
+              recordProgress(session.timeUpdated);
+              return;
+            }
             quarantine(session, error);
             examined++;
             recordProgress(session.timeUpdated);
             return;
           }
+          coldPassFetchFailures.delete(session.id);
 
           let card: Card;
           let rows: PartTextRow[];
