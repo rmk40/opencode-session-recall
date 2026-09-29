@@ -690,7 +690,7 @@ export function createV2HistorySource(db: ReadOnlyDb, opts: V2SourceOptions = {}
       const row = read("message", () =>
         db.get(
           `SELECT ${BODY_COLUMNS} FROM session_message
-           WHERE id = ? AND session_id = ? AND ${FORK_FILTER} LIMIT ?`,
+           WHERE id = ? AND session_id = ? AND ${CONTENT_FILTER} AND ${FORK_FILTER} LIMIT ?`,
           [byteCeiling, messageID, sessionID, ...fork, 1],
         ),
       );

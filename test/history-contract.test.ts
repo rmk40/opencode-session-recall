@@ -585,6 +585,32 @@ describe("v2 history source", () => {
     expect(partText(page.items[0])).toMatch(/message omitted/);
   });
 
+  it("treats oversized non-content rows as absent in point reads, like pages", async () => {
+    const t = await fresh();
+    session(t, "ses_nc");
+    const kept = message(t, "ses_nc", "user", text("visible"));
+    const hidden = [
+      message(t, "ses_nc", "system", { text: "s".repeat(5_000), time: { created: 0 } }),
+      message(t, "ses_nc", "idle", { outcome: "x".repeat(5_000), time: { created: 0 } }),
+      message(t, "ses_nc", "compaction", {
+        status: "running",
+        reason: "auto",
+        summary: "c".repeat(5_000),
+        recent: "",
+      }),
+    ];
+    const { source } = await capped(t);
+    const { seen } = await walk(source, "ses_nc", 10);
+    expect(seen).toEqual([kept]);
+    for (const id of hidden) {
+      expect(await source.getMessage("ses_nc", id), id).toEqual({
+        ok: false,
+        reason: "not-found",
+        error: `Message not found: ${id}`,
+      });
+    }
+  });
+
   it("orders sessions by max(time_updated, time_idle) with NULL idle, id breaking ties", async () => {
     const t = await fresh();
     session(t, "ses_a", { time_updated: 100, time_idle: null });
