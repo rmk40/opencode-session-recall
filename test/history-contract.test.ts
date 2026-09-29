@@ -913,6 +913,18 @@ describe("v2 history source", () => {
 
   it("round-trips its opaque cursor and rejects foreign ones", () => {
     expect(decodeV2Cursor(encodeV2Cursor(42))).toBe(42);
+    // The encoder and decoder agree on the full safe-integer range.
+    expect(decodeV2Cursor(encodeV2Cursor(Number.MAX_SAFE_INTEGER))).toBe(Number.MAX_SAFE_INTEGER);
+    for (const bad of [-1, 1.5, Number.NaN, Number.MAX_SAFE_INTEGER + 1]) {
+      expect(() => encodeV2Cursor(bad), String(bad)).toThrow(/non-negative safe integer/);
+    }
+    // 16 digits but past MAX_SAFE_INTEGER: well-formed, still rejected.
+    const unsafe = btoa("v2:9999999999999999")
+      .replace(/\+/g, "-")
+      .replace(/\//g, "_")
+      .replace(/=+$/, "");
+    expect(unsafe).toMatch(/^[A-Za-z0-9_-]+$/);
+    expect(() => decodeV2Cursor(unsafe)).toThrow(/Invalid message cursor/);
     expect(encodeV2Cursor(7)).toMatch(/^[A-Za-z0-9_-]+$/);
     for (const bad of ["", "MTI", "djI6", "djI6LTE", "djI6eA", "a b"]) {
       expect(() => decodeV2Cursor(bad), bad).toThrow(/Invalid message cursor/);

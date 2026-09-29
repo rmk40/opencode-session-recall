@@ -138,8 +138,12 @@ export async function openOpencodeDb(path: string): Promise<OpencodeDbOpen> {
 
 const CURSOR_PREFIX = "v2:";
 
-/** Opaque page cursor: `base64url("v2:" + seq)`. */
+/** Opaque page cursor: `base64url("v2:" + seq)`. `seq` is a non-negative
+ *  safe integer (up to 16 digits), the same range the decoder accepts. */
 export function encodeV2Cursor(seq: number): string {
+  if (!Number.isSafeInteger(seq) || seq < 0) {
+    throw new Error(`cursor seq must be a non-negative safe integer, got ${String(seq)}`);
+  }
   return btoa(`${CURSOR_PREFIX}${seq}`).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }
 
@@ -153,9 +157,11 @@ export function decodeV2Cursor(cursor: string): number {
   } catch {
     throw invalid;
   }
-  const match = /^v2:(\d{1,15})$/.exec(decoded);
+  const match = /^v2:(\d{1,16})$/.exec(decoded);
   if (!match) throw invalid;
-  return Number(match[1]);
+  const seq = Number(match[1]);
+  if (!Number.isSafeInteger(seq)) throw invalid;
+  return seq;
 }
 
 // ── Source ───────────────────────────────────────────────────────────────────
