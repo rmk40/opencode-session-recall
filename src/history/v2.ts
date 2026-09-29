@@ -40,12 +40,16 @@ import {
  *   enforces it), and a page also stops at a byte ceiling on the rows'
  *   encoded size, read before any row body is loaded. A row larger than the
  *   ceiling on its own is never loaded at all: it projects as a placeholder
- *   message (see {@link oversizedData}), so paging, drill, deep and the
+ *   message (see {@link placeholderData}), so paging, drill, deep and the
  *   distiller keep moving past it, and the placeholder text is what gets
  *   indexed. The body statement re-reads every size, since rows can grow
  *   between the two statements, and cuts the page where a running total
- *   would pass the ceiling, so the bytes a page loads never exceed it. (The compaction status filter still
- *   parses a compaction row's JSON inside SQLite; nothing reaches JS.)
+ *   would pass the ceiling, so the bytes a page loads never exceed it. An
+ *   oversized row's placeholder takes the session's agent and model; no
+ *   statement reads anything from its body (beyond measuring it, which on
+ *   SQLite before 3.43 loads it inside SQLite). (The one exception is the
+ *   compaction status filter, which parses a compaction row's JSON inside
+ *   SQLite; nothing reaches JS.)
  * - Polite: an `await` on a macrotask separates statements, so a page never
  *   holds the shared v2 service's event loop for more than one statement.
  * - Tolerant: a row with unparseable data becomes a placeholder message (a
@@ -283,35 +287,31 @@ function placeholderData(
   }
 }
 
-/** Longest identity field (agent, model id/provider/variant) read in SQL. */
-const IDENTITY_FIELD_CHARS = 512;
-
-/** One string field of a row's JSON, read inside SQLite: NULL unless the data
- *  is valid JSON and the field is a string (nested CASE, since `json_type`
- *  rejects malformed JSON and AND does not short-circuit reliably). */
-function jsonTextField(path: string): string {
-  return `CASE WHEN json_valid(data) THEN
-    CASE WHEN json_type(data, '${path}') = 'text'
-      THEN substr(json_extract(data, '${path}'), 1, ${IDENTITY_FIELD_CHARS}) END END`;
-}
-
-/** An assistant or compaction row's identity as bounded scalars, so a row
- *  whose body is never loaded still attributes like a loaded one. */
-const IDENTITY_COLUMNS = `${jsonTextField("$.agent")} AS id_agent,
-  ${jsonTextField("$.model.id")} AS id_model,
-  ${jsonTextField("$.model.providerID")} AS id_provider,
-  ${jsonTextField("$.model.variant")} AS id_variant`;
-
-/** The identity columns as the JSON shape the projector reads. */
-function identityData(row: Row): { agent?: string; model?: Record<string, string> } {
+/**
+ * An assistant row's identity from the one `json_extract` with several paths
+ * the next-assistant lookup returns: a JSON array `[agent, model.id,
+ * model.providerID, model.variant]`, or NULL for a row over the byte ceiling
+ * or with invalid JSON. Only non-empty strings count, for every field.
+ */
+function identityFromArray(value: SqlValue | undefined): {
+  agent?: string;
+  model?: Record<string, string>;
+} {
+  if (typeof value !== "string") return {};
+  let fields: unknown;
+  try {
+    fields = JSON.parse(value);
+  } catch {
+    return {};
+  }
+  if (!Array.isArray(fields)) return {};
+  const text = (v: unknown): string | undefined => (typeof v === "string" && v ? v : undefined);
+  const [agent, id, providerID, variant] = fields.map(text);
   const out: { agent?: string; model?: Record<string, string> } = {};
-  const agent = asString(row.id_agent);
   if (agent) out.agent = agent;
-  const id = asString(row.id_model);
   if (id) {
-    const model: Record<string, string> = { id, providerID: asString(row.id_provider) ?? "" };
-    const variant = asString(row.id_variant);
-    if (variant !== null) model.variant = variant;
+    const model: Record<string, string> = { id, providerID: providerID ?? "" };
+    if (variant) model.variant = variant;
     out.model = model;
   }
   return out;
@@ -576,19 +576,28 @@ export function createV2HistorySource(db: ReadOnlyDb, opts: V2SourceOptions = {}
     let after: Partial<UserIdentity> | undefined;
     if (!assistants.some((a) => a.row.seq > newestUser)) {
       await pause();
+      // The identity of a row over the byte ceiling is NULL, exactly as an
+      // on-page oversized assistant's placeholder carries none, so a page and
+      // getMessage both fall back to the session for it. One json_extract with
+      // several paths keeps it to one parse of the row.
       const row = read("next assistant", () =>
         db.get(
-          `SELECT seq, ${IDENTITY_COLUMNS}
+          `SELECT seq,
+             CASE WHEN ${BYTES} <= ? THEN
+               CASE WHEN json_valid(data) THEN
+                 json_extract(data, '$.agent', '$.model.id', '$.model.providerID', '$.model.variant')
+               END
+             END AS identity
            FROM session_message
            WHERE session_id = ? AND type = 'assistant' AND seq > ?
            ORDER BY seq ASC LIMIT ?`,
-          [sessionID, newestRow, 1],
+          [byteCeiling, sessionID, newestRow, 1],
         ),
       );
       if (row) {
         after = identityOf({
           row: { ...toMessageRow(row), type: "assistant" },
-          data: identityData(row),
+          data: identityFromArray(row.identity),
         });
       }
     }
@@ -619,37 +628,19 @@ export function createV2HistorySource(db: ReadOnlyDb, opts: V2SourceOptions = {}
     strict: boolean,
   ): Promise<HistoryMessage[]> {
     const decoded: Array<Extract<DecodedRow, { ok: true }>> = [];
-    const unloaded: Array<Extract<DecodedRow, { ok: true }>> = [];
     for (let i = 0; i < rows.length; i++) {
       if (i > 0 && i % ROWS_PER_YIELD === 0) await pause();
-      const row = rows[i]!;
-      const d = decodeBody(row);
+      // An oversized row's placeholder carries no agent or model: reading them
+      // would make SQLite parse the whole row, the stall the ceiling exists to
+      // prevent. It takes the session's, in pages and point reads alike.
+      const d = decodeBody(rows[i]!);
       if (d.ok) {
         decoded.push(d);
-        // An oversized assistant or compaction lost its identity with its
-        // body; recover it below so it attributes like the loaded row would.
-        if (row.data == null && (d.row.type === "assistant" || d.row.type === "compaction")) {
-          unloaded.push(d);
-        }
         continue;
       }
       if (strict) throw new MalformedSessionError(d.reason);
       const { type, data } = placeholderData(d.row.type, malformedNote(d.reason));
       decoded.push({ ok: true, row: { ...d.row, type, data: "" }, data });
-    }
-    if (unloaded.length > 0) {
-      await pause();
-      const seqs = unloaded.map((d) => d.row.seq);
-      const found = read("oversized identity", () =>
-        db.all(
-          `SELECT seq, ${IDENTITY_COLUMNS} FROM session_message
-           WHERE session_id = ? AND seq IN (${seqs.map(() => "?").join(", ")})
-           ORDER BY seq DESC LIMIT ?`,
-          [session.id, ...seqs, seqs.length],
-        ),
-      );
-      const bySeq = new Map(found.map((row) => [asNumber(row.seq), identityData(row)]));
-      for (const d of unloaded) Object.assign(d.data, bySeq.get(d.row.seq) ?? {});
     }
     const who = await identities(decoded, session.id, session);
     const fallback = resolveIdentity([], session);
