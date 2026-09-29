@@ -46,6 +46,10 @@ All notable changes to this project are documented here. This project follows
 - The build tag in `coverage.semantic.pluginVersion` and in the distill
   lease's `build` field now names the host: `schema4.gen4.opencode-v1`
   instead of `schema3.gen4`.
+- `recall_sessions` still returns `{ ok: false }` when the server answers a
+  session listing with a body that is not an array, but the error text is
+  now `session listing response was not an array` instead of the runtime's
+  own TypeError message (such as `result.data is not iterable`).
 
 ## 2.3.0
 
