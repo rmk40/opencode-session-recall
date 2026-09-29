@@ -10,6 +10,8 @@ import {
   createDistiller,
   type Distiller,
   deriveCard,
+  deriveCardCooperative,
+  DERIVE_YIELD_EVERY,
   distillFields,
   resolveRootId,
   type DeriveCardInput,
@@ -379,6 +381,77 @@ describe("distillFields", () => {
 });
 
 // ── deriveCard ───────────────────────────────────────────────────────────────
+
+describe("deriveCardCooperative", () => {
+  it("yields while deriving and matches deriveCard exactly on a large session", async () => {
+    // A mixed session well past several yield intervals: user and assistant
+    // text, reasoning, tool calls (reads, edits, commands, failures), a
+    // subtask, and a synthetic recall-auto part, with shared timestamps so
+    // ordering ties are exercised too.
+    const sid = "s-large";
+    const messages = [];
+    for (let i = 0; i < 2_400; i++) {
+      const id = `m${String(i).padStart(5, "0")}`;
+      const at = 1_000 + Math.floor(i / 3);
+      if (i % 2 === 0) {
+        messages.push(
+          bundle(userMessage(id, sid, at), [
+            textPart(`${id}-t`, sid, id, `request ${i}: fix rateLimit in checkout_${i % 17}.ts`),
+            ...(i % 50 === 0
+              ? [subtaskPart(`${id}-s`, sid, id, "review", `review batch ${i}`)]
+              : []),
+          ]),
+        );
+      } else {
+        messages.push(
+          bundle(assistantMessage(id, sid, at), [
+            reasoningPart(`${id}-r`, sid, id, `thinking about GHOST_${i % 11} and parser`),
+            completedToolPart(
+              `${id}-read`,
+              sid,
+              id,
+              "read",
+              { filePath: `/w/src/f${i % 23}.ts` },
+              "...",
+            ),
+            completedToolPart(`${id}-bash`, sid, id, "bash", { command: `npm test -- ${i}` }, "ok"),
+            ...(i % 7 === 0
+              ? [errorToolPart(`${id}-err`, sid, id, "bash", { command: "make" }, `Error: E${i}`)]
+              : []),
+            textPart(`${id}-a`, sid, id, `answer ${i} with deploy.yaml notes`),
+          ]),
+        );
+      }
+    }
+    const input = {
+      session: {
+        id: sid,
+        parentId: null,
+        title: "Large session",
+        slug: "large",
+        directory: PROJECT_DIR,
+        projectId: "p",
+        agent: null,
+        model: null,
+        timeCreated: 1_000,
+        timeUpdated: 9_000,
+      },
+      // Shuffled: both must sort the same way.
+      messages: [...messages].reverse(),
+      parentById: new Map<string, string | null>([[sid, null]]),
+      caps: { ftsRowsPerSession: 3_000, inventoryTokens: 200 },
+    };
+    let yields = 0;
+    const cooperative = await deriveCardCooperative(input, async () => {
+      yields++;
+    });
+    const synchronous = deriveCard(input);
+    expect(cooperative).toEqual(synchronous);
+    expect(JSON.stringify(cooperative)).toBe(JSON.stringify(synchronous));
+    // Yields after the sort, through the walk, and through the inventory.
+    expect(yields).toBeGreaterThanOrEqual(Math.floor(2_400 / DERIVE_YIELD_EVERY));
+  });
+});
 
 describe("deriveCard", () => {
   it("builds norm rows with both tokenized and verbatim code tokens", () => {

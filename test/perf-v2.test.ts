@@ -17,12 +17,12 @@
  * calls inside the worst stall, so the offending path is visible rather than
  * the budget being loosened.
  *
- * Status when added (2026-09-28, Apple Silicon, Node): the poll (about 3 ms)
- * and listSessions (under 10 ms) pass; the cold pass does NOT (93 to 153 ms).
- * Its worst slice is one session's derivation: after the post-fetch tail
- * checkpoint read (about 11 ms), deriveCard over a 4,000-message session
- * (32 to 68 ms) and its replaceSessionParts transaction (about 20 ms) run
- * without a yield. This gate stays red until that path is split.
+ * Status (2026-09-28, Apple Silicon, Node): all three pass. The cold pass
+ * peaks at 38 to 48 ms, now set by one 4,000-row replaceSessionParts
+ * transaction (32 to 46 ms), which stays whole for per-session atomicity;
+ * the derivation yields cooperatively (deriveCardCooperative). The poll
+ * peaks near 3 ms and listSessions under 12 ms. Before the cooperative
+ * derivation the cold pass peaked at 93 to 153 ms.
  */
 import { describe, expect, it } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";

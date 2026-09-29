@@ -400,7 +400,10 @@ type Walk = {
  * card contribution. `prevForFirst` is the message id preceding the first walked
  * message (the checkpoint, when appending) so drill neighbor ids stay correct.
  */
-function walkMessages(chrono: HistoryMessage[], prevForFirst: string | null): Walk {
+function createWalker(
+  chrono: HistoryMessage[],
+  prevForFirst: string | null,
+): { step(i: number): void; result(): Walk } {
   const rows: PartTextRow[] = [];
   const files: string[] = [];
   const tools: string[] = [];
@@ -409,7 +412,7 @@ function walkMessages(chrono: HistoryMessage[], prevForFirst: string | null): Wa
   let firstUserHead = "";
   let lastTextHead = "";
 
-  for (let i = 0; i < chrono.length; i++) {
+  const step = (i: number): void => {
     const msg = chrono[i]!;
     const prevMessageId = i === 0 ? prevForFirst : chrono[i - 1]!.info.id;
     const nextMessageId = i === chrono.length - 1 ? null : chrono[i + 1]!.info.id;
@@ -458,18 +461,46 @@ function walkMessages(chrono: HistoryMessage[], prevForFirst: string | null): Wa
       const signature = errorSignatureOf(part);
       if (signature) errors.push(signature);
     }
-  }
+  };
 
   return {
-    rows,
-    files,
-    tools,
-    errors,
-    partCount,
-    firstUserHead,
-    lastTextHead,
-    newestMessageId: chrono.length ? chrono[chrono.length - 1]!.info.id : null,
+    step,
+    result: () => ({
+      rows,
+      files,
+      tools,
+      errors,
+      partCount,
+      firstUserHead,
+      lastTextHead,
+      newestMessageId: chrono.length ? chrono[chrono.length - 1]!.info.id : null,
+    }),
   };
+}
+
+function walkMessages(chrono: HistoryMessage[], prevForFirst: string | null): Walk {
+  const walker = createWalker(chrono, prevForFirst);
+  for (let i = 0; i < chrono.length; i++) walker.step(i);
+  return walker.result();
+}
+
+/** How often a cooperative derivation yields: every this many messages (the
+ *  walk) or rows (the inventory). */
+export const DERIVE_YIELD_EVERY = 250;
+
+/** {@link walkMessages}, yielding every {@link DERIVE_YIELD_EVERY} messages.
+ *  Same steps in the same order, so the result is identical. */
+async function walkMessagesCooperative(
+  chrono: HistoryMessage[],
+  prevForFirst: string | null,
+  pause: () => Promise<void>,
+): Promise<Walk> {
+  const walker = createWalker(chrono, prevForFirst);
+  for (let i = 0; i < chrono.length; i++) {
+    if (i > 0 && i % DERIVE_YIELD_EVERY === 0) await pause();
+    walker.step(i);
+  }
+  return walker.result();
 }
 
 function sortChronological(messages: HistoryMessage[]): HistoryMessage[] {
@@ -487,33 +518,54 @@ function capRows(rows: PartTextRow[], limit: number): PartTextRow[] {
  * append recompute over the same rows agree exactly. Code anchors are the layer
  * agents query by, so they take priority under the combined cap.
  */
-function deriveInventory(rows: Array<{ class: string; raw: string }>, limit: number): string {
-  const digest = new Map<string, number>();
-  const code = new Map<string, number>();
-  for (const row of rows) {
-    const digestBearing =
-      row.class === "human-text" || (row.class === "tool-input" && !row.raw.startsWith("{"));
-    if (digestBearing) {
-      for (const token of tokenize(row.raw)) {
-        if (isDigestToken(token)) digest.set(token, (digest.get(token) ?? 0) + 1);
-      }
-    }
-    for (const token of extractCodeTokens(row.raw)) {
-      code.set(token, (code.get(token) ?? 0) + 1);
+type InventoryCounts = { digest: Map<string, number>; code: Map<string, number> };
+
+function countInventoryRow(counts: InventoryCounts, row: { class: string; raw: string }): void {
+  const digestBearing =
+    row.class === "human-text" || (row.class === "tool-input" && !row.raw.startsWith("{"));
+  if (digestBearing) {
+    for (const token of tokenize(row.raw)) {
+      if (isDigestToken(token)) counts.digest.set(token, (counts.digest.get(token) ?? 0) + 1);
     }
   }
+  for (const token of extractCodeTokens(row.raw)) {
+    counts.code.set(token, (counts.code.get(token) ?? 0) + 1);
+  }
+}
+
+function inventoryFromCounts(counts: InventoryCounts, limit: number): string {
   const byFrequency = (entries: Map<string, number>): string[] =>
     [...entries.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0])).map(([t]) => t);
 
   const out: string[] = [];
   const seen = new Set<string>();
-  for (const token of [...byFrequency(code), ...byFrequency(digest)]) {
+  for (const token of [...byFrequency(counts.code), ...byFrequency(counts.digest)]) {
     if (out.length >= limit) break;
     if (seen.has(token)) continue;
     seen.add(token);
     out.push(token);
   }
   return out.join(" ");
+}
+
+function deriveInventory(rows: Array<{ class: string; raw: string }>, limit: number): string {
+  const counts: InventoryCounts = { digest: new Map(), code: new Map() };
+  for (const row of rows) countInventoryRow(counts, row);
+  return inventoryFromCounts(counts, limit);
+}
+
+/** {@link deriveInventory}, yielding every {@link DERIVE_YIELD_EVERY} rows. */
+async function deriveInventoryCooperative(
+  rows: Array<{ class: string; raw: string }>,
+  limit: number,
+  pause: () => Promise<void>,
+): Promise<string> {
+  const counts: InventoryCounts = { digest: new Map(), code: new Map() };
+  for (let i = 0; i < rows.length; i++) {
+    if (i > 0 && i % DERIVE_YIELD_EVERY === 0) await pause();
+    countInventoryRow(counts, rows[i]!);
+  }
+  return inventoryFromCounts(counts, limit);
 }
 
 /** Distinct list keeping each item's LAST occurrence position (recency order). */
@@ -580,13 +632,51 @@ export function resolveRootId(
  * are known.
  */
 export function deriveCard(input: DeriveCardInput): DerivedCard {
-  const { session, messages, parentById } = input;
-  const ftsRowsPerSession = input.caps?.ftsRowsPerSession ?? DEFAULT_FTS_ROWS_PER_SESSION;
-  const inventoryTokens = input.caps?.inventoryTokens ?? DEFAULT_INVENTORY_TOKENS;
-
-  const chrono = sortChronological(messages);
+  const caps = deriveCaps(input);
+  const chrono = sortChronological(input.messages);
   const walk = walkMessages(chrono, null);
-  const rows = capRows(walk.rows, ftsRowsPerSession);
+  const rows = capRows(walk.rows, caps.ftsRowsPerSession);
+  return assembleCard(input, walk, rows, deriveInventory(rows, caps.inventoryTokens));
+}
+
+/**
+ * {@link deriveCard} for a caller that must not hold the event loop (the v2
+ * host runs inside the shared opencode service): the same steps in the same
+ * order, yielding through `pause` after the sort and every
+ * {@link DERIVE_YIELD_EVERY} messages or rows, so the card and rows are
+ * identical to the synchronous result.
+ */
+export async function deriveCardCooperative(
+  input: DeriveCardInput,
+  pause: () => Promise<void>,
+): Promise<DerivedCard> {
+  const caps = deriveCaps(input);
+  const chrono = sortChronological(input.messages);
+  await pause();
+  const walk = await walkMessagesCooperative(chrono, null, pause);
+  const rows = capRows(walk.rows, caps.ftsRowsPerSession);
+  await pause();
+  const inventory = await deriveInventoryCooperative(rows, caps.inventoryTokens, pause);
+  return assembleCard(input, walk, rows, inventory);
+}
+
+function deriveCaps(input: DeriveCardInput): {
+  ftsRowsPerSession: number;
+  inventoryTokens: number;
+} {
+  return {
+    ftsRowsPerSession: input.caps?.ftsRowsPerSession ?? DEFAULT_FTS_ROWS_PER_SESSION,
+    inventoryTokens: input.caps?.inventoryTokens ?? DEFAULT_INVENTORY_TOKENS,
+  };
+}
+
+function assembleCard(
+  input: DeriveCardInput,
+  walk: Walk,
+  rows: PartTextRow[],
+  inventory: string,
+): DerivedCard {
+  const { session, parentById } = input;
   const retainedChars = rows.reduce((sum, row) => sum + row.raw.length, 0);
 
   const card: Card = {
@@ -605,7 +695,7 @@ export function deriveCard(input: DeriveCardInput): DerivedCard {
     retainedChars,
     summaryHead: walk.firstUserHead,
     outcomeHead: walk.lastTextHead,
-    inventory: deriveInventory(rows, inventoryTokens),
+    inventory,
     files: mergeKeepLast([], walk.files, FILES_CAP),
     tools: mergeKeepFirst([], walk.tools, TOOLS_CAP),
     errors: mergeKeepFirst([], walk.errors, ERRORS_CAP),
@@ -893,6 +983,18 @@ export function createDistiller(options: DistillerOptions): Distiller {
     return { messages: collected, reached };
   }
 
+  /**
+   * Derive a card for a store write. With `yieldBetween`, the derivation
+   * yields before it starts (so it does not share a slice with the fetch and
+   * tail read before it) and cooperatively while it runs; callers yield again
+   * before the store transaction. The result is identical either way.
+   */
+  async function derive(input: DeriveCardInput): Promise<DerivedCard> {
+    if (!pause) return deriveCard(input);
+    await pause();
+    return deriveCardCooperative(input, pause);
+  }
+
   /** The session's tail (sync hosts only); see {@link bracketCheckpoint}. */
   async function fetchCheckpoint(sessionID: string): Promise<DistillCheckpoint | null> {
     if (!sync) return null;
@@ -1044,12 +1146,13 @@ export function createDistiller(options: DistillerOptions): Distiller {
     // continuation (the fetch settled after dispose's bounded wait) must not
     // read SQLite, which may already be closed.
     if (stopped || !leaseHeld) return;
-    const { card, rows } = deriveCard({
+    const { card, rows } = await derive({
       session,
       messages,
       parentById: parentChainOf(session),
       caps,
     });
+    if (pause) await pause();
     // Authoritative re-check (live lease row, not the cached flag): a process
     // suspended past the TTL can lose the lease to a rival before its heartbeat
     // callback ever runs; the resumed fetch must not replace the new holder's
@@ -1263,7 +1366,8 @@ export function createDistiller(options: DistillerOptions): Distiller {
           let card: Card;
           let rows: PartTextRow[];
           try {
-            ({ card, rows } = deriveCard({ session, messages, parentById, caps }));
+            ({ card, rows } = await derive({ session, messages, parentById, caps }));
+            if (pause) await pause();
           } catch (error) {
             // Quarantine only data-shape failures (mirroring the fetch path
             // above): a TypeError walking malformed legacy parts is this

@@ -260,6 +260,9 @@ export const server: Plugin = async (ctx, options) => {
     build: PLUGIN_BUILD,
     gen: EMBED_REPRESENTATION,
     discover,
+    // Yield between sessions and inside a card's derivation, so a large
+    // session never holds the host's event loop in one slice.
+    yieldBetween: () => new Promise((resolve) => setTimeout(resolve, 0)),
     onColdPassDone: () => {
       if (!disposed && summarizer) {
         // Summarizer.stop() owns the bounded shutdown of this drain. Do not add

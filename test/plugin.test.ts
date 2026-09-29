@@ -390,8 +390,9 @@ describe("plugin entry", () => {
           },
         }));
       const hooks = await server(ctx({ fetch: vi.fn() }), { coldPass: true });
+      // The cold pass yields on a macrotask between sessions: step fake time.
       for (let i = 0; i < 100 && messages.mock.calls.length === 0; i++) {
-        await Promise.resolve();
+        await vi.advanceTimersByTimeAsync(0);
       }
       expect(messages).toHaveBeenCalled();
 
@@ -668,8 +669,9 @@ describe("plugin entry", () => {
         coldPass: true,
         summaries: { enabled: true, model: "test/cheap" },
       });
+      // The cold pass yields on a macrotask between steps: step fake time.
       for (let i = 0; i < 100 && deleteWorker.mock.calls.length === 0; i++) {
-        await Promise.resolve();
+        await vi.advanceTimersByTimeAsync(1);
       }
       expect(deleteWorker).toHaveBeenCalledWith({ sessionID: "blocked-worker" });
 
