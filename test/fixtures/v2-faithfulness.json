@@ -1,0 +1,2073 @@
+{
+  "_note": "Structure of real opencode.db sessions (a migrated root windowed around a cleared tool output, empty user texts, a synthetic row, a tool error, a completed compaction and the migration system notice; its migrated subagent child; a native 2.0.18 subagent child), exported read-only. Every human, model and tool string is replaced by synthetic text, ids and paths are re-issued, unknown tool/agent/model names and input keys are renamed, and times are shifted. Only row types, content item kinds, tool names, tool states and the cleared marker are real.",
+  "projects": [
+    {
+      "id": "prj_f1",
+      "worktree": "/work/project-a",
+      "name": null
+    }
+  ],
+  "sessions": [
+    {
+      "id": "ses_f1",
+      "project_id": "prj_f1",
+      "parent_id": null,
+      "slug": "slug-ses_f1",
+      "directory": "/work/project-a",
+      "title": "Synthetic title for ses_f1",
+      "version": "1.14.25",
+      "agent": "plan",
+      "model": "{\"id\":\"model-1\",\"providerID\":\"provider-1\"}",
+      "time_created": 1700000000000,
+      "time_updated": 1704139270940,
+      "time_idle": null,
+      "time_archived": null
+    },
+    {
+      "id": "ses_f2",
+      "project_id": "prj_f1",
+      "parent_id": "ses_f1",
+      "slug": "slug-ses_f2",
+      "directory": "/work/project-a",
+      "title": "Synthetic title for ses_f2",
+      "version": "1.14.25",
+      "agent": "agent-1",
+      "model": "{\"id\":\"model-1\",\"providerID\":\"provider-1\"}",
+      "time_created": 1701391225441,
+      "time_updated": 1703229136463,
+      "time_idle": null,
+      "time_archived": null
+    },
+    {
+      "id": "ses_f3",
+      "project_id": "prj_f1",
+      "parent_id": "ses_f4",
+      "slug": "slug-ses_f3",
+      "directory": "/work/project-a",
+      "title": "Synthetic title for ses_f3",
+      "version": "2.0.18",
+      "agent": "agent-2",
+      "model": "{\"id\":\"model-3\",\"providerID\":\"provider-2\"}",
+      "time_created": 1714769126004,
+      "time_updated": 1714769126005,
+      "time_idle": 1714769174198,
+      "time_archived": null
+    }
+  ],
+  "messages": [
+    {
+      "id": "msg_f1_0000",
+      "session_id": "ses_f1",
+      "type": "user",
+      "seq": 0,
+      "time_created": 1700000000006,
+      "time_updated": 1700000116148,
+      "data": {
+        "time": {
+          "created": 1700000000006
+        },
+        "text": "Synthetic prompt 1."
+      }
+    },
+    {
+      "id": "msg_f1_0001",
+      "session_id": "ses_f1",
+      "type": "assistant",
+      "seq": 1,
+      "time_created": 1700000000010,
+      "time_updated": 1700000003414,
+      "data": {
+        "time": {
+          "created": 1700000000010,
+          "completed": 1700000003414
+        },
+        "agent": "build",
+        "model": {
+          "id": "model-2",
+          "providerID": "provider-1"
+        },
+        "content": [
+          {
+            "type": "text",
+            "text": "Synthetic text 2."
+          },
+          {
+            "type": "tool",
+            "id": "call_1",
+            "name": "read",
+            "state": {
+              "status": "completed",
+              "input": {
+                "filePath": "Synthetic input 3."
+              },
+              "content": [
+                {
+                  "type": "text",
+                  "text": "[Old tool result content cleared]"
+                }
+              ]
+            },
+            "time": {
+              "created": 1700000003346,
+              "completed": 1700000003349
+            }
+          }
+        ],
+        "finish": "tool-calls",
+        "tokens": {
+          "input": 3,
+          "output": 95,
+          "reasoning": 0,
+          "cache": {
+            "read": 28979,
+            "write": 351
+          }
+        },
+        "cost": 0
+      }
+    },
+    {
+      "id": "msg_f1_0002",
+      "session_id": "ses_f1",
+      "type": "assistant",
+      "seq": 2,
+      "time_created": 1700000003415,
+      "time_updated": 1700000010216,
+      "data": {
+        "time": {
+          "created": 1700000003415,
+          "completed": 1700000010216
+        },
+        "agent": "build",
+        "model": {
+          "id": "model-2",
+          "providerID": "provider-1"
+        },
+        "content": [
+          {
+            "type": "tool",
+            "id": "call_2",
+            "name": "read",
+            "state": {
+              "status": "completed",
+              "input": {
+                "filePath": "Synthetic input 4."
+              },
+              "content": [
+                {
+                  "type": "text",
+                  "text": "[Old tool result content cleared]"
+                }
+              ]
+            },
+            "time": {
+              "created": 1700000007931,
+              "completed": 1700000007934
+            }
+          },
+          {
+            "type": "tool",
+            "id": "call_3",
+            "name": "read",
+            "state": {
+              "status": "completed",
+              "input": {
+                "filePath": "Synthetic input 5."
+              },
+              "content": [
+                {
+                  "type": "text",
+                  "text": "[Old tool result content cleared]"
+                }
+              ]
+            },
+            "time": {
+              "created": 1700000008461,
+              "completed": 1700000008465
+            }
+          },
+          {
+            "type": "tool",
+            "id": "call_4",
+            "name": "read",
+            "state": {
+              "status": "completed",
+              "input": {
+                "filePath": "Synthetic input 6."
+              },
+              "content": [
+                {
+                  "type": "text",
+                  "text": "[Old tool result content cleared]"
+                }
+              ]
+            },
+            "time": {
+              "created": 1700000008933,
+              "completed": 1700000008939
+            }
+          },
+          {
+            "type": "tool",
+            "id": "call_5",
+            "name": "read",
+            "state": {
+              "status": "completed",
+              "input": {
+                "filePath": "Synthetic input 7."
+              },
+              "content": [
+                {
+                  "type": "text",
+                  "text": "[Old tool result content cleared]"
+                }
+              ]
+            },
+            "time": {
+              "created": 1700000008937,
+              "completed": 1700000008941
+            }
+          },
+          {
+            "type": "tool",
+            "id": "call_6",
+            "name": "read",
+            "state": {
+              "status": "completed",
+              "input": {
+                "filePath": "Synthetic input 8."
+              },
+              "content": [
+                {
+                  "type": "text",
+                  "text": "[Old tool result content cleared]"
+                }
+              ]
+            },
+            "time": {
+              "created": 1700000009502,
+              "completed": 1700000009505
+            }
+          },
+          {
+            "type": "tool",
+            "id": "call_7",
+            "name": "read",
+            "state": {
+              "status": "completed",
+              "input": {
+                "filePath": "Synthetic input 9."
+              },
+              "content": [
+                {
+                  "type": "text",
+                  "text": "[Old tool result content cleared]"
+                }
+              ]
+            },
+            "time": {
+              "created": 1700000010157,
+              "completed": 1700000010160
+            }
+          }
+        ],
+        "finish": "tool-calls",
+        "tokens": {
+          "input": 1,
+          "output": 357,
+          "reasoning": 0,
+          "cache": {
+            "read": 29330,
+            "write": 244
+          }
+        },
+        "cost": 0
+      }
+    },
+    {
+      "id": "msg_f1_0003",
+      "session_id": "ses_f1",
+      "type": "assistant",
+      "seq": 3,
+      "time_created": 1700000010217,
+      "time_updated": 1700000015143,
+      "data": {
+        "time": {
+          "created": 1700000010217,
+          "completed": 1700000015143
+        },
+        "agent": "build",
+        "model": {
+          "id": "model-2",
+          "providerID": "provider-1"
+        },
+        "content": [
+          {
+            "type": "text",
+            "text": "Synthetic text 10."
+          },
+          {
+            "type": "tool",
+            "id": "call_8",
+            "name": "read",
+            "state": {
+              "status": "completed",
+              "input": {
+                "filePath": "Synthetic input 11."
+              },
+              "content": [
+                {
+                  "type": "text",
+                  "text": "[Old tool result content cleared]"
+                }
+              ]
+            },
+            "time": {
+              "created": 1700000015073,
+              "completed": 1700000015074
+            }
+          }
+        ],
+        "finish": "tool-calls",
+        "tokens": {
+          "input": 1,
+          "output": 97,
+          "reasoning": 0,
+          "cache": {
+            "read": 29574,
+            "write": 17773
+          }
+        },
+        "cost": 0
+      }
+    },
+    {
+      "id": "msg_f1_0004",
+      "session_id": "ses_f1",
+      "type": "assistant",
+      "seq": 4,
+      "time_created": 1700000015144,
+      "time_updated": 1700000022133,
+      "data": {
+        "time": {
+          "created": 1700000015144,
+          "completed": 1700000022133
+        },
+        "agent": "build",
+        "model": {
+          "id": "model-2",
+          "providerID": "provider-1"
+        },
+        "content": [
+          {
+            "type": "tool",
+            "id": "call_9",
+            "name": "read",
+            "state": {
+              "status": "completed",
+              "input": {
+                "filePath": "Synthetic input 12."
+              },
+              "content": [
+                {
+                  "type": "text",
+                  "text": "[Old tool result content cleared]"
+                }
+              ]
+            },
+            "time": {
+              "created": 1700000019530,
+              "completed": 1700000019533
+            }
+          },
+          {
+            "type": "tool",
+            "id": "call_10",
+            "name": "read",
+            "state": {
+              "status": "completed",
+              "input": {
+                "filePath": "Synthetic input 13."
+              },
+              "content": [
+                {
+                  "type": "text",
+                  "text": "[Old tool result content cleared]"
+                }
+              ]
+            },
+            "time": {
+              "created": 1700000019977,
+              "completed": 1700000019980
+            }
+          },
+          {
+            "type": "tool",
+            "id": "call_11",
+            "name": "read",
+            "state": {
+              "status": "completed",
+              "input": {
+                "filePath": "Synthetic input 14."
+              },
+              "content": [
+                {
+                  "type": "text",
+                  "text": "[Old tool result content cleared]"
+                }
+              ]
+            },
+            "time": {
+              "created": 1700000020448,
+              "completed": 1700000020453
+            }
+          },
+          {
+            "type": "tool",
+            "id": "call_12",
+            "name": "read",
+            "state": {
+              "status": "completed",
+              "input": {
+                "filePath": "Synthetic input 15."
+              },
+              "content": [
+                {
+                  "type": "text",
+                  "text": "[Old tool result content cleared]"
+                }
+              ]
+            },
+            "time": {
+              "created": 1700000020510,
+              "completed": 1700000020513
+            }
+          },
+          {
+            "type": "tool",
+            "id": "call_13",
+            "name": "read",
+            "state": {
+              "status": "completed",
+              "input": {
+                "filePath": "Synthetic input 16."
+              },
+              "content": [
+                {
+                  "type": "text",
+                  "text": "[Old tool result content cleared]"
+                }
+              ]
+            },
+            "time": {
+              "created": 1700000021017,
+              "completed": 1700000021020
+            }
+          },
+          {
+            "type": "tool",
+            "id": "call_14",
+            "name": "read",
+            "state": {
+              "status": "completed",
+              "input": {
+                "filePath": "Synthetic input 17."
+              },
+              "content": [
+                {
+                  "type": "text",
+                  "text": "[Old tool result content cleared]"
+                }
+              ]
+            },
+            "time": {
+              "created": 1700000021435,
+              "completed": 1700000021442
+            }
+          },
+          {
+            "type": "tool",
+            "id": "call_15",
+            "name": "read",
+            "state": {
+              "status": "completed",
+              "input": {
+                "filePath": "Synthetic input 18."
+              },
+              "content": [
+                {
+                  "type": "text",
+                  "text": "[Old tool result content cleared]"
+                }
+              ]
+            },
+            "time": {
+              "created": 1700000021878,
+              "completed": 1700000021888
+            }
+          },
+          {
+            "type": "tool",
+            "id": "call_16",
+            "name": "read",
+            "state": {
+              "status": "completed",
+              "input": {
+                "filePath": "Synthetic input 19."
+              },
+              "content": [
+                {
+                  "type": "text",
+                  "text": "[Old tool result content cleared]"
+                }
+              ]
+            },
+            "time": {
+              "created": 1700000022041,
+              "completed": 1700000022044
+            }
+          }
+        ],
+        "finish": "tool-calls",
+        "tokens": {
+          "input": 1,
+          "output": 466,
+          "reasoning": 0,
+          "cache": {
+            "read": 47347,
+            "write": 176
+          }
+        },
+        "cost": 0
+      }
+    },
+    {
+      "id": "msg_f1_0060",
+      "session_id": "ses_f1",
+      "type": "user",
+      "seq": 60,
+      "time_created": 1700001624602,
+      "time_updated": 1700001671987,
+      "data": {
+        "time": {
+          "created": 1700001624602
+        },
+        "text": "Synthetic prompt 20."
+      }
+    },
+    {
+      "id": "msg_f1_0061",
+      "session_id": "ses_f1",
+      "type": "assistant",
+      "seq": 61,
+      "time_created": 1700001624612,
+      "time_updated": 1700001671902,
+      "data": {
+        "time": {
+          "created": 1700001624612,
+          "completed": 1700001671902
+        },
+        "agent": "build",
+        "model": {
+          "id": "model-2",
+          "providerID": "provider-1"
+        },
+        "content": [
+          {
+            "type": "text",
+            "text": "Synthetic text 21."
+          },
+          {
+            "type": "tool",
+            "id": "call_17",
+            "name": "custom_tool_1",
+            "state": {
+              "status": "completed",
+              "input": {
+                "k1": "Synthetic input 22.",
+                "content": [
+                  {
+                    "k2": "Synthetic input 23.",
+                    "k3": "Synthetic input 24.",
+                    "k4": "Synthetic input 25."
+                  }
+                ]
+              },
+              "content": [
+                {
+                  "type": "text",
+                  "text": "[Old tool result content cleared]"
+                }
+              ]
+            },
+            "time": {
+              "created": 1700001670882,
+              "completed": 1700001671863
+            }
+          }
+        ],
+        "finish": "tool-calls",
+        "tokens": {
+          "input": 3,
+          "output": 1749,
+          "reasoning": 0,
+          "cache": {
+            "read": 0,
+            "write": 115563
+          }
+        },
+        "cost": 0
+      }
+    },
+    {
+      "id": "msg_f1_0062",
+      "session_id": "ses_f1",
+      "type": "user",
+      "seq": 62,
+      "time_created": 1700001671860,
+      "time_updated": 1700002000870,
+      "data": {
+        "time": {
+          "created": 1700001671860
+        },
+        "text": ""
+      }
+    },
+    {
+      "id": "msg_f1_0063",
+      "session_id": "ses_f1",
+      "type": "assistant",
+      "seq": 63,
+      "time_created": 1700001671905,
+      "time_updated": 1700001677158,
+      "data": {
+        "time": {
+          "created": 1700001671905,
+          "completed": 1700001677158
+        },
+        "agent": "build",
+        "model": {
+          "id": "model-2",
+          "providerID": "provider-1"
+        },
+        "content": [
+          {
+            "type": "text",
+            "text": "Synthetic text 26."
+          },
+          {
+            "type": "tool",
+            "id": "call_18",
+            "name": "read",
+            "state": {
+              "status": "completed",
+              "input": {
+                "filePath": "Synthetic input 27."
+              },
+              "content": [
+                {
+                  "type": "text",
+                  "text": "[Old tool result content cleared]"
+                }
+              ]
+            },
+            "time": {
+              "created": 1700001676312,
+              "completed": 1700001676327
+            }
+          },
+          {
+            "type": "tool",
+            "id": "call_19",
+            "name": "custom_tool_2",
+            "state": {
+              "status": "completed",
+              "input": {
+                "path": "Synthetic input 28."
+              },
+              "content": [
+                {
+                  "type": "text",
+                  "text": "[Old tool result content cleared]"
+                }
+              ]
+            },
+            "time": {
+              "created": 1700001676569,
+              "completed": 1700001676583
+            }
+          },
+          {
+            "type": "tool",
+            "id": "call_20",
+            "name": "custom_tool_3",
+            "state": {
+              "status": "completed",
+              "input": {
+                "path": "Synthetic input 29."
+              },
+              "content": [
+                {
+                  "type": "text",
+                  "text": "[Old tool result content cleared]"
+                }
+              ]
+            },
+            "time": {
+              "created": 1700001676979,
+              "completed": 1700001676995
+            }
+          }
+        ],
+        "finish": "tool-calls",
+        "tokens": {
+          "input": 3,
+          "output": 221,
+          "reasoning": 0,
+          "cache": {
+            "read": 30835,
+            "write": 6335
+          }
+        },
+        "cost": 0
+      }
+    },
+    {
+      "id": "msg_f1_0207",
+      "session_id": "ses_f1",
+      "type": "assistant",
+      "seq": 207,
+      "time_created": 1700012519932,
+      "time_updated": 1700012522849,
+      "data": {
+        "time": {
+          "created": 1700012519932,
+          "completed": 1700012522849
+        },
+        "agent": "build",
+        "model": {
+          "id": "model-2",
+          "providerID": "provider-1"
+        },
+        "content": [
+          {
+            "type": "tool",
+            "id": "call_21",
+            "name": "bash",
+            "state": {
+              "status": "completed",
+              "input": {
+                "command": "Synthetic input 30.",
+                "description": "Synthetic input 31.",
+                "timeout": 30000
+              },
+              "content": [
+                {
+                  "type": "text",
+                  "text": "Synthetic tool output 32."
+                }
+              ]
+            },
+            "time": {
+              "created": 1700012522804,
+              "completed": 1700012522811
+            }
+          }
+        ],
+        "finish": "tool-calls",
+        "tokens": {
+          "input": 1,
+          "output": 108,
+          "reasoning": 0,
+          "cache": {
+            "read": 166783,
+            "write": 878
+          }
+        },
+        "cost": 0
+      }
+    },
+    {
+      "id": "msg_f1_0208",
+      "session_id": "ses_f1",
+      "type": "assistant",
+      "seq": 208,
+      "time_created": 1700012522855,
+      "time_updated": 1700012525469,
+      "data": {
+        "time": {
+          "created": 1700012522855,
+          "completed": 1700012525469
+        },
+        "agent": "build",
+        "model": {
+          "id": "model-2",
+          "providerID": "provider-1"
+        },
+        "content": [
+          {
+            "type": "text",
+            "text": "Synthetic text 33."
+          }
+        ],
+        "finish": "stop",
+        "tokens": {
+          "input": 1,
+          "output": 18,
+          "reasoning": 0,
+          "cache": {
+            "read": 166783,
+            "write": 1324
+          }
+        },
+        "cost": 0
+      }
+    },
+    {
+      "id": "msg_f1_0209",
+      "session_id": "ses_f1",
+      "type": "synthetic",
+      "seq": 209,
+      "time_created": 1700012530772,
+      "time_updated": 1700012530772,
+      "data": {
+        "time": {
+          "created": 1700012530772
+        },
+        "text": "Synthetic synthetic 34."
+      }
+    },
+    {
+      "id": "msg_f1_0210",
+      "session_id": "ses_f1",
+      "type": "assistant",
+      "seq": 210,
+      "time_created": 1700012530773,
+      "time_updated": 1700012534409,
+      "data": {
+        "time": {
+          "created": 1700012530773,
+          "completed": 1700012534409
+        },
+        "agent": "build",
+        "model": {
+          "id": "model-2",
+          "providerID": "provider-1"
+        },
+        "content": [
+          {
+            "type": "tool",
+            "id": "call_22",
+            "name": "bash",
+            "state": {
+              "status": "completed",
+              "input": {
+                "command": "Synthetic input 35."
+              },
+              "content": [
+                {
+                  "type": "text",
+                  "text": ""
+                }
+              ]
+            },
+            "time": {
+              "created": 1700012530774,
+              "completed": 1700012534410
+            }
+          }
+        ],
+        "tokens": {
+          "input": 0,
+          "output": 0,
+          "reasoning": 0,
+          "cache": {
+            "read": 0,
+            "write": 0
+          }
+        },
+        "cost": 0
+      }
+    },
+    {
+      "id": "msg_f1_0211",
+      "session_id": "ses_f1",
+      "type": "user",
+      "seq": 211,
+      "time_created": 1700012588141,
+      "time_updated": 1700012610210,
+      "data": {
+        "time": {
+          "created": 1700012588141
+        },
+        "text": "Synthetic prompt 36."
+      }
+    },
+    {
+      "id": "msg_f1_0263",
+      "session_id": "ses_f1",
+      "type": "user",
+      "seq": 263,
+      "time_created": 1700158241263,
+      "time_updated": 1700158303318,
+      "data": {
+        "time": {
+          "created": 1700158241263
+        },
+        "text": "Synthetic prompt 37."
+      }
+    },
+    {
+      "id": "msg_f1_0264",
+      "session_id": "ses_f1",
+      "type": "assistant",
+      "seq": 264,
+      "time_created": 1700158241278,
+      "time_updated": 1700158245655,
+      "data": {
+        "time": {
+          "created": 1700158241278,
+          "completed": 1700158245655
+        },
+        "agent": "build",
+        "model": {
+          "id": "model-2",
+          "providerID": "provider-1"
+        },
+        "content": [
+          {
+            "type": "tool",
+            "id": "call_23",
+            "name": "todowrite",
+            "state": {
+              "status": "completed",
+              "input": {
+                "todos": [
+                  {
+                    "content": "Synthetic input 38.",
+                    "status": "Synthetic input 39.",
+                    "priority": "Synthetic input 40."
+                  },
+                  {
+                    "content": "Synthetic input 41.",
+                    "status": "Synthetic input 42.",
+                    "priority": "Synthetic input 43."
+                  },
+                  {
+                    "content": "Synthetic input 44.",
+                    "status": "Synthetic input 45.",
+                    "priority": "Synthetic input 46."
+                  },
+                  {
+                    "content": "Synthetic input 47.",
+                    "status": "Synthetic input 48.",
+                    "priority": "Synthetic input 49."
+                  }
+                ]
+              },
+              "content": [
+                {
+                  "type": "text",
+                  "text": "Synthetic tool output 50."
+                }
+              ]
+            },
+            "time": {
+              "created": 1700158245564,
+              "completed": 1700158245565
+            }
+          }
+        ],
+        "finish": "tool-calls",
+        "tokens": {
+          "input": 3,
+          "output": 180,
+          "reasoning": 0,
+          "cache": {
+            "read": 30975,
+            "write": 118464
+          }
+        },
+        "cost": 0
+      }
+    },
+    {
+      "id": "msg_f1_0265",
+      "session_id": "ses_f1",
+      "type": "assistant",
+      "seq": 265,
+      "time_created": 1700158245662,
+      "time_updated": 1700158252664,
+      "data": {
+        "time": {
+          "created": 1700158245662,
+          "completed": 1700158252664
+        },
+        "agent": "build",
+        "model": {
+          "id": "model-2",
+          "providerID": "provider-1"
+        },
+        "content": [
+          {
+            "type": "tool",
+            "id": "call_24",
+            "name": "edit",
+            "state": {
+              "status": "error",
+              "input": {
+                "filePath": "Synthetic input 51.",
+                "oldString": "Synthetic input 52.",
+                "newString": "Synthetic input 53."
+              },
+              "error": {
+                "type": "unknown",
+                "message": "Synthetic error 54."
+              }
+            },
+            "time": {
+              "created": 1700158252611,
+              "completed": 1700158252613
+            }
+          }
+        ],
+        "finish": "tool-calls",
+        "tokens": {
+          "input": 1,
+          "output": 424,
+          "reasoning": 0,
+          "cache": {
+            "read": 149439,
+            "write": 383
+          }
+        },
+        "cost": 0
+      }
+    },
+    {
+      "id": "msg_f1_0266",
+      "session_id": "ses_f1",
+      "type": "assistant",
+      "seq": 266,
+      "time_created": 1700158252671,
+      "time_updated": 1700158255798,
+      "data": {
+        "time": {
+          "created": 1700158252671,
+          "completed": 1700158255798
+        },
+        "agent": "build",
+        "model": {
+          "id": "model-2",
+          "providerID": "provider-1"
+        },
+        "content": [
+          {
+            "type": "tool",
+            "id": "call_25",
+            "name": "read",
+            "state": {
+              "status": "completed",
+              "input": {
+                "filePath": "Synthetic input 55.",
+                "offset": 82,
+                "limit": 65
+              },
+              "content": [
+                {
+                  "type": "text",
+                  "text": "Synthetic tool output 56."
+                }
+              ]
+            },
+            "time": {
+              "created": 1700158255735,
+              "completed": 1700158255746
+            }
+          }
+        ],
+        "finish": "tool-calls",
+        "tokens": {
+          "input": 1,
+          "output": 112,
+          "reasoning": 0,
+          "cache": {
+            "read": 149822,
+            "write": 482
+          }
+        },
+        "cost": 0
+      }
+    },
+    {
+      "id": "msg_f1_0495",
+      "session_id": "ses_f1",
+      "type": "user",
+      "seq": 495,
+      "time_created": 1701228786706,
+      "time_updated": 1701228786824,
+      "data": {
+        "time": {
+          "created": 1701228786706
+        },
+        "text": "Synthetic prompt 57."
+      }
+    },
+    {
+      "id": "msg_f1_0496",
+      "session_id": "ses_f1",
+      "type": "assistant",
+      "seq": 496,
+      "time_created": 1701228786736,
+      "time_updated": 1701228797449,
+      "data": {
+        "time": {
+          "created": 1701228786736,
+          "completed": 1701228797449
+        },
+        "agent": "plan",
+        "model": {
+          "id": "model-1",
+          "providerID": "provider-1"
+        },
+        "content": [],
+        "error": {
+          "type": "unknown",
+          "message": "Synthetic error 58."
+        },
+        "tokens": {
+          "input": 0,
+          "output": 0,
+          "reasoning": 0,
+          "cache": {
+            "read": 0,
+            "write": 0
+          }
+        },
+        "cost": 0
+      }
+    },
+    {
+      "id": "msg_f1_0497",
+      "session_id": "ses_f1",
+      "type": "compaction",
+      "seq": 497,
+      "time_created": 1701228799054,
+      "time_updated": 1701228864401,
+      "data": {
+        "time": {
+          "created": 1701228799054
+        },
+        "status": "completed",
+        "reason": "manual",
+        "summary": "Synthetic summary 59.",
+        "recent": "Synthetic recent 60."
+      }
+    },
+    {
+      "id": "msg_f1_0498",
+      "session_id": "ses_f1",
+      "type": "user",
+      "seq": 498,
+      "time_created": 1701260194678,
+      "time_updated": 1701260318763,
+      "data": {
+        "time": {
+          "created": 1701260194678
+        },
+        "text": "Synthetic prompt 61."
+      }
+    },
+    {
+      "id": "msg_f1_0499",
+      "session_id": "ses_f1",
+      "type": "assistant",
+      "seq": 499,
+      "time_created": 1701260194689,
+      "time_updated": 1701260199743,
+      "data": {
+        "time": {
+          "created": 1701260194689,
+          "completed": 1701260199743
+        },
+        "agent": "plan",
+        "model": {
+          "id": "model-1",
+          "providerID": "provider-1"
+        },
+        "content": [
+          {
+            "type": "text",
+            "text": "Synthetic text 62."
+          },
+          {
+            "type": "tool",
+            "id": "call_26",
+            "name": "read",
+            "state": {
+              "status": "completed",
+              "input": {
+                "filePath": "Synthetic input 63.",
+                "offset": 130,
+                "limit": 90
+              },
+              "content": [
+                {
+                  "type": "text",
+                  "text": "Synthetic tool output 64."
+                }
+              ]
+            },
+            "time": {
+              "created": 1701260199051,
+              "completed": 1701260199067
+            }
+          },
+          {
+            "type": "tool",
+            "id": "call_27",
+            "name": "grep",
+            "state": {
+              "status": "completed",
+              "input": {
+                "pattern": "Synthetic input 65.",
+                "path": "Synthetic input 66."
+              },
+              "content": [
+                {
+                  "type": "text",
+                  "text": "Synthetic tool output 67."
+                }
+              ]
+            },
+            "time": {
+              "created": 1701260199565,
+              "completed": 1701260199581
+            }
+          }
+        ],
+        "finish": "tool-calls",
+        "tokens": {
+          "input": 5,
+          "output": 280,
+          "reasoning": 0,
+          "cache": {
+            "read": 0,
+            "write": 54153
+          }
+        },
+        "cost": 0
+      }
+    },
+    {
+      "id": "msg_f1_1005",
+      "session_id": "ses_f1",
+      "type": "assistant",
+      "seq": 1005,
+      "time_created": 1703935484440,
+      "time_updated": 1703936162917,
+      "data": {
+        "time": {
+          "created": 1703935484440,
+          "completed": 1703936162917
+        },
+        "agent": "plan",
+        "model": {
+          "id": "model-1",
+          "providerID": "provider-1"
+        },
+        "content": [
+          {
+            "type": "text",
+            "text": "Synthetic text 68."
+          },
+          {
+            "type": "tool",
+            "id": "call_28",
+            "name": "question",
+            "state": {
+              "status": "error",
+              "input": {
+                "k5": [
+                  {
+                    "k6": "Synthetic input 69.",
+                    "k7": "Synthetic input 70.",
+                    "k8": [
+                      {
+                        "k9": "Synthetic input 71.",
+                        "description": "Synthetic input 72."
+                      },
+                      {
+                        "k9": "Synthetic input 73.",
+                        "description": "Synthetic input 74."
+                      },
+                      {
+                        "k9": "Synthetic input 75.",
+                        "description": "Synthetic input 76."
+                      },
+                      {
+                        "k9": "Synthetic input 77.",
+                        "description": "Synthetic input 78."
+                      }
+                    ]
+                  },
+                  {
+                    "k6": "Synthetic input 79.",
+                    "k7": "Synthetic input 80.",
+                    "k8": [
+                      {
+                        "k9": "Synthetic input 81.",
+                        "description": "Synthetic input 82."
+                      },
+                      {
+                        "k9": "Synthetic input 83.",
+                        "description": "Synthetic input 84."
+                      },
+                      {
+                        "k9": "Synthetic input 85.",
+                        "description": "Synthetic input 86."
+                      },
+                      {
+                        "k9": "Synthetic input 87.",
+                        "description": "Synthetic input 88."
+                      }
+                    ]
+                  },
+                  {
+                    "k6": "Synthetic input 89.",
+                    "k7": "Synthetic input 90.",
+                    "k8": [
+                      {
+                        "k9": "Synthetic input 91.",
+                        "description": "Synthetic input 92."
+                      },
+                      {
+                        "k9": "Synthetic input 93.",
+                        "description": "Synthetic input 94."
+                      },
+                      {
+                        "k9": "Synthetic input 95.",
+                        "description": "Synthetic input 96."
+                      }
+                    ]
+                  },
+                  {
+                    "k6": "Synthetic input 97.",
+                    "k7": "Synthetic input 98.",
+                    "k8": [
+                      {
+                        "k9": "Synthetic input 99.",
+                        "description": "Synthetic input 100."
+                      },
+                      {
+                        "k9": "Synthetic input 101.",
+                        "description": "Synthetic input 102."
+                      },
+                      {
+                        "k9": "Synthetic input 103.",
+                        "description": "Synthetic input 104."
+                      },
+                      {
+                        "k9": "Synthetic input 105.",
+                        "description": "Synthetic input 106."
+                      }
+                    ]
+                  },
+                  {
+                    "k6": "Synthetic input 107.",
+                    "k7": "Synthetic input 108.",
+                    "k8": [
+                      {
+                        "k9": "Synthetic input 109.",
+                        "description": "Synthetic input 110."
+                      },
+                      {
+                        "k9": "Synthetic input 111.",
+                        "description": "Synthetic input 112."
+                      }
+                    ]
+                  }
+                ]
+              },
+              "error": {
+                "type": "unknown",
+                "message": "Synthetic error 113."
+              }
+            },
+            "time": {
+              "created": 1703935524966,
+              "completed": 1703936162867
+            }
+          }
+        ],
+        "finish": "tool-calls",
+        "tokens": {
+          "input": 1,
+          "output": 2625,
+          "reasoning": 0,
+          "cache": {
+            "read": 213021,
+            "write": 22645
+          }
+        },
+        "cost": 0
+      }
+    },
+    {
+      "id": "msg_f1_1006",
+      "session_id": "ses_f1",
+      "type": "system",
+      "seq": 1006,
+      "time_created": 1703935484440,
+      "time_updated": 1703936162917,
+      "data": {
+        "time": {
+          "created": 1703935484440
+        },
+        "text": "Synthetic system 114."
+      }
+    },
+    {
+      "id": "msg_f2_0000",
+      "session_id": "ses_f2",
+      "type": "user",
+      "seq": 0,
+      "time_created": 1701391225445,
+      "time_updated": 1701391231474,
+      "data": {
+        "time": {
+          "created": 1701391225445
+        },
+        "text": "Synthetic prompt 115."
+      }
+    },
+    {
+      "id": "msg_f2_0001",
+      "session_id": "ses_f2",
+      "type": "assistant",
+      "seq": 1,
+      "time_created": 1701391225449,
+      "time_updated": 1701391231450,
+      "data": {
+        "time": {
+          "created": 1701391225449,
+          "completed": 1701391231450
+        },
+        "agent": "agent-1",
+        "model": {
+          "id": "model-1",
+          "providerID": "provider-1"
+        },
+        "content": [
+          {
+            "type": "text",
+            "text": "Synthetic text 116."
+          }
+        ],
+        "finish": "stop",
+        "tokens": {
+          "input": 6,
+          "output": 251,
+          "reasoning": 0,
+          "cache": {
+            "read": 0,
+            "write": 46863
+          }
+        },
+        "cost": 0
+      }
+    },
+    {
+      "id": "msg_f3_0004",
+      "session_id": "ses_f3",
+      "type": "user",
+      "seq": 4,
+      "time_created": 1714769126011,
+      "time_updated": 1714769126011,
+      "data": {
+        "time": {
+          "created": 1714769126011
+        },
+        "text": "You are a subagent spawned by another session.\nSynthetic prompt 117."
+      }
+    },
+    {
+      "id": "msg_f3_0005",
+      "session_id": "ses_f3",
+      "type": "assistant",
+      "seq": 5,
+      "time_created": 1714769126027,
+      "time_updated": 1714769129481,
+      "data": {
+        "time": {
+          "created": 1714769126027,
+          "streamed": 1714769129469,
+          "completed": 1714769129481
+        },
+        "agent": "agent-2",
+        "model": {
+          "id": "model-3",
+          "providerID": "provider-2"
+        },
+        "content": [
+          {
+            "type": "tool",
+            "id": "call_29",
+            "name": "shell",
+            "state": {
+              "status": "completed",
+              "input": {
+                "command": "Synthetic input 118.",
+                "timeout": 120000
+              },
+              "content": [
+                {
+                  "type": "text",
+                  "text": "Synthetic tool output 119."
+                }
+              ]
+            },
+            "time": {
+              "created": 1714769128246,
+              "ran": 1714769129388,
+              "completed": 1714769129407
+            }
+          }
+        ],
+        "finish": "tool-calls",
+        "tokens": {
+          "input": 23530,
+          "output": 48,
+          "reasoning": 0,
+          "cache": {
+            "read": 0,
+            "write": 0
+          }
+        },
+        "cost": 0
+      }
+    },
+    {
+      "id": "msg_f3_0012",
+      "session_id": "ses_f3",
+      "type": "assistant",
+      "seq": 12,
+      "time_created": 1714769129498,
+      "time_updated": 1714769134925,
+      "data": {
+        "time": {
+          "created": 1714769129498,
+          "streamed": 1714769134912,
+          "completed": 1714769134925
+        },
+        "agent": "agent-2",
+        "model": {
+          "id": "model-3",
+          "providerID": "provider-2"
+        },
+        "content": [
+          {
+            "type": "tool",
+            "id": "call_30",
+            "name": "shell",
+            "state": {
+              "status": "completed",
+              "input": {
+                "command": "Synthetic input 120."
+              },
+              "content": [
+                {
+                  "type": "text",
+                  "text": "Synthetic tool output 121."
+                }
+              ]
+            },
+            "time": {
+              "created": 1714769132941,
+              "ran": 1714769134862,
+              "completed": 1714769134889
+            }
+          }
+        ],
+        "finish": "tool-calls",
+        "tokens": {
+          "input": 14518,
+          "output": 73,
+          "reasoning": 0,
+          "cache": {
+            "read": 23424,
+            "write": 0
+          }
+        },
+        "cost": 0
+      }
+    },
+    {
+      "id": "msg_f3_0019",
+      "session_id": "ses_f3",
+      "type": "assistant",
+      "seq": 19,
+      "time_created": 1714769134949,
+      "time_updated": 1714769138764,
+      "data": {
+        "time": {
+          "created": 1714769134949,
+          "streamed": 1714769138746,
+          "completed": 1714769138764
+        },
+        "agent": "agent-2",
+        "model": {
+          "id": "model-3",
+          "providerID": "provider-2"
+        },
+        "content": [
+          {
+            "type": "tool",
+            "id": "call_31",
+            "name": "read",
+            "state": {
+              "status": "completed",
+              "input": {
+                "path": "Synthetic input 122.",
+                "limit": 500
+              },
+              "content": [
+                {
+                  "type": "text",
+                  "text": "Synthetic tool output 123."
+                }
+              ]
+            },
+            "time": {
+              "created": 1714769138046,
+              "ran": 1714769138670,
+              "completed": 1714769138679
+            }
+          }
+        ],
+        "finish": "tool-calls",
+        "tokens": {
+          "input": 5051,
+          "output": 30,
+          "reasoning": 0,
+          "cache": {
+            "read": 37760,
+            "write": 0
+          }
+        },
+        "cost": 0
+      }
+    },
+    {
+      "id": "msg_f3_0026",
+      "session_id": "ses_f3",
+      "type": "assistant",
+      "seq": 26,
+      "time_created": 1714769138787,
+      "time_updated": 1714769144227,
+      "data": {
+        "time": {
+          "created": 1714769138787,
+          "streamed": 1714769144211,
+          "completed": 1714769144226
+        },
+        "agent": "agent-2",
+        "model": {
+          "id": "model-3",
+          "providerID": "provider-2"
+        },
+        "content": [
+          {
+            "type": "tool",
+            "id": "call_32",
+            "name": "read",
+            "state": {
+              "status": "completed",
+              "input": {
+                "path": "Synthetic input 124."
+              },
+              "content": [
+                {
+                  "type": "text",
+                  "text": "Synthetic tool output 125."
+                }
+              ]
+            },
+            "time": {
+              "created": 1714769144080,
+              "ran": 1714769144085,
+              "completed": 1714769144089
+            }
+          },
+          {
+            "type": "tool",
+            "id": "call_33",
+            "name": "shell",
+            "state": {
+              "status": "completed",
+              "input": {
+                "command": "Synthetic input 126."
+              },
+              "content": [
+                {
+                  "type": "text",
+                  "text": "Synthetic tool output 127."
+                }
+              ]
+            },
+            "time": {
+              "created": 1714769144086,
+              "ran": 1714769144127,
+              "completed": 1714769144157
+            }
+          },
+          {
+            "type": "tool",
+            "id": "call_34",
+            "name": "grep",
+            "state": {
+              "status": "completed",
+              "input": {
+                "pattern": "Synthetic input 128.",
+                "path": "Synthetic input 129.",
+                "limit": 70
+              },
+              "content": [
+                {
+                  "type": "text",
+                  "text": "Synthetic tool output 130."
+                }
+              ]
+            },
+            "time": {
+              "created": 1714769144129,
+              "ran": 1714769144131,
+              "completed": 1714769144140
+            }
+          },
+          {
+            "type": "tool",
+            "id": "call_35",
+            "name": "skill",
+            "state": {
+              "status": "completed",
+              "input": {
+                "id": "Synthetic input 131."
+              },
+              "content": [
+                {
+                  "type": "text",
+                  "text": "Synthetic tool output 132."
+                }
+              ]
+            },
+            "time": {
+              "created": 1714769144132,
+              "ran": 1714769144181,
+              "completed": 1714769144183
+            }
+          }
+        ],
+        "finish": "tool-calls",
+        "tokens": {
+          "input": 11473,
+          "output": 133,
+          "reasoning": 0,
+          "cache": {
+            "read": 42624,
+            "write": 0
+          }
+        },
+        "cost": 0
+      }
+    },
+    {
+      "id": "msg_f3_0045",
+      "session_id": "ses_f3",
+      "type": "assistant",
+      "seq": 45,
+      "time_created": 1714769144249,
+      "time_updated": 1714769148107,
+      "data": {
+        "time": {
+          "created": 1714769144249,
+          "streamed": 1714769148085,
+          "completed": 1714769148107
+        },
+        "agent": "agent-2",
+        "model": {
+          "id": "model-3",
+          "providerID": "provider-2"
+        },
+        "content": [
+          {
+            "type": "reasoning",
+            "text": ""
+          },
+          {
+            "type": "tool",
+            "id": "call_36",
+            "name": "read",
+            "state": {
+              "status": "completed",
+              "input": {
+                "path": "Synthetic input 133.",
+                "offset": 960,
+                "limit": 100
+              },
+              "content": [
+                {
+                  "type": "text",
+                  "text": "Synthetic tool output 134."
+                }
+              ]
+            },
+            "time": {
+              "created": 1714769147620,
+              "ran": 1714769148008,
+              "completed": 1714769148016
+            }
+          }
+        ],
+        "finish": "tool-calls",
+        "tokens": {
+          "input": 9138,
+          "output": 29,
+          "reasoning": 28,
+          "cache": {
+            "read": 54016,
+            "write": 0
+          }
+        },
+        "cost": 0
+      }
+    },
+    {
+      "id": "msg_f3_0054",
+      "session_id": "ses_f3",
+      "type": "assistant",
+      "seq": 54,
+      "time_created": 1714769148132,
+      "time_updated": 1714769152216,
+      "data": {
+        "time": {
+          "created": 1714769148132,
+          "streamed": 1714769152194,
+          "completed": 1714769152215
+        },
+        "agent": "agent-2",
+        "model": {
+          "id": "model-3",
+          "providerID": "provider-2"
+        },
+        "content": [
+          {
+            "type": "reasoning",
+            "text": ""
+          },
+          {
+            "type": "tool",
+            "id": "call_37",
+            "name": "grep",
+            "state": {
+              "status": "completed",
+              "input": {
+                "pattern": "Synthetic input 135.",
+                "path": "Synthetic input 136.",
+                "limit": 60
+              },
+              "content": [
+                {
+                  "type": "text",
+                  "text": "Synthetic tool output 137."
+                }
+              ]
+            },
+            "time": {
+              "created": 1714769151434,
+              "ran": 1714769152088,
+              "completed": 1714769152106
+            }
+          }
+        ],
+        "finish": "tool-calls",
+        "tokens": {
+          "input": 1536,
+          "output": 35,
+          "reasoning": 56,
+          "cache": {
+            "read": 62976,
+            "write": 0
+          }
+        },
+        "cost": 0
+      }
+    },
+    {
+      "id": "msg_f3_0063",
+      "session_id": "ses_f3",
+      "type": "assistant",
+      "seq": 63,
+      "time_created": 1714769152239,
+      "time_updated": 1714769154861,
+      "data": {
+        "time": {
+          "created": 1714769152239,
+          "streamed": 1714769154845,
+          "completed": 1714769154861
+        },
+        "agent": "agent-2",
+        "model": {
+          "id": "model-3",
+          "providerID": "provider-2"
+        },
+        "content": [
+          {
+            "type": "tool",
+            "id": "call_38",
+            "name": "shell",
+            "state": {
+              "status": "completed",
+              "input": {
+                "command": "Synthetic input 138.",
+                "timeout": 120000
+              },
+              "content": [
+                {
+                  "type": "text",
+                  "text": "Synthetic tool output 139."
+                }
+              ]
+            },
+            "time": {
+              "created": 1714769154091,
+              "ran": 1714769154758,
+              "completed": 1714769154781
+            }
+          }
+        ],
+        "finish": "tool-calls",
+        "tokens": {
+          "input": 603,
+          "output": 32,
+          "reasoning": 0,
+          "cache": {
+            "read": 64384,
+            "write": 0
+          }
+        },
+        "cost": 0
+      }
+    },
+    {
+      "id": "msg_f3_0070",
+      "session_id": "ses_f3",
+      "type": "assistant",
+      "seq": 70,
+      "time_created": 1714769154884,
+      "time_updated": 1714769161317,
+      "data": {
+        "time": {
+          "created": 1714769154884,
+          "streamed": 1714769161303,
+          "completed": 1714769161317
+        },
+        "agent": "agent-2",
+        "model": {
+          "id": "model-3",
+          "providerID": "provider-2"
+        },
+        "content": [
+          {
+            "type": "reasoning",
+            "text": ""
+          },
+          {
+            "type": "tool",
+            "id": "call_39",
+            "name": "shell",
+            "state": {
+              "status": "completed",
+              "input": {
+                "command": "Synthetic input 140."
+              },
+              "content": [
+                {
+                  "type": "text",
+                  "text": "Synthetic tool output 141."
+                }
+              ]
+            },
+            "time": {
+              "created": 1714769159389,
+              "ran": 1714769161208,
+              "completed": 1714769161241
+            }
+          }
+        ],
+        "finish": "tool-calls",
+        "tokens": {
+          "input": 9897,
+          "output": 50,
+          "reasoning": 86,
+          "cache": {
+            "read": 64896,
+            "write": 0
+          }
+        },
+        "cost": 0
+      }
+    },
+    {
+      "id": "msg_f3_0079",
+      "session_id": "ses_f3",
+      "type": "assistant",
+      "seq": 79,
+      "time_created": 1714769161339,
+      "time_updated": 1714769174197,
+      "data": {
+        "time": {
+          "created": 1714769161339,
+          "streamed": 1714769174175,
+          "completed": 1714769174196
+        },
+        "agent": "agent-2",
+        "model": {
+          "id": "model-3",
+          "providerID": "provider-2"
+        },
+        "content": [
+          {
+            "type": "text",
+            "text": "Synthetic text 142."
+          }
+        ],
+        "finish": "stop",
+        "tokens": {
+          "input": 1146,
+          "output": 362,
+          "reasoning": 0,
+          "cache": {
+            "read": 74624,
+            "write": 0
+          }
+        },
+        "cost": 0
+      }
+    },
+    {
+      "id": "msg_f3_0084",
+      "session_id": "ses_f3",
+      "type": "idle",
+      "seq": 84,
+      "time_created": 1714769174198,
+      "time_updated": 1714769174198,
+      "data": {
+        "time": {
+          "created": 1714769174198
+        },
+        "outcome": "succeeded"
+      }
+    }
+  ]
+}
