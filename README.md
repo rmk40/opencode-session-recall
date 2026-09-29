@@ -9,7 +9,7 @@
 
 [OpenCode](https://github.com/opencode-ai/opencode) already keeps the full history of every session you've run: messages, tool calls, tool outputs, and reasoning traces. That history covers every project on the machine, and it survives compaction. When compaction trims the context window, the original content stays in the database; the agent just stops being able to see it.
 
-This plugin adds five tools that read that history on demand. To answer in a couple of seconds without pulling gigabytes into memory, it keeps a small derived index alongside opencode's data: one card per session, plus a slim full-text index over the human layer (conversation text, reasoning traces, and the commands tools ran). That index lives in a local SQLite file under `~/.cache/opencode-session-recall/`, built once in the background through the opencode SDK and updated incrementally as sessions change. It is derived and safe to delete at any time; opencode's own database stays the sole source of truth, and the index adds zero npm dependencies because it uses the runtime's built-in SQLite. Embeddings are still an opt-in local layer that stays off by default. You install it, and the agent can search its own past.
+This plugin adds five tools that read that history on demand. It runs on opencode v1 (1.3.4 and later) and on opencode v2 (2.0.x); see [Running on opencode v2](#running-on-opencode-v2) for what differs there. To answer in a couple of seconds without pulling gigabytes into memory, it keeps a small derived index alongside opencode's data: one card per session, plus a slim full-text index over the human layer (conversation text, reasoning traces, and the commands tools ran). That index lives in a local SQLite file under `~/.cache/opencode-session-recall/`, built once in the background (through the opencode SDK on v1, by reading opencode's database read-only on v2) and updated incrementally as sessions change. It is derived and safe to delete at any time; opencode's own database stays the sole source of truth, and the index adds zero npm dependencies because it uses the runtime's built-in SQLite. Embeddings are still an opt-in local layer that stays off by default. You install it, and the agent can search its own past.
 
 ## Why you want this
 
@@ -82,6 +82,10 @@ One call returns the matching sessions across all your projects, each with a `hi
 
 ## Install
 
+The same package works on both opencode generations.
+
+**opencode v1:**
+
 ```bash
 opencode plugin opencode-session-recall
 ```
@@ -94,13 +98,31 @@ Or add it to your `opencode.json`:
 }
 ```
 
-That's the whole setup. The agent picks up the tools on the next session and uses them on its own; you don't have to teach it the syntax. To disable cross-project search:
+Options go in a `[name, options]` pair. To disable cross-project search:
 
 ```jsonc
 {
   "plugin": [["opencode-session-recall", { "global": false }]],
 }
 ```
+
+**opencode v2:**
+
+```bash
+opencode plugin add opencode-session-recall
+```
+
+Or list it under `plugins`, with options in an object:
+
+```jsonc
+{
+  "plugins": [{ "package": "opencode-session-recall", "options": { "global": false } }],
+}
+```
+
+v2 also reads the v1 `plugin` form above, so an existing config keeps working.
+
+That's the whole setup. The agent picks up the tools on the next session and uses them on its own; you don't have to teach it the syntax.
 
 ## Getting the agent to actually use it
 
@@ -122,25 +144,26 @@ A search tool only helps if the agent reaches for it. The plugin has three featu
 
 ## Options
 
-| Option             | Type      | Default                    | Description                                                                                                                                   |
-| ------------------ | --------- | -------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
-| `primary`          | `boolean` | `true`                     | Register tools as primary (available to all agents)                                                                                           |
-| `global`           | `boolean` | `true`                     | Allow cross-project search via `scope: "global"`                                                                                              |
-| `nudge`            | `boolean` | `true`                     | Inject a short system-prompt reminder to use recall for past work                                                                             |
-| `autoRecall`       | `boolean` | `false`                    | On user messages that reference prior work, auto-run a bounded recall and inject the top cited hits                                           |
-| `compactionRecall` | `boolean` | `false`                    | Before compaction, preserve the session's distilled card into the summary                                                                     |
-| `prewarm`          | `boolean` | `false`                    | Deprecated no-op, kept so existing configs don't error; the card store persists across processes                                              |
-| `semantic`         | `boolean` | `false`                    | Enable the opt-in local [semantic layer](#semantic-search-opt-in)                                                                             |
-| `semanticWeight`   | `number`  | `0.35`                     | Blend weight for the semantic signal, clamped to 0.05–0.95                                                                                    |
-| `semanticModel`    | `string`  | `minishlab/potion-base-8M` | Hugging Face model id for the static-embedding model                                                                                          |
-| `summaries`        | `object`  | off                        | Opt-in LLM card summaries: `{ enabled, model: "providerID/modelID", agent?, maxPromptsPerPass? }`. See [LLM summaries](#llm-summaries-opt-in) |
-| `mode`             | `string`  | `"persistent"`             | `"ephemeral"` runs with no store and no on-disk artifacts. See [Ephemeral mode](#ephemeral-mode-opt-in)                                       |
+| Option             | Type      | Default                    | Description                                                                                                                                       |
+| ------------------ | --------- | -------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `primary`          | `boolean` | `true`                     | Register tools as primary (available to all agents)                                                                                               |
+| `global`           | `boolean` | `true`                     | Allow cross-project search via `scope: "global"`                                                                                                  |
+| `nudge`            | `boolean` | `true`                     | Inject a short system-prompt reminder to use recall for past work                                                                                 |
+| `autoRecall`       | `boolean` | `false`                    | On user messages that reference prior work, auto-run a bounded recall and inject the top cited hits                                               |
+| `compactionRecall` | `boolean` | `false`                    | Before compaction, preserve the session's distilled card into the summary                                                                         |
+| `prewarm`          | `boolean` | `false`                    | Deprecated no-op, kept so existing configs don't error; the card store persists across processes                                                  |
+| `semantic`         | `boolean` | `false`                    | Enable the opt-in local [semantic layer](#semantic-search-opt-in)                                                                                 |
+| `semanticWeight`   | `number`  | `0.35`                     | Blend weight for the semantic signal, clamped to 0.05–0.95                                                                                        |
+| `semanticModel`    | `string`  | `minishlab/potion-base-8M` | Hugging Face model id for the static-embedding model                                                                                              |
+| `summaries`        | `object`  | off                        | Opt-in LLM card summaries: `{ enabled, model: "providerID/modelID", agent?, maxPromptsPerPass? }`. See [LLM summaries](#llm-summaries-opt-in)     |
+| `mode`             | `string`  | `"persistent"`             | `"ephemeral"` runs with no store and no on-disk artifacts. See [Ephemeral mode](#ephemeral-mode-opt-in)                                           |
+| `opencodeDbPath`   | `string`  | opencode's own resolution  | opencode v2 only: the `opencode.db` to read, overriding the path opencode itself would use. See [Running on opencode v2](#running-on-opencode-v2) |
 
 Advanced limits (all have sensible defaults):
 
 | Option                 | Default                                        | Description                                                                    |
 | ---------------------- | ---------------------------------------------- | ------------------------------------------------------------------------------ |
-| `storePath`            | `~/.cache/opencode-session-recall/store-v1.db` | Path to the derived SQLite store                                               |
+| `storePath`            | `~/.cache/opencode-session-recall/store-v1.db` | Path to the derived SQLite store (v2 default: `store-opencode-v2.db`)          |
 | `coldPass`             | `true`                                         | Run the background distiller cold pass that builds the store                   |
 | `concurrency`          | `3`                                            | Max concurrent SDK fetches shared by drill and distiller                       |
 | `drillSessions`        | `12`                                           | How many shortlisted sessions a query drills into                              |
@@ -161,6 +184,26 @@ Advanced limits (all have sensible defaults):
 | `maxWindow`            | `10`                                           | Max context window size                                                        |
 | `defaultWidth`         | `200`                                          | Default snippet width                                                          |
 
+## Running on opencode v2
+
+On opencode v2 (checked against 2.0.18) the plugin registers the same five tools with the same arguments and results, keeps the `nudge` and `primary` behavior, and supports `global`, `mode`, `semantic` and the advanced limits. A few things work differently because v2 is built differently.
+
+**Where history comes from.** v2's plugin API cannot list sessions or page messages, so the plugin reads opencode's own `opencode.db` directly, strictly read-only: it never writes to that file and never holds a read transaction open. It finds the file the way opencode does (`OPENCODE_DB`, the build channel, `XDG_DATA_HOME`); set `opencodeDbPath` to point it somewhere else. If the file is missing or unreadable, every response says so in `coverage.source`, `recall_get`, `recall_context` and `recall_messages` return that reason as their error, `recall_sessions` lists from the session cards, and `recall` answers from those cards alone (title, first request, last answer, summary) with a warning. Both need cards from an earlier run; without them there is nothing to answer from. The one exception is a path that cannot be resolved at all (`:memory:`, an empty `opencodeDbPath`): then no store is opened and the cards are unavailable too.
+
+**How the index stays current.** v2 events are only a hint, so a background poll keeps the store fresh without them: new messages show up within about 30 seconds, and renames, moves and other metadata-only changes within about 5 minutes. A turn that is still streaming is re-read on every poll until it settles.
+
+**A separate store.** The v2 index lives in `~/.cache/opencode-session-recall/store-opencode-v2.db`, next to the v1 `store-v1.db`. Each store records which opencode and which history database it was built from, and refuses to be used by the other, so the two never overwrite each other. One v2 process indexes every project into that one file.
+
+**What is different.**
+
+- Tool calls show no custom titles in the TUI; v2 has no title channel for plugin tools.
+- `primary` hides the tools from subagents by checking whether the session has a parent session, and refuses them there as well.
+- The distiller always indexes every project. `global: false` only limits what queries can reach to the current project.
+- `autoRecall`, `compactionRecall` and `summaries` are not available on v2 yet. Turning one on logs a line and changes nothing.
+- v2 discards plugin console output. Set `RECALL_DEBUG=1` in the environment of the opencode service to log to `~/.cache/opencode-session-recall/recall.log` (size-capped, one rotation).
+
+**Resetting the store.** If the v2 store is refused (the log says `store refused (<reason>)`), quit every opencode v2 process, including the background service (`opencode service stop`), delete `~/.cache/opencode-session-recall/store-opencode-v2.db`, and start opencode again. The store rebuilds in the background.
+
 ## Recall is not memory
 
 This is not a memory system, and it doesn't try to be one. A memory system is selective and curated; recall just returns raw history verbatim, on demand.
@@ -179,7 +222,7 @@ The sections above describe 2.0. This one explains what it replaced, and why the
 
 The retrieval contract changed with the architecture. 1.x promised exhaustive scanning; 2.0 promises bounded, precision-first retrieval with honest coverage reporting, so a response says how many sessions it actually drilled and what it skipped instead of implying it read everything. Tool outputs are searched inside the sessions a query drills into, not swept across all of history on every call, because that tier is roughly 88% of the corpus and mostly low-signal build logs. When you truly need an output that lives only in a session nothing else points at, `deep: true` runs that sweep within an explicit scope.
 
-The store is derived and disposable. Delete the file and the distiller rebuilds it in the background; nothing you can lose lives only there. opencode's own database stays the sole source of truth, reached only through the SDK, never by a direct query. Several opencode processes can run against one store at once without corrupting it: a schema stamp fences out any build that would misread the format, persisted vectors carry a write generation so an older build cannot downgrade a newer one, and a single-writer lease keeps exactly one distiller writing at a time.
+The store is derived and disposable. Delete the file and the distiller rebuilds it in the background; nothing you can lose lives only there. opencode's own database stays the sole source of truth. On v1 it is reached only through the SDK, never by a direct query; on v2, whose plugin API cannot page history, it is read directly and only ever read-only. Several opencode processes can run against one store at once without corrupting it: a schema stamp fences out any build that would misread the format, persisted vectors carry a write generation so an older build cannot downgrade a newer one, and a single-writer lease keeps exactly one distiller writing at a time.
 
 The rest of this document is reference material. The agent gets the full parameter and response schema from each tool's own description at runtime, so you don't need to read it to use the plugin.
 
@@ -287,9 +330,9 @@ All four modes work in every scope: `"session"`, `"project"`, and `"global"`.
 
 Compaction in OpenCode doesn't delete anything. Tool outputs get a `compacted` timestamp and are swapped for placeholder text in the model's context, and messages before a compaction boundary are skipped when the context is rebuilt, but in both cases the original rows stay in the database.
 
-This plugin reads them back through the OpenCode SDK:
+This plugin reads them back, through the OpenCode SDK on v1 and from opencode's database, read-only, on v2:
 
-- No direct database queries. All access goes through the SDK; opencode's database stays the sole source of truth.
+- On v1, no direct database queries: all access goes through the SDK. On v2, whose plugin API cannot page history, the plugin opens `opencode.db` read-only and never writes to it. Either way opencode's database stays the sole source of truth.
 - One derived index, built in the background and safe to delete. There is nothing for you to set up or sync. ([Ephemeral mode](#ephemeral-mode-opt-in) skips the index entirely.)
 - Every message fetch is bounded and paginated. A search never pulls a whole session into memory, and a background distiller never competes with a live query. (Metadata listings, like the parent/child lookup, are single bounded-in-practice calls.)
 - Long-running work respects abort signals.
@@ -298,7 +341,7 @@ This plugin reads them back through the OpenCode SDK:
 
 ### The derived store
 
-Everything in this section describes the default persistent mode; [ephemeral mode](#ephemeral-mode-opt-in) opts out of all of it. A background distiller reads history through the SDK once and writes a compact index to a local SQLite file (`~/.cache/opencode-session-recall/store-v1.db`). The first cold pass walks every session one at a time, distills each into a card plus a set of slim index rows, and checkpoints as it goes; after that, opencode's `session.idle` and related events drive incremental updates, so the store stays current without polling. It is derived and versioned: delete the file and it rebuilds itself in the background, and a store written by a newer build than yours makes the plugin fall back to a degraded metadata-only mode rather than misread it. The same fence applies when you downgrade the plugin: the older build runs degraded against a store the newer one upgraded, until you reset it (quit every opencode process sharing the store, delete the file, restart). Multiple opencode processes share the file safely through a single-writer lease. The store uses the runtime's built-in SQLite (`bun:sqlite`, with `node:sqlite` for tests), so it adds no npm dependency; if neither driver is available, the plugin degrades to in-memory metadata cards with no persistence.
+Everything in this section describes the default persistent mode; [ephemeral mode](#ephemeral-mode-opt-in) opts out of all of it. A background distiller reads history once and writes a compact index to a local SQLite file (`~/.cache/opencode-session-recall/store-v1.db` on v1, `store-opencode-v2.db` on v2). The first cold pass walks every session one at a time, distills each into a card plus a set of slim index rows, and checkpoints as it goes. After that, on v1, opencode's `session.idle` and related events drive incremental updates, so the store stays current without polling. On v2, a poll of `opencode.db` does that job (about every 30 seconds for new messages, every 5 minutes for metadata-only changes), and events only make it sooner; each card records the tail of its session, so a rewritten or reverted session is re-read in full rather than appended to. It is derived and versioned: delete the file and it rebuilds itself in the background, and a store written by a newer build than yours makes the plugin fall back to a degraded metadata-only mode rather than misread it. The same fence applies when you downgrade the plugin: the older build runs degraded against a store the newer one upgraded, until you reset it (quit every opencode process sharing the store, delete the file, restart). Multiple opencode processes share the file safely through a single-writer lease. The store uses the runtime's built-in SQLite (`bun:sqlite`, with `node:sqlite` for tests), so it adds no npm dependency; if neither driver is available, the plugin degrades to in-memory metadata cards with no persistence.
 
 ### Two tiers: cards and the slim index
 
