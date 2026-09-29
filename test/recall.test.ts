@@ -45,7 +45,7 @@ async function recallTool(
 ): Promise<ToolDefinition> {
   const { deps, cleanup } = await makeRecallDeps(h, limits);
   cleanups.push(cleanup);
-  return search(h.client, h.unscoped, global, limits, deps);
+  return search(h.source, global, limits, deps);
 }
 
 function messageTime(
@@ -1484,7 +1484,7 @@ describe("recall", () => {
       });
       const drill = createDrill({ source: h.source, gate, limits: TEST_LIMITS });
       const deps: SearchDeps = { gate, store: null, cards, drill };
-      const tool = search(h.client, h.unscoped, true, TEST_LIMITS, deps);
+      const tool = search(h.source, true, TEST_LIMITS, deps);
 
       const out = await runTool<SearchOutput>(tool, {
         query: "fix review findings batch",
@@ -2036,7 +2036,7 @@ describe("explicit shortlist includes uncarded sessions", () => {
   ) {
     const { deps, store, cleanup } = await makeRecallDeps(h, limits, opts);
     cleanups.push(cleanup);
-    return { recall: search(h.client, h.unscoped, true, limits, deps), store };
+    return { recall: search(h.source, true, limits, deps), store };
   }
 
   it("drills an uncarded shortlist member: hit returned, eligible counted, warning present", async () => {

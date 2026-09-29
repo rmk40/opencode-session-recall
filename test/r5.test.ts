@@ -12,7 +12,7 @@ beforeAll(async () => {
   const h = makeFakeHarness();
   const { deps, cleanup: c } = await makeRecallDeps(h);
   cleanup = c;
-  sharedTool = search(h.client, h.unscoped, true, TEST_LIMITS, deps);
+  sharedTool = search(h.source, true, TEST_LIMITS, deps);
 });
 afterAll(() => cleanup());
 

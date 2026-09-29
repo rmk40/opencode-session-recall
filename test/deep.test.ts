@@ -55,7 +55,7 @@ describe("deep scope validation", () => {
     const h = makeFakeHarness();
     const { deps, cleanup } = await makeRecallDeps(h);
     try {
-      const recall = search(h.client, h.unscoped, true, TEST_LIMITS, deps);
+      const recall = search(h.source, true, TEST_LIMITS, deps);
       const out = await runTool<ErrorOutput>(recall, {
         query: "anything",
         deep: true,
@@ -73,7 +73,7 @@ describe("deep scope validation", () => {
     const h = makeFakeHarness();
     const { deps, cleanup } = await makeRecallDeps(h);
     try {
-      const recall = search(h.client, h.unscoped, true, TEST_LIMITS, deps);
+      const recall = search(h.source, true, TEST_LIMITS, deps);
       const out = await runTool<SearchOutput>(recall, {
         query: "rate",
         deep: true,
@@ -90,7 +90,7 @@ describe("deep scope validation", () => {
     const h = makeFakeHarness();
     const { deps, cleanup } = await makeRecallDeps(h);
     try {
-      const recall = search(h.client, h.unscoped, true, TEST_LIMITS, deps);
+      const recall = search(h.source, true, TEST_LIMITS, deps);
       const out = await runTool<SearchOutput>(recall, {
         query: "rate",
         deep: true,
@@ -108,7 +108,7 @@ describe("deep scope validation", () => {
     const h = makeFakeHarness();
     const { deps, cleanup } = await makeRecallDeps(h);
     try {
-      const recall = search(h.client, h.unscoped, true, TEST_LIMITS, deps);
+      const recall = search(h.source, true, TEST_LIMITS, deps);
       const garbage = await runTool<ErrorOutput>(recall, {
         query: "rate",
         deepCursor: "!!!not-a-valid-cursor!!!",
@@ -147,7 +147,7 @@ describe("deep scope validation", () => {
       ]),
     ]);
     try {
-      const recall = search(h.client, h.unscoped, true, TEST_LIMITS, deps);
+      const recall = search(h.source, true, TEST_LIMITS, deps);
       const out = await runTool<SearchOutput>(recall, {
         query: "crunkleberry",
         deep: true,
@@ -175,7 +175,7 @@ describe("deep scope validation", () => {
       ]),
     ]);
     try {
-      const recall = search(h.client, h.unscoped, true, TEST_LIMITS, deps);
+      const recall = search(h.source, true, TEST_LIMITS, deps);
       const excluded = await runTool<SearchOutput>(recall, {
         query: "murkfen",
         deep: true,
@@ -237,7 +237,7 @@ describe("deep scope validation", () => {
       before: null,
     });
     try {
-      const recall = search(h.client, h.unscoped, true, TEST_LIMITS, deps);
+      const recall = search(h.source, true, TEST_LIMITS, deps);
       const out = await runTool<SearchOutput>(recall, {
         query: "snorkelwick",
         deepCursor: cursor,
@@ -297,7 +297,7 @@ describe("deep scope validation", () => {
       before: Buffer.from("1").toString("base64url"),
     });
     try {
-      const recall = search(h.client, h.unscoped, true, TEST_LIMITS, deps);
+      const recall = search(h.source, true, TEST_LIMITS, deps);
       const out = await runTool<SearchOutput>(recall, {
         query: "glimmerquartz",
         deepCursor: cursor,
@@ -362,7 +362,7 @@ describe("deep finds output-only needles that non-deep honestly misses", () => {
     const limits: Limits = { ...TEST_LIMITS, drillSessions: 1 };
     const { deps, cleanup } = await recallDeps(h, limits);
     try {
-      const recall = search(h.client, h.unscoped, true, limits, deps);
+      const recall = search(h.source, true, limits, deps);
 
       const shallow = await runTool<SearchOutput>(recall, {
         query: NEEDLE,
@@ -395,7 +395,7 @@ describe("deep finds output-only needles that non-deep honestly misses", () => {
     const h = buildHarness();
     const { deps, cleanup } = await recallDeps(h, TEST_LIMITS);
     try {
-      const recall = search(h.client, h.unscoped, true, TEST_LIMITS, deps);
+      const recall = search(h.source, true, TEST_LIMITS, deps);
       const out = await runTool<SearchOutput>(recall, {
         query: NEEDLE,
         match: "smart",
@@ -425,7 +425,7 @@ describe("deep finds output-only needles that non-deep honestly misses", () => {
     };
     const { deps, cleanup } = await recallDeps(h, TEST_LIMITS, spy);
     try {
-      const recall = search(h.client, h.unscoped, true, TEST_LIMITS, deps);
+      const recall = search(h.source, true, TEST_LIMITS, deps);
       await runTool<SearchOutput>(recall, {
         query: NEEDLE,
         deep: true,
@@ -471,7 +471,7 @@ describe("deep budget stop and cursor continuation", () => {
     const limits: Limits = { ...TEST_LIMITS, deepCharsPerQuery: 400 };
     const { deps, cleanup } = await recallDeps(h, limits);
     try {
-      const recall = search(h.client, h.unscoped, true, limits, deps);
+      const recall = search(h.source, true, limits, deps);
 
       const first = await runTool<SearchOutput>(recall, {
         query: SHARED,
@@ -520,7 +520,7 @@ describe("deep budget stop and cursor continuation", () => {
       deepWallClockMs: 100,
     });
     try {
-      const recall = search(h.client, h.unscoped, true, TEST_LIMITS, deps);
+      const recall = search(h.source, true, TEST_LIMITS, deps);
       const out = await runTool<SearchOutput>(recall, {
         query: SHARED,
         match: "literal",
@@ -544,7 +544,7 @@ describe("deep args survive the Zod-bypass host path", () => {
     const h = makeFakeHarness();
     const { deps, cleanup } = await makeRecallDeps(h);
     try {
-      const recall = search(h.client, h.unscoped, true, TEST_LIMITS, deps);
+      const recall = search(h.source, true, TEST_LIMITS, deps);
 
       // Raw boolean + raw array forwarded straight through (no Zod defaults).
       const raw = await runToolRaw<SearchOutput>(recall, {
@@ -593,7 +593,7 @@ describe("deep cursor hardening", () => {
     const h = makeFakeHarness();
     const { deps, cleanup } = await makeRecallDeps(h);
     try {
-      const recall = search(h.client, h.unscoped, true, TEST_LIMITS, deps);
+      const recall = search(h.source, true, TEST_LIMITS, deps);
       const out = await runTool<SearchOutput>(recall, { query: "rate", deepCursor: encoded });
       expect(out.ok).toBe(true);
       // s-project-2 is a known card → swept; the unknown id is dropped.

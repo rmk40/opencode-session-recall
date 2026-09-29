@@ -129,7 +129,7 @@ function makeAuthorshipHarness(options: FakeOptions = {}): FakeHarness {
 async function setup(h: FakeHarness): Promise<{ recall: ToolDefinition; store: Store }> {
   const { deps, store, cleanup } = await makeRecallDeps(h, TEST_LIMITS);
   cleanups.push(cleanup);
-  return { recall: search(h.client, h.unscoped, true, TEST_LIMITS, deps), store };
+  return { recall: search(h.source, true, TEST_LIMITS, deps), store };
 }
 
 /**
@@ -164,7 +164,7 @@ async function setupWithDrillSpy(
     cachedChars: () => inner.cachedChars(),
   };
   return {
-    recall: search(h.client, h.unscoped, true, TEST_LIMITS, { ...deps, drill: spy }),
+    recall: search(h.source, true, TEST_LIMITS, { ...deps, drill: spy }),
     drilled: () => [...new Set(selected)],
   };
 }
@@ -950,7 +950,7 @@ describe("authorship reporting", () => {
     const h = makeAuthorshipHarness();
     const { deps, cleanup } = await makeRecallDeps(h, { ...TEST_LIMITS, drillSessions: 1 });
     cleanups.push(cleanup);
-    const recall = search(h.client, h.unscoped, true, { ...TEST_LIMITS, drillSessions: 1 }, deps);
+    const recall = search(h.source, true, { ...TEST_LIMITS, drillSessions: 1 }, deps);
 
     const out = await runTool<SearchOutput>(recall, {
       query: "quarkbeam",
@@ -1180,7 +1180,7 @@ describe("authorship compatibility", () => {
   it("works on the degraded (store-null) path without changing its default output", async () => {
     const h = makeAuthorshipHarness();
     const { deps } = makeStoreNullDeps(h, TEST_LIMITS);
-    const recall = search(h.client, h.unscoped, true, TEST_LIMITS, deps);
+    const recall = search(h.source, true, TEST_LIMITS, deps);
     const base = { query: "quarkbeam", match: "smart" as const, results: 50 };
 
     const { absent, any } = await withFrozenClock(async () => ({

@@ -1,5 +1,5 @@
 import { tool, type ToolDefinition, type ToolContext } from "@opencode-ai/plugin";
-import type { OpencodeClient, Session, GlobalSession } from "@opencode-ai/sdk/v2";
+import type { Session, GlobalSession } from "@opencode-ai/sdk/v2";
 import {
   errmsg,
   optionalString,
@@ -56,8 +56,7 @@ import type { Store, FtsHit, Card } from "./store.js";
 import type { FetchGate } from "./fetch-gate.js";
 import { fetchMessageWindow, type FetchRunner } from "./fetch-window.js";
 import type { HistoryMessage } from "./history/model.js";
-import type { HistorySource } from "./history/source.js";
-import { createV1HistorySource } from "./history/v1.js";
+import type { HistorySource, SessionScope } from "./history/source.js";
 
 /** The embedder as the search path consumes it: the cache-facing surface plus
  *  the init error, so the one-time "unavailable" warning can explain why. */
@@ -1218,7 +1217,6 @@ const MAX_EXPAND_CONTEXT_FETCH = 200;
 
 async function expandSearchResults(
   results: SearchResult[],
-  client: OpencodeClient,
   source: HistorySource,
   gate: FetchGate,
   limits: Limits,
@@ -1259,21 +1257,18 @@ async function expandSearchResults(
   for (const { result, resultIndex } of expandable) {
     if (mode === "message") {
       try {
-        const resp = await gate.runQuery(() =>
-          client.session.message({
-            sessionID: result.sessionID,
-            messageID: result.messageID,
-          }),
+        const lookup = await gate.runQuery(() =>
+          source.getMessage(result.sessionID, result.messageID),
         );
-        if (resp.error || !resp.data) {
+        if (!lookup.ok) {
           warnings.push(
             `Expansion could not load session ${result.sessionID}: ${
-              resp.error ? errmsg(resp.error) : "no message returned"
+              lookup.error ?? "no message returned"
             }.`,
           );
           continue;
         }
-        const bundle = resp.data as HistoryMessage;
+        const bundle = lookup.value;
         expanded.push({
           resultIndex,
           sessionID: result.sessionID,
@@ -1762,15 +1757,12 @@ export function mergeShortlist(
 // ── Main export ──────────────────────────────────────────────────────
 
 export function search(
-  client: OpencodeClient,
-  unscoped: OpencodeClient,
+  source: HistorySource,
   global: boolean,
   limits: Limits,
   deps: SearchDeps,
 ): ToolDefinition {
   const { cards, drill, store, gate, mode, maybeRefresh } = deps;
-  // Interim: this tool still takes clients until its own seam commit.
-  const source = createV1HistorySource({ scoped: client, unscoped });
   return tool({
     description: `Search prior opencode conversations by message/tool-output content. Primary history-discovery tool; prefer over recall_sessions for topical discovery (titles only).
 
@@ -2428,8 +2420,8 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
               !workerCard(id),
           );
 
-        /** One uncarded id's metadata probe: the scoped client first, then one
-         *  retry on the UNSCOPED client — workers and cross-project sessions
+        /** One uncarded id's metadata probe: the project scope first, then one
+         *  retry at GLOBAL scope — workers and cross-project sessions
          *  live outside the caller's directory scope, so the retry closes most
          *  "probe failed → admitted unverified" gaps (including a worker whose
          *  scoped fetch 404s). Only when BOTH fail is the id admitted
@@ -2440,12 +2432,14 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
         ): Promise<
           { title: string; directory: string; updated: number; parentID: string | null } | undefined
         > => {
-          const probeClients = client === unscoped ? [client] : [client, unscoped];
-          for (const c of probeClients) {
+          const probeScopes: SessionScope[] = source.scopedLookup
+            ? ["project", "global"]
+            : ["project"];
+          for (const scope of probeScopes) {
             try {
-              const sess = await gate.runQuery(() => c.session.get({ sessionID: id }));
-              if (sess.data) {
-                const data = sess.data as Session | GlobalSession;
+              const sess = await gate.runQuery(() => source.getSession(id, { scope }));
+              if (sess.ok) {
+                const data = sess.value as Session | GlobalSession;
                 return {
                   title: data.title,
                   directory: data.directory,
@@ -2458,7 +2452,7 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
                 };
               }
             } catch {
-              // Try the next client / fall through to unverified.
+              // Try the next scope / fall through to unverified.
             }
           }
           return undefined;
@@ -2568,9 +2562,11 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
           // `unknown` parentage, never root.
           let sParent: string | null | undefined;
           try {
-            const sess = await gate.runQuery(() => client.session.get({ sessionID: singleTarget }));
-            if (sess.data) {
-              const data = sess.data as Session | GlobalSession;
+            const sess = await gate.runQuery(() =>
+              source.getSession(singleTarget, { scope: "project" }),
+            );
+            if (sess.ok) {
+              const data = sess.value as Session | GlobalSession;
               sTitle = data.title;
               sDir = data.directory;
               sUpdated = data.time.updated;
@@ -3275,7 +3271,6 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
         ): Promise<T> => {
           const expansion = await expandSearchResults(
             final,
-            client,
             source,
             gate,
             limits,

@@ -27,13 +27,13 @@ afterAll(() => setStrictNoLimitMessages(false));
 
 function ephemeralTool(h: FakeHarness, opts: Parameters<typeof makeStoreNullDeps>[2] = {}) {
   const { deps } = makeStoreNullDeps(h, TEST_LIMITS, { mode: "ephemeral", ...opts });
-  return search(h.client, h.unscoped, true, TEST_LIMITS, deps);
+  return search(h.source, true, TEST_LIMITS, deps);
 }
 
 function degradedTool(h: FakeHarness) {
   // Store-null WITHOUT mode: the accidental driver-missing degraded path.
   const { deps } = makeStoreNullDeps(h, TEST_LIMITS);
-  return search(h.client, h.unscoped, true, TEST_LIMITS, deps);
+  return search(h.source, true, TEST_LIMITS, deps);
 }
 
 /** Age every fixture session so a since:"1h" window has zero eligible cards. */
@@ -158,7 +158,7 @@ describe("ephemeral scope default flip", () => {
     const h = makeFakeHarness();
     const { deps, cleanup } = await makeRecallDeps(h);
     try {
-      const definition = search(h.client, h.unscoped, true, TEST_LIMITS, deps);
+      const definition = search(h.source, true, TEST_LIMITS, deps);
       // Schema default is untouched too.
       expect(tool.schema.object(definition.args).parse({ query: "x" }).scope).toBe("global");
       const out = await runToolRaw<SearchOutput>(definition, {
@@ -212,7 +212,7 @@ describe("ephemeral deep-gate explicitness (unconditional fork)", () => {
     const h = makeFakeHarness();
     const { deps, cleanup } = await makeRecallDeps(h);
     try {
-      const definition = search(h.client, h.unscoped, true, TEST_LIMITS, deps);
+      const definition = search(h.source, true, TEST_LIMITS, deps);
       const rejected = await runToolRaw<ErrorOutput>(definition, {
         query: "rateLimit",
         deep: true,
@@ -325,7 +325,7 @@ describe("ephemeral deep-gate explicitness (unconditional fork)", () => {
     const h = makeFakeHarness();
     const { deps, cleanup } = await makeRecallDeps(h);
     try {
-      const definition = search(h.client, h.unscoped, true, TEST_LIMITS, deps);
+      const definition = search(h.source, true, TEST_LIMITS, deps);
       const persistentOut = await runToolRaw<SearchOutput>(definition, {
         query: "rateLimit",
         deep: true,
@@ -349,7 +349,7 @@ describe("ephemeral deep-gate explicitness (unconditional fork)", () => {
     const h = makeFakeHarness();
     const { deps, cleanup } = await makeRecallDeps(h);
     try {
-      const definition = search(h.client, h.unscoped, true, TEST_LIMITS, deps);
+      const definition = search(h.source, true, TEST_LIMITS, deps);
       const persistentOut = await runToolRaw<ErrorOutput>(definition, {
         query: "rateLimit",
         deep: true,

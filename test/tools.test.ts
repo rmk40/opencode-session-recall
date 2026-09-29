@@ -1331,7 +1331,7 @@ describe("LLM-facing schemas", () => {
     const limits = { ...TEST_LIMITS, maxResults: 2 };
     const { deps, cleanup } = await makeRecallDeps(h, limits);
     try {
-      const recall = search(h.client, h.unscoped, true, limits, deps);
+      const recall = search(h.source, true, limits, deps);
       await expect(
         runTool<SearchOutput>(recall, { query: "rate", scope: "everywhere" }),
       ).rejects.toThrow();

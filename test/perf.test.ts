@@ -507,12 +507,9 @@ describe.skipIf(!ENABLED)("perf: distill-then-search gates", () => {
       const cards = createCardsRuntime({
         source: { getCards: () => store.allCards(), revision: () => store.getMeta("cards_rev") },
       });
-      const drill = createDrill({
-        source: createV1HistorySource({ scoped: client, unscoped }),
-        gate,
-        limits: LIMITS,
-      });
-      const tool: ToolDefinition = search(client, unscoped, true, LIMITS, {
+      const source = createV1HistorySource({ scoped: client, unscoped });
+      const drill = createDrill({ source, gate, limits: LIMITS });
+      const tool: ToolDefinition = search(source, true, LIMITS, {
         gate,
         store,
         cards,

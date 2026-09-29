@@ -21,7 +21,7 @@ describe("recall smart fallback", () => {
     const { deps, cleanup } = await makeRecallDeps(h);
     let out: SearchOutput;
     try {
-      out = await runTool<SearchOutput>(search(h.client, h.unscoped, true, TEST_LIMITS, deps), {
+      out = await runTool<SearchOutput>(search(h.source, true, TEST_LIMITS, deps), {
         query: "walkthrough",
         match: "smart",
       });

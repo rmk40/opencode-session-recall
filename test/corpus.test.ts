@@ -154,7 +154,7 @@ describe("expansion over the cache", () => {
       return original(params);
     };
     const { deps, cleanup } = await makeRecallDeps(h);
-    const tool = search(h.client, h.unscoped, true, TEST_LIMITS, deps);
+    const tool = search(h.source, true, TEST_LIMITS, deps);
     try {
       // Warm the drill LRU, then break the message endpoint: the second query is
       // served warm (no fetch) while only the expansion re-fetch fails.

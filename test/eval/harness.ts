@@ -163,7 +163,7 @@ export async function makeEvalSearch(
     semanticModel: semantic ? EVAL_SEMANTIC_MODEL : undefined,
   });
   const drill = createDrill({ source, gate, limits });
-  const searchTool = search(client, unscoped, true, limits, {
+  const searchTool = search(source, true, limits, {
     gate,
     store,
     cards,
@@ -191,7 +191,7 @@ export function makeDegradedEvalSearch(corpus: EvalCorpus = makeEvalCorpus()): {
   searchTool: ToolDefinition;
 } {
   setStrictNoLimitMessages(true);
-  const { client, unscoped, source } = makeEvalClients(corpus);
+  const { source } = makeEvalClients(corpus);
   const gate = createFetchGate({ concurrency: TEST_LIMITS.concurrency });
   const liteCards = cardsLiteFromSessions(corpus.globalSessions);
   const cards = createCardsRuntime({
@@ -199,7 +199,7 @@ export function makeDegradedEvalSearch(corpus: EvalCorpus = makeEvalCorpus()): {
   });
   const drill = createDrill({ source, gate, limits: TEST_LIMITS });
   const deps: SearchDeps = { gate, store: null, cards, drill };
-  const searchTool = search(client, unscoped, true, TEST_LIMITS, deps);
+  const searchTool = search(source, true, TEST_LIMITS, deps);
   return { searchTool };
 }
 
