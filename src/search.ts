@@ -3120,9 +3120,9 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
         // An unreadable history source (v2: opencode.db unavailable) cannot be
         // drilled or swept. The selected sessions are still searched, through
         // their cards: the card drill builds each session's pool from its
-        // title and first request, and the ordinary
-        // routes rank, filter and group those exactly as drilled parts.
-        // Results are card-quality; coverage.source and a warning say why.
+        // title and first request, and the ordinary routes rank, filter and
+        // group those exactly as drilled parts. Results are card-quality;
+        // coverage.source and a warning say why.
         const sourceUnavailable = source.unavailable;
         const activeDrill =
           sourceUnavailable === undefined

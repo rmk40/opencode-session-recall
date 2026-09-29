@@ -54,29 +54,30 @@ export type CardDrillFilters = {
   authorshipNarrowed: boolean;
 };
 
-type CardField = { key: string; text: string; role: "user" | "assistant"; time: number };
-
-function candidateOf(
+/** The one card field offered as a message: the summary head, a user
+ *  statement (the only field whose role the card records). */
+function summaryCandidate(
   target: DrillTarget,
   messageID: string,
-  field: CardField,
+  text: string,
+  time: number,
 ): Candidate | undefined {
-  const text = field.text.trim();
-  if (!text) return undefined;
+  const trimmed = text.trim();
+  if (!trimmed) return undefined;
   const candidate: Candidate = {
     sessionID: target.sessionId,
     sessionTitle: target.title,
     directory: target.directory,
     messageID,
-    role: field.role,
-    time: field.time,
-    partID: `${target.sessionId}:card:${field.key}`,
+    role: "user",
+    time,
+    partID: `${target.sessionId}:card:summary`,
     partType: "text",
     isPruned: false,
     sessionParentID: target.parentID,
-    rawText: text,
-    fieldTexts: [{ field: "text", text }],
-    tokens: tokenize(text),
+    rawText: trimmed,
+    fieldTexts: [{ field: "text", text: trimmed }],
+    tokens: tokenize(trimmed),
     source: "message",
     why: { matchedFields: [], confidence: "low" },
   };
@@ -92,22 +93,15 @@ function cardCandidates(
   const card = cards.get(target.sessionId);
   if (!card) return [];
   const { filters } = narrow;
-  const messageID = card.distilledThrough ?? `${card.sessionId}:card`;
   const summaryAllowed =
     (filters.role === "all" || filters.role === "user") &&
     filters.type === "all" &&
     !filters.toolName &&
     !narrow.authorshipNarrowed;
-  const fields: CardField[] = [];
-  if (summaryAllowed) {
-    fields.push({ key: "summary", text: card.summaryHead, role: "user", time: card.timeCreated });
-  }
-  const out: Candidate[] = [];
-  for (const field of fields) {
-    const candidate = candidateOf(target, messageID, field);
-    if (candidate) out.push(candidate);
-  }
-  return out;
+  if (!summaryAllowed) return [];
+  const messageID = card.distilledThrough ?? `${card.sessionId}:card`;
+  const candidate = summaryCandidate(target, messageID, card.summaryHead, card.timeCreated);
+  return candidate ? [candidate] : [];
 }
 
 /** The session title as a standalone candidate: no message behind it, so it

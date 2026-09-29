@@ -29,8 +29,10 @@ All notable changes to this project are documented here. This project follows
     streaming, rewritten or reverted session is re-read rather than
     appended to.
   - When `opencode.db` cannot be read, responses say why in
-    `coverage.source`, `recall` answers from the session cards alone,
-    and the message-reading tools return the reason as their error.
+    `coverage.source`, `recall` answers from the session cards alone
+    (a selected session whose card has nothing to offer counts under
+    `coverage.skippedByReason.noCardCandidate`), and the message-reading
+    tools return the reason as their error.
     That holds when the file is missing or its path cannot be resolved
     too: a store stamped for the same file is opened for its cards,
     without being re-stamped or distilled into.
