@@ -281,6 +281,34 @@ describe("v2 setup", () => {
     }
   });
 
+  it("logs the channel fallback once per process, even across module re-evaluations", async () => {
+    const lines: string[] = [];
+    const sink = Object.assign((line: string) => void lines.push(line), {
+      flush: async () => {},
+    });
+    setV2LogSinkForTests(sink);
+    const channelLines = () => lines.filter((l) => l.includes("ctx.app.channel is missing"));
+    try {
+      const a = host();
+      (a.ctx as { app?: unknown }).app = {};
+      await setup(a);
+      expect(channelLines()).toHaveLength(1);
+      // opencode v2 re-evaluates a local plugin module per location.
+      vi.resetModules();
+      const freshHost = await import("../src/host/v2.js");
+      freshHost.setV2LogSinkForTests(sink);
+      const fresh = (await import("../src/opencode-session-recall.js")).default;
+      const b = host({ directory: "/workspace/other", projectID: "prj_other" });
+      (b.ctx as { app?: unknown }).app = {};
+      const cleanupB = await fresh.setup(b.ctx);
+      if (cleanupB) cleanups.push(cleanupB);
+      expect(channelLines()).toHaveLength(1);
+      freshHost.setV2LogSinkForTests(undefined);
+    } finally {
+      setV2LogSinkForTests(undefined);
+    }
+  });
+
   it("stops reading events after cleanup", async () => {
     const h = host();
     const cleanup = await setup(h);

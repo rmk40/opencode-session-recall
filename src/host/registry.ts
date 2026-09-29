@@ -18,6 +18,9 @@ export type Registry = {
   v1ServerActive?: boolean;
   /** Owned by `host/runtime.ts`. */
   runtimes?: unknown;
+  /** Set once the v2 entry has logged that `ctx.app.channel` was missing
+   *  (once per process, across module re-evaluations). */
+  channelFallbackLogged?: boolean;
 };
 
 /** The shared registry, created on first use. */

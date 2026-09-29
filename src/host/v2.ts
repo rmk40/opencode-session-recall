@@ -88,8 +88,6 @@ export function setV2LogSinkForTests(sink: FileSink | undefined): void {
 /** One deadline for an instance cleanup: the runtime detach and the log
  *  flush run concurrently under it. */
 export const CLEANUP_WAIT_MS = 3_000;
-/** Whether the missing-channel fallback was logged (once per process). */
-let channelFallbackLogged = false;
 
 function isFunction(value: unknown): boolean {
   return typeof value === "function";
@@ -247,8 +245,10 @@ async function start(ctx: V2PluginContext): Promise<V2Cleanup> {
   };
   let channel = "latest";
   if (typeof ctx.app?.channel === "string") channel = ctx.app.channel;
-  else if (!channelFallbackLogged) {
-    channelFallbackLogged = true;
+  else if (registry().channelFallbackLogged !== true) {
+    // On the registry, not the module: v2 re-evaluates this module per
+    // location and reload, so module state would log once per location.
+    registry().channelFallbackLogged = true;
     v2Log('ctx.app.channel is missing; assuming "latest" to locate opencode.db');
   }
   const attachment = attachRuntime(
