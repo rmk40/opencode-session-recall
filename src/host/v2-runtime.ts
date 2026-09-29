@@ -24,6 +24,8 @@ import type { HistorySession } from "../history/model.js";
 import { createUnavailableSource, type HistorySource } from "../history/source.js";
 import { createV2HistorySource, openOpencodeDb } from "../history/v2.js";
 import { opencodeDbPath } from "../history/v2-path.js";
+import { createV2Sync, type V2SyncOptions } from "../history/v2-sync.js";
+import { createV2EventMapper } from "../history/v2-events.js";
 import type { SearchDeps, SemanticSearchConfig } from "../search.js";
 import type { SessionEnrichment } from "../sessions.js";
 import type { ResolvedOptions } from "../options.js";
@@ -86,6 +88,10 @@ export type V2RuntimeInputs = {
   /** `ctx.app.channel` of the attaching instance (process-wide). */
   channel: string;
   log: (message: string) => void;
+  /** Test affordance: poll timing and the like. */
+  sync?: V2SyncOptions;
+  /** Test affordance: the distiller's idle debounce. */
+  idleDebounceMs?: number;
 };
 
 /** The runtime-shaping values an attaching instance compares. */
@@ -313,6 +319,7 @@ async function createV2Runtime(
     globalThis.crypto?.randomUUID?.() ??
     `recall-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 
+  const macrotask = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0));
   const distiller = createDistiller({
     source: globalSource,
     // No history, no distilling: the distiller does not start.
@@ -324,8 +331,14 @@ async function createV2Runtime(
     gen: EMBED_REPRESENTATION,
     discover,
     log,
+    // The poll, checkpoints and deletion reconcile keep the store fresh with
+    // no events at all; the yields keep long passes off the shared loop.
+    ...(opencodeDb && { sync: createV2Sync(opencodeDb, inputs.sync) }),
+    yieldBetween: macrotask,
+    ...(inputs.idleDebounceMs !== undefined && { idleDebounceMs: inputs.idleDebounceMs }),
   });
   if (limits.coldPass) distiller.start();
+  const mapper = createV2EventMapper({ emit: (signal) => distiller.onEvent(signal) });
 
   const liteRefreshHook = liteRefresh;
   const deps: SearchDeps = {
@@ -367,11 +380,12 @@ async function createV2Runtime(
     onEvent(event) {
       if (disposed) return;
       if (typeof event?.id === "string" && !freshEvent(event.id)) return;
-      // Signals are mapped in history/v2-events.ts (wired with the poll).
+      mapper.map(event);
     },
     dispose() {
       if (disposePromise) return disposePromise;
       disposed = true;
+      mapper.dispose();
       distiller.quiesce();
       cards.dispose();
       disposePromise = (async () => {

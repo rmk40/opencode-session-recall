@@ -18,6 +18,8 @@ import type {
 
 /** An async iterable tests push events into; `end()` finishes it. */
 export type EventStream = AsyncIterable<V2Event> & {
+  /** One subscription; aborting `signal` ends it, as the real host does. */
+  subscribe(signal?: AbortSignal): AsyncIterable<V2Event>;
   push(event: V2Event): void;
   end(): void;
   /** How many subscribers are currently iterating. */
@@ -26,7 +28,7 @@ export type EventStream = AsyncIterable<V2Event> & {
 
 export function eventStream(): EventStream {
   const listeners = new Set<(event: V2Event | null) => void>();
-  return {
+  const stream: EventStream = {
     push(event) {
       for (const listener of listeners) listener(event);
     },
@@ -35,6 +37,15 @@ export function eventStream(): EventStream {
     },
     get active() {
       return listeners.size;
+    },
+    subscribe(signal) {
+      return {
+        [Symbol.asyncIterator]: () => {
+          const iterator = stream[Symbol.asyncIterator]();
+          signal?.addEventListener("abort", () => void iterator.return?.(), { once: true });
+          return iterator;
+        },
+      };
     },
     [Symbol.asyncIterator]() {
       const queue: Array<V2Event | null> = [];
@@ -57,11 +68,14 @@ export function eventStream(): EventStream {
         },
         async return(): Promise<IteratorResult<V2Event>> {
           listeners.delete(listener);
+          queue.push(null);
+          wake?.();
           return { done: true, value: undefined };
         },
       };
     },
   };
+  return stream;
 }
 
 export type FakeV2Host = {
@@ -129,7 +143,7 @@ export function fakeV2Host(opts: FakeV2HostOptions = {}): FakeV2Host {
       },
     },
     options: opts.options ?? {},
-    event: { subscribe: () => events },
+    event: { subscribe: (options) => events.subscribe(options?.signal) },
     session: {
       hook: (name, callback) => {
         const list = hooks.get(name as string) ?? [];

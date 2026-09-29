@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -145,5 +145,43 @@ describe("v2 setup", () => {
     expect(e).not.toBe(p);
     expect(e.store).toBeNull();
     expect(e.deps.mode).toBe("ephemeral");
+  });
+
+  it("forwards each bus event to the distiller once, however many locations deliver it", async () => {
+    const a = host();
+    const b = host({ directory: "/workspace/other", projectID: "prj_other" });
+    setup(a);
+    setup(b);
+    const runtime = await runtimeOf(a);
+    const onEvent = vi.spyOn(runtime.distiller, "onEvent");
+    const renamed = {
+      id: "evt_1",
+      type: "session.renamed",
+      data: { sessionID: "ses_a", title: "Renamed" },
+    };
+    // Delivery is global today: both locations see the same event.
+    a.events.push(renamed);
+    b.events.push(renamed);
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(onEvent).toHaveBeenCalledTimes(1);
+    expect(onEvent).toHaveBeenCalledWith({
+      type: "meta",
+      sessionID: "ses_a",
+      patch: { title: "Renamed" },
+    });
+    a.events.push({ ...renamed, id: "evt_2" });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    expect(onEvent).toHaveBeenCalledTimes(2);
+  });
+
+  it("stops reading events after cleanup", async () => {
+    const h = host();
+    const cleanup = setup(h);
+    await runtimeOf(h);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(h.events.active).toBe(1);
+    await cleanup();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(h.events.active).toBe(0);
   });
 });
