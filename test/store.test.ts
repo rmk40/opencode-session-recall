@@ -688,10 +688,44 @@ describe("store migration", () => {
     db.run("UPDATE meta SET value='5' WHERE key='schema_version'");
     db.close();
     await expectRefusal(path, "opencode-v1", "newer");
-    // Newer wins over the host check: the format itself is unknown.
-    await expectRefusal(path, "opencode-v2", "newer", {
+    // A foreign host stamp is checked before the schema stamp, so the other
+    // host is refused as a mismatch rather than as a newer format.
+    await expectRefusal(path, "opencode-v2", "host-mismatch", {
       source: "/data/opencode.db",
     });
+  });
+
+  it("refuses a foreign-stamped store with a missing or unparseable schema stamp", async () => {
+    // Without the stamp-first check these would fall through to a rebuild:
+    // the v1 host wiping the v2 host's store.
+    for (const damage of [
+      "DELETE FROM meta WHERE key='schema_version'",
+      "UPDATE meta SET value='not-a-number' WHERE key='schema_version'",
+    ]) {
+      const path = freshDbPath();
+      await buildV4Store(path, "opencode-v2", "/data/opencode.db");
+      const db = await openSqlite(path);
+      if (!db) throw new Error("reopen failed");
+      db.run(damage);
+      db.close();
+      await expectRefusal(path, "opencode-v1", "host-mismatch");
+    }
+  });
+
+  it("refuses a pre-fence schema stamp that carries a foreign host stamp", async () => {
+    const path = freshDbPath();
+    await buildV3Store(path);
+    const raw = await openSqlite(path);
+    if (!raw) throw new Error("reopen failed");
+    raw.run("INSERT INTO meta(key, value) VALUES('store_host', 'opencode-v2')");
+    raw.close();
+
+    await expectRefusal(path, "opencode-v1", "host-mismatch");
+    const db = await openSqlite(path);
+    if (!db) throw new Error("reopen failed");
+    expect(rawMeta(db, "schema_version")).toBe("3");
+    expect(columnNames(db, "card")).not.toContain("distill_cursor");
+    db.close();
   });
 
   it("preserves data when reopening a store already at the current version", async () => {

@@ -552,11 +552,15 @@ export function buildMatch(strong: string[], weak: string[]): string | null {
 
 // ── Schema management ────────────────────────────────────────────────────────
 
-function readSchemaVersion(db: SqliteDb): number | null {
-  const hasMeta = db.get(
-    "SELECT 1 AS present FROM sqlite_master WHERE type='table' AND name='meta'",
+function hasMetaTable(db: SqliteDb): boolean {
+  return (
+    db.get("SELECT 1 AS present FROM sqlite_master WHERE type='table' AND name='meta'") !==
+    undefined
   );
-  if (!hasMeta) return null;
+}
+
+function readSchemaVersion(db: SqliteDb): number | null {
+  if (!hasMetaTable(db)) return null;
   const value = readMetaValue(db, SCHEMA_VERSION_KEY);
   if (value === undefined) return null;
   const parsed = Number(value);
@@ -647,6 +651,15 @@ function migrateV3ToV4(db: SqliteDb): void {
   stampVersion(db, 4);
 }
 
+/** The identity stamps, if the file has a `meta` table at all. */
+function readStampedIdentity(db: SqliteDb): { host?: string; source?: string } {
+  if (!hasMetaTable(db)) return {};
+  return {
+    host: readMetaValue(db, STORE_HOST_KEY),
+    source: readMetaValue(db, SOURCE_DB_KEY),
+  };
+}
+
 /**
  * The host fence for a store at a known schema version. A pre-fence store
  * (`legacy`, schema 1-3) implies {@link LEGACY_HOST}; a v4 store must carry an
@@ -671,9 +684,12 @@ function checkIdentity(
  * transaction, and only then switches an accepted store to WAL.
  *
  * Refuses, leaving the file untouched (no migration, no rebuild, no write), when
- * the schema stamp is newer than this build, when another host owns the store
- * (checked before any migration, so a v2-host opener never upgrades a v1
- * store), or when the store was distilled from a different `opts.source`. Any
+ * another host owns the store, when the store was distilled from a different
+ * `opts.source`, or when the schema stamp is newer than this build. A host
+ * stamp is checked first, before the schema stamp is even read, so a store
+ * stamped for another host is refused whatever its schema state; a pre-fence
+ * (schema 1-3) store without a stamp implies the v1 host, so a v2-host opener
+ * never upgrades a v1 store. Any
  * unexpected failure is refused as `error`. Refusals never rebuild: rebuilding
  * would make two hosts sharing one file wipe each other on every start. An
  * absent stamp or a foreign layout is still dropped and rebuilt for `host`.
@@ -684,6 +700,14 @@ export function openStore(db: SqliteDb, host: StoreHost, opts?: StoreOptions): O
   try {
     db.exec(PRE_FENCE_PRAGMAS);
     const outcome = db.tx((): "ok" | StoreRefusal => {
+      // Stamp first: a store that names another owner is refused before its
+      // schema stamp is read, so no schema state (missing, unparseable, or
+      // pre-fence) can lead to rebuilding or migrating another host's file.
+      const stamped = readStampedIdentity(db);
+      if (stamped.host !== undefined) {
+        if (stamped.host !== host) return "host-mismatch";
+        if (stamped.source !== source) return "source-mismatch";
+      }
       const current = readSchemaVersion(db);
       // Newer than this build understands: refuse (degrade), never misread it.
       if (current !== null && current > SCHEMA_VERSION) return "newer";
