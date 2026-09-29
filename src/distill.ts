@@ -140,10 +140,15 @@ export const COLD_PASS_COMPLETE_KEY = "coldpass_complete";
 export const COLD_PASS_PROGRESS_KEY = "coldpass_progress";
 /** The holder writes {@link COLD_PASS_PROGRESS_KEY} at most this often. */
 export const PROGRESS_WRITE_MS = 2_000;
-/** A completed pass that left sessions skipped arms one more pass after
- *  `coldPassRetryMs` times this, so a host-wide fetch outage that skipped
- *  everything recovers once the host heals. */
+/** A completed pass that leaves sessions skipped arms another pass after
+ *  `coldPassRetryMs` times this, doubling with each consecutive pass that
+ *  indexes none of them, up to {@link SKIPPED_RETRY_MAX_FACTOR} (10 minutes
+ *  growing to 1 hour by default). It repeats until the skipped sessions heal,
+ *  are deleted or leave discovery, so a host-wide fetch outage that skipped
+ *  everything recovers once the host heals. Progress (a skipped session
+ *  fetched, or a pass ending with none skipped) resets it to the base. */
 const SKIPPED_RETRY_FACTOR = 10;
+const SKIPPED_RETRY_MAX_FACTOR = 60;
 /** Skipped sessions a pass logs one line each for; the rest are counted in
  *  one line at the end of the pass. */
 const SKIP_LOG_LIMIT = 3;
@@ -970,6 +975,19 @@ export function createDistiller(options: DistillerOptions): Distiller {
     }
   }
 
+  /** Delay before the next pass for skipped sessions; see
+   *  {@link SKIPPED_RETRY_FACTOR}. */
+  let skippedRetryMs = coldPassRetryMs * SKIPPED_RETRY_FACTOR;
+
+  /** A session fetched or found current: clear its strikes, and if it was
+   *  skipped, that is progress, so the skipped-pass backoff starts over. */
+  function clearStrikesOnSuccess(sessionId: string): void {
+    if ((coldPassFetchFailures.get(sessionId) ?? 0) >= MAX_COLD_PASS_FETCH_FAILURES) {
+      skippedRetryMs = coldPassRetryMs * SKIPPED_RETRY_FACTOR;
+    }
+    setStrikes(sessionId, undefined);
+  }
+
   /** One more strike for a session whose fetch failed; returns the count. */
   function bumpFetchFailure(sessionId: string): number {
     const strikes = (coldPassFetchFailures.get(sessionId) ?? 0) + 1;
@@ -1596,7 +1614,7 @@ export function createDistiller(options: DistillerOptions): Distiller {
             return;
           }
           consecutiveFailures = 0;
-          setStrikes(session.id, undefined);
+          clearStrikesOnSuccess(session.id);
 
           let card: Card;
           let rows: PartTextRow[];
@@ -1639,7 +1657,7 @@ export function createDistiller(options: DistillerOptions): Distiller {
           distilledCount = distilled; // status counts only sessions actually distilled
         } else {
           // Indexed and current (perhaps by another holder): not failing.
-          setStrikes(session.id, undefined);
+          clearStrikesOnSuccess(session.id);
         }
         countExamined(session);
       };
@@ -1717,11 +1735,15 @@ export function createDistiller(options: DistillerOptions): Distiller {
             : retryFailure;
         scheduleColdPassRetry(true);
       } else if (skippedSessions > 0) {
-        // Skipped sessions are not retried by follow-ups. One more pass on a
-        // long backoff tries them again, so a host-wide fetch outage that
-        // skipped everything recovers when the host heals.
-        scheduleColdPassRetry(true, coldPassRetryMs * SKIPPED_RETRY_FACTOR);
+        // Skipped sessions are not retried by follow-ups. Another pass on a
+        // long backoff tries them again, and again (doubling, capped) while
+        // none of them heals, until they heal, are deleted or leave
+        // discovery; a host-wide fetch outage recovers when the host heals.
+        scheduleColdPassRetry(true, skippedRetryMs);
+        skippedRetryMs = Math.min(skippedRetryMs * 2, coldPassRetryMs * SKIPPED_RETRY_MAX_FACTOR);
       }
+      // No session left skipped: the next skipped-only run starts at the base.
+      if (skippedSessions === 0) skippedRetryMs = coldPassRetryMs * SKIPPED_RETRY_FACTOR;
     } catch (error) {
       lastError = errmsg(error);
       coldPassState = "idle"; // resumable: per-card skip resumes on the next run
@@ -1929,7 +1951,7 @@ export function createDistiller(options: DistillerOptions): Distiller {
         if (stored && stored.rootId !== sessionID) recomputeRootRollup(stored.rootId);
         succeeded = true;
         reDistillFailures.delete(sessionID);
-        setStrikes(sessionID, undefined); // it fetched fine: no longer failing
+        clearStrikesOnSuccess(sessionID); // it fetched fine: no longer failing
         options.onSessionDistilled?.(sessionID);
       }
     } catch (error) {

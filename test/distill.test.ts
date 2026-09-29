@@ -1427,6 +1427,56 @@ describe("cold pass", () => {
     db.close();
   });
 
+  it("grows the skipped-pass backoff while nothing heals, and resets it on progress", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    try {
+      const R = 1_000; // coldPassRetryMs: the backoff runs 10R, 20R, 40R, 60R, 60R
+      const { graph, failTimes } = failingGraph([
+        { id: "ok" },
+        { id: "a", bad: true },
+        { id: "b", bad: true },
+      ]);
+      const { source } = makeDistillFake(graph, { failTimes });
+      const discoveries: number[] = [];
+      const { db, store } = await freshStore();
+      const distiller = createDistiller({
+        source,
+        store,
+        gate: makeSpyGate().gate,
+        limits: { ...TEST_LIMITS, distillConcurrency: 1 },
+        instanceId: "backoff",
+        coldPassRetryMs: R,
+        discover: async () => {
+          discoveries.push(Date.now());
+          const listing = await source.listSessions({ scope: "project", limit: 100 });
+          if (!listing.ok) throw new Error(listing.error);
+          return listing.items;
+        },
+        log: () => {},
+      });
+      distiller.start();
+      let healed = false;
+      for (let steps = 0; discoveries.length < 10 && steps < 500; steps++) {
+        await vi.advanceTimersToNextTimerAsync();
+        // After pass 7, a heals: pass 8 indexes it (progress) while b stays.
+        if (!healed && discoveries.length === 7 && distiller.status().coldPass === "done") {
+          failTimes.a = 0;
+          healed = true;
+        }
+      }
+      expect(discoveries).toHaveLength(10);
+      const gaps = discoveries.slice(1).map((t, i) => (t - discoveries[i]!) / R);
+      // Passes 1-3 strike (follow-ups at R); then skipped-only passes back
+      // off 10, 20, 40, 60, 60; a's recovery in pass 8 resets it: 10, 20.
+      expect(gaps).toEqual([1, 1, 10, 20, 40, 60, 60, 10, 20]);
+      expect(store.getCard("a")?.distillState).toBe("full");
+      await distiller.stop();
+      db.close();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("ends a first build under a host-wide fetch outage unstamped, with a long-backoff pass", async () => {
     const order = Array.from({ length: 6 }, (_, i) => ({ id: `s${i}`, bad: true }));
     const { graph, failTimes } = failingGraph(order);
