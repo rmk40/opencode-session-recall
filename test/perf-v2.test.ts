@@ -25,8 +25,9 @@
  * the derivation yields cooperatively (deriveCardCooperative). The poll
  * peaks near 3 ms and listSessions under 12 ms. Before the cooperative
  * derivation the cold pass peaked at 93 to 153 ms. The append of 200 rows to
- * a 4,002-part session peaks at 37.6 ms, set by its one appendSessionParts
- * transaction (35.7 ms); the whole append takes about 106 ms.
+ * a 4,002-part session peaks at 37.6 to 41.3 ms, set by its one
+ * appendSessionParts transaction (36 to 39 ms); the whole append takes about
+ * 110 ms.
  */
 import { describe, expect, it } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
