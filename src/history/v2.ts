@@ -251,16 +251,30 @@ export function malformedNote(reason: string): string {
 
 /**
  * Minimal data for a placeholder row of `type`, shaped so the projector yields
- * one text part carrying `note`. User-role types project as a plain user
- * message; assistant and compaction rows keep their role.
+ * one part carrying `note` in the row's own shape, so its role and authorship
+ * are what the loaded row's would be: assistant and compaction text, a
+ * synthetic (injected) text for `synthetic`, a completed `skill` or `shell`
+ * tool part (injected, with an empty input) for those, and plain user text
+ * for `user`.
  */
 function placeholderData(
   type: string,
   note: string,
 ): { type: string; data: Record<string, unknown> } {
-  if (type === "assistant") return { type, data: { content: [{ type: "text", text: note }] } };
-  if (type === "compaction") return { type, data: { status: "completed", summary: note } };
-  return { type: "user", data: { text: note } };
+  switch (type) {
+    case "assistant":
+      return { type, data: { content: [{ type: "text", text: note }] } };
+    case "compaction":
+      return { type, data: { status: "completed", summary: note } };
+    case "synthetic":
+      return { type, data: { text: note } };
+    case "skill":
+      return { type, data: { skill: "", name: "", text: note } };
+    case "shell":
+      return { type, data: { status: "exited", exit: 0, output: { output: note } } };
+    default:
+      return { type: "user", data: { text: note } };
+  }
 }
 
 /** Longest identity field (agent, model id/provider/variant) read in SQL. */

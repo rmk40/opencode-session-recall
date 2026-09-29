@@ -502,7 +502,9 @@ export function projectMessage(
     case "shell": {
       const start = row.time_created;
       const end = num(time.completed, start);
-      const input = { command: str(data.command) };
+      // A real row always has `command`; only a source placeholder omits it,
+      // and gets an empty input so no pseudo-command is indexed.
+      const input: Obj = typeof data.command === "string" ? { command: data.command } : {};
       const output = str(obj(data.output).output);
       const status = str(data.status);
       let state: ToolState;

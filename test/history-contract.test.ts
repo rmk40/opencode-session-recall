@@ -2,7 +2,9 @@ import { afterAll, afterEach, describe, expect, it } from "vitest";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { Part } from "@opencode-ai/sdk/v2";
 import type { HistoryMessage } from "../src/history/model.js";
+import { classifyAuthorship } from "../src/authorship.js";
 import { MalformedSessionError, type HistorySource } from "../src/history/source.js";
 import {
   checkV2Schema,
@@ -527,6 +529,46 @@ describe("v2 history source", () => {
     // Two statement yields, plus two while decoding and two while projecting
     // (after rows 25 and 50 of each loop).
     expect(yields.calls).toBe(6);
+  });
+
+  it("keeps a placeholder's role and authorship for synthetic, skill and shell rows", async () => {
+    const t = await fresh();
+    session(t, "ses_auth");
+    const big = "b".repeat(5_000);
+    const synthetic = message(t, "ses_auth", "synthetic", text(big));
+    const skill = message(t, "ses_auth", "skill", { skill: "sk", name: "n", text: big });
+    const shell = message(t, "ses_auth", "shell", {
+      command: "cat huge.log",
+      status: "exited",
+      exit: 0,
+      output: { output: big },
+    });
+    const { source } = await capped(t);
+    const page = await source.messagePage({ sessionID: "ses_auth", limit: 10 });
+    expect(page.items.map((m) => m.info.id)).toEqual([shell, skill, synthetic]);
+    const [shellPart, skillPart, syntheticPart] = page.items.map((m) => m.parts[0]!);
+    const authorship = (part: Part) =>
+      classifyAuthorship({
+        partType: part.type,
+        role: "user",
+        synthetic: part.type === "text" ? part.synthetic : undefined,
+        parentID: null,
+      });
+    expect(syntheticPart).toMatchObject({ type: "text", synthetic: true });
+    expect(skillPart).toMatchObject({
+      type: "tool",
+      tool: "skill",
+      state: { status: "completed" },
+    });
+    expect(shellPart).toMatchObject({
+      type: "tool",
+      tool: "shell",
+      state: { status: "completed", input: {} },
+    });
+    for (const part of [syntheticPart!, skillPart!, shellPart!]) {
+      expect(authorship(part)).toBe("injected");
+    }
+    expect(JSON.stringify(page.items)).not.toContain("bbbb");
   });
 
   it("lets the distiller card a session past an oversized row, indexing the placeholder", async () => {
