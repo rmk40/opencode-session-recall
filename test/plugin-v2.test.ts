@@ -361,6 +361,45 @@ describe("v2 tools and hooks", () => {
     expect(out.ok).toBe(true);
   });
 
+  it("global:false keeps queries to the instance's project; the distiller still sees every project", async () => {
+    const h = host({ options: { global: false } });
+    await setup(h);
+    await runtimeOf(h);
+    expect(await call(h, "recall_sessions", { scope: "global" })).toEqual({
+      ok: false,
+      error: "Global scope disabled via plugin option: global: false",
+    });
+    const project = await call(h, "recall_sessions", { scope: "project" });
+    expect(project.ok).toBe(true);
+  });
+
+  it("persistent mode distills opencode.db and recall finds content through the cards", async () => {
+    const h = host({ options: { coldPass: true } });
+    await setup(h);
+    const runtime = await runtimeOf(h);
+    await waitUntil(() => runtime.distiller.status().coldPass === "done");
+    expect(runtime.store?.getCard("ses_a")?.distillState).toBe("full");
+    const out = await call(h, "recall", { query: "orchidneedle", scope: "global" }, "ses_new");
+    expect(out.ok).toBe(true);
+    expect((out.coverage as { cards: { full: number } }).cards.full).toBe(2);
+    expect((out.results as Array<{ sessionID: string }>)[0]?.sessionID).toBe("ses_a");
+  });
+
+  it("ephemeral mode serves cards-lite from session_v2 and drills content live", async () => {
+    const h = host({ options: { mode: "ephemeral" } });
+    await setup(h);
+    const runtime = await runtimeOf(h);
+    expect(runtime.store).toBeNull();
+    await waitUntil(() => runtime.cards.coverage().totalCards === 2);
+    // Called from another session: recall excludes the caller's own family.
+    const out = await call(h, "recall", { query: "orchidneedle", scope: "project" }, "ses_new");
+    expect(out.ok).toBe(true);
+    expect((out.coverage as { mode?: string }).mode).toBe("ephemeral");
+    expect((out.results as Array<{ sessionID: string }>).map((r) => r.sessionID)).toContain(
+      "ses_a",
+    );
+  });
+
   it("is inert after cleanup: tools report disposal and hooks do nothing", async () => {
     const h = host();
     const cleanup = await setup(h);
