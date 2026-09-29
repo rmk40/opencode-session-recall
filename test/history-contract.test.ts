@@ -11,7 +11,13 @@ import {
   encodeV2Cursor,
   openOpencodeDb,
 } from "../src/history/v2.js";
-import { makeFakeHarness, openV1Store, PROJECT_DIR, TEST_LIMITS } from "./helpers.js";
+import {
+  makeFakeHarness,
+  openV1Store,
+  PROJECT_DIR,
+  setStrictNoLimitMessages,
+  TEST_LIMITS,
+} from "./helpers.js";
 import { openSqlite } from "../src/sqlite.js";
 import { createDistiller } from "../src/distill.js";
 import { createFetchGate } from "../src/fetch-gate.js";
@@ -52,11 +58,14 @@ function chronoIds(bundles: HistoryMessage[]): string[] {
 }
 
 async function v1Adapter(): Promise<Adapter> {
+  // The v1 leg's counterpart of the v2 LIMIT spy: the fake client throws on
+  // any session.messages call without a limit.
+  setStrictNoLimitMessages(true);
   const h = makeFakeHarness();
   const ids = Object.fromEntries(
     Object.entries(h.messagesBySession).map(([id, bundles]) => [id, chronoIds(bundles)]),
   );
-  return { source: h.source, ids, cleanup: () => {} };
+  return { source: h.source, ids, cleanup: () => setStrictNoLimitMessages(false) };
 }
 
 /** Open a written test db through the production read-only path and wrap it
