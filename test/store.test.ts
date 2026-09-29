@@ -10,6 +10,7 @@ import {
   type PartTextRow,
   type Store,
   type StoreIdentity,
+  type StoreOptions,
   type StoreRefusal,
 } from "../src/store.js";
 import { openV1Store } from "./helpers.js";
@@ -153,6 +154,7 @@ async function expectRefusal(
   path: string,
   identity: StoreIdentity,
   reason: StoreRefusal,
+  opts?: StoreOptions,
 ): Promise<void> {
   const probe = await openSqlite(path);
   if (!probe) throw new Error("probe open failed");
@@ -161,7 +163,7 @@ async function expectRefusal(
 
   const db = await openSqlite(path);
   if (!db) throw new Error("reopen failed");
-  expect(openStore(db, identity)).toEqual({ ok: false, reason });
+  expect(openStore(db, identity, opts)).toEqual({ ok: false, reason });
   expect(db.get("SELECT total_changes() AS n")?.n).toBe(0);
   expect(snapshot(db)).toEqual(before);
   db.close();
@@ -675,6 +677,37 @@ describe("store migration", () => {
       expect(store.getCard("s-v3")?.nlSummary).toBe("Linked the sprockets.");
       retry.close();
     }
+  });
+
+  it("existingOnly refuses, untouched, a store it would rebuild or migrate", async () => {
+    // Identity matches, but the schema stamp is damaged: the rebuilding
+    // open would drop every card.
+    const damaged = freshDbPath();
+    const seed = await openSqlite(damaged);
+    if (!seed) throw new Error("open failed");
+    const seeded = openStore(seed, v2("/data/opencode.db"));
+    if (!seeded.ok) throw new Error(seeded.reason);
+    seeded.store.upsertCard(makeCard("s1"));
+    seed.run("UPDATE meta SET value = 'garbage' WHERE key = 'schema_version'");
+    seed.close();
+    await expectRefusal(damaged, v2("/data/opencode.db"), "needs-rebuild", {
+      existingOnly: true,
+    });
+
+    // A pre-fence store for its own (v1) host would be migrated.
+    const legacy = freshDbPath();
+    await buildV3Store(legacy);
+    await expectRefusal(legacy, { host: "opencode-v1" }, "needs-migration", {
+      existingOnly: true,
+    });
+
+    // A current store opens as usual.
+    const current = freshDbPath();
+    const fresh = await openSqlite(current);
+    if (!fresh) throw new Error("open failed");
+    if (!openStore(fresh, v2("/data/opencode.db")).ok) throw new Error("seed refused");
+    expect(openStore(fresh, v2("/data/opencode.db"), { existingOnly: true }).ok).toBe(true);
+    fresh.close();
   });
 
   it("refuses a v3 store for the v2 host without migrating it", async () => {

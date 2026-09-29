@@ -165,12 +165,13 @@ async function fileExists(path: string): Promise<boolean> {
  * same file (both compared as real directory plus name). The store is opened
  * with the stamped string as its source identity, so the exact-string fence
  * matches and nothing is stamped; the caller must not distill into it.
- * Null (and nothing created or written) in every other case.
+ * Null (and nothing created or written) in every other case, with
+ * `refused` set when a matching store was refused by openStore.
  */
 async function openStampedStore(
   storePath: string,
   located: string,
-): Promise<{ db: SqliteDb; store: Store; stamped: string } | null> {
+): Promise<{ db: SqliteDb; store: Store; stamped: string } | { refused: string } | null> {
   if (storePath === ":memory:") return null;
   const logical = await logicalFilePath(located, null);
   if (logical === null || !(await fileExists(storePath))) return null;
@@ -182,8 +183,17 @@ async function openStampedStore(
     stamped.source !== undefined &&
     (await logicalFilePath(stamped.source, stamped.source)) === logical
   ) {
-    const opened = openStore(db, { host: STORE_HOST, source: stamped.source });
+    // Existing layout only: a store needing a migration or a rebuild is
+    // refused untouched, never rebuilt, since its cards cannot be rebuilt
+    // while the source is unavailable.
+    const opened = openStore(
+      db,
+      { host: STORE_HOST, source: stamped.source },
+      { existingOnly: true },
+    );
     if (opened.ok) return { db, store: opened.store, stamped: stamped.source };
+    closeQuietly(db);
+    return { refused: opened.reason };
   }
   closeQuietly(db);
   return null;
@@ -307,15 +317,18 @@ async function createV2Runtime(
   let cardsOnly = false;
   if (identity.store !== null && identity.source !== null && identity.sourceCanonical !== true) {
     const fallback = await openStampedStore(identity.store, identity.source);
-    if (fallback) {
+    if (fallback && "store" in fallback) {
       ({ db, store } = fallback);
       cardsOnly = true;
       log(
         `opencode database path ${identity.source} could not be canonicalized; serving cards from the store stamped for ${fallback.stamped}, without distilling`,
       );
     } else {
+      const refused = fallback?.refused
+        ? ` (the store stamped for it was refused: ${fallback.refused})`
+        : "";
       log(
-        `opencode database path ${identity.source} could not be canonicalized; running degraded without a store`,
+        `opencode database path ${identity.source} could not be canonicalized${refused}; running degraded without a store`,
       );
     }
   } else if (identity.store !== null && identity.source !== null) {

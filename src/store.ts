@@ -233,12 +233,20 @@ export type FtsHit = {
 export type StoreOptions = {
   /** Injectable clock for lease TTL logic; defaults to `Date.now`. */
   now?: () => number;
+  /** Open only a store already at the current schema: refuse
+   *  (`needs-migration` / `needs-rebuild`) instead of migrating or rebuilding
+   *  it, so the file is never written. For a caller that must keep existing
+   *  cards intact (the v2 card-only fallback, which cannot rebuild them). */
+  existingOnly?: boolean;
 };
 
 /** Why {@link openStore} refused a store; the caller degrades to cards-lite.
- *  The three fence refusals (`newer`, `host-mismatch`, `source-mismatch`) are
- *  non-writing: decided by reads alone, their transaction rolls back.
+ *  Every refusal but `error` is non-writing: decided by reads alone, its
+ *  transaction rolls back.
  *  - `newer`: the schema stamp is newer than this build understands.
+ *  - `needs-migration` / `needs-rebuild` (only with `existingOnly`): the
+ *    store is at an older schema, or has no valid schema stamp or layout,
+ *    so opening it would migrate or rebuild it.
  *  - `host-mismatch`: another host lane owns the store (or its host stamp is
  *    missing or unknown).
  *  - `source-mismatch`: the store was distilled from a different history
@@ -246,7 +254,13 @@ export type StoreOptions = {
  *  - `error`: the open, the schema check or a migration threw. The
  *    transaction's rollback undoes a partial migration, but unlike a fence
  *    refusal this is a failure path, not a decision made before any write. */
-export type StoreRefusal = "newer" | "host-mismatch" | "source-mismatch" | "error";
+export type StoreRefusal =
+  | "newer"
+  | "host-mismatch"
+  | "source-mismatch"
+  | "needs-migration"
+  | "needs-rebuild"
+  | "error";
 
 /** The refusals the fence decides; `error` is anything that threw instead. */
 type FenceRefusal = Exclude<StoreRefusal, "error">;
@@ -768,6 +782,9 @@ export function openStore(
       if (refusal) throw new StoreRefused(refusal);
       const current = readSchemaVersion(db);
       const legacy = current === 1 || current === 2 || current === 3;
+      if (opts?.existingOnly && current !== SCHEMA_VERSION) {
+        throw new StoreRefused(legacy ? "needs-migration" : "needs-rebuild");
+      }
       if (current === SCHEMA_VERSION || legacy) {
         // v1, v2 and v3 upgrade additively in place, keeping all data, each
         // chaining through every later step.

@@ -246,6 +246,13 @@ migration. A failed WAL switch after an accepted open is not a refusal at all: t
 store opens with `warning` set. The reset is manual: quit every opencode process
 sharing the store, delete the store file, restart.
 
+A matching identity is not enough when the caller cannot rebuild what a rebuild
+drops. The v2 card-only fallback (the store opened for its cards while
+`opencode.db` is missing or unreadable) passes `existingOnly: true`: a store that
+would be migrated or rebuilt (a missing or garbled `schema_version`, a legacy
+schema) refuses as `needs-migration` or `needs-rebuild` without writing, instead of
+losing its cards. Any new caller in that position must do the same.
+
 The stamp-first fence reads `meta.store_host` before it knows the schema, so **every
 future schema must keep the `meta(key, value)` table and the `store_host` key
 readable**. Today a renamed key falls through to the schema check (and refuses as

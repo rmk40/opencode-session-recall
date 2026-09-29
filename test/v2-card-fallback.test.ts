@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { chmodSync, mkdtempSync, realpathSync, rmSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, readFileSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { resetRuntimeRegistryForTests } from "../src/host/runtime.js";
@@ -46,7 +46,7 @@ vi.mock("../src/node-import.js", async (importOriginal) => {
 });
 
 const { default: entry } = await import("../src/opencode-session-recall.js");
-const { instanceOf } = await import("../src/host/v2.js");
+const { instanceOf, setV2LogSinkForTests } = await import("../src/host/v2.js");
 
 type Json = Record<string, unknown>;
 
@@ -207,6 +207,38 @@ describe("v2 card-only fallback for a source that cannot be canonicalized", () =
     await setup(h);
     await expectCardOnlyAnswers(h);
     expect((await storeMeta()).source_db).toBe(stamped);
+  });
+
+  it("refuses, untouched, a matching store whose schema stamp is damaged", async () => {
+    await buildStore();
+    // Damage the schema stamp: the rebuilding open would drop every card.
+    const raw = await openSqlite(storePath);
+    if (!raw) throw new Error("no sqlite");
+    raw.run("UPDATE meta SET value = 'garbage' WHERE key = 'schema_version'");
+    raw.exec("PRAGMA wal_checkpoint(TRUNCATE)");
+    raw.close();
+    const before = readFileSync(storePath);
+    v2db.db.close();
+    for (const suffix of ["", "-wal", "-shm"]) rmSync(v2db.path + suffix, { force: true });
+
+    const lines: string[] = [];
+    setV2LogSinkForTests(
+      Object.assign((line: string) => void lines.push(line), { flush: async () => {} }),
+    );
+    try {
+      const h = host();
+      await setup(h);
+      const runtime = await runtimeOf(h);
+      expect(runtime.store).toBeNull();
+      expect(
+        lines.some((l) => l.includes("the store stamped for it was refused: needs-rebuild")),
+      ).toBe(true);
+      await cleanups.splice(0).reduce((p, c) => p.then(() => c()), Promise.resolve());
+    } finally {
+      setV2LogSinkForTests(undefined);
+    }
+    expect(existsSync(`${storePath}-wal`) ? readFileSync(`${storePath}-wal`).length : 0).toBe(0);
+    expect(readFileSync(storePath).equals(before)).toBe(true);
   });
 
   it("degrades without a store when the store is stamped for another file", async () => {
