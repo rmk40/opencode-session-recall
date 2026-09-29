@@ -2,6 +2,7 @@ import type { OpencodeClient, Event, Part, Session } from "@opencode-ai/sdk/v2";
 import { errmsg, DISCOVERY_LIMIT, type Limits } from "./types.js";
 import { compareMessages, type HistoryMessage } from "./history/model.js";
 import { MalformedSessionError, type MessagePage } from "./history/source.js";
+import { fetchMessagePage, isNotFoundError } from "./history/v1.js";
 import type { Card, FamilyRollup, LeaseInfo, PartTextRow, Store } from "./store.js";
 import type { FetchGate } from "./fetch-gate.js";
 import { isSelfTool, toolNameMatches, pruned, isSummarizerTitle } from "./extract.js";
@@ -539,57 +540,10 @@ export function deriveCard(input: DeriveCardInput): DerivedCard {
 
 // ── Paginated fetch ──────────────────────────────────────────────────────────
 
+// The bounded page primitive lives in the v1 history adapter; re-exported here
+// so existing importers keep one stable path.
+export { fetchMessagePage };
 export type { MessagePage };
-
-/** Read `X-Next-Cursor` from a fields-style response's fetch `Response`, case-
- *  insensitively (native `Headers.get` folds case) and defensively (a missing
- *  response, headers, or getter yields null). */
-function readNextCursor(response: unknown): string | null {
-  if (!response || typeof response !== "object") return null;
-  const headers = (response as { headers?: unknown }).headers;
-  if (!headers || typeof headers !== "object") return null;
-  const get = (headers as { get?: unknown }).get;
-  if (typeof get !== "function") return null;
-  try {
-    const value = (get as (name: string) => unknown).call(headers, "X-Next-Cursor");
-    return typeof value === "string" && value.length > 0 ? value : null;
-  } catch {
-    return null;
-  }
-}
-
-/**
- * Fetch one page of a session's messages. ALWAYS sends `limit` — omitting it
- * triggers the legacy full-session fetch (the incident path) and `before`
- * without `limit` is a 400. The next-page cursor rides the `X-Next-Cursor`
- * header; the body is the `{ info, parts }` array. Throws on an SDK error so the
- * caller's try/catch handles fetch failures uniformly.
- *
- * A successful response whose body is not an array is ambiguous: the query path
- * (browse/context/drill) treats it as a deliberate "empty page, ok:true" — a
- * documented decision for sessions with no data — while the distiller passes
- * `strict: true` so its quarantine can distinguish a malformed session from an
- * empty one.
- */
-export async function fetchMessagePage(
-  client: OpencodeClient,
-  opts: { sessionID: string; limit: number; before?: string; strict?: boolean },
-): Promise<MessagePage> {
-  const params =
-    opts.before != null
-      ? { sessionID: opts.sessionID, limit: opts.limit, before: opts.before }
-      : { sessionID: opts.sessionID, limit: opts.limit };
-  const resp = await client.session.messages(params);
-  if (resp.error) throw new Error(errmsg(resp.error));
-  if (!Array.isArray(resp.data)) {
-    if (opts.strict) {
-      throw new MalformedSessionError("successful message response was not an array");
-    }
-    return { items: [], nextCursor: readNextCursor(resp.response) };
-  }
-  const items = resp.data as HistoryMessage[];
-  return { items, nextCursor: readNextCursor(resp.response) };
-}
 
 // ── The distiller ────────────────────────────────────────────────────────────
 
@@ -733,26 +687,6 @@ export function createDistiller(options: DistillerOptions): Distiller {
     // Never distill the summarizer's worker session — its prompts embed card
     // digests, which recall must not surface (see isSummarizerTitle).
     return sessions.map(toMeta).filter((meta) => !isSummarizerTitle(meta.title));
-  }
-
-  /** Whether an SDK error return means "session does not exist" (absence)
-   *  rather than a transport failure. `session.get`'s 404 body is the generic
-   *  `NotFoundError` discriminated by `name: "NotFoundError"` (SessionGetErrors
-   *  in the v2 typings) — that is the primary check. The `_tag:
-   *  "SessionNotFoundError"` shape belongs to OTHER endpoints' 404s and the
-   *  fields-style `response.status` is transport-level; both are kept as
-   *  belt-and-suspenders fallbacks. Any matching signal → absence. */
-  function isNotFoundError(error: unknown, response: unknown): boolean {
-    if (error && typeof error === "object") {
-      const shaped = error as { name?: unknown; _tag?: unknown };
-      if (shaped.name === "NotFoundError") return true;
-      if (shaped._tag === "SessionNotFoundError") return true;
-    }
-    return (
-      response != null &&
-      typeof response === "object" &&
-      (response as { status?: unknown }).status === 404
-    );
   }
 
   async function fetchSessionMeta(sessionID: string): Promise<DistillSessionMeta | null> {
