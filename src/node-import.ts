@@ -24,7 +24,10 @@ export type FsLike = {
     appendFile(path: string, data: string): Promise<void>;
   };
 };
-export type PathLike = { join(...parts: string[]): string };
+export type PathLike = {
+  join(...parts: string[]): string;
+  resolve(...parts: string[]): string;
+};
 export type OsLike = { homedir(): string };
 
 const NODE_FS: string = "node:fs";
