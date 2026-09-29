@@ -35,7 +35,9 @@ import type {
  *   the watermark moves only once the window is drained. So a page that
  *   fills up (more changed sessions than the page limit, or many sharing one
  *   timestamp inside the overlap) always moves forward on the next poll.
- *   Each window reads one page per turn: the message window one page per
+ *   Every `reconcileEveryMs` the poll also drops cards of sessions that are
+ *   gone from `session_v2`, so a deletion with no event is caught without a
+ *   new cold pass. Each window reads one page per turn: the message window one page per
  *   poll, the session scan one page per `sessionScanEveryMs`. A poll returns
  *   its watermark updates for the distiller to commit after it dispatched
  *   the signals, and a failing window is isolated from the other.
@@ -57,6 +59,9 @@ export type V2SyncOptions = {
   pollIntervalMs?: number;
   /** Minimum time between `session_v2` scans. Default 5 minutes. */
   sessionScanEveryMs?: number;
+  /** Minimum time between the poll's deletion reconciles (cards whose
+   *  session is gone from `session_v2`). Default 5 minutes. */
+  reconcileEveryMs?: number;
   /** Watermark overlap for rows committed after their timestamp. Default 5 s. */
   overlapMs?: number;
   /** A watermark older than this is clamped (the cold pass covers the rest).
@@ -142,6 +147,7 @@ function parseCheckpoint(stored: string | null | undefined): Checkpoint | null {
 export function createV2Sync(db: ReadOnlyDb, opts: V2SyncOptions = {}): DistillSync {
   const pollIntervalMs = opts.pollIntervalMs ?? 30_000;
   const sessionScanEveryMs = opts.sessionScanEveryMs ?? 300_000;
+  const reconcileEveryMs = opts.reconcileEveryMs ?? 300_000;
   const overlapMs = opts.overlapMs ?? 5_000;
   const maxLookbackMs = opts.maxLookbackMs ?? 3_600_000;
   const pollSessionLimit = opts.pollSessionLimit ?? 500;
@@ -424,5 +430,5 @@ export function createV2Sync(db: ReadOnlyDb, opts: V2SyncOptions = {}): DistillS
     };
   }
 
-  return { checkpoint, compare, missing, poll, pollIntervalMs };
+  return { checkpoint, compare, missing, poll, pollIntervalMs, reconcileEveryMs };
 }

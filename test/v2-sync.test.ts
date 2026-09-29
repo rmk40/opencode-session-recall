@@ -324,6 +324,24 @@ describe("v2 distiller freshness", () => {
     expect(hits("iotaneedle")).toEqual(["ses_1"]);
   });
 
+  it("removes a deleted session's card on the poll's reconcile, with no event and no cold pass", async () => {
+    const at = Date.now();
+    addSession("ses_1", at - 10_000);
+    addSession("ses_2", at - 10_000);
+    addRow("ses_1", "user", user("omeganeedle", at - 9_000), at - 9_000);
+    addRow("ses_2", "user", user("psineedle", at - 9_000), at - 9_000);
+    const d = startDistiller({ reconcileEveryMs: 30 });
+    await waitFor(() => d.status().coldPass === "done");
+    expect(store.getCard("ses_2")).toBeDefined();
+
+    v2db.db.run("DELETE FROM session_message WHERE session_id = ?", ["ses_2"]);
+    v2db.db.run("DELETE FROM session_v2 WHERE id = ?", ["ses_2"]);
+    await waitFor(() => store.getCard("ses_2") === undefined);
+    expect(hits("psineedle")).toEqual([]);
+    expect(store.getCard("ses_1")).toBeDefined();
+    expect(d.status().coldPass).toBe("done"); // no new cold pass ran
+  });
+
   it("removes cards of sessions opencode deleted, on the cold pass", async () => {
     const at = Date.now();
     addSession("ses_1", at - 10_000);

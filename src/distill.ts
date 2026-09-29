@@ -189,6 +189,9 @@ export type DistillSync = {
   /** One poll: signals for sessions that changed since its watermarks. */
   poll(meta: PollMeta): Promise<PollResult>;
   readonly pollIntervalMs: number;
+  /** How often the lease holder's poll also drops cards of sessions the host
+   *  no longer has ({@link DistillSync.missing}); the cold pass does it too. */
+  readonly reconcileEveryMs: number;
 };
 
 export type Distiller = {
@@ -808,6 +811,8 @@ export function createDistiller(options: DistillerOptions): Distiller {
    *  signal hundreds of sessions at once; at most `distillConcurrency`
    *  re-distills run at a time and the rest wait here, in signal order. */
   const reDistillQueue = new Set<string>();
+  /** When the deletions were last reconciled (the cold pass or the poll). */
+  let lastReconcileAt = Date.now();
   /** Consecutive failed re-distills of an unsettled session. Past
    *  {@link MAX_UNSETTLED_FAILURES} the session leaves the per-poll re-read
    *  set, so a session that always fails is not retried forever (a later
@@ -1430,7 +1435,10 @@ export function createDistiller(options: DistillerOptions): Distiller {
         coldPassState = "idle";
         return;
       }
-      if (sync) await reconcileDeletions();
+      if (sync) {
+        await reconcileDeletions();
+        lastReconcileAt = Date.now();
+      }
       if (stopped || !ownsLease()) {
         coldPassState = "idle";
         return;
@@ -1471,7 +1479,7 @@ export function createDistiller(options: DistillerOptions): Distiller {
       handleDeleted(id);
       removed++;
     }
-    if (removed > 0) logMsg(`cold pass removed ${removed} card(s) of deleted sessions`);
+    if (removed > 0) logMsg(`removed ${removed} card(s) of deleted sessions`);
   }
 
   function quarantine(session: DistillSessionMeta, error: unknown): void {
@@ -1698,6 +1706,13 @@ export function createDistiller(options: DistillerOptions): Distiller {
       }
       // Unsettled tails are re-read even when no row arrived.
       for (const sessionID of unsettled) scheduleReDistill(sessionID);
+      // Deletions made with no event (or while no process held the lease)
+      // are caught on a slow cadence, not only by the next cold pass. A
+      // running cold pass reconciles on its own at its end.
+      if (coldPassState !== "running" && Date.now() - lastReconcileAt >= sync.reconcileEveryMs) {
+        lastReconcileAt = Date.now();
+        await reconcileDeletions();
+      }
     } catch (error) {
       lastError = errmsg(error);
       logMsg(`poll failed: ${lastError}`);

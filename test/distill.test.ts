@@ -2011,6 +2011,7 @@ describe("sync-host re-distill fan-out", () => {
         return { signals, commit: () => {}, failures: [] };
       },
       pollIntervalMs: 5,
+      reconcileEveryMs: 1e12,
     };
     const { db, store } = await freshStore();
     const distiller = createDistiller({
@@ -2064,6 +2065,7 @@ describe("sync-host re-distill queue across a lease handoff", () => {
         return { signals, commit: () => {}, failures: [] };
       },
       pollIntervalMs: 5,
+      reconcileEveryMs: 1e12,
     };
     const { db, store } = await freshStore();
     const distiller = createDistiller({
@@ -2124,6 +2126,7 @@ describe("sync-host unsettled retries", () => {
       missing: async () => [],
       poll: async () => ({ signals: [], commit: () => {}, failures: [] }),
       pollIntervalMs: 3,
+      reconcileEveryMs: 1e12,
     };
     const { db, store } = await freshStore();
     const distiller = createDistiller({
