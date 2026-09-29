@@ -293,7 +293,7 @@ export type Distiller = {
    * The cold pass's progress, for queries to report, while the store is
    * really incomplete: no pass has ever completed on this store
    * ({@link COLD_PASS_COMPLETE_KEY}) and more sessions are known than the
-   * store has cards. Undefined otherwise, so a re-verify pass over a complete
+   * store has cards (`indexed`). Undefined otherwise, so a re-verify pass over a complete
    * store on every restart reports nothing.
    *
    * The lease holder with a pass running reports its own counts (while it is
@@ -301,7 +301,7 @@ export type Distiller = {
    * process, and a holder whose pass aborted and waits for its retry, reads
    * the progress the holder shares in {@link COLD_PASS_PROGRESS_KEY}; when
    * that is older than {@link PROGRESS_STALE_MS} nothing is indexing, and the
-   * store gap is reported as `stalled` (cards so far of the sessions known).
+   * store gap is reported as `stalled`.
    * Query-path cost: in-memory state, up to two meta reads and one card
    * count; no lease read and no map scan.
    */
@@ -2204,8 +2204,12 @@ export function createDistiller(options: DistillerOptions): Distiller {
       if (indexComplete) return undefined;
       if (coldPassState === "running" && leaseHeld) {
         const cards = store.cardCount();
-        if (knownCount === 0) return cards === 0 ? { examined: 0, known: 0 } : undefined;
-        return knownCount > cards ? { examined: examinedCount, known: knownCount } : undefined;
+        if (knownCount === 0) {
+          return cards === 0 ? { indexed: 0, examined: 0, known: 0 } : undefined;
+        }
+        return knownCount > cards
+          ? { indexed: cards, examined: examinedCount, known: knownCount }
+          : undefined;
       }
       // Not running a pass here: what the holder shares, if the store is
       // still incomplete. Completion is stamped by whichever process got there.
@@ -2218,9 +2222,9 @@ export function createDistiller(options: DistillerOptions): Distiller {
       const cards = store.cardCount();
       if (shared.known <= cards) return undefined;
       if (!shared.running || now() - shared.at > PROGRESS_STALE_MS) {
-        return { examined: cards, known: shared.known, stalled: true };
+        return { indexed: cards, examined: shared.examined, known: shared.known, stalled: true };
       }
-      return { examined: shared.examined, known: shared.known };
+      return { indexed: cards, examined: shared.examined, known: shared.known };
     },
 
     status(): DistillStatus {

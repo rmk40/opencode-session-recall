@@ -64,8 +64,10 @@ All notable changes to this project are documented here. This project follows
 
 - While the background cold pass is still building the index for the
   first time, `recall` responses carry `coverage.cards.indexing`
-  (`{ examined, known }`) and a warning that says how many sessions the
-  pass has checked so far and that older history may be missing.
+  (`{ indexed, examined, known }`: sessions with a card, sessions the
+  current pass has checked, sessions known) and a warning such as
+  "Indexing in progress: 1008 of 6101 sessions indexed; 0 checked in this
+  pass; older history may be missing."
   `recall_sessions` adds the same note, with an `indexing` field, to
   listings it selects from the index (a `since`/`until` filter); plain
   listings are live and carry neither. Before, the card counts alone read

@@ -160,12 +160,12 @@ export type SearchCoverage = {
     storeRecency: number;
     degraded: boolean;
     /** Present while the store is not complete yet (no cold pass has
-     *  completed on it, and it has fewer cards than sessions): how many of
-     *  the sessions the pass discovered it has checked so far (`known` is 0
-     *  until discovery finishes). Every process sharing the store reports the
-     *  lease holder's pass. With `stalled`, no pass is making progress, and
-     *  `examined` counts the cards the store holds. Cards for the rest may be
-     *  missing. A re-verify pass over a complete store reports nothing. */
+     *  indexed every session, and it has fewer cards than sessions): how many
+     *  of the `known` sessions have a card (`indexed`) and how many the
+     *  current pass has checked (`examined`; `known` is 0 until discovery
+     *  finishes). Every process sharing the store reports the lease holder's
+     *  pass. With `stalled`, no pass is making progress right now. A
+     *  re-verify pass over a complete store reports nothing. */
     indexing?: IndexingProgress;
   };
   /** Present only when the semantic layer is configured on. `ready` is the
@@ -411,22 +411,29 @@ export type SessionItem = {
   distilled?: boolean;
 };
 
-/** A cold pass's progress (see {@link IndexingStatus}). With `stalled`, no
- *  pass is making progress right now: `examined` is then the cards the store
- *  holds of the `known` sessions. */
-export type IndexingProgress = { examined: number; known: number; stalled?: true };
+/** A cold pass's progress (see {@link IndexingStatus}). `indexed` is how
+ *  many of the `known` sessions have a card; `examined` how many the current
+ *  (or last) pass has checked, which restarts at 0 with every pass. With
+ *  `stalled`, no pass is making progress right now. */
+export type IndexingProgress = {
+  indexed: number;
+  examined: number;
+  known: number;
+  stalled?: true;
+};
 
 /** Reads the cold pass's progress: undefined unless a pass is building an
  *  incomplete store (see `Distiller.indexing`). */
 export type IndexingStatus = () => IndexingProgress | undefined;
 
-/** The warning for a query answered while the cold pass is still running. */
+/** The warning for a query answered while the store is still incomplete. */
 export function indexingWarning(progress: IndexingProgress): string {
+  const indexed = `${progress.indexed} of ${progress.known} sessions indexed`;
   if (progress.stalled) {
-    return `Index incomplete: ${progress.examined} of ${progress.known} sessions indexed, and indexing is not running right now; older history may be missing.`;
+    return `Index incomplete: ${indexed}, and indexing is not running right now; older history may be missing.`;
   }
   return progress.known > 0
-    ? `Indexing in progress: ${progress.examined} of ${progress.known} sessions checked so far; older history may be missing.`
+    ? `Indexing in progress: ${indexed}; ${progress.examined} checked in this pass; older history may be missing.`
     : "Indexing in progress: sessions are still being discovered; older history may be missing.";
 }
 

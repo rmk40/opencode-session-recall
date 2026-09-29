@@ -515,9 +515,10 @@ describe("v2 tools and hooks", () => {
     await setup(h);
     const runtime = await runtimeOf(h);
     expect(runtime.deps.indexing?.()).toBeUndefined();
-    vi.spyOn(runtime.distiller, "indexing").mockReturnValue({ examined: 1, known: 5 });
+    vi.spyOn(runtime.distiller, "indexing").mockReturnValue({ indexed: 2, examined: 1, known: 5 });
     const out = await call(h, "recall", { query: "orchidneedle", scope: "global" }, "ses_new");
     expect((out.coverage as { cards: { indexing?: unknown } }).cards.indexing).toEqual({
+      indexed: 2,
       examined: 1,
       known: 5,
     });

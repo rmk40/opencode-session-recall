@@ -392,9 +392,9 @@ describe("plugin entry", () => {
         await new Promise((resolve) => setTimeout(resolve, 5));
         out = await recall();
       }
-      expect(out.coverage.cards.indexing).toEqual({ examined: 0, known: 2 });
+      expect(out.coverage.cards.indexing).toEqual({ indexed: 0, examined: 0, known: 2 });
       expect(out.warnings).toContain(
-        "Indexing in progress: 0 of 2 sessions checked so far; older history may be missing.",
+        "Indexing in progress: 0 of 2 sessions indexed; 0 checked in this pass; older history may be missing.",
       );
       await hooks.dispose?.();
     } finally {

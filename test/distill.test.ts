@@ -2615,7 +2615,7 @@ describe("cold-pass progress reporting", () => {
     const first = make("first-build");
     first.start();
     await waitFor(() => first.status().knownCount === 2);
-    expect(first.indexing()).toEqual({ examined: 0, known: 2 });
+    expect(first.indexing()).toEqual({ indexed: 0, examined: 0, known: 2 });
     gate.hold(false);
     await waitFor(() => first.status().coldPass === "done");
     expect(first.indexing()).toBeUndefined();
@@ -2706,7 +2706,7 @@ describe("cold-pass progress reporting", () => {
     const other = make("other");
     other.start(); // the lease is taken: this one only answers queries
     expect(other.status().leaseHeld).toBe(false);
-    expect(other.indexing()).toEqual({ examined: 0, known: 2 });
+    expect(other.indexing()).toEqual({ indexed: 0, examined: 0, known: 2 });
 
     gate.hold(false);
     await waitFor(() => holder.status().coldPass === "done");
@@ -2744,12 +2744,12 @@ describe("cold-pass progress reporting", () => {
       log: () => {},
     });
     store.setMeta(COLD_PASS_PROGRESS_KEY, JSON.stringify({ examined: 1, known: 5, at: t - 1_000 }));
-    expect(reader.indexing()).toEqual({ examined: 1, known: 5 });
+    expect(reader.indexing()).toEqual({ indexed: 2, examined: 1, known: 5 });
     store.setMeta(
       COLD_PASS_PROGRESS_KEY,
       JSON.stringify({ examined: 1, known: 5, at: t - PROGRESS_STALE_MS - 1 }),
     );
-    expect(reader.indexing()).toEqual({ examined: 2, known: 5, stalled: true });
+    expect(reader.indexing()).toEqual({ indexed: 2, examined: 1, known: 5, stalled: true });
     // Once the store holds a card per known session, there is no gap.
     store.setMeta(COLD_PASS_PROGRESS_KEY, JSON.stringify({ examined: 2, known: 2, at: t }));
     expect(reader.indexing()).toBeUndefined();
@@ -2782,7 +2782,7 @@ describe("cold-pass progress reporting", () => {
     distiller.start();
     await waitFor(() => distiller.status().lastError !== undefined);
     expect(distiller.status().coldPass).toBe("idle");
-    expect(distiller.indexing()).toEqual({ examined: 0, known: 6 });
+    expect(distiller.indexing()).toEqual({ indexed: 0, examined: 0, known: 6 });
     await distiller.stop();
     db.close();
   });

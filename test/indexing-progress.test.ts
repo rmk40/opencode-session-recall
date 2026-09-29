@@ -16,12 +16,12 @@ describe("cold-pass progress in responses", () => {
     const h = makeFakeHarness();
     const { deps, cleanup } = await makeRecallDeps(h, TEST_LIMITS);
     try {
-      let progress: IndexingProgress | undefined = { examined: 3, known: 40 };
+      let progress: IndexingProgress | undefined = { indexed: 12, examined: 3, known: 40 };
       const recall = search(h.source, true, TEST_LIMITS, { ...deps, indexing: () => progress });
       const running = await runTool<SearchOutput>(recall, { query: "rateLimit", scope: "global" });
-      expect(running.coverage?.cards?.indexing).toEqual({ examined: 3, known: 40 });
+      expect(running.coverage?.cards?.indexing).toEqual({ indexed: 12, examined: 3, known: 40 });
       expect(running.warnings).toContain(
-        "Indexing in progress: 3 of 40 sessions checked so far; older history may be missing.",
+        "Indexing in progress: 12 of 40 sessions indexed; 3 checked in this pass; older history may be missing.",
       );
 
       progress = undefined; // the pass finished
@@ -37,7 +37,7 @@ describe("cold-pass progress in responses", () => {
     const h = makeFakeHarness();
     const { deps, cleanup } = await makeRecallDeps(h, TEST_LIMITS);
     try {
-      const stalled: IndexingProgress = { examined: 4, known: 40, stalled: true };
+      const stalled: IndexingProgress = { indexed: 4, examined: 9, known: 40, stalled: true };
       const recall = search(h.source, true, TEST_LIMITS, { ...deps, indexing: () => stalled });
       const out = await runTool<SearchOutput>(recall, { query: "rateLimit", scope: "global" });
       expect(out.coverage?.cards?.indexing).toEqual(stalled);
@@ -56,13 +56,13 @@ describe("cold-pass progress in responses", () => {
     try {
       const tool = sessions(h.source, true, TEST_LIMITS, {
         cards: () => store.allCards(),
-        indexing: () => ({ examined: 0, known: 0 }),
+        indexing: () => ({ indexed: 0, examined: 0, known: 0 }),
       });
       // A time filter selects from the cards.
       const carded = await runTool<SessionsOutput>(tool, { scope: "project", since: "30d" });
       expect(carded.ok).toBe(true);
       expect(carded.sessions.length).toBeGreaterThan(0);
-      expect(carded.indexing).toEqual({ examined: 0, known: 0 });
+      expect(carded.indexing).toEqual({ indexed: 0, examined: 0, known: 0 });
       expect(carded.note).toContain("Indexing in progress: sessions are still being discovered");
 
       // A plain listing is live: it does not depend on the index.
