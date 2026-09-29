@@ -69,8 +69,9 @@ All notable changes to this project are documented here. This project follows
   "Indexing in progress: 1008 of 6101 sessions indexed; 0 checked in this
   pass; older history may be missing."
   `recall_sessions` adds the same note, with an `indexing` field, to
-  listings it selects from the index (a `since`/`until` filter); plain
-  listings are live and carry neither. Before, the card counts alone read
+  listings it selects from the index (a `since`/`until` filter, or the
+  card listing served while the history is unavailable); plain listings
+  are live and carry neither. Before, the card counts alone read
   as complete while older sessions were not indexed yet. Every opencode
   process sharing the store reports the pass, not only the one running
   it; if no pass has made progress for 5 minutes the warning says the
