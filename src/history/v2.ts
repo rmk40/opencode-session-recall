@@ -41,8 +41,9 @@ import {
  *   ceiling on its own is never loaded at all: it projects as a placeholder
  *   message (see {@link oversizedData}), so paging, drill, deep and the
  *   distiller keep moving past it, and the placeholder text is what gets
- *   indexed. The body statement re-checks each row's size, since a row can
- *   grow between the two statements. (The compaction status filter still
+ *   indexed. The body statement re-reads every size, since rows can grow
+ *   between the two statements, and cuts the page where a running total
+ *   would pass the ceiling, so the bytes a page loads never exceed it. (The compaction status filter still
  *   parses a compaction row's JSON inside SQLite; nothing reaches JS.)
  * - Polite: an `await` on a macrotask separates statements, so a page never
  *   holds the shared v2 service's event loop for more than one statement.
@@ -361,6 +362,10 @@ export function createV2HistorySource(db: ReadOnlyDb, opts: V2SourceOptions = {}
    *  size. Binds the ceiling first. */
   const BODY_COLUMNS = `${MESSAGE_META_COLUMNS}, ${BYTES} AS bytes,
     CASE WHEN ${BYTES} <= ? THEN data END AS data`;
+  /** The same columns for a page, from a budgeted range (see messagePage):
+   *  `m` is the message row, `b` its size and running page total. */
+  const PAGE_BODY_COLUMNS = `m.id, m.session_id, m.type, m.seq, m.time_created, m.time_updated,
+    b.bytes AS bytes, CASE WHEN b.bytes <= ? THEN m.data END AS data`;
 
   /** Decode a body row, or build the placeholder for one too large to load. */
   function decodeBody(row: Row): DecodedRow {
@@ -701,13 +706,41 @@ export function createV2HistorySource(db: ReadOnlyDb, opts: V2SourceOptions = {}
         const oldest = asNumber(sizes[take - 1]!.seq) ?? 0;
         const plannedMore = sizes.length > take;
 
+        // Bodies, under the cumulative budget: sizes are re-read in the same
+        // statement (rows may have grown since the plan), a running total
+        // over loadable rows cuts the page where it would pass the ceiling,
+        // and only rows inside the cut load `data`. The first row always fits
+        // (its total is its own size, or 0 when it is oversized). The CTEs
+        // hold only seq and size; bodies are read by the final join.
         await pause();
         const rows = read("page rows", () =>
           db.all(
-            `SELECT ${BODY_COLUMNS} FROM session_message
-             WHERE session_id = ? AND seq <= ? AND seq >= ? AND ${CONTENT_FILTER} AND ${FORK_FILTER}
-             ORDER BY seq DESC LIMIT ?`,
-            [byteCeiling, o.sessionID, newest, oldest, ...fork, take],
+            `WITH sized AS (
+               SELECT seq, ${BYTES} AS bytes FROM session_message
+               WHERE session_id = ? AND seq <= ? AND seq >= ? AND ${CONTENT_FILTER} AND ${FORK_FILTER}
+               ORDER BY seq DESC LIMIT ?
+             ), budget AS (
+               SELECT seq, bytes,
+                 sum(CASE WHEN bytes <= ? THEN bytes ELSE 0 END)
+                   OVER (ORDER BY seq DESC ROWS UNBOUNDED PRECEDING) AS running
+               FROM sized
+             )
+             SELECT ${PAGE_BODY_COLUMNS}
+             FROM budget b JOIN session_message m ON m.session_id = ? AND m.seq = b.seq
+             WHERE b.running <= ?
+             ORDER BY m.seq DESC LIMIT ?`,
+            [
+              o.sessionID,
+              newest,
+              oldest,
+              ...fork,
+              take,
+              byteCeiling,
+              byteCeiling,
+              o.sessionID,
+              byteCeiling,
+              take,
+            ],
           ),
         );
         if (rows.length === 0) {

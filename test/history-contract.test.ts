@@ -585,6 +585,33 @@ describe("v2 history source", () => {
     expect(partText(page.items[0])).toMatch(/message omitted/);
   });
 
+  it("enforces the page budget on sizes grown after the plan", async () => {
+    const t = await fresh();
+    session(t, "ses_sum");
+    // ~430 bytes each: all three fit the 1,500-byte plan.
+    const ids = [0, 1, 2].map((i) => message(t, "ses_sum", "user", text(`${i}`.repeat(400))));
+    let grown = false;
+    const { source } = await capped(t, (call) => {
+      // After the first page's size read, each row grows to ~1,030 bytes:
+      // still under the ceiling alone, but any two together pass it.
+      if (call !== 2 || grown) return;
+      grown = true;
+      for (const [i, id] of ids.entries()) {
+        t.db.run("UPDATE session_message SET data = ? WHERE id = ?", [
+          JSON.stringify(text(`${i}`.repeat(1_000))),
+          id,
+        ]);
+      }
+    });
+    const first = await source.messagePage({ sessionID: "ses_sum", limit: 10 });
+    expect(grown).toBe(true);
+    expect(first.items.map((m) => m.info.id)).toEqual([ids[2]]);
+    expect(partText(first.items[0])).toBe("2".repeat(1_000));
+    expect(first.nextCursor).not.toBeNull();
+    const { seen } = await walk(source, "ses_sum", 10);
+    expect(seen).toEqual([...ids].reverse());
+  });
+
   it("gives an oversized assistant its real identity on pages and in point reads", async () => {
     const t = await fresh();
     session(t, "ses_id", {
