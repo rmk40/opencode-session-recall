@@ -28,6 +28,7 @@ import { v1EventToSignal } from "./history/v1-events.js";
 import { createDistiller } from "./distill.js";
 import { createSummarizer, type Summarizer } from "./summarize.js";
 import { parseOptions } from "./options.js";
+import { consoleSink, createLogger } from "./log.js";
 import { TOOLS, errmsg, settleWithin, type ErrorOutput } from "./types.js";
 
 /** Per-phase bound on dispose()'s awaited waits. The host awaits dispose as a
@@ -39,17 +40,8 @@ import { TOOLS, errmsg, settleWithin, type ErrorOutput } from "./types.js";
  *  writing, so closing SQLite with a detached fetch pending is safe. */
 const SHUTDOWN_TIMEOUT_MS = 2_500;
 
-/** Guarded, Node-free logger: `console` is a std global, but `src/` declares no
- *  types, so reach it defensively. */
-function pluginLog(message: string): void {
-  try {
-    (globalThis as { console?: { log?: (msg: string) => void } }).console?.log?.(
-      `[recall] ${message}`,
-    );
-  } catch {
-    // Logging is best-effort; never let it throw into plugin init.
-  }
-}
+/** v1 plugin log: `[recall] `-prefixed lines on the host console. */
+const pluginLog = createLogger(consoleSink);
 
 /**
  * Plugin build tag — recorded in the distill lease and surfaced in

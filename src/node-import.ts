@@ -9,8 +9,9 @@
  * declaring only the surface we use.
  *
  * `FsLike` is the superset of everything the callers touch: {@link defaultStorePath}
- * in `store.ts` uses only `promises.mkdir`, while the semantic embedder uses the
- * read/write/rename/stat surface too. One shared shape satisfies both.
+ * in `store.ts` uses only `promises.mkdir`, the semantic embedder uses the
+ * read/write/rename/stat surface too, and the debug log file sink (`log.ts`)
+ * adds `appendFile`. One shared shape satisfies all of them.
  */
 
 export type FsLike = {
@@ -20,6 +21,7 @@ export type FsLike = {
     writeFile(path: string, data: Uint8Array): Promise<void>;
     rename(from: string, to: string): Promise<void>;
     stat(path: string): Promise<{ size: number }>;
+    appendFile(path: string, data: string): Promise<void>;
   };
 };
 export type PathLike = { join(...parts: string[]): string };

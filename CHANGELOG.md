@@ -25,6 +25,13 @@ All notable changes to this project are documented here. This project follows
   `skippedByReason.authorship`, all only when the filter is active or
   `explain: true`, so default responses are unchanged.
 
+### Changed
+
+- Plugin log lines now go through an internal log sink (`src/log.ts`)
+  instead of calling `console.log` directly. Under opencode v1 the output
+  is the same `[recall] ...` lines on the console. The sink is groundwork
+  for opencode v2, which discards plugin console output.
+
 ## 2.3.0
 
 ### Added
