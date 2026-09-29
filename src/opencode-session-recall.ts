@@ -155,7 +155,17 @@ const server: Plugin = async (ctx, options) => {
       if (db) {
         const opened = openStore(db, STORE_IDENTITY);
         if (opened.ok) store = opened.store;
-        else pluginLog(`store refused (${opened.reason}): ${storePath}; running degraded`);
+        else {
+          pluginLog(`store refused (${opened.reason}): ${storePath}; running degraded`);
+          // A refused store is never read or written, so release its handle now
+          // rather than holding a lock-capable connection until dispose.
+          try {
+            db.close();
+          } catch {
+            // Best-effort: degraded mode does not depend on the close.
+          }
+          db = null;
+        }
       }
     }
   }

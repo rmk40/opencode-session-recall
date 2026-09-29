@@ -8,7 +8,15 @@ import { TOOLS } from "../src/types.js";
 import { LITE_REFRESH_WINDOW_MS } from "../src/lite-refresh.js";
 import { openSqlite } from "../src/sqlite.js";
 import { defaultStorePath, openStore } from "../src/store.js";
-import { bundle, makeContext, openV1Store, PROJECT_DIR, textPart, userMessage } from "./helpers.js";
+import {
+  bundle,
+  makeContext,
+  openV1Store,
+  PROJECT_DIR,
+  session,
+  textPart,
+  userMessage,
+} from "./helpers.js";
 
 const createOpencodeClient = vi.hoisted(() => vi.fn((options: unknown) => options));
 const sqliteLifecycle = vi.hoisted(() => ({ opens: 0, closes: 0, postCloseCalls: 0 }));
@@ -751,6 +759,53 @@ describe("plugin entry", () => {
       } finally {
         probe.close();
       }
+    } finally {
+      log.mockRestore();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("closes a refused store at init and still answers recall_sessions degraded", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "recall-plugin-refused-sessions-"));
+    const storePath = join(dir, "recall.db");
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    try {
+      const seedDb = await openSqlite(storePath);
+      if (!seedDb) throw new Error("openSqlite returned null for seed");
+      const seeded = openStore(seedDb, { host: "opencode-v2", source: "/data/opencode.db" });
+      if (!seeded.ok) throw new Error(seeded.reason);
+      seedDb.close();
+      sqliteLifecycle.opens = 0;
+      sqliteLifecycle.closes = 0;
+
+      const live = session("s-live", "Live session", PROJECT_DIR, Date.now() - 60_000);
+      const list = vi.fn(async () => ({ data: [live] }));
+      createOpencodeClient
+        .mockImplementationOnce((options: unknown) => ({
+          ...(options as object),
+          session: { list },
+        }))
+        .mockImplementationOnce((options: unknown) => ({ ...(options as object) }));
+
+      const hooks = await server(ctx({ fetch: vi.fn() }), { storePath });
+      // Refused at init: the handle is closed right away, not held to dispose.
+      expect(sqliteLifecycle.opens).toBe(1);
+      expect(sqliteLifecycle.closes).toBe(1);
+
+      const out = JSON.parse(
+        (await mustTool(hooks.tool?.recall_sessions).execute(
+          { since: "30d" },
+          makeContext().ctx,
+        )) as string,
+      );
+      expect(out).toMatchObject({ ok: true, scope: "project", returned: 1 });
+      expect(out.sessions.map((s: { id: string }) => s.id)).toEqual(["s-live"]);
+      // The degraded path's tell: no card store resolved the time window.
+      expect(out.note).toContain("no card store");
+
+      await hooks.dispose?.();
+      expect(sqliteLifecycle.closes).toBe(1); // dispose does not close it twice
+      expect(sqliteLifecycle.postCloseCalls).toBe(0);
     } finally {
       log.mockRestore();
       rmSync(dir, { recursive: true, force: true });
