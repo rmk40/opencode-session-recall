@@ -290,15 +290,17 @@ describe("v2 history source", () => {
     expect(seen).toEqual([...content].reverse());
   });
 
-  it("skips unparseable rows, or rejects them under strict", async () => {
+  it("projects unparseable rows as placeholders, or rejects them under strict", async () => {
     const t = await fresh();
     session(t, "ses_b");
     const good = message(t, "ses_b", "user", text("fine"));
-    message(t, "ses_b", "assistant", "{not json");
-    message(t, "ses_b", "compaction", "{also not json");
+    const badReply = message(t, "ses_b", "assistant", "{not json");
+    const badCompaction = message(t, "ses_b", "compaction", "{also not json");
     const { source } = await open(t);
     const page = await source.messagePage({ sessionID: "ses_b", limit: 10 });
-    expect(page.items.map((m) => m.info.id)).toEqual([good]);
+    expect(page.items.map((m) => m.info.id)).toEqual([badCompaction, badReply, good]);
+    expect(page.items.map((m) => m.info.role)).toEqual(["assistant", "assistant", "user"]);
+    expect(partText(page.items[1])).toMatch(/^\[message omitted .*not valid JSON\]$/);
     await expect(
       source.messagePage({ sessionID: "ses_b", limit: 10, strict: true }),
     ).rejects.toBeInstanceOf(MalformedSessionError);
@@ -414,6 +416,108 @@ describe("v2 history source", () => {
 
     const lookup = await source.getMessage("ses_big", huge);
     expect(lookup.ok && partText(lookup.value)).toBe(partText(placeholder));
+  });
+
+  /** A source with a counting yield (and default ceiling) over the LIMIT spy,
+   *  optionally wrapping the spy so a hook runs after each `all`. */
+  async function counted(t: V2TestDb, afterAll?: (sql: string) => void) {
+    const opened = await openOpencodeDb(t.path);
+    if (!opened.ok) throw new Error(opened.reason);
+    cleanups.push(() => opened.db.close());
+    const spy = limitSpy(opened.db);
+    const db: typeof spy = afterAll
+      ? {
+          ...spy,
+          all: (sql, params) => {
+            const rows = spy.all(sql, params);
+            afterAll(sql);
+            return rows;
+          },
+        }
+      : spy;
+    const yields = { calls: 0 };
+    const source = createV2HistorySource(db, {
+      yieldBetween: async () => {
+        yields.calls++;
+      },
+    });
+    return { source, spy, yields };
+  }
+
+  it("resumes from the oldest returned row when a row turns eligible mid-page", async () => {
+    const t = await fresh();
+    session(t, "ses_race");
+    const u1 = message(t, "ses_race", "user", text("one"));
+    const u2 = message(t, "ses_race", "user", text("two"));
+    const pending = message(t, "ses_race", "compaction", {
+      status: "running",
+      reason: "auto",
+      summary: "",
+      recent: "",
+    });
+    const u3 = message(t, "ses_race", "user", text("three"));
+    const u4 = message(t, "ses_race", "user", text("four"));
+    let completed = false;
+    // Right after the first page's size read (which skips the running
+    // compaction), the compaction completes, so the body read's LIMIT drops
+    // the planned oldest row (u2).
+    const { source } = await counted(t, (sql) => {
+      if (completed || !/AS bytes FROM session_message/.test(sql)) return;
+      completed = true;
+      t.db.run("UPDATE session_message SET data = ? WHERE id = ?", [
+        JSON.stringify({ status: "completed", reason: "auto", summary: "done", recent: "" }),
+        pending,
+      ]);
+    });
+    const { seen } = await walk(source, "ses_race", 3);
+    expect(completed).toBe(true);
+    expect(seen).toEqual([u4, u3, pending, u2, u1]);
+  });
+
+  it("walks past a page of undecodable rows instead of ending early", async () => {
+    const t = await fresh();
+    session(t, "ses_bad");
+    const good = message(t, "ses_bad", "user", text("still reachable"));
+    const bad = [
+      message(t, "ses_bad", "assistant", "{x"),
+      message(t, "ses_bad", "assistant", "{y"),
+    ];
+    const { source } = await open(t);
+    const first = await source.messagePage({ sessionID: "ses_bad", limit: 2 });
+    expect(first.items.map((m) => m.info.id)).toEqual([bad[1], bad[0]]);
+    expect(first.nextCursor).not.toBeNull();
+    const { seen } = await walk(source, "ses_bad", 2);
+    expect(seen).toEqual([bad[1], bad[0], good]);
+  });
+
+  it("remembers fork fields per session and reads a message without yielding first", async () => {
+    const t = await fresh();
+    session(t, "ses_memo");
+    const reply1 = message(t, "ses_memo", "assistant", reply("r1"));
+    message(t, "ses_memo", "assistant", reply("r2"));
+    const { source, spy, yields } = await counted(t);
+    await source.messagePage({ sessionID: "ses_memo", limit: 1 });
+    await source.messagePage({ sessionID: "ses_memo", limit: 1 });
+    const forkReads = spy.statements.filter((sql) => /SELECT fork_session_id/.test(sql));
+    expect(forkReads).toHaveLength(1);
+
+    yields.calls = 0;
+    const got = await source.getMessage("ses_memo", reply1);
+    expect(got.ok).toBe(true);
+    // An assistant row needs no attribution reads, so nothing yields.
+    expect(yields.calls).toBe(0);
+  });
+
+  it("yields while decoding and projecting a long page", async () => {
+    const t = await fresh();
+    session(t, "ses_long");
+    for (let i = 0; i < 60; i++) message(t, "ses_long", "assistant", reply(`r${i}`));
+    const { source, yields } = await counted(t);
+    const page = await source.messagePage({ sessionID: "ses_long", limit: 60 });
+    expect(page.items).toHaveLength(60);
+    // Two statement yields, plus two while decoding and two while projecting
+    // (after rows 25 and 50 of each loop).
+    expect(yields.calls).toBe(6);
   });
 
   it("lets the distiller card a session past an oversized row, indexing the placeholder", async () => {
@@ -570,11 +674,10 @@ describe("v2 history source", () => {
       reason: "not-found",
       error: `Message not found: ${idle}`,
     });
+    // An undecodable row reads as its placeholder, the same as on a page.
     const bad = message(t, "ses_root", "user", "{bad");
-    expect(await source.getMessage("ses_root", bad)).toMatchObject({
-      ok: false,
-      reason: "malformed",
-    });
+    const lookup = await source.getMessage("ses_root", bad);
+    expect(lookup.ok && partText(lookup.value)).toMatch(/not valid JSON/);
   });
 
   it("attributes user rows: switch, else next assistant (even on a newer page), else session", async () => {

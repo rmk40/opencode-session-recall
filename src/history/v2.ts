@@ -16,7 +16,7 @@ import {
   projectMessage,
   projectSession,
   resolveIdentity,
-  sessionContext,
+  parseModelRef,
   type DecodedRow,
   type SessionContext,
   type UserIdentity,
@@ -46,9 +46,11 @@ import {
  *   parses a compaction row's JSON inside SQLite; nothing reaches JS.)
  * - Polite: an `await` on a macrotask separates statements, so a page never
  *   holds the shared v2 service's event loop for more than one statement.
- * - Tolerant: a row with unparseable data is skipped (a
- *   `MalformedSessionError` under `strict`); non-content types never leave
- *   SQL.
+ * - Tolerant: a row with unparseable data becomes a placeholder message (a
+ *   `MalformedSessionError` under `strict`), so a page with rows is never
+ *   empty; non-content types never leave SQL. The next-page cursor comes from
+ *   the rows a page actually returned, so a row that changes eligibility
+ *   between the size read and the body read is never skipped.
  */
 
 // ── Schema guard ─────────────────────────────────────────────────────────────
@@ -169,14 +171,23 @@ export type V2SourceOptions = {
 };
 
 const DEFAULT_PAGE_BYTE_CEILING = 4 * 1024 * 1024;
-/** Children per parent read in one statement. */
+/** Children per parent read in one statement. A parent with more direct
+ *  children lists only the most recent 1,000 (v1's `session.children` has no
+ *  limit at all); no real session is known to come close. */
 const CHILDREN_LIMIT = 1_000;
+/** Sessions whose immutable fork fields are remembered per source. */
+const FORK_MEMO_LIMIT = 512;
+/** Rows decoded or projected between yields to the event loop. */
+const ROWS_PER_YIELD = 25;
 /** Switch rows of one type read at once between a page's oldest and newest
  *  user; a longer run falls back to one seek per user. */
 const SWITCH_SCAN_LIMIT = 64;
 
 type SwitchType = "agent-switched" | "model-switched";
 const NO_CURSOR_SEQ = Number.MAX_SAFE_INTEGER;
+/** Page plans retried when a whole planned range turns ineligible between the
+ *  size read and the body read. */
+const PAGE_ATTEMPTS = 3;
 
 const macrotask = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0));
 
@@ -228,12 +239,18 @@ export function oversizedNote(bytes: number, ceiling: number): string {
   return `[message omitted by opencode-session-recall: ${bytes} bytes exceeds the ${ceiling}-byte read limit]`;
 }
 
+/** The text a placeholder carries in place of a row whose data cannot be
+ *  decoded (outside `strict`, which rejects instead). */
+export function malformedNote(reason: string): string {
+  return `[message omitted by opencode-session-recall: ${reason}]`;
+}
+
 /**
  * Minimal data for a placeholder row of `type`, shaped so the projector yields
  * one text part carrying `note`. User-role types project as a plain user
  * message; assistant and compaction rows keep their role.
  */
-function oversizedData(
+function placeholderData(
   type: string,
   note: string,
 ): { type: string; data: Record<string, unknown> } {
@@ -316,7 +333,7 @@ export function createV2HistorySource(db: SqliteDb, opts: V2SourceOptions = {}):
     const message = toMessageRow(row);
     const bytes = asNumber(row.bytes) ?? 0;
     if (row.data === null && bytes > byteCeiling) {
-      const { type, data } = oversizedData(message.type, oversizedNote(bytes, byteCeiling));
+      const { type, data } = placeholderData(message.type, oversizedNote(bytes, byteCeiling));
       return { ok: true, row: { ...message, type, data: "" }, data };
     }
     return decodeRow(message);
@@ -339,6 +356,43 @@ export function createV2HistorySource(db: SqliteDb, opts: V2SourceOptions = {}):
       db.get(`SELECT ${SESSION_COLUMNS} ${SESSION_FROM} WHERE s.id = ?`, [id]),
     );
     return row ? toSessionRecord(row) : undefined;
+  }
+
+  /** A session's fork filter binds (isFork, created). Both fields are fixed at
+   *  creation, so they are remembered per source (FIFO-bounded); an unknown
+   *  session is not remembered. */
+  const forkMemo = new Map<string, SqlValue[]>();
+  function forkBinds(id: string): SqlValue[] | undefined {
+    const known = forkMemo.get(id);
+    if (known) return known;
+    const row = read("session fork", () =>
+      db.get("SELECT fork_session_id, time_created FROM session_v2 WHERE id = ?", [id]),
+    );
+    if (!row) return undefined;
+    const fork = typeof row.fork_session_id === "string" && row.fork_session_id !== "";
+    const binds = [fork ? 1 : 0, asNumber(row.time_created) ?? 0];
+    if (forkMemo.size >= FORK_MEMO_LIMIT) {
+      const oldest = forkMemo.keys().next().value;
+      if (oldest !== undefined) forkMemo.delete(oldest);
+    }
+    forkMemo.set(id, binds);
+    return binds;
+  }
+
+  /** The session fields projection reads. Directory, agent and model can
+   *  change, so they are read per call (one primary-key statement, only when
+   *  there are rows to project). */
+  function contextOf(id: string): SessionContext | undefined {
+    const row = read("session context", () =>
+      db.get("SELECT directory, agent, model FROM session_v2 WHERE id = ?", [id]),
+    );
+    if (!row) return undefined;
+    return {
+      id,
+      directory: asString(row.directory) ?? "",
+      agent: asString(row.agent) || null,
+      model: parseModelRef(asString(row.model)) ?? null,
+    };
   }
 
   function listing(where: string[], params: SqlValue[], limit: number): HistorySession[] {
@@ -479,23 +533,35 @@ export function createV2HistorySource(db: SqliteDb, opts: V2SourceOptions = {}):
     return out;
   }
 
-  /** Decode rows (newest first), dropping or, under `strict`, rejecting
-   *  unparseable ones, then project them. */
+  /**
+   * Decode and project body rows (newest first). An undecodable row rejects
+   * the page under `strict` (the distiller's quarantine); otherwise it becomes
+   * a placeholder message, so a page with rows is never empty and a walk never
+   * stops early on bad data. Yields every {@link ROWS_PER_YIELD} rows.
+   */
   async function project(
-    rows: DecodedRow[],
-    record: SessionRecord,
+    rows: Row[],
+    session: SessionContext,
     strict: boolean,
   ): Promise<HistoryMessage[]> {
     const decoded: Array<Extract<DecodedRow, { ok: true }>> = [];
-    for (const d of rows) {
-      if (d.ok) decoded.push(d);
-      else if (strict) throw new MalformedSessionError(d.reason);
+    for (let i = 0; i < rows.length; i++) {
+      if (i > 0 && i % ROWS_PER_YIELD === 0) await pause();
+      const d = decodeBody(rows[i]!);
+      if (d.ok) {
+        decoded.push(d);
+        continue;
+      }
+      if (strict) throw new MalformedSessionError(d.reason);
+      const { type, data } = placeholderData(d.row.type, malformedNote(d.reason));
+      decoded.push({ ok: true, row: { ...d.row, type, data: "" }, data });
     }
-    const session = sessionContext(record.row);
-    const who = await identities(decoded, record.row.id, session);
+    const who = await identities(decoded, session.id, session);
     const fallback = resolveIdentity([], session);
     const items: HistoryMessage[] = [];
-    for (const d of decoded) {
+    for (let i = 0; i < decoded.length; i++) {
+      if (i > 0 && i % ROWS_PER_YIELD === 0) await pause();
+      const d = decoded[i]!;
       const message = projectMessage(d, session, who.get(d.row.id) ?? fallback);
       if (message) items.push(message);
     }
@@ -546,73 +612,93 @@ export function createV2HistorySource(db: SqliteDb, opts: V2SourceOptions = {}):
 
     async messagePage(o): Promise<MessagePage> {
       assertBoundedLimit(o.limit);
-      const below = o.before === undefined ? NO_CURSOR_SEQ : decodeV2Cursor(o.before);
-      const record = sessionById(o.sessionID);
-      if (!record) throw new Error(`Session not found: ${o.sessionID}`);
-      const fork = [record.fork ? 1 : 0, record.row.time_created];
+      let below = o.before === undefined ? NO_CURSOR_SEQ : decodeV2Cursor(o.before);
+      const fork = forkBinds(o.sessionID);
+      if (!fork) throw new Error(`Session not found: ${o.sessionID}`);
+      const notFound = new Error(`Session not found: ${o.sessionID}`);
 
-      // Sizes first: pick the page without loading a row body.
-      await pause();
-      const sizes = read("page sizes", () =>
-        db.all(
-          `SELECT seq, ${BYTES} AS bytes FROM session_message
-           WHERE session_id = ? AND seq < ? AND ${CONTENT_FILTER} AND ${FORK_FILTER}
-           ORDER BY seq DESC LIMIT ?`,
-          [o.sessionID, below, ...fork, o.limit + 1],
-        ),
-      );
-      if (sizes.length === 0) return { items: [], nextCursor: null };
-      let take = 0;
-      let bytes = 0;
-      for (const size of sizes) {
-        if (take >= o.limit) break;
-        const rowBytes = asNumber(size.bytes) ?? 0;
-        // An oversized row is never loaded, so it costs the page nothing.
-        const cost = rowBytes > byteCeiling ? 0 : rowBytes;
-        if (take > 0 && bytes + cost > byteCeiling) break;
-        bytes += cost;
-        take++;
+      // Each attempt plans a page from sizes, then reads its bodies. Rows can
+      // change eligibility between the two statements (a compaction completing,
+      // a row growing), so the cursor comes from the rows actually returned.
+      // Only a planned range that emptied entirely retries, bounded.
+      for (let attempt = 0; attempt < PAGE_ATTEMPTS; attempt++) {
+        // Sizes first: pick the page without loading a row body.
+        await pause();
+        const sizes = read("page sizes", () =>
+          db.all(
+            `SELECT seq, ${BYTES} AS bytes FROM session_message
+             WHERE session_id = ? AND seq < ? AND ${CONTENT_FILTER} AND ${FORK_FILTER}
+             ORDER BY seq DESC LIMIT ?`,
+            [o.sessionID, below, ...fork, o.limit + 1],
+          ),
+        );
+        if (sizes.length === 0) return { items: [], nextCursor: null };
+        let take = 0;
+        let bytes = 0;
+        for (const size of sizes) {
+          if (take >= o.limit) break;
+          const rowBytes = asNumber(size.bytes) ?? 0;
+          // An oversized row is never loaded, so it costs the page nothing.
+          const cost = rowBytes > byteCeiling ? 0 : rowBytes;
+          if (take > 0 && bytes + cost > byteCeiling) break;
+          bytes += cost;
+          take++;
+        }
+        const newest = asNumber(sizes[0]!.seq) ?? 0;
+        const oldest = asNumber(sizes[take - 1]!.seq) ?? 0;
+        const plannedMore = sizes.length > take;
+
+        await pause();
+        const rows = read("page rows", () =>
+          db.all(
+            `SELECT ${BODY_COLUMNS} FROM session_message
+             WHERE session_id = ? AND seq <= ? AND seq >= ? AND ${CONTENT_FILTER} AND ${FORK_FILTER}
+             ORDER BY seq DESC LIMIT ?`,
+            [byteCeiling, o.sessionID, newest, oldest, ...fork, take],
+          ),
+        );
+        if (rows.length === 0) {
+          // The whole planned range became ineligible: continue below it.
+          if (!plannedMore) return { items: [], nextCursor: null };
+          below = oldest;
+          continue;
+        }
+        // If a row became eligible mid-range, LIMIT cut the page above the
+        // planned oldest row; resuming from the oldest returned row keeps
+        // every row below it for the next page.
+        const returnedOldest = asNumber(rows[rows.length - 1]!.seq) ?? oldest;
+        const more = plannedMore || returnedOldest > oldest;
+        const session = contextOf(o.sessionID);
+        if (!session) throw notFound;
+        const items = await project(rows, session, o.strict === true);
+        return { items, nextCursor: more ? encodeV2Cursor(returnedOldest) : null };
       }
-      const newest = asNumber(sizes[0]!.seq) ?? 0;
-      const oldest = asNumber(sizes[take - 1]!.seq) ?? 0;
-      const more = sizes.length > take;
-
-      await pause();
-      const rows = read("page rows", () =>
-        db.all(
-          `SELECT ${BODY_COLUMNS} FROM session_message
-           WHERE session_id = ? AND seq <= ? AND seq >= ? AND ${CONTENT_FILTER} AND ${FORK_FILTER}
-           ORDER BY seq DESC LIMIT ?`,
-          [byteCeiling, o.sessionID, newest, oldest, ...fork, take],
-        ),
-      ).map(decodeBody);
-
-      const items = await project(rows, record, o.strict === true);
-      return { items, nextCursor: more ? encodeV2Cursor(oldest) : null };
+      return { items: [], nextCursor: encodeV2Cursor(below) };
     },
 
     async getMessage(sessionID, messageID): Promise<Lookup<HistoryMessage>> {
-      const record = sessionById(sessionID);
-      if (!record) {
-        return { ok: false, reason: "not-found", error: `Session not found: ${sessionID}` };
-      }
       const notFound = {
         ok: false as const,
         reason: "not-found" as const,
         error: `Message not found: ${messageID}`,
       };
-      await pause();
+      const fork = forkBinds(sessionID);
+      if (!fork) {
+        return { ok: false, reason: "not-found", error: `Session not found: ${sessionID}` };
+      }
+      // One primary-key read: no yield before it.
       const row = read("message", () =>
         db.get(
           `SELECT ${BODY_COLUMNS} FROM session_message
            WHERE id = ? AND session_id = ? AND ${FORK_FILTER} LIMIT ?`,
-          [byteCeiling, messageID, sessionID, record.fork ? 1 : 0, record.row.time_created, 1],
+          [byteCeiling, messageID, sessionID, ...fork, 1],
         ),
       );
       if (!row) return notFound;
-      const decoded = decodeBody(row);
-      if (!decoded.ok) return { ok: false, reason: "malformed", error: decoded.reason };
-      const [message] = await project([decoded], record, false);
+      const session = contextOf(sessionID);
+      if (!session)
+        return { ok: false, reason: "not-found", error: `Session not found: ${sessionID}` };
+      const [message] = await project([row], session, false);
       return message ? { ok: true, value: message } : notFound;
     },
   };
