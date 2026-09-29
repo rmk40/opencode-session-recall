@@ -167,18 +167,25 @@ async function expectRefusal(
 
 /**
  * Wrap a real connection to observe how {@link openStore} ends its transaction
- * and, optionally, make `exec` throw on a statement matching `failExec`.
+ * and, optionally, make `exec` throw on a statement matching `fail.exec` or
+ * `run` throw when a bound parameter equals `fail.runParam`.
  */
 function instrument(
   db: SqliteDb,
-  failExec?: RegExp,
+  fail: { exec?: RegExp; runParam?: string } = {},
 ): { db: SqliteDb; txOutcomes: Array<"committed" | "rolled-back"> } {
   const txOutcomes: Array<"committed" | "rolled-back"> = [];
   const wrapped: SqliteDb = {
     ...db,
     exec(sql) {
-      if (failExec?.test(sql)) throw new Error(`injected failure: ${sql}`);
+      if (fail.exec?.test(sql)) throw new Error(`injected failure: ${sql}`);
       db.exec(sql);
+    },
+    run(sql, params) {
+      if (fail.runParam !== undefined && params?.includes(fail.runParam)) {
+        throw new Error(`injected failure: ${sql}`);
+      }
+      return db.run(sql, params);
     },
     tx(fn) {
       try {
@@ -619,6 +626,39 @@ describe("store migration", () => {
     // The slim index and its FTS mirror survived.
     expect(sessions(store.ftsSearch({ strong: ["zorblequin"], weak: [] }))).toEqual(["s-v3"]);
     db.close();
+  });
+
+  it("refuses as `error` and keeps a v3 store intact when its migration throws", async () => {
+    // Two failure points: the first statement of the v3 -> v4 step (the ALTER),
+    // and a later one (the host stamp write, after the ALTER has run). Either
+    // way the whole migration rolls back.
+    for (const fail of [{ exec: /ADD COLUMN distill_cursor/ }, { runParam: "store_host" }]) {
+      const path = freshDbPath();
+      await buildV3Store(path);
+      const db = await openSqlite(path);
+      if (!db) throw new Error("reopen failed");
+      const spy = instrument(db, fail);
+      expect(openStore(spy.db, "opencode-v1")).toEqual({ ok: false, reason: "error" });
+      expect(spy.txOutcomes).toEqual(["rolled-back"]);
+      db.close();
+
+      const clean = await openSqlite(path);
+      if (!clean) throw new Error("reopen failed");
+      expect(rawMeta(clean, "schema_version")).toBe("3");
+      expect(rawMeta(clean, "store_host")).toBeUndefined();
+      expect(columnNames(clean, "card")).not.toContain("distill_cursor");
+      expect(clean.get("SELECT title FROM card WHERE session_id='s-v3'")?.title).toBe("V3 session");
+      expect(clean.get("SELECT COUNT(*) AS n FROM part_text")?.n).toBe(1);
+      clean.close();
+
+      // Nothing was lost: a clean open then migrates it normally.
+      const retry = await openSqlite(path);
+      const store = retry && openV1Store(retry);
+      if (!retry || !store) throw new Error("retry open failed");
+      expect(store.getMeta("schema_version")).toBe("4");
+      expect(store.getCard("s-v3")?.nlSummary).toBe("Linked the sprockets.");
+      retry.close();
+    }
   });
 
   it("refuses a v3 store for the v2 host without migrating it", async () => {
