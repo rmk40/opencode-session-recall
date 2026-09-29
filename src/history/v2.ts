@@ -382,7 +382,10 @@ export function createV2HistorySource(db: ReadOnlyDb, opts: V2SourceOptions = {}
   const BYTES = byteLengthSql(db);
   /** A row's columns, with `data` NULL when it is larger than the ceiling
    *  now (re-checked here, not trusted from an earlier size read), plus its
-   *  size. Binds the ceiling first. */
+   *  size. Binds the ceiling first. The size expression appears twice; with
+   *  `octet_length` both reads are header-only, so only the pre-3.43
+   *  `length(CAST(...))` fallback pays for it twice (one row, point reads
+   *  only; a page measures once in its CTE). */
   const BODY_COLUMNS = `${MESSAGE_META_COLUMNS}, ${BYTES} AS bytes,
     CASE WHEN ${BYTES} <= ? THEN data END AS data`;
   /** The same columns for a page, from a budgeted range (see messagePage):
@@ -394,7 +397,7 @@ export function createV2HistorySource(db: ReadOnlyDb, opts: V2SourceOptions = {}
   function decodeBody(row: Row): DecodedRow {
     const message = toMessageRow(row);
     const bytes = asNumber(row.bytes) ?? 0;
-    if (row.data === null && bytes > byteCeiling) {
+    if (row.data == null && bytes > byteCeiling) {
       const { type, data } = placeholderData(message.type, oversizedNote(bytes, byteCeiling));
       return { ok: true, row: { ...message, type, data: "" }, data };
     }
@@ -422,7 +425,13 @@ export function createV2HistorySource(db: ReadOnlyDb, opts: V2SourceOptions = {}
 
   /** A session's fork filter binds (isFork, created). Both fields are fixed at
    *  creation, so they are remembered per source (FIFO-bounded); an unknown
-   *  session is not remembered. */
+   *  session is not remembered.
+   *
+   *  This makes deletion handling depend on call order: a session deleted
+   *  before this source first reads it rejects "Session not found", but one
+   *  deleted after its first read still has its binds here, finds no rows,
+   *  and pages as empty (`nextCursor: null`); only a page that has rows to
+   *  project re-reads the session and rejects. Both end the walk. */
   const forkMemo = new Map<string, SqlValue[]>();
   function forkBinds(id: string): SqlValue[] | undefined {
     const known = forkMemo.get(id);
@@ -475,8 +484,9 @@ export function createV2HistorySource(db: ReadOnlyDb, opts: V2SourceOptions = {}
     type: SwitchType,
     sessionID: string,
     seq: number,
+    yieldFirst = true,
   ): Promise<Partial<UserIdentity> | undefined> {
-    await pause();
+    if (yieldFirst) await pause();
     const row = read("switch", () =>
       db.get(
         `SELECT ${MESSAGE_COLUMNS} FROM session_message
@@ -521,10 +531,14 @@ export function createV2HistorySource(db: ReadOnlyDb, opts: V2SourceOptions = {}
     );
     const truncated = range.length > SWITCH_SCAN_LIMIT;
     const switches = range.map((row) => decodeRow(toMessageRow(row)));
+    let seeks = 0;
     for (const seq of userSeqs) {
       if (seq === oldest) continue;
       if (truncated) {
-        out.set(seq, await switchBefore(type, sessionID, seq));
+        // Single-row index seeks: yield before the first and then every
+        // ROWS_PER_YIELD, not before each one.
+        const yieldFirst = seeks++ % ROWS_PER_YIELD === 0;
+        out.set(seq, await switchBefore(type, sessionID, seq, yieldFirst));
         continue;
       }
       // Newest first, so the first one below `seq` is its latest predecessor.
@@ -614,7 +628,7 @@ export function createV2HistorySource(db: ReadOnlyDb, opts: V2SourceOptions = {}
         decoded.push(d);
         // An oversized assistant or compaction lost its identity with its
         // body; recover it below so it attributes like the loaded row would.
-        if (row.data === null && (d.row.type === "assistant" || d.row.type === "compaction")) {
+        if (row.data == null && (d.row.type === "assistant" || d.row.type === "compaction")) {
           unloaded.push(d);
         }
         continue;
@@ -782,6 +796,11 @@ export function createV2HistorySource(db: ReadOnlyDb, opts: V2SourceOptions = {}
         const items = await project(rows, session, o.strict === true);
         return { items, nextCursor: more ? encodeV2Cursor(returnedOldest) : null };
       }
+      // Every attempt's planned range emptied between the size read and the
+      // body read. This empty page with a cursor is the one case that can end
+      // a drill early (a reader may stop on an empty page); it takes
+      // PAGE_ATTEMPTS consecutive whole-range invalidations, which only a
+      // concurrent writer rewriting the tail on every read could cause.
       return { items: [], nextCursor: encodeV2Cursor(below) };
     },
 

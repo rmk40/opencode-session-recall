@@ -501,6 +501,27 @@ describe("v2 history source", () => {
     expect(seen).toEqual([bad[1], bad[0], good]);
   });
 
+  it("pages a session deleted after its first read as empty, and rejects it on a fresh source", async () => {
+    const t = await fresh();
+    session(t, "ses_gone");
+    message(t, "ses_gone", "user", text("one"));
+    message(t, "ses_gone", "user", text("two"));
+    const { source } = await open(t);
+    const first = await source.messagePage({ sessionID: "ses_gone", limit: 1 });
+    expect(first.items).toHaveLength(1);
+    t.db.run("DELETE FROM session_message WHERE session_id = ?", ["ses_gone"]);
+    t.db.run("DELETE FROM session_v2 WHERE id = ?", ["ses_gone"]);
+    // Remembered fork binds, no rows left: an empty last page.
+    expect(
+      await source.messagePage({ sessionID: "ses_gone", limit: 1, before: first.nextCursor! }),
+    ).toEqual({ items: [], nextCursor: null });
+    // A source that never read it rejects, as before any read.
+    const { source: fresher } = await open(t);
+    await expect(fresher.messagePage({ sessionID: "ses_gone", limit: 1 })).rejects.toThrow(
+      "Session not found: ses_gone",
+    );
+  });
+
   it("remembers fork fields per session and reads a message without yielding first", async () => {
     const t = await fresh();
     session(t, "ses_memo");
