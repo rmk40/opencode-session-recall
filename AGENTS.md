@@ -72,15 +72,31 @@ import `bun:*` or `node:*` directly.
 
 ## How the plugin is loaded (why a rebuild is needed to test live)
 
-- The global opencode config (`~/.config/opencode/opencode.json`) loads this
-  plugin **by directory path**, and opencode resolves it via `package.json`
-  `main` → `dist/opencode-session-recall.js`. **Source changes do nothing until
-  you rebuild `dist/`** (`npm run compile`, or `npx tsup ... --format esm` for a
-  quick JS-only rebuild during debugging).
+- One default export serves both hosts: `{ id, server, setup }` from
+  `src/opencode-session-recall.ts`. opencode v1 (`@opencode-ai/plugin` 1.3.4+) reads
+  `id` and calls `server(ctx, options)`. opencode v2 (`@opencode/plugin` 2.0.x)
+  decodes `{ id, setup }` and calls `setup(ctx)`. v1.18+ also calls `setup` with a
+  partial context, so `setup` first runs a capability probe (`isV2HostContext` in
+  `src/host/v2.ts`) and stays inert unless the context has `session.hook`,
+  `tool.transform`, `event.subscribe` and `location.directory`. `server()` sets
+  `registry.v1ServerActive` as a second guard.
+- **v1** loads a local directory through `package.json` (`main`, and `exports` for
+  npm installs) → `dist/opencode-session-recall.js`.
+- **v2** loads a local directory by trying `<dir>/server.*` then `<dir>/index.*`,
+  and never reads `package.json` for it; the root `server.js` shim re-exports the
+  build. npm installs resolve through `exports` (`.` and `./server`) and never see
+  the shim, which is not in `files`.
+- **Source changes do nothing until you rebuild `dist/`** (`npm run compile`, or
+  `npx tsup ... --format esm` for a quick JS-only rebuild during debugging).
 - A **running** opencode process has already loaded the old `dist/`. After
   rebuilding you must **restart the session** (or relaunch) for it to pick up
   changes. Live testing loop: edit → rebuild dist → restart the tuistory session
-  → reproduce.
+  → reproduce. On v2 the plugin runs inside the background service, so restart
+  that (`opencode service restart`), not only the TUI.
+- Logging differs per host. v1 logs `[recall] ...` lines to the console, which
+  reaches the TUI log. v2 discards plugin console output, so it logs only when
+  `RECALL_DEBUG=1` is set in the service's environment, to
+  `~/.cache/opencode-session-recall/recall.log` (size-capped, one rotation).
 - `files: ["dist"]` in `package.json` means only `dist/` is published to npm;
   CHANGELOG, AGENTS.md, src, etc. never ship.
 
@@ -106,6 +122,43 @@ Cross-project trick: to prove recall finds _this_ project's history from a fresh
 session in a tmp dir, search `scope:"global"` for distinctive strings you know
 are in the DB. That exercises the cross-project path, which is exactly where the
 scoped-vs-unscoped and defaults bugs hide.
+
+### Which binary, which database
+
+On this machine the v1 binary is
+`/opt/homebrew/lib/node_modules/opencode-ai/bin/opencode.exe` (1.18.33) and `opencode`
+on `PATH` is v2 (2.0.18). Isolate every live run with temporary
+`XDG_CONFIG_HOME`/`XDG_DATA_HOME`/`XDG_CACHE_HOME`/`XDG_STATE_HOME` directories. For
+v1 cold-pass tests, copy a v1-only database (here
+`~/.local/share/opencode/opencode.db.v1-final`) into the temp data directory as
+`opencode/opencode.db`; a v2 database has no v1 tables.
+
+### v2 hazards: a copied opencode.db can run real turns
+
+A v2 service opened on a **copy** of a live `opencode.db` resumes sessions that
+were mid-turn when the copy was taken, and can start real model turns with the
+copy's stored credentials. Before launching v2 against a copy, scrub it (tables
+from opencode's `packages/core/src/{credential,account,session}/sql.ts`):
+
+```sql
+DELETE FROM credential;
+DELETE FROM account;
+DELETE FROM account_state;
+DELETE FROM control_account;
+-- time_suspended is the execution claim; claimed root sessions resume on start.
+UPDATE session_v2 SET time_suspended = NULL, resume_attempts = 0
+  WHERE time_suspended IS NOT NULL;
+-- Queued and admitted prompts would be drained into new turns.
+DELETE FROM session_pending;
+DELETE FROM session_inbox;
+```
+
+Also unset provider API keys in the launching shell. v2 runs the plugin in a
+background service: give the temporary config its own port
+(`opencode service set port <free port>` with the temp `XDG_CONFIG_HOME` exported) so
+it cannot collide with, or attach to, your real service. Even `opencode plugin list`
+can start that private service in the background; stop it with
+`opencode service stop` (same environment) when done.
 
 ## Debugging a "data is there but result is empty" bug
 
