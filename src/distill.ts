@@ -1769,6 +1769,9 @@ export function createDistiller(options: DistillerOptions): Distiller {
       logMsg(`lease acquired (build ${build}, gen ${gen})`);
       scheduleHeartbeat();
       schedulePoll();
+      // Re-distills queued when the lease was lost resume now, not only when
+      // some later re-distill finishes.
+      drainReDistillQueue();
       if (limits.coldPass && coldPassState === "idle") void startColdPass();
     } else {
       leaseHeld = false;

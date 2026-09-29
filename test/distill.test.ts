@@ -2032,6 +2032,70 @@ describe("sync-host re-distill fan-out", () => {
   });
 });
 
+describe("sync-host re-distill queue across a lease handoff", () => {
+  it("drains queued re-distills when the lease is reacquired", async () => {
+    const graph: Graph = { sessions: [], messagesBySession: {} };
+    for (const id of ["s1", "s2", "s3"]) {
+      graph.sessions.push(session(id, id, PROJECT_DIR, 1_000));
+      graph.messagesBySession[id] = [
+        bundle(userMessage(`m-${id}`, id, 100), [textPart(`p-${id}`, id, `m-${id}`, `${id} text`)]),
+      ];
+    }
+    const { source: inner } = makeDistillFake(graph);
+    let releaseS1!: () => void;
+    const s1Blocked = new Promise<void>((resolve) => (releaseS1 = resolve));
+    const source: HistorySource = {
+      ...inner,
+      getSession: async (id, o) => {
+        if (id === "s1") await s1Blocked;
+        return inner.getSession(id, o);
+      },
+    };
+    let polled = false;
+    const sync: DistillSync = {
+      checkpoint: async () => null,
+      compare: async () => "rewritten",
+      missing: async () => [],
+      poll: async () => {
+        const signals: DistillSignal[] = polled
+          ? []
+          : graph.sessions.map((s) => ({ type: "turn-ended", sessionID: s.id }));
+        polled = true;
+        return { signals, commit: () => {}, failures: [] };
+      },
+      pollIntervalMs: 5,
+    };
+    const { db, store } = await freshStore();
+    const distiller = createDistiller({
+      source,
+      store,
+      gate: createFetchGate({ concurrency: 4 }),
+      limits: { ...TEST_LIMITS, coldPass: false, distillConcurrency: 1 },
+      instanceId: "handoff",
+      sync,
+      idleDebounceMs: 1,
+      leaseRetryMs: 10,
+      log: () => {},
+    });
+    distiller.start();
+    // s1 runs (blocked), s2 and s3 wait in the queue.
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    // A rival takes the lease; s1's write sees it and the distiller demotes.
+    store.setMeta(
+      "distill_lease",
+      JSON.stringify({ holder: "rival", heartbeat: Date.now(), ttl: 30_000, build: "x", gen: 1 }),
+    );
+    releaseS1();
+    await waitFor(() => !distiller.status().leaseHeld);
+    expect(store.getCard("s2")).toBeUndefined();
+    // The rival lets go; the retry reacquires and must drain the queue.
+    store.releaseLease("rival");
+    await waitFor(() => store.getCard("s2") !== undefined && store.getCard("s3") !== undefined);
+    await distiller.stop();
+    db.close();
+  });
+});
+
 describe("sync-host unsettled retries", () => {
   it("stops re-reading an unsettled session on every poll after repeated failures", async () => {
     const graph: Graph = {
