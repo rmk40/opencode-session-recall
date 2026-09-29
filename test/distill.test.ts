@@ -1382,7 +1382,7 @@ describe("cold pass", () => {
     return { graph, failTimes };
   }
 
-  it("skips sessions that always fail among healthy ones and stops scheduling passes", async () => {
+  it("skips sessions that always fail among healthy ones, then indexes them once the host heals", async () => {
     // Pass 1 sets the five aside (healthy fetches in between reset the outage
     // streak). On follow-up passes every healthy session is up to date, so the
     // five are fetched back to back: as known-bad sessions they must not read
@@ -1404,15 +1404,52 @@ describe("cold pass", () => {
     await waitFor(
       () => distiller.status().skippedCount === 5 && distiller.status().coldPass === "done",
     );
+    expect(sdk.list).toBe(3);
     expect(distiller.status().failingCount).toBe(0);
     for (const { id, bad } of order) {
       if (!bad) expect(store.getCard(id)?.distillState).toBe("full");
     }
-    // Three passes, then no follow-up is scheduled.
+    // Skipped sessions without a card: the store is not complete, and says so.
+    expect(store.getMeta(COLD_PASS_COMPLETE_KEY)).toBeUndefined();
+    expect(distiller.indexing()).toMatchObject({ known: 10, stalled: true });
+
+    // The host heals; the long-backoff pass indexes them and stamps the store.
+    for (const { id, bad } of order) if (bad) failTimes[id] = 0;
+    await waitFor(() => store.getMeta(COLD_PASS_COMPLETE_KEY) === "1");
+    for (const { id } of order) expect(store.getCard(id)?.distillState).toBe("full");
+    expect(distiller.status().skippedCount).toBe(0);
+    expect(distiller.indexing()).toBeUndefined();
+    // Nothing left to retry: no further pass is scheduled.
     const passes = sdk.list;
-    expect(passes).toBe(3);
-    await new Promise((resolve) => setTimeout(resolve, 60));
+    await new Promise((resolve) => setTimeout(resolve, 120));
     expect(sdk.list).toBe(passes);
+    await distiller.stop();
+    db.close();
+  });
+
+  it("ends a first build under a host-wide fetch outage unstamped, with a long-backoff pass", async () => {
+    const order = Array.from({ length: 6 }, (_, i) => ({ id: `s${i}`, bad: true }));
+    const { graph, failTimes } = failingGraph(order);
+    const { source, sdk } = makeDistillFake(graph, { failTimes });
+    const { db, store } = await freshStore();
+    const distiller = createDistiller({
+      source,
+      store,
+      gate: makeSpyGate().gate,
+      limits: { ...TEST_LIMITS, distillConcurrency: 1 },
+      instanceId: "host-outage",
+      coldPassRetryMs: 5,
+      log: () => {},
+    });
+    distiller.start();
+    await waitFor(
+      () => distiller.status().skippedCount === 6 && distiller.status().coldPass === "done",
+    );
+    expect(store.getMeta(COLD_PASS_COMPLETE_KEY)).toBeUndefined();
+    expect(distiller.indexing()).toMatchObject({ known: 6, stalled: true });
+    // One more pass comes on the long backoff (10 x coldPassRetryMs).
+    const passes = sdk.list;
+    await waitFor(() => sdk.list > passes);
     await distiller.stop();
     db.close();
   });
@@ -1469,6 +1506,8 @@ describe("cold pass", () => {
     // Seven failing sessions: the first five are retried, the last two not.
     expect(bad.map(fetches)).toEqual([2, 2, 2, 2, 2, 1, 1]);
     expect(distiller.status().failingCount).toBe(7);
+    // Sessions wait for a retry: the store is not complete.
+    expect(store.getMeta(COLD_PASS_COMPLETE_KEY)).toBeUndefined();
     // lastError names the first and counts the rest.
     expect(distiller.status().lastError).toBe("session s1 fetch failed: failing: s1 (and 6 more)");
     await distiller.stop();

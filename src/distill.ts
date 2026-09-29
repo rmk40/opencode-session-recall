@@ -140,21 +140,35 @@ export const COLD_PASS_COMPLETE_KEY = "coldpass_complete";
 export const COLD_PASS_PROGRESS_KEY = "coldpass_progress";
 /** The holder writes {@link COLD_PASS_PROGRESS_KEY} at most this often. */
 export const PROGRESS_WRITE_MS = 2_000;
+/** A completed pass that left sessions skipped arms one more pass after
+ *  `coldPassRetryMs` times this, so a host-wide fetch outage that skipped
+ *  everything recovers once the host heals. */
+const SKIPPED_RETRY_FACTOR = 10;
+/** Skipped sessions a pass logs one line each for; the rest are counted in
+ *  one line at the end of the pass. */
+const SKIP_LOG_LIMIT = 3;
 /** Shared progress older than this is not a pass in progress: the store gap
  *  is reported instead (`stalled`). The holder refreshes it at least every
  *  heartbeat while a pass runs. */
 export const PROGRESS_STALE_MS = 5 * 60_000;
 
-/** Parse a {@link COLD_PASS_PROGRESS_KEY} value; undefined when malformed. */
+/** Parse a {@link COLD_PASS_PROGRESS_KEY} value; undefined when malformed.
+ *  `running: false` means the pass that wrote it ended without completing
+ *  the store and no pass is running (older values carry no flag). */
 function parseSharedProgress(
   raw: string | undefined,
-): { examined: number; known: number; at: number } | undefined {
+): { examined: number; known: number; at: number; running: boolean } | undefined {
   if (!raw) return undefined;
   try {
     const value = JSON.parse(raw) as Record<string, unknown>;
-    const { examined, known, at } = value;
-    return typeof examined === "number" && typeof known === "number" && typeof at === "number"
-      ? { examined, known, at }
+    const { examined, known, at, running } = value;
+    return typeof examined === "number" &&
+      Number.isFinite(examined) &&
+      typeof known === "number" &&
+      Number.isFinite(known) &&
+      typeof at === "number" &&
+      Number.isFinite(at)
+      ? { examined, known, at, running: running !== false }
       : undefined;
   } catch {
     return undefined;
@@ -1481,6 +1495,10 @@ export function createDistiller(options: DistillerOptions): Distiller {
        *  and how many there were. */
       let retryFailure: string | undefined;
       let retryFailureCount = 0;
+      /** Sessions skipped this pass, and those of them with no card: the
+       *  store is not complete while any session lacks one. */
+      let skippedThisPass = 0;
+      let skippedWithoutCard = 0;
 
       const countExamined = (session: DistillSessionMeta): void => {
         examined++;
@@ -1498,9 +1516,13 @@ export function createDistiller(options: DistillerOptions): Distiller {
           retryFailureCount++;
           return;
         }
-        logMsg(
-          `session ${session.id} skipped: ${failures} cold passes failed to fetch it (${errmsg(error)}); later passes and changes to it still try it, without holding a pass back`,
-        );
+        skippedThisPass++;
+        if (!store.getCard(session.id)) skippedWithoutCard++;
+        if (skippedThisPass <= SKIP_LOG_LIMIT) {
+          logMsg(
+            `session ${session.id} skipped: ${failures} cold passes failed to fetch it (${errmsg(error)}); later passes and changes to it still try it, without holding a pass back`,
+          );
+        }
         countExamined(session);
       };
 
@@ -1666,9 +1688,21 @@ export function createDistiller(options: DistillerOptions): Distiller {
         return;
       }
       coldPassState = "done";
-      if (!indexComplete) {
+      // The store is complete only when nothing is waiting for a retry and
+      // no skipped session lacks a card; otherwise the gap stays reported.
+      const complete = retryFailure === undefined && skippedWithoutCard === 0;
+      if (complete && !indexComplete) {
         indexComplete = true;
         store.setMeta(COLD_PASS_COMPLETE_KEY, "1"); // lease verified just above
+      } else if (!complete) {
+        // A follow-up pass is near: still in progress. Only skipped sessions
+        // left: nothing is indexing until the long backoff below.
+        shareProgress(true, retryFailure !== undefined);
+      }
+      if (skippedThisPass > SKIP_LOG_LIMIT) {
+        logMsg(
+          `${skippedThisPass - SKIP_LOG_LIMIT} more session(s) skipped this pass after repeated fetch failures`,
+        );
       }
       logMsg(
         `cold pass done (${distilled} distilled / ${examined} examined / ${knownCount} known)`,
@@ -1682,6 +1716,11 @@ export function createDistiller(options: DistillerOptions): Distiller {
             ? `${retryFailure} (and ${retryFailureCount - 1} more)`
             : retryFailure;
         scheduleColdPassRetry(true);
+      } else if (skippedSessions > 0) {
+        // Skipped sessions are not retried by follow-ups. One more pass on a
+        // long backoff tries them again, so a host-wide fetch outage that
+        // skipped everything recovers when the host heals.
+        scheduleColdPassRetry(true, coldPassRetryMs * SKIPPED_RETRY_FACTOR);
       }
     } catch (error) {
       lastError = errmsg(error);
@@ -1692,6 +1731,9 @@ export function createDistiller(options: DistillerOptions): Distiller {
       // skip limit instead of aborting forever. Their failures are known from
       // then on and no longer count toward the next outage.
       if (outageAbort && !stopped && leaseHeld) {
+        // This can take a session past the skip limit without the "skipped"
+        // log line: that line belongs to a pass that reaches its end, and the
+        // session is simply fetched once, unretried, by the next one.
         for (const session of failedThisPass) bumpFetchFailure(session.id);
       }
       // Other processes keep reporting where the pass got to until the retry
@@ -1746,10 +1788,11 @@ export function createDistiller(options: DistillerOptions): Distiller {
     return running;
   }
 
-  /** Re-arm a cold pass after `coldPassRetryMs`: after an aborted pass
-   *  (`lastError` set, state idle), or as a follow-up for sessions still
-   *  failing after a completed one. */
-  function scheduleColdPassRetry(followUp = false): void {
+  /** Re-arm a cold pass after `delayMs` (default `coldPassRetryMs`): after
+   *  an aborted pass (`lastError` set, state idle), or as a follow-up after a
+   *  completed one (sessions still failing, or skipped ones on a long
+   *  backoff). */
+  function scheduleColdPassRetry(followUp = false, delayMs = coldPassRetryMs): void {
     if (stopped || !leaseHeld) return;
     clearTimer(coldPassRetryTimer);
     coldPassRetryTimer = setTimeout(() => {
@@ -1759,14 +1802,14 @@ export function createDistiller(options: DistillerOptions): Distiller {
       if (followUp || (coldPassState === "idle" && lastError !== undefined)) {
         void startColdPass();
       }
-    }, coldPassRetryMs);
+    }, delayMs);
   }
 
   /** Share this pass's progress in {@link COLD_PASS_PROGRESS_KEY}, at most
    *  every {@link PROGRESS_WRITE_MS} unless `force`. Holder-only (the lease
    *  is verified before the write), and never once the store is complete. */
   let progressWrittenAt = Number.NEGATIVE_INFINITY;
-  function shareProgress(force = false): void {
+  function shareProgress(force = false, running = true): void {
     if (stopped || !leaseHeld || indexComplete) return;
     const t = now();
     if (!force && t - progressWrittenAt < PROGRESS_WRITE_MS) return;
@@ -1774,7 +1817,7 @@ export function createDistiller(options: DistillerOptions): Distiller {
     progressWrittenAt = t;
     store.setMeta(
       COLD_PASS_PROGRESS_KEY,
-      JSON.stringify({ examined: examinedCount, known: knownCount, at: t }),
+      JSON.stringify({ examined: examinedCount, known: knownCount, at: t, running }),
     );
   }
 
@@ -2174,7 +2217,7 @@ export function createDistiller(options: DistillerOptions): Distiller {
       if (!shared) return undefined;
       const cards = store.cardCount();
       if (shared.known <= cards) return undefined;
-      if (now() - shared.at > PROGRESS_STALE_MS) {
+      if (!shared.running || now() - shared.at > PROGRESS_STALE_MS) {
         return { examined: cards, known: shared.known, stalled: true };
       }
       return { examined: shared.examined, known: shared.known };

@@ -73,8 +73,9 @@ All notable changes to this project are documented here. This project follows
   process sharing the store reports the pass, not only the one running
   it; if no pass has made progress for 5 minutes the warning says the
   index is incomplete and not being built right now (`stalled: true`).
-  Once a pass has completed on the store, later passes (such as the check
-  on every restart) report nothing.
+  Once a pass has indexed every session (nothing waiting for a retry, and
+  no skipped session without a card), later passes (such as the check on
+  every restart) report nothing.
 - The v1 cold pass now yields to the event loop between sessions, inside
   a large session's card derivation, and every 50 family-rollup writes,
   so a big history no longer holds the host's loop for long stretches.
@@ -126,9 +127,11 @@ All notable changes to this project are documented here. This project follows
   now no longer stops the pass: it is set aside, the pass indexes
   everything else, and the session is retried once at the end. If that
   retry fails too, a follow-up pass tries again after 60 s; after three
-  passes the session is skipped with one log line, so passes stop being
-  scheduled for it (a later pass still tries it once, and so does any
-  change to it). Five sessions failing in a row still abort the pass as
+  passes the session is skipped (logged one line each for the first few,
+  then as a count), so it stops holding passes back; a later pass still
+  tries it once, and so does any change to it. While skipped sessions
+  remain, one more pass runs after 10 minutes, so an outage that failed
+  every fetch recovers once the host heals. Five sessions failing in a row still abort the pass as
   an outage, but only sessions not already known to fail count toward
   that, and an aborted pass counts against every session that failed in
   it, so a failure that repeats cannot abort passes forever.
