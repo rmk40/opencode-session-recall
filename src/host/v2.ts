@@ -121,21 +121,60 @@ export function instanceOf(ctx: object): V2Instance | undefined {
   return instances.get(ctx);
 }
 
-/** Pump the host's event stream into the runtime until aborted. Events that
- *  arrive before the runtime exists are dropped: the poll covers them. */
+/** Backoff between event re-subscriptions after the stream fails or ends
+ *  (the last value repeats). Mutable for tests. */
+export const eventResubscribe = { delaysMs: [1_000, 5_000, 30_000] };
+
+/** Resolve after `ms`, or at once when `signal` aborts. */
+function sleepUnlessAborted(ms: number, signal: AbortSignal): Promise<void> {
+  return new Promise((resolve) => {
+    if (signal.aborted) return resolve();
+    const timer = setTimeout(done, ms);
+    function done(): void {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", done);
+      resolve();
+    }
+    signal.addEventListener("abort", done, { once: true });
+  });
+}
+
+/**
+ * Pump the host's event stream into the runtime until aborted. Events that
+ * arrive before the runtime exists are dropped: the poll covers them. A stream
+ * that fails or ends while the instance is live is re-subscribed after a
+ * backoff ({@link eventResubscribe}), with one log line when it drops and one
+ * when events flow again. Events are only a latency hint, so a gap costs
+ * freshness until the next poll, never correctness.
+ */
 function pumpEvents(ctx: V2PluginContext, instance: V2Instance, signal: AbortSignal): void {
+  const live = (): boolean => !instance.disposed && !signal.aborted;
   void (async () => {
-    try {
-      for await (const event of ctx.event.subscribe({ signal })) {
-        if (instance.disposed || signal.aborted) break;
-        try {
-          instance.attachment.current()?.onEvent(event);
-        } catch (error) {
-          v2Log(`event handling failed: ${errmsg(error)}`);
+    let failures = 0;
+    while (live()) {
+      let reason = "ended";
+      try {
+        for await (const event of ctx.event.subscribe({ signal })) {
+          if (!live()) return;
+          if (failures > 0) {
+            v2Log("event stream resumed");
+            failures = 0;
+          }
+          try {
+            instance.attachment.current()?.onEvent(event);
+          } catch (error) {
+            v2Log(`event handling failed: ${errmsg(error)}`);
+          }
         }
+      } catch (error) {
+        reason = `failed: ${errmsg(error)}`;
       }
-    } catch (error) {
-      if (!signal.aborted) v2Log(`event stream ended: ${errmsg(error)}`);
+      if (!live()) return;
+      const delays = eventResubscribe.delaysMs;
+      const delay = delays[Math.min(failures, delays.length - 1)] ?? 30_000;
+      failures++;
+      v2Log(`event stream ${reason}; resubscribing in ${delay}ms`);
+      await sleepUnlessAborted(delay, signal);
     }
   })();
 }

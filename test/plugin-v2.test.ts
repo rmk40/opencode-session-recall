@@ -3,7 +3,7 @@ import { mkdtempSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import entry from "../src/opencode-session-recall.js";
-import { instanceOf, PRIMARY_ONLY_ERROR } from "../src/host/v2.js";
+import { eventResubscribe, instanceOf, PRIMARY_ONLY_ERROR } from "../src/host/v2.js";
 import { NUDGE_BASE_TEXT, NUDGE_SENTINEL, NUDGE_TEXT } from "../src/hooks/system-nudge.js";
 import { unavailableHistoryError } from "../src/history/source.js";
 import { STARTING_REASON } from "../src/host/v2-tools.js";
@@ -15,7 +15,14 @@ import type { V2Runtime } from "../src/host/v2-runtime.js";
 import type { V2Cleanup } from "../src/host/opencode-v2-types.js";
 import { openSqlite } from "../src/sqlite.js";
 import { insertMessage, insertProject, insertSession, makeV2Db, type V2TestDb } from "./v2-db.js";
-import { fakeV2Host, type FakeV2Host, type FakeV2HostOptions } from "./v2-host.js";
+import {
+  eventStream,
+  fakeV2Host,
+  type EventStream,
+  type FakeV2Host,
+  type FakeV2HostOptions,
+} from "./v2-host.js";
+import type { V2Event } from "../src/host/opencode-v2-types.js";
 
 /**
  * The v2 host entry end to end over a fake v2 context and a temp opencode.db.
@@ -198,6 +205,55 @@ describe("v2 setup", () => {
     a.events.push({ ...renamed, id: "evt_2" });
     await new Promise((resolve) => setTimeout(resolve, 10));
     expect(onEvent).toHaveBeenCalledTimes(2);
+  });
+
+  it("re-subscribes with backoff after the event stream fails mid-stream", async () => {
+    eventResubscribe.delaysMs = [5, 5, 5];
+    try {
+      const inner = eventStream();
+      let subscriptions = 0;
+      // The first subscription delivers one event, then fails; later ones work.
+      const flaky: EventStream = Object.assign(Object.create(inner) as EventStream, {
+        subscribe(signal?: AbortSignal): AsyncIterable<V2Event> {
+          const base = inner.subscribe(signal);
+          if (++subscriptions > 1) return base;
+          return {
+            [Symbol.asyncIterator]() {
+              const it = base[Symbol.asyncIterator]();
+              let delivered = 0;
+              return {
+                async next(): Promise<IteratorResult<V2Event>> {
+                  if (delivered > 0) {
+                    await it.return?.();
+                    throw new Error("stream broke");
+                  }
+                  delivered++;
+                  return it.next();
+                },
+                return: () => it.return?.() ?? Promise.resolve({ done: true, value: undefined }),
+              };
+            },
+          };
+        },
+      });
+      const h = host({ events: flaky });
+      await setup(h);
+      const runtime = await runtimeOf(h);
+      const onEvent = vi.spyOn(runtime, "onEvent");
+      const renamed = (id: string) => ({
+        id,
+        type: "session.renamed",
+        data: { sessionID: "ses_a", title: id },
+      });
+      inner.push(renamed("evt_before"));
+      await new Promise((resolve) => setTimeout(resolve, 40));
+      expect(subscriptions).toBe(2);
+      inner.push(renamed("evt_after"));
+      await new Promise((resolve) => setTimeout(resolve, 10));
+      expect(onEvent.mock.calls.map(([event]) => event.id)).toEqual(["evt_before", "evt_after"]);
+    } finally {
+      eventResubscribe.delaysMs = [1_000, 5_000, 30_000];
+    }
   });
 
   it("stops reading events after cleanup", async () => {
