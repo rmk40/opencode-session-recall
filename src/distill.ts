@@ -1787,6 +1787,9 @@ export function createDistiller(options: DistillerOptions): Distiller {
   }
 
   function quarantine(session: DistillSessionMeta, error: unknown): void {
+    // A malformed session is quarantined, not failing: drop any fetch strikes
+    // so it is not counted twice or kept alive by the skipped-pass backoff.
+    setStrikes(session.id, undefined);
     // Reinsertion keeps FIFO eviction aligned with the latest failure.
     quarantined.delete(session.id);
     quarantined.set(session.id, session.timeUpdated);

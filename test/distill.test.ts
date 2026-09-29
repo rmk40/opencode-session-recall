@@ -1477,6 +1477,31 @@ describe("cold pass", () => {
     }
   });
 
+  it("clears a session's fetch strikes when it is quarantined", async () => {
+    const { graph } = failingGraph([{ id: "ok" }, { id: "x" }]);
+    const nonArray = new Set<string>();
+    const { source } = makeDistillFake(graph, { failTimes: { x: 2 }, nonArray });
+    const { db, store } = await freshStore();
+    const distiller = createDistiller({
+      source,
+      store,
+      gate: makeSpyGate().gate,
+      limits: { ...TEST_LIMITS, distillConcurrency: 1 },
+      instanceId: "strikes-quarantine",
+      coldPassRetryMs: 30,
+      log: () => {},
+    });
+    distiller.start();
+    await waitFor(() => distiller.status().coldPass === "done");
+    expect(distiller.status().failingCount).toBe(1);
+    // x now fails as malformed data: quarantined, no longer failing.
+    nonArray.add("x");
+    await waitFor(() => distiller.status().quarantinedCount === 1);
+    expect(distiller.status().failingCount).toBe(0);
+    await distiller.stop();
+    db.close();
+  });
+
   it("ends a first build under a host-wide fetch outage unstamped, with a long-backoff pass", async () => {
     const order = Array.from({ length: 6 }, (_, i) => ({ id: `s${i}`, bad: true }));
     const { graph, failTimes } = failingGraph(order);
