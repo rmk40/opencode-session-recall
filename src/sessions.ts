@@ -69,8 +69,9 @@ export function sessions(
   limits: Limits,
   enrichment?: SessionEnrichment,
 ): ToolDefinition {
-  /** A card-backed listing made while the cold pass runs may be missing
-   *  sessions: say so, with the pass's progress. */
+  /** A listing selected from the cards while the index is still being built
+   *  may be missing sessions: say so, with the pass's progress. Only the
+   *  card-selected paths use it; a live listing is complete as it is. */
   const withIndexing = (out: SessionsOutput): SessionsOutput => {
     const progress = enrichment?.indexing?.();
     if (!progress) return out;
@@ -497,7 +498,8 @@ export function sessions(
               }
             : {}),
         };
-        return JSON.stringify(withIndexing(out));
+        // A live listing does not depend on the card index: no indexing note.
+        return JSON.stringify(out);
       } catch (e) {
         const err: ErrorOutput = { ok: false, error: errmsg(e) };
         return JSON.stringify(err);

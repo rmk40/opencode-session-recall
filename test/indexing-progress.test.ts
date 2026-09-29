@@ -33,7 +33,7 @@ describe("cold-pass progress in responses", () => {
     }
   });
 
-  it("recall_sessions notes indexing progress on card-backed listings", async () => {
+  it("recall_sessions notes indexing progress on card-selected listings only", async () => {
     const h = makeFakeHarness();
     const { store, cleanup } = await makeRecallDeps(h, TEST_LIMITS);
     try {
@@ -41,10 +41,18 @@ describe("cold-pass progress in responses", () => {
         cards: () => store.allCards(),
         indexing: () => ({ examined: 0, known: 0 }),
       });
-      const out = await runTool<SessionsOutput>(tool, { scope: "project" });
-      expect(out.ok).toBe(true);
-      expect(out.indexing).toEqual({ examined: 0, known: 0 });
-      expect(out.note).toContain("Indexing in progress: sessions are still being discovered");
+      // A time filter selects from the cards.
+      const carded = await runTool<SessionsOutput>(tool, { scope: "project", since: "30d" });
+      expect(carded.ok).toBe(true);
+      expect(carded.sessions.length).toBeGreaterThan(0);
+      expect(carded.indexing).toEqual({ examined: 0, known: 0 });
+      expect(carded.note).toContain("Indexing in progress: sessions are still being discovered");
+
+      // A plain listing is live: it does not depend on the index.
+      const live = await runTool<SessionsOutput>(tool, { scope: "project" });
+      expect(live.ok).toBe(true);
+      expect(live.indexing).toBeUndefined();
+      expect(live.note).toBeUndefined();
     } finally {
       cleanup();
     }
