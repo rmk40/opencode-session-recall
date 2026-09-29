@@ -81,6 +81,8 @@ function makeDistillFake(
   graph: Graph,
   opts: {
     throwOnce?: Set<string>;
+    /** Session id → how many message fetches of it throw before one succeeds. */
+    failTimes?: Record<string, number>;
     nonArray?: Set<string>;
     metadataErrorOnce?: Set<string>;
     /** session.get returns the v2 404 body (`name: "NotFoundError"`). */
@@ -122,6 +124,11 @@ function makeDistillFake(
         if (opts.throwOnce?.has(params.sessionID) && !threw.has(params.sessionID)) {
           threw.add(params.sessionID);
           throw new Error(`throw once: ${params.sessionID}`);
+        }
+        const left = opts.failTimes?.[params.sessionID] ?? 0;
+        if (left > 0) {
+          opts.failTimes![params.sessionID] = left - 1;
+          throw new Error(`failing: ${params.sessionID}`);
         }
         if (opts.nonArray?.has(params.sessionID)) {
           return { data: { messages: "not-an-array" } };
@@ -810,7 +817,9 @@ describe("cold pass", () => {
         ],
       },
     };
-    const { source, sdk } = makeDistillFake(graph, { throwOnce: new Set(["flaky"]) });
+    // flaky fails its first fetch and the end-of-pass retry, so a follow-up
+    // pass runs; it must not refetch the quarantined session.
+    const { source, sdk } = makeDistillFake(graph, { failTimes: { flaky: 2 } });
     const { db, store } = await freshStore();
     const { gate } = makeSpyGate();
     const distiller = createDistiller({
@@ -823,7 +832,7 @@ describe("cold pass", () => {
     });
 
     distiller.start();
-    await waitFor(() => distiller.status().coldPass === "done");
+    await waitFor(() => store.getCard("flaky")?.distillState === "full");
 
     expect(sdk.list).toBe(2);
     expect(sdk.messages.filter((call) => call.sessionID === "bad")).toHaveLength(1);
@@ -1031,7 +1040,9 @@ describe("cold pass", () => {
         ],
       },
     };
-    const { source, sdk } = makeDistillFake(graph, { throwOnce: new Set(["flaky"]) });
+    // flaky fails its fetch and the end-of-pass retry, so a follow-up pass
+    // runs after coldPassRetryMs; by then bad has been repaired.
+    const { source, sdk } = makeDistillFake(graph, { failTimes: { flaky: 2 } });
     const { db, store } = await freshStore();
     const { gate } = makeSpyGate();
     const distiller = createDistiller({
@@ -1051,7 +1062,7 @@ describe("cold pass", () => {
         textPart("p-bad-fixed", "bad", "m-bad-fixed", "repaired content"),
       ]),
     ];
-    await waitFor(() => distiller.status().coldPass === "done");
+    await waitFor(() => store.getCard("bad")?.timeUpdated === 4000);
 
     expect(sdk.messages.filter((call) => call.sessionID === "bad")).toHaveLength(2);
     expect(store.getCard("bad")?.timeUpdated).toBe(4000);
@@ -1106,7 +1117,7 @@ describe("cold pass", () => {
     db.close();
   });
 
-  it("resumes from the checkpoint after a mid-pass fetch failure", async () => {
+  it("carries on past a mid-pass fetch failure and retries it at the end of the pass", async () => {
     const s1 = session("s1", "Alpha", PROJECT_DIR, 3000);
     const s2 = session("s2", "Bravo", PROJECT_DIR, 2000);
     const s3 = session("s3", "Charlie", PROJECT_DIR, 1000);
@@ -1118,26 +1129,51 @@ describe("cold pass", () => {
         s3: [bundle(userMessage("m3", "s3", 100), [textPart("p3", "s3", "m3", "charlie xray")])],
       },
     };
-    const { source } = makeDistillFake(graph, { throwOnce: new Set(["s2"]) });
+    const { source, sdk } = makeDistillFake(graph, { throwOnce: new Set(["s2"]) });
     const { db, store } = await freshStore();
     const { gate } = makeSpyGate();
     const limits = { ...TEST_LIMITS, distillConcurrency: 1 };
 
     const first = createDistiller({ source, store, gate, limits, instanceId: "cold-a" });
     first.start();
-    await waitFor(() => first.status().coldPass !== "running");
-    expect(first.status().lastError).toBeDefined();
-    expect(store.getCard("s1")?.distillState).toBe("full"); // processed before the failure
-    expect(store.getCard("s2")).toBeUndefined(); // failed
-    expect(store.getCard("s3")).toBeUndefined(); // never reached (pass aborted)
-    first.stop(); // releases the lease
+    await waitFor(() => first.status().coldPass === "done");
+    // One pass: s3 was reached after s2 failed, and s2 succeeded on the retry.
+    for (const id of ["s1", "s2", "s3"]) expect(store.getCard(id)?.distillState).toBe("full");
+    expect(sdk.list).toBe(1);
+    expect(sdk.messages.map((call) => call.sessionID)).toEqual(["s1", "s2", "s3", "s2"]);
+    expect(first.status().lastError).toBeUndefined();
+    first.stop();
+    db.close();
+  });
 
-    const second = createDistiller({ source, store, gate, limits, instanceId: "cold-b" });
-    second.start();
-    await waitFor(() => second.status().coldPass === "done");
-    expect(store.getCard("s2")?.distillState).toBe("full"); // completed on resume
-    expect(store.getCard("s3")?.distillState).toBe("full");
-    second.stop();
+  it("aborts the pass when five sessions in a row fail (an outage)", async () => {
+    const ids = ["s1", "s2", "s3", "s4", "s5", "s6"];
+    const graph: Graph = { sessions: [], messagesBySession: {} };
+    ids.forEach((id, i) => {
+      graph.sessions.push(session(id, id, PROJECT_DIR, 9000 - i * 1000));
+      graph.messagesBySession[id] = [
+        bundle(userMessage(`m-${id}`, id, 100), [textPart(`p-${id}`, id, `m-${id}`, id)]),
+      ];
+    });
+    const { source } = makeDistillFake(graph, {
+      failTimes: { s1: 1, s2: 1, s3: 1, s4: 1, s5: 1 },
+    });
+    const { db, store } = await freshStore();
+    const { gate } = makeSpyGate();
+    const distiller = createDistiller({
+      source,
+      store,
+      gate,
+      limits: { ...TEST_LIMITS, distillConcurrency: 1 },
+      instanceId: "outage",
+      coldPassRetryMs: 60_000,
+      log: () => {},
+    });
+    distiller.start();
+    await waitFor(() => distiller.status().lastError !== undefined);
+    expect(distiller.status().coldPass).toBe("idle");
+    expect(store.getCard("s6")).toBeUndefined(); // never reached: the pass aborted
+    await distiller.stop();
     db.close();
   });
 
@@ -1304,19 +1340,23 @@ describe("cold pass", () => {
 
     distiller.start();
     await waitFor(() => distiller.status().coldPass === "done");
-
+    // The first pass finishes: every other session is indexed right away.
     for (const id of ["s1", "s3", "s4"]) expect(store.getCard(id)?.distillState).toBe("full");
     expect(store.getCard("s2")).toBeUndefined();
-    // Two passes aborted on it (a passing outage still retries); the third
-    // skipped it and finished.
-    expect(s2Reads).toBe(3);
+    expect(distiller.status().failingCount).toBe(1);
+
+    // Follow-up passes retry it; after three passes (a fetch and an
+    // end-of-pass retry each) it is skipped.
+    await waitFor(() => distiller.status().skippedCount === 1);
+    expect(s2Reads).toBe(6);
+    expect(distiller.status().failingCount).toBe(0);
     expect(store.getMeta("coldpass_cursor")).toBe("1000");
     expect(logs.some((line) => line.includes("session s2 skipped for this cold pass"))).toBe(true);
     distiller.stop();
     db.close();
   });
 
-  it("recovers a concurrency-2 cold pass from a mid-pass failure via backoff retry", async () => {
+  it("recovers a concurrency-2 cold pass from a mid-pass failure via the end-of-pass retry", async () => {
     const graph: Graph = {
       sessions: [
         session("s1", "One", PROJECT_DIR, 4000),
@@ -1351,7 +1391,7 @@ describe("cold pass", () => {
       expect(store.getCard(id)?.distillState).toBe("full");
     }
     expect(sdk.messages.filter((c) => c.sessionID === "s2").length).toBe(2); // threw once, retried
-    expect(sdk.list).toBe(2); // discovery re-ran on the backoff retry
+    expect(sdk.list).toBe(1); // retried at the end of the same pass, no second discovery
     distiller.stop();
     db.close();
   });
@@ -2217,7 +2257,10 @@ describe("null store", () => {
       coldPass: "idle",
       distilledCount: 0,
       knownCount: 0,
+      examinedCount: 0,
       quarantinedCount: 0,
+      skippedCount: 0,
+      failingCount: 0,
     });
   });
 });

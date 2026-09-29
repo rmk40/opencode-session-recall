@@ -98,10 +98,13 @@ All notable changes to this project are documented here. This project follows
   on.** If opencode could not serve a session (seen live on 1.18.33, where
   booting that session's project directory failed with
   `no such column: project_id`), every cold pass aborted on it and retried
-  it every 60 s, so older sessions were never indexed. A session whose fetch
-  fails in three consecutive passes is now skipped for the rest of that pass
-  with one log line; the pass finishes, and the session is still tried on
-  every later pass and when it changes.
+  it every 60 s, so older sessions were never indexed. A failing session now
+  no longer stops the pass: it is set aside, the pass indexes everything
+  else, and the session is retried once at the end. If that retry fails too,
+  a follow-up pass tries it again after 60 s; after three such passes it is
+  skipped with one log line (still tried when it changes). Only five
+  different sessions failing in a row, which looks like an outage, aborts
+  the pass as before.
 
 ## 2.3.0
 
