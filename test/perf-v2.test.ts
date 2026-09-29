@@ -1,0 +1,344 @@
+/**
+ * v2 event-loop stall gate, gated behind RECALL_PERF=1
+ * like test/perf.test.ts:
+ *
+ *     RECALL_PERF=1 npx vitest run test/perf-v2.test.ts
+ *
+ * On opencode v2 the plugin runs inside the shared service process, so a long
+ * synchronous slice stalls every session, not just one TUI. This builds a
+ * large synthetic opencode v2 database (thousands of small sessions, a few
+ * 4,000-row sessions, and some multi-megabyte rows, including rows over the
+ * page byte ceiling), then measures the longest gap a `setInterval(0)` probe
+ * sees during a full v2 cold pass, one poll cycle, and a `listSessions` call.
+ * Budget: no slice over 50 ms.
+ *
+ * When the budget fails the report names the slowest synchronous calls it
+ * could attribute (opencode.db statements and store transactions) and the
+ * calls inside the worst stall, so the offending path is visible rather than
+ * the budget being loosened.
+ *
+ * Status when added (2026-09-28, Apple Silicon, Node): the poll (about 3 ms)
+ * and listSessions (under 10 ms) pass; the cold pass does NOT (93 to 153 ms).
+ * Its worst slice is one session's derivation: after the post-fetch tail
+ * checkpoint read (about 11 ms), deriveCard over a 4,000-message session
+ * (32 to 68 ms) and its replaceSessionParts transaction (about 20 ms) run
+ * without a yield. This gate stays red until that path is split.
+ */
+import { describe, expect, it } from "vitest";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { createDistiller, type PollMeta } from "../src/distill.js";
+import { createFetchGate } from "../src/fetch-gate.js";
+import { openStore } from "../src/store.js";
+import { openSqlite, type ReadOnlyDb, type SqliteDb } from "../src/sqlite.js";
+import { createV2HistorySource, openOpencodeDb } from "../src/history/v2.js";
+import {
+  createV2Sync,
+  POLL_CURSOR_KEY,
+  POLL_WATERMARK_KEY,
+  SESSION_CURSOR_KEY,
+  SESSION_WATERMARK_KEY,
+} from "../src/history/v2-sync.js";
+import { DEFAULTS, DISCOVERY_LIMIT } from "../src/types.js";
+import { insertProject, insertSession, makeV2Db } from "./v2-db.js";
+
+const ENABLED = process.env.RECALL_PERF === "1";
+const BUDGET_MS = 50;
+
+const SMALL_SESSIONS = 3_000;
+const RECENT_SESSIONS = 600;
+const BIG_SESSIONS = 3;
+const BIG_SESSION_ROWS = 4_000;
+const LOADED_HUGE_ROW_BYTES = 3 * 1024 * 1024; // under the 4 MiB page ceiling
+const OVERSIZED_ROW_BYTES = 6 * 1024 * 1024; // over it: a placeholder
+
+type SlowCall = { what: string; ms: number };
+
+/** The longest gap between ticks of a 0 ms interval while it runs, and
+ *  where it was (start and end times). */
+function stallProbe(): {
+  reset(): void;
+  max(): number;
+  worst(): { from: number; to: number };
+  stop(): void;
+} {
+  let last = performance.now();
+  let max = 0;
+  let worst = { from: 0, to: 0 };
+  const timer = setInterval(() => {
+    const now = performance.now();
+    if (now - last > max) {
+      max = now - last;
+      worst = { from: last, to: now };
+    }
+    last = now;
+  }, 0);
+  return {
+    reset() {
+      max = 0;
+      last = performance.now();
+    },
+    max: () => max,
+    worst: () => worst,
+    stop: () => clearInterval(timer),
+  };
+}
+
+/** Record every synchronous call: the slowest, and a timeline to place the
+ *  worst stall (calls that ran inside it, and the last one before it). */
+function slowLog(): {
+  note(what: string, ms: number): void;
+  top(n: number): SlowCall[];
+  around(window: { from: number; to: number }): Array<{ at: number; what: string; ms: number }>;
+} {
+  const calls: SlowCall[] = [];
+  const timeline: Array<{ at: number; what: string; ms: number }> = [];
+  return {
+    note(what, ms) {
+      if (ms > 5) calls.push({ what, ms: Math.round(ms * 10) / 10 });
+      timeline.push({ at: performance.now() - ms, what, ms: Math.round(ms * 10) / 10 });
+    },
+    top: (n) => [...calls].sort((a, b) => b.ms - a.ms).slice(0, n),
+    around: ({ from, to }) => {
+      // The slow calls inside the stall, and the last call before it.
+      const inside = timeline.filter((e) => e.at >= from && e.at <= to && e.ms > 1);
+      const before = timeline.filter((e) => e.at < from).slice(-1);
+      return [...before, ...inside].map((e) => ({ ...e, at: Math.round(e.at - from) }));
+    },
+  };
+}
+
+function timedReader(inner: ReadOnlyDb, log: ReturnType<typeof slowLog>): ReadOnlyDb {
+  const label = (sql: string) => `opencode.db: ${sql.replace(/\s+/g, " ").slice(0, 90)}`;
+  return {
+    get: (sql, params) => {
+      const start = performance.now();
+      try {
+        return inner.get(sql, params);
+      } finally {
+        log.note(label(sql), performance.now() - start);
+      }
+    },
+    all: (sql, params) => {
+      const start = performance.now();
+      try {
+        return inner.all(sql, params);
+      } finally {
+        log.note(label(sql), performance.now() - start);
+      }
+    },
+    close: () => inner.close(),
+  };
+}
+
+function timedStoreDb(inner: SqliteDb, log: ReturnType<typeof slowLog>): SqliteDb {
+  return {
+    ...inner,
+    tx(fn) {
+      const start = performance.now();
+      try {
+        return inner.tx(fn);
+      } finally {
+        log.note("store transaction", performance.now() - start);
+      }
+    },
+    run(sql, params) {
+      const start = performance.now();
+      try {
+        return inner.run(sql, params);
+      } finally {
+        log.note(`store: ${sql.slice(0, 60)}`, performance.now() - start);
+      }
+    },
+  };
+}
+
+const words = [
+  "migration",
+  "checkout",
+  "parser",
+  "websocket",
+  "lease",
+  "cursor",
+  "rollback",
+  "sprocket",
+  "latency",
+  "budget",
+];
+const sentence = (i: number, n = 12) =>
+  Array.from({ length: n }, (_, k) => words[(i + k * 7) % words.length]).join(" ");
+
+describe.skipIf(!ENABLED)("perf: v2 event-loop stalls", () => {
+  it(`cold pass, one poll and listSessions never block the loop over ${BUDGET_MS} ms`, async () => {
+    const v2 = await makeV2Db();
+    const storeDir = mkdtempSync(join(tmpdir(), "recall-perf-v2-"));
+    try {
+      // ── Build the synthetic opencode.db (one writer transaction) ──
+      const built = performance.now();
+      const at = Date.now();
+      let seq = 0;
+      const w = v2.db;
+      w.tx(() => {
+        insertProject(w, { id: "prj", worktree: "/workspace/perf" });
+        const add = (sid: string, type: string, data: unknown, t: number) => {
+          w.run(
+            `INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data)
+             VALUES (?, ?, ?, ?, ?, ?, ?)`,
+            [`msg_${++seq}`, sid, type, seq, t, t, JSON.stringify(data)],
+          );
+        };
+        const user = (text: string, t: number) => ({ text, time: { created: t } });
+        const reply = (text: string, t: number) => ({
+          agent: "build",
+          model: { id: "m", providerID: "p" },
+          content: [{ type: "text", text }],
+          time: { created: t, completed: t + 1 },
+        });
+        for (let i = 0; i < SMALL_SESSIONS; i++) {
+          const sid = `ses_small_${i}`;
+          // The newest RECENT_SESSIONS fall inside the poll's window below.
+          const t =
+            i < SMALL_SESSIONS - RECENT_SESSIONS
+              ? at - 10_000_000 + i * 1_000
+              : at - 1_200_000 + (i - (SMALL_SESSIONS - RECENT_SESSIONS)) * 1_000;
+          insertSession(w, {
+            id: sid,
+            project_id: "prj",
+            directory: "/workspace/perf",
+            time_created: t,
+            time_updated: t + 500,
+          });
+          add(sid, "user", user(sentence(i), t), t);
+          add(sid, "assistant", reply(sentence(i + 1, 40), t + 10), t + 10);
+          add(sid, "user", user(sentence(i + 2), t + 20), t + 20);
+          add(sid, "assistant", reply(sentence(i + 3, 40), t + 30), t + 30);
+        }
+        for (let b = 0; b < BIG_SESSIONS; b++) {
+          const sid = `ses_big_${b}`;
+          const t = at - 1_000_000 + b * 100_000;
+          insertSession(w, {
+            id: sid,
+            project_id: "prj",
+            directory: "/workspace/perf",
+            time_created: t,
+            time_updated: t + BIG_SESSION_ROWS * 10,
+          });
+          for (let r = 0; r < BIG_SESSION_ROWS; r++) {
+            const rt = t + r * 10;
+            if (r % 2 === 0) add(sid, "user", user(sentence(r), rt), rt);
+            else add(sid, "assistant", reply(sentence(r, 60), rt), rt);
+          }
+          // One loaded multi-megabyte reply and one over the page ceiling.
+          const rt = t + BIG_SESSION_ROWS * 10;
+          add(sid, "assistant", reply("x".repeat(LOADED_HUGE_ROW_BYTES), rt), rt);
+          add(sid, "assistant", reply("y".repeat(OVERSIZED_ROW_BYTES), rt + 1), rt + 1);
+        }
+      });
+      const buildMs = performance.now() - built;
+
+      const slow = slowLog();
+      const opened = await openOpencodeDb(v2.path);
+      if (!opened.ok) throw new Error(opened.reason);
+      const reader = timedReader(opened.db, slow);
+      const rawStoreDb = await openSqlite(join(storeDir, "store.db"));
+      if (!rawStoreDb) throw new Error("no sqlite");
+      const storeDb = timedStoreDb(rawStoreDb, slow);
+      const openedStore = openStore(storeDb, { host: "opencode-v2", source: v2.path });
+      if (!openedStore.ok) throw new Error(openedStore.reason);
+      const store = openedStore.store;
+
+      const source = createV2HistorySource(reader);
+      const sync = createV2Sync(reader, { pollIntervalMs: 3_600_000 });
+      const probe = stallProbe();
+      let coldWorst = { from: 0, to: 0 };
+      const results: Record<string, number> = {};
+      try {
+        // ── Cold pass ──
+        probe.reset();
+        const coldStart = performance.now();
+        const distiller = createDistiller({
+          source,
+          store,
+          gate: createFetchGate({ concurrency: DEFAULTS.concurrency }),
+          limits: { ...DEFAULTS, distillDelayMs: 0 },
+          instanceId: "perf-v2",
+          discover: async () => {
+            const listing = await source.listSessions({ scope: "global", limit: DISCOVERY_LIMIT });
+            if (!listing.ok) throw new Error(listing.error);
+            return listing.items;
+          },
+          sync,
+          yieldBetween: () => new Promise((resolve) => setTimeout(resolve, 0)),
+          log: () => {},
+        });
+        distiller.start();
+        while (distiller.status().coldPass !== "done") {
+          if (performance.now() - coldStart > 600_000) throw new Error("cold pass did not finish");
+          await new Promise((resolve) => setTimeout(resolve, 50));
+        }
+        results.coldPassMaxSliceMs = probe.max();
+        coldWorst = probe.worst();
+        results.coldPassTotalMs = performance.now() - coldStart;
+        await distiller.stop();
+
+        // ── One poll cycle (both queries; the session scan is due on a first poll) ──
+        const meta: PollMeta = {
+          get: (key) => store.getMeta(key),
+          set: (key, value) => store.setMeta(key, value),
+        };
+        // A watermark 30 minutes back: the poll pages through the recent
+        // sessions (more than one page of 500) and the session scan sees them.
+        meta.set(POLL_WATERMARK_KEY, String(at - 1_800_000));
+        meta.set(POLL_CURSOR_KEY, "");
+        meta.set(SESSION_WATERMARK_KEY, String(at - 1_800_000));
+        meta.set(SESSION_CURSOR_KEY, "");
+        probe.reset();
+        const pollStart = performance.now();
+        const signals = await sync.poll(meta);
+        results.pollMaxSliceMs = probe.max();
+        results.pollTotalMs = performance.now() - pollStart;
+        results.pollSignals = signals.length;
+
+        // ── listSessions ──
+        probe.reset();
+        const listStart = performance.now();
+        const listing = await source.listSessions({ scope: "global", limit: DISCOVERY_LIMIT });
+        results.listMaxSliceMs = probe.max();
+        results.listTotalMs = performance.now() - listStart;
+        results.listed = listing.ok ? listing.items.length : -1;
+        results.cards = store.allCards().length;
+      } finally {
+        probe.stop();
+        reader.close();
+        rawStoreDb.close();
+      }
+
+      const round = (n: number) => Math.round(n * 10) / 10;
+      console.log(
+        "v2 perf:",
+        JSON.stringify(
+          {
+            buildMs: round(buildMs),
+            ...Object.fromEntries(Object.entries(results).map(([k, v]) => [k, round(v)])),
+          },
+          null,
+          1,
+        ),
+      );
+      console.log("slowest synchronous calls:", JSON.stringify(slow.top(8)));
+      console.log(
+        "calls around the worst cold-pass stall (ms relative to its start):",
+        JSON.stringify(slow.around(coldWorst)),
+      );
+
+      expect(results.cards).toBe(SMALL_SESSIONS + BIG_SESSIONS);
+      expect(results.coldPassMaxSliceMs).toBeLessThan(BUDGET_MS);
+      expect(results.pollMaxSliceMs).toBeLessThan(BUDGET_MS);
+      expect(results.listMaxSliceMs).toBeLessThan(BUDGET_MS);
+    } finally {
+      v2.cleanup();
+      rmSync(storeDir, { recursive: true, force: true });
+    }
+  }, 900_000);
+});
