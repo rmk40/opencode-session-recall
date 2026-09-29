@@ -414,7 +414,11 @@ export type SessionItem = {
 /** A cold pass's progress (see {@link IndexingStatus}). `indexed` is how
  *  many of the `known` sessions have a card; `examined` how many the current
  *  (or last) pass has checked, which restarts at 0 with every pass. With
- *  `stalled`, no pass is making progress right now. */
+ *  `stalled`, no pass is making progress right now. Quarantined (malformed)
+ *  sessions are counted as examined but never get a card, and `indexed`
+ *  counts every card in the store, including cards of sessions no longer
+ *  known: `indexed` reaching `known` does not mean every known session,
+ *  malformed ones included, was indexed. */
 export type IndexingProgress = {
   indexed: number;
   examined: number;

@@ -133,11 +133,14 @@ All notable changes to this project are documented here. This project follows
   passes the session is skipped (logged one line each for the first few,
   then as a count), so it stops holding passes back; a later pass still
   tries it once, and so does any change to it. While skipped sessions
-  remain, one more pass runs after 10 minutes, so an outage that failed
-  every fetch recovers once the host heals. Five sessions failing in a row still abort the pass as
-  an outage, but only sessions not already known to fail count toward
-  that, and an aborted pass counts against every session that failed in
-  it, so a failure that repeats cannot abort passes forever.
+  remain, another pass tries them after 10 minutes, and again with the
+  wait doubling up to 1 hour while none of them heals, until they heal,
+  are deleted or leave the session list; so an outage that failed every
+  fetch recovers once the host heals. Five sessions failing in a row
+  still abort the pass as an outage, but only sessions not already known
+  to fail count toward that, and an aborted pass counts against every
+  session that failed in it, so a failure that repeats cannot abort
+  passes forever.
 
 ## 2.3.0
 
