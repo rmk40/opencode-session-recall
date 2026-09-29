@@ -93,10 +93,20 @@ import `bun:*` or `node:*` directly.
   changes. Live testing loop: edit → rebuild dist → restart the tuistory session
   → reproduce. On v2 the plugin runs inside the background service, so restart
   that (`opencode service restart`), not only the TUI.
-- Logging differs per host. v1 logs `[recall] ...` lines to the console, which
-  reaches the TUI log. v2 discards plugin console output, so it logs only when
-  `RECALL_DEBUG=1` is set in the service's environment, to
-  `~/.cache/opencode-session-recall/recall.log` (size-capped, one rotation).
+- Logging differs per host. v1 logs `[recall] ...` lines with `console.log`,
+  and few of them: option warnings, a store refusal, summarizer failures and
+  dispose deferrals. The v1 distiller gets no `log`, so lease and cold-pass
+  lines never print. Where console output lands on 1.18.33 (checked with a
+  probe plugin): under `opencode serve`, on its stdout (`console.error` on
+  stderr), but only once a request has loaded the instance. Under the TUI
+  the server runs in a Bun Worker: `console.log` is painted straight over the
+  TUI screen (gone on the next redraw) and `console.error` goes to the
+  process's stderr (the terminal, unless redirected).
+  Neither reaches opencode's log file (`$XDG_DATA_HOME/opencode/log/`). To
+  see v1 lines, run `serve` and redirect its output. v2 discards plugin
+  console output, so it logs only when `RECALL_DEBUG=1` is set in the
+  service's environment, to `~/.cache/opencode-session-recall/recall.log`
+  (size-capped, one rotation).
 - On v2, give `storePath` and `opencodeDbPath` as absolute paths in live test
   configs: both resolve against the working directory of the background service
   the plugin runs in, not the project the TUI was started from.
@@ -154,6 +164,8 @@ UPDATE session_v2 SET time_suspended = NULL, resume_attempts = 0
 -- Queued and admitted prompts would be drained into new turns.
 DELETE FROM session_pending;
 DELETE FROM session_inbox;
+-- Background subagent recovery jobs also resume on start.
+DELETE FROM kv WHERE key LIKE 'job.%';
 ```
 
 Also unset provider API keys in the launching shell. v2 runs the plugin in a
@@ -161,7 +173,9 @@ background service: give the temporary config its own port
 (`opencode service set port <free port>` with the temp `XDG_CONFIG_HOME` exported) so
 it cannot collide with, or attach to, your real service. Even `opencode plugin list`
 can start that private service in the background; stop it with
-`opencode service stop` (same environment) when done.
+`opencode service stop` (same environment) when done. On 2.0.18 `opencode plugin
+list` shows a local (`file://`) plugin only with `--builtin`, so its absence from
+the plain listing does not mean it failed to load.
 
 ## Debugging a "data is there but result is empty" bug
 

@@ -5,8 +5,9 @@ import { loadFs, loadOs, loadPath, type FsLike } from "./node-import.js";
  *
  * Every log call goes through {@link createLogger}, which adds the `[recall] `
  * prefix and swallows sink failures, so logging can never throw into plugin
- * init, a hook, or a tool. The v1 host uses {@link consoleSink} (its console
- * reaches the TUI log). The v2 host discards plugin console output, so it gets
+ * init, a hook, or a tool. The v1 host uses {@link consoleSink} (`opencode
+ * serve` prints it on stdout; the TUI paints it over the screen, and it never
+ * reaches opencode's log file). The v2 host discards plugin console output, so it gets
  * {@link createFileSink}: an opt-in, size-capped append-only file.
  */
 
