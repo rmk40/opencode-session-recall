@@ -20,8 +20,10 @@ export type Listing<T> = { ok: true; items: T[] } | { ok: false; error: string }
 /**
  * A point lookup. `not-found` covers both an explicit not-found error and an
  * empty response; `error` is any other host error; `malformed` is a successful
- * response whose body has the wrong shape. `error` carries the host's string
- * when there was one, so callers can keep their own wording for the empty case.
+ * response whose body has the wrong shape, and only `getSession` returns it
+ * (v1 `getMessage` passes a truthy body through unchecked, exactly as the
+ * tools read it before the seam). `error` carries the host's string when there
+ * was one, so callers can keep their own wording for the empty case.
  */
 export type Lookup<T> =
   | { ok: true; value: T }
@@ -36,6 +38,8 @@ export type MessagePage = { items: HistoryMessage[]; nextCursor: string | null }
 export type SessionScope = "project" | "global";
 
 export interface HistorySource {
+  /** Which host backend this is. Nothing reads it yet; it exists so tool
+   *  `coverage` can show which history a response searched. */
   readonly kind: "v1-http" | "v2-sqlite";
   /** Whether project and global lookups can disagree (v1: a directory-scoped
    *  client can 404 on a session the unscoped client resolves). Callers that

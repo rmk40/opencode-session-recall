@@ -1,6 +1,5 @@
 import { tool } from "./tool-def.js";
 import type { ToolDefinition, ToolContext } from "./host/opencode-v1-types.js";
-import type { Session, GlobalSession } from "@opencode-ai/sdk/v2";
 import {
   errmsg,
   optionalString,
@@ -2440,15 +2439,15 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
             try {
               const sess = await gate.runQuery(() => source.getSession(id, { scope }));
               if (sess.ok) {
-                const data = sess.value as Session | GlobalSession;
+                const data = sess.value;
                 return {
                   title: data.title,
                   directory: data.directory,
                   updated: data.time.updated,
                   // A SUCCESSFUL fetch whose `parentID` is absent means root,
                   // so it maps to `null` — never `undefined` (which is reserved
-                  // for "no metadata"). Read defensively: the cast site is
-                  // `Session | GlobalSession`.
+                  // for "no metadata"). Read defensively: host rows are not
+                  // validated against the type.
                   parentID: typeof data.parentID === "string" ? data.parentID : null,
                 };
               }
@@ -2567,7 +2566,7 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
               source.getSession(singleTarget, { scope: "project" }),
             );
             if (sess.ok) {
-              const data = sess.value as Session | GlobalSession;
+              const data = sess.value;
               sTitle = data.title;
               sDir = data.directory;
               sUpdated = data.time.updated;
