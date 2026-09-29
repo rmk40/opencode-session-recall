@@ -60,12 +60,16 @@ All notable changes to this project are documented here. This project follows
 
 ### Changed
 
-- While the background cold pass is still indexing, `recall` responses carry
-  `coverage.cards.indexing` (`{ examined, known }`) and a warning that says
-  how many sessions are indexed so far and that older history may be
-  missing; `recall_sessions` adds the same note to card-backed listings
-  (with an `indexing` field). Before, the card counts alone read as
-  complete while older sessions were not indexed yet.
+- While the background cold pass is still building the index for the
+  first time, `recall` responses carry `coverage.cards.indexing`
+  (`{ examined, known }`) and a warning that says how many sessions the
+  pass has checked so far and that older history may be missing.
+  `recall_sessions` adds the same note, with an `indexing` field, to
+  listings it selects from the index (a `since`/`until` filter); plain
+  listings are live and carry neither. Before, the card counts alone read
+  as complete while older sessions were not indexed yet. Once a pass has
+  completed on the store, later passes (such as the check on every
+  restart) report nothing.
 - The v1 cold pass now yields to the event loop between sessions, inside
   a large session's card derivation, and every 50 family-rollup writes,
   so a big history no longer holds the host's loop for long stretches.

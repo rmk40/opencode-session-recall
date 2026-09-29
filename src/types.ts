@@ -419,7 +419,7 @@ export type IndexingStatus = () => IndexingProgress | undefined;
 /** The warning for a query answered while the cold pass is still running. */
 export function indexingWarning(progress: IndexingProgress): string {
   return progress.known > 0
-    ? `Indexing in progress: ${progress.examined} of ${progress.known} sessions indexed so far; older history may be missing.`
+    ? `Indexing in progress: ${progress.examined} of ${progress.known} sessions checked so far; older history may be missing.`
     : "Indexing in progress: sessions are still being discovered; older history may be missing.";
 }
 

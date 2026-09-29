@@ -387,7 +387,7 @@ describe("plugin entry", () => {
       );
       expect(out.coverage.cards.indexing).toEqual({ examined: 0, known: 2 });
       expect(out.warnings).toContain(
-        "Indexing in progress: 0 of 2 sessions indexed so far; older history may be missing.",
+        "Indexing in progress: 0 of 2 sessions checked so far; older history may be missing.",
       );
       await hooks.dispose?.();
     } finally {

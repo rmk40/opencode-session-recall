@@ -21,7 +21,7 @@ describe("cold-pass progress in responses", () => {
       const running = await runTool<SearchOutput>(recall, { query: "rateLimit", scope: "global" });
       expect(running.coverage?.cards?.indexing).toEqual({ examined: 3, known: 40 });
       expect(running.warnings).toContain(
-        "Indexing in progress: 3 of 40 sessions indexed so far; older history may be missing.",
+        "Indexing in progress: 3 of 40 sessions checked so far; older history may be missing.",
       );
 
       progress = undefined; // the pass finished
