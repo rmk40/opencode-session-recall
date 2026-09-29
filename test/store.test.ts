@@ -3,7 +3,16 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openSqlite, type SqliteDb } from "../src/sqlite.js";
-import { openStore, type Card, type PartTextRow, type Store } from "../src/store.js";
+import {
+  openStore,
+  pluginBuild,
+  type Card,
+  type PartTextRow,
+  type Store,
+  type StoreHost,
+  type StoreRefusal,
+} from "../src/store.js";
+import { openV1Store } from "./helpers.js";
 
 // These tests run against the REAL node:sqlite driver (Node >= 22.5). Under
 // vitest there is no `Bun` global, so openSqlite selects node:sqlite.
@@ -23,7 +32,7 @@ afterAll(() => {
 async function fresh(now?: () => number): Promise<{ db: SqliteDb; store: Store }> {
   const db = await openSqlite(freshDbPath());
   if (!db) throw new Error("openSqlite returned null");
-  const store = openStore(db, now ? { now } : undefined);
+  const store = openV1Store(db, now ? { now } : undefined);
   if (!store) throw new Error("openStore returned null");
   return { db, store };
 }
@@ -110,18 +119,194 @@ describe("sqlite adapter", () => {
   });
 });
 
+/** Column names of `table` over the raw connection. */
+function columnNames(db: SqliteDb, table: string): string[] {
+  return db.all(`PRAGMA table_info(${table})`).map((r) => String(r.name));
+}
+
+/** One `meta` value over the raw connection, bypassing any Store. */
+function rawMeta(db: SqliteDb, key: string): string | undefined {
+  const row = db.get("SELECT value FROM meta WHERE key=?", [key]);
+  return typeof row?.value === "string" ? row.value : undefined;
+}
+
+/** Everything a refusal must leave untouched: every meta row, the schema DDL,
+ *  and the row counts of the data tables. */
+function snapshot(db: SqliteDb): unknown {
+  return {
+    meta: db.all("SELECT key, value FROM meta ORDER BY key"),
+    schema: db.all("SELECT type, name, sql FROM sqlite_master ORDER BY type, name"),
+    cards: db.all("SELECT session_id FROM card ORDER BY session_id"),
+    parts: db.get("SELECT COUNT(*) AS n FROM part_text"),
+  };
+}
+
+/**
+ * Open `path` on a fresh connection as `host` and assert a refusal with
+ * `reason` that wrote nothing: the connection's `total_changes()` stays 0 and
+ * the file matches its pre-open snapshot.
+ */
+async function expectRefusal(
+  path: string,
+  host: StoreHost,
+  reason: StoreRefusal,
+  opts?: { source?: string },
+): Promise<void> {
+  const probe = await openSqlite(path);
+  if (!probe) throw new Error("probe open failed");
+  const before = snapshot(probe);
+  probe.close();
+
+  const db = await openSqlite(path);
+  if (!db) throw new Error("reopen failed");
+  expect(openStore(db, host, opts)).toEqual({ ok: false, reason });
+  expect(db.get("SELECT total_changes() AS n")?.n).toBe(0);
+  expect(snapshot(db)).toEqual(before);
+  db.close();
+}
+
+/**
+ * Hand-build a populated schema-3 store (the last pre-fence layout: the current
+ * DDL minus `card.distill_cursor`, no host stamp) carrying one card with a
+ * summary and a current-generation vector, its slim-index and FTS rows, the
+ * semantic/revision stamps, and a held distill lease: everything a v1 install
+ * has on disk at upgrade time.
+ */
+async function buildV3Store(path: string): Promise<void> {
+  const db = await openSqlite(path);
+  if (!db) throw new Error("open failed");
+  db.exec("PRAGMA journal_mode=WAL;");
+  db.exec(`
+    CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL) WITHOUT ROWID;
+    CREATE TABLE card (
+      session_id TEXT PRIMARY KEY, parent_id TEXT, root_id TEXT NOT NULL,
+      title TEXT NOT NULL DEFAULT '', slug TEXT NOT NULL DEFAULT '',
+      directory TEXT NOT NULL DEFAULT '', project_id TEXT NOT NULL DEFAULT '',
+      agent TEXT, model TEXT,
+      time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL,
+      part_count INTEGER NOT NULL DEFAULT 0, retained_chars INTEGER NOT NULL DEFAULT 0,
+      summary_head TEXT NOT NULL DEFAULT '', outcome_head TEXT NOT NULL DEFAULT '',
+      inventory TEXT NOT NULL DEFAULT '',
+      files TEXT NOT NULL DEFAULT '[]', tools TEXT NOT NULL DEFAULT '[]',
+      errors TEXT NOT NULL DEFAULT '[]', family_rollup TEXT NOT NULL DEFAULT '[]',
+      distill_state TEXT NOT NULL DEFAULT 'metadata',
+      distilled_through TEXT,
+      embedding BLOB,
+      embedding_gen INTEGER,
+      nl_summary TEXT NOT NULL DEFAULT '',
+      summary_hash TEXT NOT NULL DEFAULT ''
+    );
+    CREATE INDEX card_updated ON card(time_updated DESC);
+    CREATE INDEX card_root ON card(root_id);
+    CREATE INDEX card_project ON card(project_id);
+    CREATE TABLE part_text (
+      id INTEGER PRIMARY KEY, session_id TEXT NOT NULL, part_id TEXT NOT NULL,
+      message_id TEXT NOT NULL, prev_message_id TEXT, next_message_id TEXT,
+      class TEXT NOT NULL, time_created INTEGER NOT NULL,
+      raw TEXT NOT NULL, norm TEXT NOT NULL
+    );
+    CREATE INDEX part_text_session ON part_text(session_id);
+    CREATE UNIQUE INDEX part_text_part ON part_text(part_id);
+    CREATE VIRTUAL TABLE part_fts USING fts5(
+      raw, norm, content='part_text', content_rowid='id',
+      tokenize="unicode61 tokenchars '_-./'"
+    );
+  `);
+  const meta: Array<[string, string]> = [
+    ["schema_version", "3"],
+    ["semantic_model", "model-x:4"],
+    ["cards_rev", "11"],
+    ["vectors_rev", "5"],
+    ["summary_rev", "2"],
+    [
+      "distill_lease",
+      JSON.stringify({
+        holder: "proc-a",
+        heartbeat: 1234,
+        ttl: 30_000,
+        build: "schema3.gen4",
+        gen: 4,
+      }),
+    ],
+  ];
+  for (const [key, value] of meta) {
+    db.run("INSERT INTO meta(key, value) VALUES(?, ?)", [key, value]);
+  }
+  db.run(
+    "INSERT INTO card(session_id, root_id, title, time_created, time_updated, distill_state, distilled_through, inventory, embedding, embedding_gen, nl_summary, summary_hash) VALUES(?, ?, ?, ?, ?, 'full', ?, ?, ?, ?, ?, ?)",
+    [
+      "s-v3",
+      "s-v3",
+      "V3 session",
+      1000,
+      2000,
+      "m1",
+      "sprocket linker",
+      new Uint8Array([9, 8, 7, 6]),
+      4,
+      "Linked the sprockets.",
+      "h3",
+    ],
+  );
+  db.run(
+    "INSERT INTO part_text(session_id, part_id, message_id, class, time_created, raw, norm) VALUES(?, ?, ?, ?, ?, ?, ?)",
+    [
+      "s-v3",
+      "p1",
+      "m1",
+      "human-text",
+      1000,
+      "sprocket linker zorblequin",
+      "sprocket linker zorblequin",
+    ],
+  );
+  db.run("INSERT INTO part_fts(rowid, raw, norm) VALUES(?, ?, ?)", [
+    1,
+    "sprocket linker zorblequin",
+    "sprocket linker zorblequin",
+  ]);
+  db.close();
+}
+
+/** Create a fresh v4 store at `path` as `host` (optionally with a source) and
+ *  seed one card so a later rebuild would be visible. */
+async function buildV4Store(path: string, host: StoreHost, source?: string): Promise<void> {
+  const db = await openSqlite(path);
+  if (!db) throw new Error("open failed");
+  const opened = openStore(db, host, source === undefined ? undefined : { source });
+  if (!opened.ok) throw new Error(`openStore refused: ${opened.reason}`);
+  opened.store.replaceSessionParts("s1", [makePart("p1", "keeper_marker")], makeCard("s1"));
+  db.close();
+}
+
 describe("store migration", () => {
-  it("creates schema v3 on a fresh db", async () => {
+  it("creates schema v4 on a fresh db, stamped for the v1 host with no source", async () => {
     const { db, store } = await fresh();
-    expect(store.getMeta("schema_version")).toBe("3");
+    expect(store.getMeta("schema_version")).toBe("4");
+    expect(store.getMeta("store_host")).toBe("opencode-v1");
+    expect(store.getMeta("source_db")).toBeUndefined();
+    expect(columnNames(db, "card")).toContain("distill_cursor");
     expect(store.allCards()).toEqual([]);
+    db.close();
+  });
+
+  it("stamps the v2 host and its source on a fresh db", async () => {
+    const db = await openSqlite(freshDbPath());
+    if (!db) throw new Error("open failed");
+    const opened = openStore(db, "opencode-v2", {
+      source: "/data/opencode.db",
+    });
+    if (!opened.ok) throw new Error(opened.reason);
+    expect(opened.store.getMeta("schema_version")).toBe("4");
+    expect(opened.store.getMeta("store_host")).toBe("opencode-v2");
+    expect(opened.store.getMeta("source_db")).toBe("/data/opencode.db");
     db.close();
   });
 
   it("drops everything and rebuilds when the on-disk version is older than v1", async () => {
     const path = freshDbPath();
     const db1 = await openSqlite(path);
-    const store1 = db1 && openStore(db1);
+    const store1 = db1 && openV1Store(db1);
     if (!db1 || !store1) throw new Error("open failed");
     store1.upsertCard(makeCard("s1"));
     // Simulate a pre-v1 layout: an older version stamp plus a foreign table.
@@ -131,15 +316,37 @@ describe("store migration", () => {
 
     const db2 = await openSqlite(path);
     if (!db2) throw new Error("reopen failed");
-    const store2 = openStore(db2);
+    const store2 = openV1Store(db2);
     if (!store2) throw new Error("reopen store failed");
-    expect(store2.getMeta("schema_version")).toBe("3");
+    expect(store2.getMeta("schema_version")).toBe("4");
+    expect(store2.getMeta("store_host")).toBe("opencode-v1");
     expect(store2.allCards()).toEqual([]);
     expect(db2.get("SELECT name FROM sqlite_master WHERE name='junk'")).toBeUndefined();
     db2.close();
   });
 
-  it("chains a populated v1 store additively to v3, preserving cards/FTS/vectors/stamps", async () => {
+  it("rebuilds a foreign layout with no stamp for whichever host opens it, stamping it", async () => {
+    // No meta table at all: not a store any host owns, so any host may claim it.
+    const path = freshDbPath();
+    const db1 = await openSqlite(path);
+    if (!db1) throw new Error("open failed");
+    db1.exec("CREATE TABLE foreign_thing(x); INSERT INTO foreign_thing VALUES (1);");
+    db1.close();
+
+    const db2 = await openSqlite(path);
+    if (!db2) throw new Error("reopen failed");
+    const opened = openStore(db2, "opencode-v2", {
+      source: "/data/opencode.db",
+    });
+    if (!opened.ok) throw new Error(opened.reason);
+    expect(opened.store.getMeta("schema_version")).toBe("4");
+    expect(opened.store.getMeta("store_host")).toBe("opencode-v2");
+    expect(opened.store.getMeta("source_db")).toBe("/data/opencode.db");
+    expect(db2.get("SELECT name FROM sqlite_master WHERE name='foreign_thing'")).toBeUndefined();
+    db2.close();
+  });
+
+  it("chains a populated v1 store additively to v4, preserving cards/FTS/vectors/stamps", async () => {
     const path = freshDbPath();
     // Build a v1-shaped store by hand (the v1 card table has no summary columns),
     // populated with a card, its slim-index/FTS rows, a persisted vector, and the
@@ -202,14 +409,16 @@ describe("store migration", () => {
     ]);
     db1.close();
 
-    // Reopen with the current (v3) code: additive upgrade chaining v1->v2->v3, no
-    // rebuild.
+    // Reopen with the current (v4) code: additive upgrade chaining
+    // v1->v2->v3->v4, no rebuild.
     const db2 = await openSqlite(path);
     if (!db2) throw new Error("reopen failed");
-    const store2 = openStore(db2);
+    const store2 = openV1Store(db2);
     if (!store2) throw new Error("reopen store failed");
 
-    expect(store2.getMeta("schema_version")).toBe("3");
+    expect(store2.getMeta("schema_version")).toBe("4");
+    expect(store2.getMeta("store_host")).toBe("opencode-v1");
+    expect(columnNames(db2, "card")).toContain("distill_cursor");
     // Everything survived: card, its vector, the semantic stamp, cards_rev.
     expect(store2.getMeta("semantic_model")).toBe("model-x:rep2");
     expect(store2.getMeta("cards_rev")).toBe("7");
@@ -230,13 +439,17 @@ describe("store migration", () => {
     expect(after?.summaryHash).toBe("hash1");
     // A vector write at the current generation lands and stamps embedding_gen.
     store2.writeCardEmbeddings("model-x:rep2", 4, [
-      { sessionId: "s-v1", embedding: new Uint8Array([5, 6, 7, 8]), expectedSummaryHash: "hash1" },
+      {
+        sessionId: "s-v1",
+        embedding: new Uint8Array([5, 6, 7, 8]),
+        expectedSummaryHash: "hash1",
+      },
     ]);
     expect(store2.getCard("s-v1")?.embeddingGen).toBe(4);
     db2.close();
   });
 
-  it("upgrades a populated v2 store additively to v3, preserving cards/FTS/vectors/summaries", async () => {
+  it("chains a populated v2 store additively to v4, preserving cards/FTS/vectors/summaries", async () => {
     const path = freshDbPath();
     // Build a v2-shaped store by hand: the v2 card table HAS the summary columns
     // but NOT embedding_gen. Populate it as a real install would be.
@@ -310,13 +523,15 @@ describe("store migration", () => {
     ]);
     db1.close();
 
-    // Reopen with the current (v3) code: single additive v2->v3 step.
+    // Reopen with the current (v4) code: additive v2->v3->v4 steps.
     const db2 = await openSqlite(path);
     if (!db2) throw new Error("reopen failed");
-    const store2 = openStore(db2);
+    const store2 = openV1Store(db2);
     if (!store2) throw new Error("reopen store failed");
 
-    expect(store2.getMeta("schema_version")).toBe("3");
+    expect(store2.getMeta("schema_version")).toBe("4");
+    expect(store2.getMeta("store_host")).toBe("opencode-v1");
+    expect(columnNames(db2, "card")).toContain("distill_cursor");
     // Card, vector, summary, stamp, and cards_rev all survived.
     expect(store2.getMeta("semantic_model")).toBe("model-x:rep3");
     expect(store2.getMeta("cards_rev")).toBe("9");
@@ -332,24 +547,135 @@ describe("store migration", () => {
     db2.close();
   });
 
-  it("returns null when the on-disk schema is newer than the code", async () => {
+  it("upgrades a populated v3 store additively to v4 for the v1 host, keeping every row and stamp", async () => {
     const path = freshDbPath();
-    const db1 = await openSqlite(path);
-    const store1 = db1 && openStore(db1);
-    if (!db1 || !store1) throw new Error("open failed");
-    store1.setMeta("schema_version", "999");
-    db1.close();
+    await buildV3Store(path);
 
-    const db2 = await openSqlite(path);
-    if (!db2) throw new Error("reopen failed");
-    expect(openStore(db2)).toBeNull();
-    db2.close();
+    const db = await openSqlite(path);
+    if (!db) throw new Error("reopen failed");
+    const store = openV1Store(db);
+    if (!store) throw new Error("reopen store failed");
+
+    expect(store.getMeta("schema_version")).toBe("4");
+    expect(store.getMeta("store_host")).toBe("opencode-v1");
+    expect(store.getMeta("source_db")).toBeUndefined();
+    expect(columnNames(db, "card")).toContain("distill_cursor");
+    expect(db.get("SELECT distill_cursor FROM card WHERE session_id='s-v3'")?.distill_cursor).toBe(
+      null,
+    );
+    // Stamps and counters, including the lease row, are untouched.
+    expect(store.getMeta("semantic_model")).toBe("model-x:4");
+    expect(store.getMeta("cards_rev")).toBe("11");
+    expect(store.getMeta("vectors_rev")).toBe("5");
+    expect(store.getMeta("summary_rev")).toBe("2");
+    expect(store.leaseStatus()).toEqual({
+      holder: "proc-a",
+      build: "schema3.gen4",
+      gen: 4,
+      heartbeat: 1234,
+      ttl: 30_000,
+    });
+    // The card keeps its summary, vector and vector generation.
+    const card = store.getCard("s-v3");
+    expect(card).toMatchObject({
+      title: "V3 session",
+      inventory: "sprocket linker",
+      distillState: "full",
+      distilledThrough: "m1",
+      nlSummary: "Linked the sprockets.",
+      summaryHash: "h3",
+      embeddingGen: 4,
+    });
+    expect(Array.from(card?.embedding ?? [])).toEqual([9, 8, 7, 6]);
+    // The slim index and its FTS mirror survived.
+    expect(sessions(store.ftsSearch({ strong: ["zorblequin"], weak: [] }))).toEqual(["s-v3"]);
+    db.close();
+  });
+
+  it("refuses a v3 store for the v2 host without migrating it", async () => {
+    // A pre-fence store implies the v1 host, so the v2 host must not upgrade it:
+    // schema_version stays 3, no distill_cursor column, no host stamp.
+    const path = freshDbPath();
+    await buildV3Store(path);
+    await expectRefusal(path, "opencode-v2", "host-mismatch", {
+      source: "/data/opencode.db",
+    });
+
+    const db = await openSqlite(path);
+    if (!db) throw new Error("reopen failed");
+    expect(rawMeta(db, "schema_version")).toBe("3");
+    expect(rawMeta(db, "store_host")).toBeUndefined();
+    expect(columnNames(db, "card")).not.toContain("distill_cursor");
+    db.close();
+  });
+
+  it("refuses a v4 store owned by the v1 host when the v2 host opens it", async () => {
+    const path = freshDbPath();
+    await buildV4Store(path, "opencode-v1");
+    await expectRefusal(path, "opencode-v2", "host-mismatch", {
+      source: "/data/opencode.db",
+    });
+  });
+
+  it("refuses a v4 store owned by the v2 host when the v1 host opens it", async () => {
+    const path = freshDbPath();
+    await buildV4Store(path, "opencode-v2", "/data/opencode.db");
+    await expectRefusal(path, "opencode-v1", "host-mismatch");
+  });
+
+  it("refuses a v4 store whose host stamp is missing instead of guessing an owner", async () => {
+    const path = freshDbPath();
+    await buildV4Store(path, "opencode-v1");
+    const db = await openSqlite(path);
+    if (!db) throw new Error("reopen failed");
+    db.run("DELETE FROM meta WHERE key='store_host'");
+    db.close();
+    await expectRefusal(path, "opencode-v1", "host-mismatch");
+  });
+
+  it("refuses a v2-host store distilled from a different source database", async () => {
+    const path = freshDbPath();
+    await buildV4Store(path, "opencode-v2", "/data/a/opencode.db");
+    await expectRefusal(path, "opencode-v2", "source-mismatch", {
+      source: "/data/b/opencode.db",
+    });
+    await expectRefusal(path, "opencode-v2", "source-mismatch");
+  });
+
+  it("opens a store whose host and source both match, keeping its data", async () => {
+    const path = freshDbPath();
+    await buildV4Store(path, "opencode-v2", "/data/opencode.db");
+    const db = await openSqlite(path);
+    if (!db) throw new Error("reopen failed");
+    const opened = openStore(db, "opencode-v2", {
+      source: "/data/opencode.db",
+    });
+    if (!opened.ok) throw new Error(opened.reason);
+    expect(opened.store.getCard("s1")).not.toBeUndefined();
+    expect(sessions(opened.store.ftsSearch({ strong: ["keeper_marker"], weak: [] }))).toEqual([
+      "s1",
+    ]);
+    db.close();
+  });
+
+  it("refuses a store whose schema is newer than the code, for either host", async () => {
+    const path = freshDbPath();
+    await buildV4Store(path, "opencode-v1");
+    const db = await openSqlite(path);
+    if (!db) throw new Error("reopen failed");
+    db.run("UPDATE meta SET value='5' WHERE key='schema_version'");
+    db.close();
+    await expectRefusal(path, "opencode-v1", "newer");
+    // Newer wins over the host check: the format itself is unknown.
+    await expectRefusal(path, "opencode-v2", "newer", {
+      source: "/data/opencode.db",
+    });
   });
 
   it("preserves data when reopening a store already at the current version", async () => {
     const path = freshDbPath();
     const db1 = await openSqlite(path);
-    const store1 = db1 && openStore(db1);
+    const store1 = db1 && openV1Store(db1);
     if (!db1 || !store1) throw new Error("open failed");
     store1.replaceSessionParts(
       "s1",
@@ -360,11 +686,17 @@ describe("store migration", () => {
 
     // A cold process restart must NOT wipe an in-version store.
     const db2 = await openSqlite(path);
-    const store2 = db2 && openStore(db2);
+    const store2 = db2 && openV1Store(db2);
     if (!db2 || !store2) throw new Error("reopen failed");
     expect(store2.getCard("s1")).not.toBeUndefined();
     expect(sessions(store2.ftsSearch({ strong: ["durable_marker"], weak: [] }))).toEqual(["s1"]);
     db2.close();
+  });
+});
+
+describe("pluginBuild", () => {
+  it("tags the schema, representation generation and host", () => {
+    expect(pluginBuild("opencode-v2")).toBe("schema4.gen4.opencode-v2");
   });
 });
 
@@ -739,22 +1071,30 @@ describe("meta and lease", () => {
 
     // Fresh acquire, and idempotent re-acquire by the same holder. The build tag
     // and generation ride the lease value for cross-process diagnosis.
-    expect(store.acquireLease("A", ttl, "schema3.gen4", 4)).toBe(true);
-    expect(store.acquireLease("A", ttl, "schema3.gen4", 4)).toBe(true);
-    expect(store.leaseStatus()).toMatchObject({ holder: "A", build: "schema3.gen4", gen: 4 });
+    expect(store.acquireLease("A", ttl, "schema4.gen4.opencode-v1", 4)).toBe(true);
+    expect(store.acquireLease("A", ttl, "schema4.gen4.opencode-v1", 4)).toBe(true);
+    expect(store.leaseStatus()).toMatchObject({
+      holder: "A",
+      build: "schema4.gen4.opencode-v1",
+      gen: 4,
+    });
 
     // A second holder is refused while A's lease is fresh.
     clock = 1_000_100;
-    expect(store.acquireLease("B", ttl, "schema3.gen4", 4)).toBe(false);
+    expect(store.acquireLease("B", ttl, "schema4.gen4.opencode-v1", 4)).toBe(false);
 
     // A heartbeat (only the holder's own) extends the lease and preserves build/gen.
     expect(store.heartbeatLease("A")).toBe(true);
     expect(store.heartbeatLease("B")).toBe(false);
-    expect(store.leaseStatus()).toMatchObject({ holder: "A", build: "schema3.gen4", gen: 4 });
+    expect(store.leaseStatus()).toMatchObject({
+      holder: "A",
+      build: "schema4.gen4.opencode-v1",
+      gen: 4,
+    });
 
     // Past the ORIGINAL acquire + ttl but within heartbeat + ttl: still A's.
     clock = 1_005_050;
-    expect(store.acquireLease("B", ttl, "schema3.gen4", 4)).toBe(false);
+    expect(store.acquireLease("B", ttl, "schema4.gen4.opencode-v1", 4)).toBe(false);
 
     // Past heartbeat + ttl: B, a DIFFERENT build, takes over the expired lease —
     // and leaseStatus now names it (the mixed-version diagnosis path).
@@ -770,16 +1110,16 @@ describe("meta and lease", () => {
 
     // A released lease is immediately acquirable by anyone.
     clock = 1_005_102;
-    expect(store.acquireLease("A", ttl, "schema3.gen4", 4)).toBe(true);
+    expect(store.acquireLease("A", ttl, "schema4.gen4.opencode-v1", 4)).toBe(true);
     db.close();
   });
 
   it("lets only one of two connections acquire the lease (changes-count, not read-check-write)", async () => {
     const path = freshDbPath();
     const dbA = await openSqlite(path);
-    const storeA = dbA && openStore(dbA);
+    const storeA = dbA && openV1Store(dbA);
     const dbB = await openSqlite(path);
-    const storeB = dbB && openStore(dbB);
+    const storeB = dbB && openV1Store(dbB);
     if (!dbA || !storeA || !dbB || !storeB) throw new Error("two-handle open failed");
 
     // Two separate connections race for the same fresh lease row.

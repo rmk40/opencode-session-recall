@@ -14,8 +14,8 @@ import type {
   UserMessage,
 } from "@opencode-ai/sdk/v2";
 import type { Limits } from "../src/types.js";
-import { openSqlite } from "../src/sqlite.js";
-import { openStore, type Store } from "../src/store.js";
+import { openSqlite, type SqliteDb } from "../src/sqlite.js";
+import { openStore, type Store, type StoreOptions } from "../src/store.js";
 import { deriveCard, type DistillSessionMeta } from "../src/distill.js";
 import { createFetchGate, type FetchGate } from "../src/fetch-gate.js";
 import { createCardsRuntime, cardsLiteFromSessions } from "../src/cards.js";
@@ -62,6 +62,13 @@ type MetadataCall = { title?: string; metadata?: Record<string, unknown> };
 // per suite via setStrictNoLimitMessages(true); the distiller/legacy fixtures
 // that intentionally exercise the no-limit full-return path opt out by leaving
 // it off.
+/** Open a store as the v1 host, mapping any refusal to `null` (the shape the
+ *  v1 entry degrades on). Tests of the refusal reasons call `openStore`. */
+export function openV1Store(db: SqliteDb, opts?: StoreOptions): Store | null {
+  const opened = openStore(db, "opencode-v1", opts);
+  return opened.ok ? opened.store : null;
+}
+
 export const UNBOUNDED_MESSAGES_ERROR = "unbounded session.messages() call without a limit";
 let strictNoLimitMessages = false;
 export function setStrictNoLimitMessages(value: boolean): void {
@@ -831,7 +838,7 @@ export async function makeRecallDeps(
   const dir = mkdtempSync(join(tmpdir(), "recall-deps-"));
   const db = await openSqlite(join(dir, "store.db"));
   if (!db) throw new Error("openSqlite returned null in test helper");
-  const store = openStore(db);
+  const store = openV1Store(db);
   if (!store) throw new Error("openStore returned null in test helper");
   seedStore(store, fixture, limits);
 

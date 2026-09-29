@@ -3,7 +3,8 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openSqlite, type SqliteDb } from "../src/sqlite.js";
-import { openStore, type Card, type Store } from "../src/store.js";
+import { type Card, type Store } from "../src/store.js";
+import { openV1Store } from "./helpers.js";
 import {
   cardsLiteFromSessions,
   createCardsRuntime,
@@ -29,7 +30,7 @@ afterAll(() => {
 async function freshStore(): Promise<{ db: SqliteDb; store: Store }> {
   const db = await openSqlite(freshDbPath());
   if (!db) throw new Error("openSqlite returned null");
-  const store = openStore(db);
+  const store = openV1Store(db);
   if (!store) throw new Error("openStore returned null");
   return { db, store };
 }
@@ -533,8 +534,8 @@ describe("cards semantic persistence", () => {
     const path = freshDbPath();
     const dbA = await openSqlite(path);
     const dbB = await openSqlite(path);
-    const storeA = dbA && openStore(dbA);
-    const storeB = dbB && openStore(dbB);
+    const storeA = dbA && openV1Store(dbA);
+    const storeB = dbB && openV1Store(dbB);
     if (!dbA || !storeA || !dbB || !storeB) throw new Error("two-handle open failed");
 
     storeA.upsertCard(makeCard("s1", { inventory: `alpha topic ${SUBST}` }));
@@ -598,8 +599,8 @@ describe("cards semantic persistence", () => {
     const path = freshDbPath();
     const dbA = await openSqlite(path);
     const dbB = await openSqlite(path);
-    const storeA = dbA && openStore(dbA);
-    const storeB = dbB && openStore(dbB);
+    const storeA = dbA && openV1Store(dbA);
+    const storeB = dbB && openV1Store(dbB);
     if (!dbA || !storeA || !dbB || !storeB) throw new Error("two-handle open failed");
 
     storeA.upsertCard(makeCard("s1", { inventory: `alpha topic ${SUBST}` }));
@@ -668,8 +669,8 @@ describe("cards semantic persistence", () => {
     const path = freshDbPath();
     const dbA = await openSqlite(path);
     const dbB = await openSqlite(path);
-    const storeA = dbA && openStore(dbA);
-    const storeB = dbB && openStore(dbB);
+    const storeA = dbA && openV1Store(dbA);
+    const storeB = dbB && openV1Store(dbB);
     if (!dbA || !storeA || !dbB || !storeB) throw new Error("two-handle open failed");
 
     storeA.upsertCard(makeCard("s1", { inventory: `alpha topic ${SUBST}` }));

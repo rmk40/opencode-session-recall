@@ -1,18 +1,26 @@
 import type { Row, SqliteDb, SqlValue } from "./sqlite.js";
 import { loadFs, loadPath, loadOs } from "./node-import.js";
+import { EMBED_REPRESENTATION } from "./embedding-text.js";
 
 /**
  * Card + slim-part-index store over a {@link SqliteDb}.
  *
  * The schema is versioned and self-healing: an absent (or pre-v1) stamp drops
- * everything and rebuilds at the current version, a v1 or v2 stamp is upgraded
- * additively in place (chaining v1->v2->v3, preserving all data), a newer stamp
- * makes {@link openStore} return `null` so the caller degrades to ephemeral mode.
+ * everything and rebuilds at the current version, a v1, v2 or v3 stamp is
+ * upgraded additively in place (chaining v1->v2->v3->v4, preserving all data), a
+ * newer stamp makes {@link openStore} refuse so the caller degrades to cards-lite.
  * All of that runs under one `BEGIN IMMEDIATE` so concurrent opencode processes
  * cannot race a rebuild. The newer-stamp refusal is the mixed-version fence: once
- * a store is bumped to v3, older plugin builds sharing the file degrade to
- * read-only ephemeral mode (no writes, no distill lease) rather than corrupting a
+ * a store is bumped to v4, older plugin builds sharing the file degrade to
+ * read-only cards-lite (no writes, no distill lease) rather than corrupting a
  * format they do not understand.
+ *
+ * Schema 4 adds the host fence: every store records the host that writes it
+ * (`meta.store_host`) and, for the opencode v2 host, the history database it
+ * was distilled from (`meta.source_db`). An opener for a different host or
+ * source is refused before any migration and the file is left untouched, so two
+ * hosts pointed at one file never thrash it with rebuilds. Stores stamped 1-3
+ * predate the fence and were all written by the v1 host.
  *
  * Per-session writes are transactional delete-and-insert with an explicit FTS
  * mirror (the `part_fts` table is external-content, so deleting `part_text` rows
@@ -20,9 +28,30 @@ import { loadFs, loadPath, loadOs } from "./node-import.js";
  * never observe half a replaced session.
  */
 
-export const SCHEMA_VERSION = 3;
+export const SCHEMA_VERSION = 4;
+
+/** The opencode host lane that writes a store. Recorded in `meta.store_host`. */
+export type StoreHost = "opencode-v1" | "opencode-v2";
+
+/**
+ * Plugin build tag, `schema{N}.gen{M}.{host}`: recorded in the distill lease and
+ * surfaced in `coverage.semantic.pluginVersion`, so one lease read or one tool
+ * response shows which build and which host wrote a store. Derived from the
+ * constants that gate mixed-version safety rather than the package semver,
+ * which `src/` cannot read without a Node import.
+ */
+export function pluginBuild(host: StoreHost): string {
+  return `schema${SCHEMA_VERSION}.gen${EMBED_REPRESENTATION}.${host}`;
+}
 
 const SCHEMA_VERSION_KEY = "schema_version";
+/** Meta stamp naming the {@link StoreHost} that owns the store (schema 4+). */
+export const STORE_HOST_KEY = "store_host";
+/** Meta stamp naming the history database a v2-host store was distilled from.
+ *  Absent for v1-host stores, whose history comes over HTTP. */
+export const SOURCE_DB_KEY = "source_db";
+/** Host implied by a pre-fence (schema 1-3) store: only the v1 host existed. */
+const LEGACY_HOST: StoreHost = "opencode-v1";
 const LEASE_KEY = "distill_lease";
 /** Meta stamp recording which embedding model produced the persisted card
  *  vectors. The card runtime reuses vectors only when this matches its
@@ -50,10 +79,11 @@ const EXPIRED_SENTINEL = JSON.stringify({
 
 const PRAGMAS = "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=5000;";
 
-// Current-version (v3) DDL for a fresh store; older stores reach the same shape
+// Current-version (v4) DDL for a fresh store; older stores reach the same shape
 // through the additive migrations below. No `prefix=` index: anchors are matched
 // as exact quoted phrases, so prefix indexes would be write/disk cost with no
-// query to serve them.
+// query to serve them. `distill_cursor` is the v2 host's per-session checkpoint;
+// the v1 lane leaves it NULL and no card read or write touches it yet.
 const DDL = `
 CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL) WITHOUT ROWID;
 
@@ -73,7 +103,8 @@ CREATE TABLE card (
   embedding BLOB,
   embedding_gen INTEGER,
   nl_summary TEXT NOT NULL DEFAULT '',
-  summary_hash TEXT NOT NULL DEFAULT ''
+  summary_hash TEXT NOT NULL DEFAULT '',
+  distill_cursor TEXT
 );
 CREATE INDEX card_updated ON card(time_updated DESC);
 CREATE INDEX card_root ON card(root_id);
@@ -179,7 +210,23 @@ export type FtsHit = {
 export type StoreOptions = {
   /** Injectable clock for lease TTL logic; defaults to `Date.now`. */
   now?: () => number;
+  /** Identity of the history database the store is distilled from (the v2
+   *  host's resolved `opencode.db` path). Stamped into `meta.source_db` on a
+   *  rebuild and compared on every open. The v1 host passes none. */
+  source?: string;
 };
+
+/** Why {@link openStore} refused a store. Every refusal leaves the file
+ *  untouched; the caller degrades to cards-lite.
+ *  - `newer`: the schema stamp is newer than this build understands.
+ *  - `host-mismatch`: another host lane owns the store (or its host stamp is
+ *    missing or unknown).
+ *  - `source-mismatch`: the store was distilled from a different history
+ *    database.
+ *  - `error`: the open or schema check threw. */
+export type StoreRefusal = "newer" | "host-mismatch" | "source-mismatch" | "error";
+
+export type OpenStoreResult = { ok: true; store: Store } | { ok: false; reason: StoreRefusal };
 
 export type Store = {
   upsertCard(card: Card): void;
@@ -504,13 +551,34 @@ function readSchemaVersion(db: SqliteDb): number | null {
     "SELECT 1 AS present FROM sqlite_master WHERE type='table' AND name='meta'",
   );
   if (!hasMeta) return null;
-  const row = db.get("SELECT value FROM meta WHERE key=?", [SCHEMA_VERSION_KEY]);
-  if (!row || typeof row.value !== "string") return null;
-  const parsed = Number(row.value);
+  const value = readMetaValue(db, SCHEMA_VERSION_KEY);
+  if (value === undefined) return null;
+  const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : null;
 }
 
-function rebuild(db: SqliteDb): void {
+/** One `meta` value over the raw connection (the table must exist). */
+function readMetaValue(db: SqliteDb, key: string): string | undefined {
+  const row = db.get("SELECT value FROM meta WHERE key=?", [key]);
+  return row && typeof row.value === "string" ? row.value : undefined;
+}
+
+/** Upsert one `meta` value over the raw connection. */
+function writeMetaValue(db: SqliteDb, key: string, value: string): void {
+  db.run(
+    "INSERT INTO meta(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+    [key, value],
+  );
+}
+
+/** Stamp the owning host and, when given, the source identity. Shared by
+ *  {@link rebuild} and {@link migrateV3ToV4}. */
+function stampIdentity(db: SqliteDb, host: StoreHost, source: string | undefined): void {
+  writeMetaValue(db, STORE_HOST_KEY, host);
+  if (source !== undefined) writeMetaValue(db, SOURCE_DB_KEY, source);
+}
+
+function rebuild(db: SqliteDb, host: StoreHost, source: string | undefined): void {
   // The store owns the whole file, so an older layout is dropped wholesale.
   // Drop the FTS virtual table first (that removes its shadow tables), then any
   // remaining regular tables — including stragglers from a foreign layout.
@@ -524,15 +592,13 @@ function rebuild(db: SqliteDb): void {
   }
   db.exec(DDL);
   db.run("INSERT INTO meta(key, value) VALUES(?, ?)", [SCHEMA_VERSION_KEY, String(SCHEMA_VERSION)]);
+  stampIdentity(db, host, source);
 }
 
 /** Stamp the schema-version meta row to `version` (upsert). Shared by the
  *  additive migrations so each records the version it actually reached. */
 function stampVersion(db: SqliteDb, version: number): void {
-  db.run(
-    "INSERT INTO meta(key, value) VALUES(?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-    [SCHEMA_VERSION_KEY, String(version)],
-  );
+  writeMetaValue(db, SCHEMA_VERSION_KEY, String(version));
 }
 
 /**
@@ -562,37 +628,79 @@ function migrateV2ToV3(db: SqliteDb): void {
 }
 
 /**
- * Open a {@link Store} over an already-open {@link SqliteDb}. Applies the
- * connection PRAGMAs, then checks/repairs the schema under one transaction.
- * Returns `null` when the on-disk schema is newer than this code understands, or
- * on any unexpected failure, so the caller can fall back to ephemeral mode.
+ * Additive v3 -> v4 upgrade: add the nullable `card.distill_cursor` column (the
+ * v2 host's per-session checkpoint; existing rows read NULL) and stamp the host
+ * fence. Every pre-fence store was written by the v1 host, so the stamp is
+ * {@link LEGACY_HOST}; {@link openStore} only reaches this step for a v1-host
+ * opener, having refused any other host before migrating. Stamps the literal
+ * destination version 4, like {@link migrateV2ToV3}.
  */
-export function openStore(db: SqliteDb, opts?: StoreOptions): Store | null {
+function migrateV3ToV4(db: SqliteDb): void {
+  db.exec("ALTER TABLE card ADD COLUMN distill_cursor TEXT");
+  stampIdentity(db, LEGACY_HOST, undefined);
+  stampVersion(db, 4);
+}
+
+/**
+ * The host fence for a store at a known schema version. A pre-fence store
+ * (`legacy`, schema 1-3) implies {@link LEGACY_HOST}; a v4 store must carry an
+ * exact host stamp (a missing or unknown one is refused, never guessed). Source
+ * identity must match exactly, absent on both sides for the v1 host.
+ */
+function checkIdentity(
+  db: SqliteDb,
+  legacy: boolean,
+  host: StoreHost,
+  source: string | undefined,
+): StoreRefusal | null {
+  const stampedHost = legacy ? LEGACY_HOST : readMetaValue(db, STORE_HOST_KEY);
+  if (stampedHost !== host) return "host-mismatch";
+  if (readMetaValue(db, SOURCE_DB_KEY) !== source) return "source-mismatch";
+  return null;
+}
+
+/**
+ * Open a {@link Store} for `host` over an already-open {@link SqliteDb}. Applies
+ * the connection PRAGMAs, then checks the fence and migrates or rebuilds under
+ * one transaction.
+ *
+ * Refuses, leaving the file untouched (no migration, no rebuild, no write), when
+ * the schema stamp is newer than this build, when another host owns the store
+ * (checked before any migration, so a v2-host opener never upgrades a v1
+ * store), or when the store was distilled from a different `opts.source`. Any
+ * unexpected failure is refused as `error`. Refusals never rebuild: rebuilding
+ * would make two hosts sharing one file wipe each other on every start. An
+ * absent stamp or a foreign layout is still dropped and rebuilt for `host`.
+ */
+export function openStore(db: SqliteDb, host: StoreHost, opts?: StoreOptions): OpenStoreResult {
   const now = opts?.now ?? Date.now;
+  const source = opts?.source;
   try {
     db.exec(PRAGMAS);
-    const outcome = db.tx((): "ok" | "newer" => {
+    const outcome = db.tx((): "ok" | StoreRefusal => {
       const current = readSchemaVersion(db);
       // Newer than this build understands: refuse (degrade), never misread it.
       if (current !== null && current > SCHEMA_VERSION) return "newer";
-      if (current === SCHEMA_VERSION) return "ok";
-      // v1 and v2 upgrade additively in place, keeping all data; v1 chains through
-      // both migrations. Anything else older (absent stamp or a foreign layout) is
-      // dropped and rebuilt fresh.
-      if (current === 1) {
-        migrateV1ToV2(db);
-        migrateV2ToV3(db);
-      } else if (current === 2) {
-        migrateV2ToV3(db);
-      } else {
-        rebuild(db);
+      const legacy = current === 1 || current === 2 || current === 3;
+      if (current === SCHEMA_VERSION || legacy) {
+        const refusal = checkIdentity(db, legacy, host, source);
+        if (refusal) return refusal;
+        // v1, v2 and v3 upgrade additively in place, keeping all data, each
+        // chaining through every later step.
+        if (current === 1) migrateV1ToV2(db);
+        if (current === 1 || current === 2) migrateV2ToV3(db);
+        if (legacy) migrateV3ToV4(db);
+        return "ok";
       }
+      // Anything else older (absent stamp or a foreign layout) is dropped and
+      // rebuilt fresh for this host.
+      rebuild(db, host, source);
       return "ok";
     });
-    if (outcome === "newer") return null;
-    return new SqliteStore(db, now);
+    if (outcome !== "ok") return { ok: false, reason: outcome };
+    return { ok: true, store: new SqliteStore(db, now) };
   } catch {
-    return null;
+    return { ok: false, reason: "error" };
   }
 }
 
@@ -922,20 +1030,28 @@ class SqliteStore implements Store {
 // the shared dynamic-import loaders in `node-import.ts`.
 
 const STORE_CACHE_SUBDIR = ".cache/opencode-session-recall";
-const STORE_FILENAME = "store-v1.db";
+/** Default store filename per host. The v1 name predates the host fence and is
+ *  kept so existing v1 stores upgrade in place instead of rebuilding. Separate
+ *  files give each host its own lease, revision counters and semantic stamp. */
+const STORE_FILENAMES: Record<StoreHost, string> = {
+  "opencode-v1": "store-v1.db",
+  "opencode-v2": "store-opencode-v2.db",
+};
 
 /**
- * Resolve the default store path (`~/.cache/opencode-session-recall/store-v1.db`)
- * and ensure its directory exists. Async because the only way to reach os/path/fs
- * from `src/` is dynamic import. Returns `null` if the directory cannot be
- * created (e.g. the drivers are unavailable), so the caller degrades.
+ * Resolve the default store path for `host` under
+ * `~/.cache/opencode-session-recall/` (`store-v1.db` for the v1 host,
+ * `store-opencode-v2.db` for the v2 host) and ensure its directory exists.
+ * Async because the only way to reach os/path/fs from `src/` is dynamic import.
+ * Returns `null` if the directory cannot be created (e.g. the drivers are
+ * unavailable), so the caller degrades.
  */
-export async function defaultStorePath(): Promise<string | null> {
+export async function defaultStorePath(host: StoreHost): Promise<string | null> {
   try {
     const [fs, path, os] = await Promise.all([loadFs(), loadPath(), loadOs()]);
     const dir = path.join(os.homedir(), STORE_CACHE_SUBDIR);
     await fs.promises.mkdir(dir, { recursive: true });
-    return path.join(dir, STORE_FILENAME);
+    return path.join(dir, STORE_FILENAMES[host]);
   } catch {
     return null;
   }

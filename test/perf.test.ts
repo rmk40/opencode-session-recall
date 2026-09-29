@@ -22,7 +22,7 @@ import { describe, expect, it } from "vitest";
 import type { OpencodeClient, Message, Part, Session } from "@opencode-ai/sdk/v2";
 import type { ToolContext, ToolDefinition } from "../src/host/opencode-v1-types.js";
 import { openSqlite } from "../src/sqlite.js";
-import { openStore, type Card, type PartTextRow } from "../src/store.js";
+import { type Card, type PartTextRow } from "../src/store.js";
 import { createCardsRuntime } from "../src/cards.js";
 import { createFetchGate } from "../src/fetch-gate.js";
 import { createDrill } from "../src/drill.js";
@@ -49,6 +49,7 @@ import {
   textPart,
   toolResultText,
   userMessage,
+  openV1Store,
 } from "./helpers.js";
 
 const ENABLED = process.env.RECALL_PERF === "1";
@@ -348,7 +349,7 @@ describe.skipIf(!ENABLED)("perf: distill-then-search gates", () => {
     const dir = mkdtempSync(join(tmpdir(), "perf-store-"));
     const db = await openSqlite(join(dir, "store.db"));
     expect(db).not.toBeNull();
-    const store = openStore(db!)!;
+    const store = openV1Store(db!)!;
     try {
       const build = (
         s: number,
@@ -422,7 +423,7 @@ describe.skipIf(!ENABLED)("perf: distill-then-search gates", () => {
     const dir = mkdtempSync(join(tmpdir(), "perf-fts-"));
     const db = await openSqlite(join(dir, "store.db"));
     expect(db).not.toBeNull();
-    const store = openStore(db!)!;
+    const store = openV1Store(db!)!;
     try {
       // 50 sessions × 1,000 rows = 50k part_text/FTS rows. A ~1% band carries the
       // rare anchor so the query returns a bounded, realistic hit set.
@@ -483,7 +484,7 @@ describe.skipIf(!ENABLED)("perf: distill-then-search gates", () => {
     const dir = mkdtempSync(join(tmpdir(), "perf-e2e-"));
     const db = await openSqlite(join(dir, "store.db"));
     expect(db).not.toBeNull();
-    const store = openStore(db!)!;
+    const store = openV1Store(db!)!;
     try {
       const parentById = new Map<string, string | null>(
         corpus.sessions.map((s) => [s.id, s.parentID ?? null]),
@@ -556,7 +557,7 @@ describe.skipIf(!ENABLED)("perf: distill-then-search gates", () => {
     const corpus = buildE2ECorpus(100);
     const dir = mkdtempSync(join(tmpdir(), "perf-mem-"));
     const db = await openSqlite(join(dir, "store.db"));
-    const store = openStore(db!)!;
+    const store = openV1Store(db!)!;
     try {
       const parentById = new Map<string, string | null>(
         corpus.sessions.map((s) => [s.id, s.parentID ?? null]),

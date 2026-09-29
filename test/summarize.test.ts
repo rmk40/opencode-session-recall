@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openSqlite } from "../src/sqlite.js";
-import { openStore, type Card, type PartTextRow, type Store } from "../src/store.js";
+import { type Card, type PartTextRow, type Store } from "../src/store.js";
 import { createFetchGate, type FetchGate } from "../src/fetch-gate.js";
 import { createDistiller, type Distiller } from "../src/distill.js";
 import { createCardsRuntime } from "../src/cards.js";
@@ -36,6 +36,7 @@ import {
   type SummarizerClient,
   type SummaryPromptCall,
   type SummaryPromptResult,
+  openV1Store,
 } from "./helpers.js";
 import type { OpencodeClient } from "@opencode-ai/sdk/v2";
 
@@ -49,7 +50,7 @@ async function freshStore(): Promise<Store> {
   tmpDirs.push(dir);
   const db = await openSqlite(join(dir, "store.db"));
   if (!db) throw new Error("openSqlite returned null");
-  const store = openStore(db);
+  const store = openV1Store(db);
   if (!store) throw new Error("openStore returned null");
   return store;
 }

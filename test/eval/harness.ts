@@ -22,9 +22,9 @@ import {
   setStrictNoLimitMessages,
   UNBOUNDED_MESSAGES_ERROR,
   toolResultText,
+  openV1Store,
 } from "../helpers.js";
 import { openSqlite } from "../../src/sqlite.js";
-import { openStore } from "../../src/store.js";
 import { createFetchGate } from "../../src/fetch-gate.js";
 import { createDistiller, type Distiller } from "../../src/distill.js";
 import { createCardsRuntime, cardsLiteFromSessions } from "../../src/cards.js";
@@ -128,7 +128,7 @@ export async function makeEvalSearch(
   const dir = mkdtempSync(join(tmpdir(), "recall-eval-"));
   const db = await openSqlite(join(dir, "store.db"));
   if (!db) throw new Error("openSqlite returned null in eval harness");
-  const store = openStore(db);
+  const store = openV1Store(db);
   if (!store) throw new Error("openStore returned null in eval harness");
 
   const gate = createFetchGate({ concurrency: limits.concurrency });

@@ -8,7 +8,7 @@ import { TOOLS } from "../src/types.js";
 import { LITE_REFRESH_WINDOW_MS } from "../src/lite-refresh.js";
 import { openSqlite } from "../src/sqlite.js";
 import { defaultStorePath, openStore } from "../src/store.js";
-import { bundle, makeContext, PROJECT_DIR, textPart, userMessage } from "./helpers.js";
+import { bundle, makeContext, openV1Store, PROJECT_DIR, textPart, userMessage } from "./helpers.js";
 
 const createOpencodeClient = vi.hoisted(() => vi.fn((options: unknown) => options));
 const sqliteLifecycle = vi.hoisted(() => ({ opens: 0, closes: 0, postCloseCalls: 0 }));
@@ -593,7 +593,7 @@ describe("plugin entry", () => {
       await Promise.resolve();
       rivalDb = await openSqlite(storePath);
       if (!rivalDb) throw new Error("failed to open rival store");
-      const rival = openStore(rivalDb);
+      const rival = openV1Store(rivalDb);
       if (!rival) throw new Error("failed to initialize rival store");
       expect(rival.acquireLease("rival", 60_000, "test", 1)).toBe(false);
 
@@ -678,7 +678,7 @@ describe("plugin entry", () => {
 
       const rivalDb = await openSqlite(storePath);
       if (!rivalDb) throw new Error("openSqlite returned null for rival");
-      const rival = openStore(rivalDb);
+      const rival = openV1Store(rivalDb);
       if (!rival) throw new Error("openStore returned null for rival");
       const initialLease = rival.leaseStatus();
       expect(initialLease).toBeDefined();
@@ -712,6 +712,47 @@ describe("plugin entry", () => {
       rivalDb.close();
     } finally {
       vi.useRealTimers();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("degrades with one log line and leaves the file untouched when another host owns the store", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "recall-plugin-host-fence-"));
+    const storePath = join(dir, "recall.db");
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    try {
+      const seedDb = await openSqlite(storePath);
+      if (!seedDb) throw new Error("openSqlite returned null for seed");
+      const seeded = openStore(seedDb, "opencode-v2", { source: "/data/opencode.db" });
+      if (!seeded.ok) throw new Error(seeded.reason);
+      seedDb.close();
+
+      const hooks = await server(ctx({ fetch: vi.fn() }), { storePath, coldPass: true });
+      await hooks.dispose?.();
+
+      const refusals = log.mock.calls.filter(
+        (c) => typeof c[0] === "string" && c[0].includes("store refused"),
+      );
+      expect(refusals).toHaveLength(1);
+      expect(refusals[0]?.[0]).toContain("store refused (host-mismatch)");
+
+      const probe = await openSqlite(storePath);
+      if (!probe) throw new Error("openSqlite returned null for probe");
+      try {
+        const meta = Object.fromEntries(
+          probe.all("SELECT key, value FROM meta").map((r) => [r.key, r.value]),
+        );
+        // Still the v2 host's store: no rebuild, no restamp, no lease taken.
+        expect(meta).toEqual({
+          schema_version: "4",
+          store_host: "opencode-v2",
+          source_db: "/data/opencode.db",
+        });
+      } finally {
+        probe.close();
+      }
+    } finally {
+      log.mockRestore();
       rmSync(dir, { recursive: true, force: true });
     }
   });
@@ -782,7 +823,7 @@ describe("plugin entry", () => {
     // cache), so a mock that stops intercepting fails here instead of letting
     // the zero-count assertion pass vacuously. The mock never touches the
     // filesystem, so this call itself creates nothing either.
-    await defaultStorePath();
+    await defaultStorePath("opencode-v1");
     expect(defaultStorePathCalls.count).toBe(1);
   });
 

@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Event, OpencodeClient, Part, Session } from "@opencode-ai/sdk/v2";
 import { openSqlite, type Row, type SqliteDb } from "../src/sqlite.js";
-import { openStore, type Card, type Store } from "../src/store.js";
+import { type Card, type Store } from "../src/store.js";
 import { createFetchGate, type FetchGate } from "../src/fetch-gate.js";
 import {
   createDistiller,
@@ -38,6 +38,7 @@ import {
   TEST_LIMITS,
   textPart,
   userMessage,
+  openV1Store,
 } from "./helpers.js";
 
 type MessageBundle = { info: import("@opencode-ai/sdk/v2").Message; parts: Part[] };
@@ -57,7 +58,7 @@ afterAll(() => {
 async function freshStore(now?: () => number): Promise<{ db: SqliteDb; store: Store }> {
   const db = await openSqlite(freshDbPath());
   if (!db) throw new Error("openSqlite returned null");
-  const store = openStore(db, now ? { now } : undefined);
+  const store = openV1Store(db, now ? { now } : undefined);
   if (!store) throw new Error("openStore returned null");
   return { db, store };
 }

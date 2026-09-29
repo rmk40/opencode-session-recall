@@ -12,10 +12,11 @@ import { openSqlite, type SqliteDb } from "./sqlite.js";
 import {
   openStore,
   defaultStorePath,
-  SCHEMA_VERSION,
+  pluginBuild,
   SEMANTIC_MODEL_KEY,
   VECTORS_REV_KEY,
   type Store,
+  type StoreHost,
   type Card,
 } from "./store.js";
 import { EMBED_REPRESENTATION } from "./embedding-text.js";
@@ -43,6 +44,9 @@ const SHUTDOWN_TIMEOUT_MS = 2_500;
 /** v1 plugin log: `[recall] `-prefixed lines on the host console. */
 const pluginLog = createLogger(consoleSink);
 
+/** The store host lane this entry runs as (see {@link StoreHost}). */
+const STORE_HOST: StoreHost = "opencode-v1";
+
 /**
  * Plugin build tag — recorded in the distill lease and surfaced in
  * `coverage.semantic.pluginVersion`, so a store shared by mixed-version processes
@@ -53,12 +57,12 @@ const pluginLog = createLogger(consoleSink);
  * `./src` and leaves `resolveJsonModule` off, so importing `../package.json` fails
  * `tsc`, and a hand-copied version const would drift silently on release (the
  * `npm version` flow only touches package.json). The tag is instead derived from
- * the two constants that actually gate mixed-version safety — the schema version
- * and the embedding representation generation — so it never lies about the fence
- * dimensions and needs no release-step upkeep. Swap in a real version here if one
- * can ever be sourced without a Node import.
+ * the constants that actually gate mixed-version safety — the schema version,
+ * the embedding representation generation and the host — so it never lies about
+ * the fence dimensions and needs no release-step upkeep. Swap in a real version
+ * here if one can ever be sourced without a Node import.
  */
-const PLUGIN_BUILD = `schema${SCHEMA_VERSION}.gen${EMBED_REPRESENTATION}`;
+const PLUGIN_BUILD = pluginBuild(STORE_HOST);
 
 const server: Plugin = async (ctx, options) => {
   const {
@@ -133,18 +137,23 @@ const server: Plugin = async (ctx, options) => {
 
   // ── Card store (Tier 0) ──
   // The derived, versioned store is the sole persistence. If SQLite is
-  // unavailable (no driver, unwritable dir) or the schema is newer than this
-  // build understands, `store` stays null and the plugin degrades to ephemeral
-  // cards-lite built from the session list. In configured ephemeral mode the
+  // unavailable (no driver, unwritable dir) or openStore refuses the file (a
+  // newer schema, another host's store, or an open error), `store` stays null
+  // and the plugin degrades to ephemeral cards-lite built from the session
+  // list; a refusal also logs its reason once. In configured ephemeral mode the
   // whole open sequence — including defaultStorePath(), which mkdirs the cache
   // dir — is skipped: `store`/`db` stay null by construction.
   let store: Store | null = null;
   let db: SqliteDb | null = null;
   if (!ephemeral) {
-    const storePath = configuredStorePath ?? (await defaultStorePath());
+    const storePath = configuredStorePath ?? (await defaultStorePath(STORE_HOST));
     if (storePath) {
       db = await openSqlite(storePath);
-      if (db) store = openStore(db);
+      if (db) {
+        const opened = openStore(db, STORE_HOST);
+        if (opened.ok) store = opened.store;
+        else pluginLog(`store refused (${opened.reason}): ${storePath}; running degraded`);
+      }
     }
   }
 
