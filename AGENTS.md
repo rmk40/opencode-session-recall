@@ -167,11 +167,21 @@ compares the host with `meta.store_host` (schema 1-3 without a stamp implies
 before `schema_version` is even read, so no schema state (missing, garbled,
 pre-fence) can rebuild or migrate another host's file. A mismatch refuses with
 `host-mismatch` or `source-mismatch` **before any migration**, so a v2 opener never
-upgrades a v1 store. Refusals never rebuild or write: the fence transaction rolls
-back, and `journal_mode=WAL` is only set after the fence accepts, because it
-rewrites the file header. Two hosts pointed at one file would otherwise wipe each
-other on every start. The reset is manual: quit every opencode process sharing the
-store, delete the store file, restart.
+upgrades a v1 store. Fence refusals (`newer`, `host-mismatch`, `source-mismatch`)
+never rebuild or write, since two hosts pointed at one file would otherwise wipe each
+other on every start: they are decided by reads, the transaction rolls back, and
+`journal_mode=WAL` is only set after the fence accepts, because it rewrites the file
+header. An `error` refusal is a failure path instead: its rollback undoes a partial
+migration. A failed WAL switch after an accepted open is not a refusal at all: the
+store opens with `warning` set. The reset is manual: quit every opencode process
+sharing the store, delete the store file, restart.
+
+The stamp-first fence reads `meta.store_host` before it knows the schema, so **every
+future schema must keep the `meta(key, value)` table and the `store_host` key
+readable**. Today a renamed key falls through to the schema check (and refuses as
+`newer`), and a changed `meta` shape throws (and refuses as `error`). Both are still
+safe refusals, but the reason stops naming the other host, which is what tells a user
+that the fix is a separate store rather than a plugin upgrade.
 
 Several opencode processes run one plugin instance each and share the file,
 coordinated by a single `distill_lease` row in `meta` (holder, heartbeat, 30s TTL,

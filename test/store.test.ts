@@ -626,6 +626,24 @@ describe("store migration", () => {
     db.close();
   });
 
+  it("opens a migrated store with a warning when the WAL switch fails", async () => {
+    // The migration commits before the WAL switch, so a failing switch must not
+    // turn a committed schema 4 store into an `error` refusal.
+    const path = freshDbPath();
+    await buildV3Store(path);
+    const db = await openSqlite(path);
+    if (!db) throw new Error("reopen failed");
+    const spy = instrument(db, { exec: /journal_mode=WAL/ });
+    const opened = openStore(spy.db, V1);
+    if (!opened.ok) throw new Error(opened.reason);
+    expect(opened.warning).toContain("could not enable WAL");
+    expect(opened.store.getMeta("schema_version")).toBe("4");
+    expect(opened.store.getCard("s-v3")?.title).toBe("V3 session");
+    opened.store.upsertCard(makeCard("s-new"));
+    expect(opened.store.getCard("s-new")).toBeDefined();
+    db.close();
+  });
+
   it("refuses as `error` and keeps a v3 store intact when its migration throws", async () => {
     // Two failure points: the first statement of the v3 -> v4 step (the ALTER),
     // and a later one (the host stamp write, after the ALTER has run). Either

@@ -18,8 +18,8 @@ import { EMBED_REPRESENTATION } from "./embedding-text.js";
  * Schema 4 adds the host fence: every store records the host that writes it
  * (`meta.store_host`) and, for the opencode v2 host, the history database it
  * was distilled from (`meta.source_db`). An opener for a different host or
- * source is refused before any migration and the file is left untouched, so two
- * hosts pointed at one file never thrash it with rebuilds. Stores stamped 1-3
+ * source is refused before any migration, and a fence refusal writes nothing, so
+ * two hosts pointed at one file never thrash it with rebuilds. Stores stamped 1-3
  * predate the fence and were all written by the v1 host.
  *
  * Per-session writes are transactional delete-and-insert with an explicit FTS
@@ -230,21 +230,26 @@ export type StoreOptions = {
   now?: () => number;
 };
 
-/** Why {@link openStore} refused a store. Every refusal leaves the file
- *  untouched; the caller degrades to cards-lite.
+/** Why {@link openStore} refused a store; the caller degrades to cards-lite.
+ *  The three fence refusals (`newer`, `host-mismatch`, `source-mismatch`) are
+ *  non-writing: decided by reads alone, their transaction rolls back.
  *  - `newer`: the schema stamp is newer than this build understands.
  *  - `host-mismatch`: another host lane owns the store (or its host stamp is
  *    missing or unknown).
  *  - `source-mismatch`: the store was distilled from a different history
  *    database.
- *  - `error`: the open, the schema check or a migration threw; the migration
- *    rolls back with it. */
+ *  - `error`: the open, the schema check or a migration threw. The
+ *    transaction's rollback undoes a partial migration, but unlike a fence
+ *    refusal this is a failure path, not a decision made before any write. */
 export type StoreRefusal = "newer" | "host-mismatch" | "source-mismatch" | "error";
 
 /** The refusals the fence decides; `error` is anything that threw instead. */
 type FenceRefusal = Exclude<StoreRefusal, "error">;
 
-export type OpenStoreResult = { ok: true; store: Store } | { ok: false; reason: StoreRefusal };
+export type OpenStoreResult =
+  /** `warning` is set when the store opened but could not be switched to WAL
+   *  (a performance setting, not a correctness one); the host may log it. */
+  { ok: true; store: Store; warning?: string } | { ok: false; reason: StoreRefusal };
 
 export type Store = {
   upsertCard(card: Card): void;
@@ -693,9 +698,12 @@ function checkIdentity(
 /**
  * Open a {@link Store} for `identity` over an already-open {@link SqliteDb}. Sets
  * the busy timeout, checks the fence and migrates or rebuilds under one
- * transaction, and only then switches an accepted store to WAL.
+ * transaction, and only then switches an accepted store to WAL. A failed WAL
+ * switch does not fail the open: the transaction has already committed, and
+ * journal mode and sync level are performance settings, so the store is
+ * returned with a `warning` instead.
  *
- * Refuses, leaving the file untouched (no migration, no rebuild, no write), when
+ * Refuses without writing (no migration, no rebuild, no write) when
  * another host owns the store, when the store was distilled from a different
  * `identity.source`, or when the schema stamp is newer than this build. A host
  * stamp is checked first, before the schema stamp is even read, so a store
@@ -735,8 +743,14 @@ export function openStore(
       // rebuilt fresh for this host.
       rebuild(db, host, source);
     });
-    db.exec(ACCEPTED_PRAGMAS);
-    return { ok: true, store: new SqliteStore(db, now) };
+    let warning: string | undefined;
+    try {
+      db.exec(ACCEPTED_PRAGMAS);
+    } catch (error) {
+      warning = `could not enable WAL: ${error instanceof Error ? error.message : String(error)}`;
+    }
+    const store = new SqliteStore(db, now);
+    return warning === undefined ? { ok: true, store } : { ok: true, store, warning };
   } catch (error) {
     return { ok: false, reason: error instanceof StoreRefused ? error.reason : "error" };
   }
@@ -769,6 +783,9 @@ function fenceRefusal(
   // Newer than this build understands: refuse (degrade), never misread it.
   if (current !== null && current > SCHEMA_VERSION) return "newer";
   const legacy = current === 1 || current === 2 || current === 3;
+  // Past the stamped block, this still catches what it cannot: a v4 store with
+  // no host stamp, and a hand-stamped pre-fence store whose stamp claims a
+  // host other than the v1 host its schema implies.
   if (current === SCHEMA_VERSION || legacy) return checkIdentity(db, legacy, host, source);
   return null;
 }
