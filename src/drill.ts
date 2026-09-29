@@ -1,9 +1,8 @@
-import type { OpencodeClient } from "@opencode-ai/sdk/v2";
 import { errmsg, type Limits } from "./types.js";
 import type { FetchGate } from "./fetch-gate.js";
 import type { ParsedQuery } from "./query.js";
-import { fetchMessagePage } from "./distill.js";
 import { compareMessages, type HistoryMessage } from "./history/model.js";
+import type { HistorySource } from "./history/source.js";
 import {
   buildCandidates,
   buildTitleCandidate,
@@ -185,7 +184,7 @@ export type Drill = {
 };
 
 export type DrillDeps = {
-  client: OpencodeClient;
+  source: HistorySource;
   gate: FetchGate;
   limits: Limits;
   /** Injectable clock for the deep sweep's wall-clock budget (tests). */
@@ -279,7 +278,7 @@ function estimateRetained(msg: HistoryMessage): number {
 }
 
 export function createDrill(deps: DrillDeps): Drill {
-  const { client, gate, limits } = deps;
+  const { source, gate, limits } = deps;
   // Drilled-session LRU keyed by (session, time.updated); Map order is LRU order.
   const cache = new Map<string, CacheEntry>();
   let cachedTotal = 0;
@@ -307,7 +306,7 @@ export function createDrill(deps: DrillDeps): Drill {
     do {
       const before = cursor;
       const page = await gate.runQuery(() =>
-        fetchMessagePage(client, {
+        source.messagePage({
           sessionID: target.sessionId,
           limit: limits.drillPageMessages,
           before,
@@ -340,11 +339,9 @@ export function createDrill(deps: DrillDeps): Drill {
       for (const messageID of wanted) {
         if (retained >= limits.drillCharsPerSession) break;
         if (byId.has(messageID)) continue;
-        const resp = await gate.runQuery(() =>
-          client.session.message({ sessionID: target.sessionId, messageID }),
-        );
-        if (resp.error || !resp.data) continue;
-        const bundle = resp.data as HistoryMessage;
+        const lookup = await gate.runQuery(() => source.getMessage(target.sessionId, messageID));
+        if (!lookup.ok) continue;
+        const bundle = lookup.value;
         byId.set(bundle.info.id, bundle);
         retained += estimateRetained(bundle);
       }
@@ -589,7 +586,7 @@ export function createDrill(deps: DrillDeps): Drill {
           }
           const before = cursor;
           const page = await gate.runQuery(() =>
-            fetchMessagePage(client, {
+            source.messagePage({
               sessionID: target.sessionId,
               limit: DEEP_PAGE_MESSAGES,
               before,

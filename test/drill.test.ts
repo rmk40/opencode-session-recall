@@ -1,6 +1,8 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { OpencodeClient, Part } from "@opencode-ai/sdk/v2";
 import { createDrill, type DrillTarget } from "../src/drill.js";
+import type { HistorySource } from "../src/history/source.js";
+import { createV1HistorySource } from "../src/history/v1.js";
 import { createFetchGate, type FetchGate } from "../src/fetch-gate.js";
 import { parseQuery } from "../src/query.js";
 import type { FtsHit } from "../src/store.js";
@@ -31,7 +33,7 @@ type Calls = {
   message: Array<{ sessionID: string; messageID: string }>;
 };
 
-function makeDrillFake(graph: Graph): { client: OpencodeClient; calls: Calls } {
+function makeDrillFake(graph: Graph): { source: HistorySource; calls: Calls } {
   const calls: Calls = { messages: [], message: [] };
   const client = {
     session: {
@@ -49,7 +51,7 @@ function makeDrillFake(graph: Graph): { client: OpencodeClient; calls: Calls } {
       },
     },
   } as unknown as OpencodeClient;
-  return { client, calls };
+  return { source: createV1HistorySource({ scoped: client, unscoped: client }), calls };
 }
 
 function makeSpyGate(): { gate: FetchGate; queries: () => number } {
@@ -133,9 +135,9 @@ describe("drill LRU parentage restamping", () => {
   }
 
   it("does not serve a cached root stamp to an unknown-parentage target", async () => {
-    const { client, calls } = makeDrillFake(parentageGraph());
+    const { source, calls } = makeDrillFake(parentageGraph());
     const { gate } = makeSpyGate();
-    const drill = createDrill({ client, gate, limits: TEST_LIMITS });
+    const drill = createDrill({ source, gate, limits: TEST_LIMITS });
 
     const first = await humanPool(drill, rootTarget);
     expect(first.human).toBe(1); // root session → human
@@ -150,9 +152,9 @@ describe("drill LRU parentage restamping", () => {
   });
 
   it("does not serve a cached unknown stamp to a root target (the reverse order)", async () => {
-    const { client, calls } = makeDrillFake(parentageGraph());
+    const { source, calls } = makeDrillFake(parentageGraph());
     const { gate } = makeSpyGate();
-    const drill = createDrill({ client, gate, limits: TEST_LIMITS });
+    const drill = createDrill({ source, gate, limits: TEST_LIMITS });
 
     const first = await humanPool(drill, unknownTarget);
     expect(first.human).toBe(0);
@@ -165,9 +167,9 @@ describe("drill LRU parentage restamping", () => {
   });
 
   it("does not serve a cached root stamp to a child target", async () => {
-    const { client } = makeDrillFake(parentageGraph());
+    const { source } = makeDrillFake(parentageGraph());
     const { gate } = makeSpyGate();
-    const drill = createDrill({ client, gate, limits: TEST_LIMITS });
+    const drill = createDrill({ source, gate, limits: TEST_LIMITS });
 
     await humanPool(drill, rootTarget);
     const second = await humanPool(drill, childTarget);
@@ -176,9 +178,9 @@ describe("drill LRU parentage restamping", () => {
   });
 
   it("leaves the cached array untouched when restamping (no retroactive reclassification)", async () => {
-    const { client } = makeDrillFake(parentageGraph());
+    const { source } = makeDrillFake(parentageGraph());
     const { gate } = makeSpyGate();
-    const drill = createDrill({ client, gate, limits: TEST_LIMITS });
+    const drill = createDrill({ source, gate, limits: TEST_LIMITS });
 
     const rootPools = await drill.pools({
       sessions: [rootTarget],
@@ -210,9 +212,9 @@ describe("drill tier-2", () => {
         ],
       },
     };
-    const { client, calls } = makeDrillFake(graph);
+    const { source, calls } = makeDrillFake(graph);
     const { gate, queries } = makeSpyGate();
-    const drill = createDrill({ client, gate, limits: TEST_LIMITS });
+    const drill = createDrill({ source, gate, limits: TEST_LIMITS });
 
     const out = await drill.drill({
       sessions: [target("s-rate"), target("s-db")],
@@ -247,9 +249,9 @@ describe("drill tier-2", () => {
         ],
       },
     };
-    const { client, calls } = makeDrillFake(graph);
+    const { source, calls } = makeDrillFake(graph);
     const { gate } = makeSpyGate();
-    const drill = createDrill({ client, gate, limits: { ...TEST_LIMITS, drillPageMessages: 1 } });
+    const drill = createDrill({ source, gate, limits: { ...TEST_LIMITS, drillPageMessages: 1 } });
     const ftsBySession = new Map<string, FtsHit[]>([
       [
         "s-x",
@@ -295,9 +297,9 @@ describe("drill tier-2", () => {
         ],
       },
     };
-    const { client, calls } = makeDrillFake(graph);
+    const { source, calls } = makeDrillFake(graph);
     const { gate } = makeSpyGate();
-    const drill = createDrill({ client, gate, limits: { ...TEST_LIMITS, drillCharsPerQuery: 1 } });
+    const drill = createDrill({ source, gate, limits: { ...TEST_LIMITS, drillCharsPerQuery: 1 } });
 
     const out = await drill.drill({
       sessions: [target("s-a"), target("s-b")],
@@ -322,9 +324,9 @@ describe("drill tier-2", () => {
         ],
       },
     };
-    const { client, calls } = makeDrillFake(graph);
+    const { source, calls } = makeDrillFake(graph);
     const { gate } = makeSpyGate();
-    const drill = createDrill({ client, gate, limits: TEST_LIMITS });
+    const drill = createDrill({ source, gate, limits: TEST_LIMITS });
     const input = {
       sessions: [target("s-c")],
       deepSet: new Set(["s-c"]),
@@ -355,9 +357,9 @@ describe("drill tier-2", () => {
         ],
       },
     };
-    const { client } = makeDrillFake(graph);
+    const { source } = makeDrillFake(graph);
     const { gate } = makeSpyGate();
-    const drill = createDrill({ client, gate, limits: TEST_LIMITS });
+    const drill = createDrill({ source, gate, limits: TEST_LIMITS });
 
     const drilled = await drill.drill({
       sessions: [target("s-a")],

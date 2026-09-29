@@ -1482,7 +1482,7 @@ describe("recall", () => {
       const cards = createCardsRuntime({
         source: { getCards: () => liteCards, revision: () => undefined, degraded: true },
       });
-      const drill = createDrill({ client: h.client, gate, limits: TEST_LIMITS });
+      const drill = createDrill({ source: h.source, gate, limits: TEST_LIMITS });
       const deps: SearchDeps = { gate, store: null, cards, drill };
       const tool = search(h.client, h.unscoped, true, TEST_LIMITS, deps);
 

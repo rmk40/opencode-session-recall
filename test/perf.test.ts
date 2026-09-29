@@ -26,6 +26,7 @@ import { openStore, type Card, type PartTextRow } from "../src/store.js";
 import { createCardsRuntime } from "../src/cards.js";
 import { createFetchGate } from "../src/fetch-gate.js";
 import { createDrill } from "../src/drill.js";
+import { createV1HistorySource } from "../src/history/v1.js";
 import { deriveCard, type DistillSessionMeta } from "../src/distill.js";
 import { parseQuery } from "../src/query.js";
 import { normalize } from "../src/normalize.js";
@@ -506,7 +507,11 @@ describe.skipIf(!ENABLED)("perf: distill-then-search gates", () => {
       const cards = createCardsRuntime({
         source: { getCards: () => store.allCards(), revision: () => store.getMeta("cards_rev") },
       });
-      const drill = createDrill({ client, gate, limits: LIMITS });
+      const drill = createDrill({
+        source: createV1HistorySource({ scoped: client, unscoped }),
+        gate,
+        limits: LIMITS,
+      });
       const tool: ToolDefinition = search(client, unscoped, true, LIMITS, {
         gate,
         store,

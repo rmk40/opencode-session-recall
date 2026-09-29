@@ -124,7 +124,7 @@ export async function makeEvalSearch(
 ): Promise<{ searchTool: ToolDefinition; cleanup: () => void }> {
   // The whole eval path (cold pass, drill, expansion) must be bounded.
   setStrictNoLimitMessages(true);
-  const { client, unscoped } = makeEvalClients(corpus);
+  const { client, unscoped, source } = makeEvalClients(corpus);
   const dir = mkdtempSync(join(tmpdir(), "recall-eval-"));
   const db = await openSqlite(join(dir, "store.db"));
   if (!db) throw new Error("openSqlite returned null in eval harness");
@@ -162,7 +162,7 @@ export async function makeEvalSearch(
     semanticWeight: semantic?.weight,
     semanticModel: semantic ? EVAL_SEMANTIC_MODEL : undefined,
   });
-  const drill = createDrill({ client, gate, limits });
+  const drill = createDrill({ source, gate, limits });
   const searchTool = search(client, unscoped, true, limits, {
     gate,
     store,
@@ -191,13 +191,13 @@ export function makeDegradedEvalSearch(corpus: EvalCorpus = makeEvalCorpus()): {
   searchTool: ToolDefinition;
 } {
   setStrictNoLimitMessages(true);
-  const { client, unscoped } = makeEvalClients(corpus);
+  const { client, unscoped, source } = makeEvalClients(corpus);
   const gate = createFetchGate({ concurrency: TEST_LIMITS.concurrency });
   const liteCards = cardsLiteFromSessions(corpus.globalSessions);
   const cards = createCardsRuntime({
     source: { getCards: () => liteCards, revision: () => undefined, degraded: true },
   });
-  const drill = createDrill({ client, gate, limits: TEST_LIMITS });
+  const drill = createDrill({ source, gate, limits: TEST_LIMITS });
   const deps: SearchDeps = { gate, store: null, cards, drill };
   const searchTool = search(client, unscoped, true, TEST_LIMITS, deps);
   return { searchTool };

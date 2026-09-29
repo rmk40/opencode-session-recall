@@ -843,7 +843,7 @@ export async function makeRecallDeps(
     refreshIntervalMs: opts.cardsRefreshIntervalMs,
   });
   const drill = createDrill({
-    client: fixture.client,
+    source: fixture.source,
     gate,
     limits,
     now: opts.now,
@@ -889,7 +889,7 @@ export function makeStoreNullDeps(
     refreshIntervalMs: opts.cardsRefreshIntervalMs,
   });
   const drill = createDrill({
-    client: fixture.client,
+    source: fixture.source,
     gate,
     limits,
     now: opts.now,

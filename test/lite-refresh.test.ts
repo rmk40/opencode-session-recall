@@ -363,7 +363,7 @@ describe("lite-refresh controller", () => {
       gate,
       store: null,
       cards: rig.runtime,
-      drill: createDrill({ client: harness.client, gate, limits: TEST_LIMITS }),
+      drill: createDrill({ source: harness.source, gate, limits: TEST_LIMITS }),
       mode: "ephemeral",
       maybeRefresh: () => rig.controller.maybeRefresh(),
     };

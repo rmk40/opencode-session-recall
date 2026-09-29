@@ -23,6 +23,7 @@ import { EMBED_REPRESENTATION } from "./embedding-text.js";
 import { createCardsRuntime, cardsLiteFromSessions, type CardSource } from "./cards.js";
 import { createLiteRefresh, type LiteRefreshController } from "./lite-refresh.js";
 import { createDrill } from "./drill.js";
+import { createV1HistorySource } from "./history/v1.js";
 import { createDistiller } from "./distill.js";
 import { createSummarizer, parseModelId, type Summarizer } from "./summarize.js";
 import {
@@ -212,6 +213,7 @@ const server: Plugin = async (ctx, options) => {
     fetch: cfg.fetch,
     headers: rest,
   });
+  const source = createV1HistorySource({ scoped: client, unscoped });
 
   // Opt-in, local-only semantic layer. Off by default; any failure to load the
   // embedder module or construct the model degrades to a plain cache with no
@@ -332,7 +334,7 @@ const server: Plugin = async (ctx, options) => {
     semanticReady,
     pluginVersion: PLUGIN_BUILD,
   });
-  const drill = createDrill({ client, gate, limits });
+  const drill = createDrill({ source, gate, limits });
 
   const instanceId =
     globalThis.crypto?.randomUUID?.() ??
