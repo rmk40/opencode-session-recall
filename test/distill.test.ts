@@ -1469,6 +1469,8 @@ describe("cold pass", () => {
     // Seven failing sessions: the first five are retried, the last two not.
     expect(bad.map(fetches)).toEqual([2, 2, 2, 2, 2, 1, 1]);
     expect(distiller.status().failingCount).toBe(7);
+    // lastError names the first and counts the rest.
+    expect(distiller.status().lastError).toBe("session s1 fetch failed: failing: s1 (and 6 more)");
     await distiller.stop();
     db.close();
   });

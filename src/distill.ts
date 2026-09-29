@@ -61,7 +61,14 @@ const MAX_UNSETTLED_FAILURES = 3;
 const MAX_COLD_PASS_FETCH_FAILURES = 3;
 /** Distinct sessions failing in a row that mean an outage rather than a few
  *  bad sessions: the cold pass aborts and retries later. Only sessions with
- *  no strike yet count: a known-bad session is not evidence of an outage. */
+ *  no strike yet count: a known-bad session is not evidence of an outage.
+ *
+ *  Small-corpus edge: with fewer sessions than this (four or fewer), an
+ *  outage that fails only message fetches (discovery still works) never
+ *  reads as one.
+ *  Every session then takes a strike per pass and is skipped after
+ *  {@link MAX_COLD_PASS_FETCH_FAILURES} passes. Skipping is not permanent: a
+ *  later pass still fetches it once, and any change re-distills it. */
 const MAX_CONSECUTIVE_FETCH_FAILURES = 5;
 /** Sessions a pass sets aside for its end-of-pass retry; failures past this
  *  take a strike without a retry and wait for the follow-up pass. */
@@ -1470,8 +1477,10 @@ export function createDistiller(options: DistillerOptions): Distiller {
        *  it (it is not evidence of an outage). A successful fetch resets it. */
       let consecutiveFailures = 0;
       /** Set when a session still fails short of the skip limit: the pass
-       *  completes, and a follow-up pass retries it. */
+       *  completes, and a follow-up pass retries it. The first such failure,
+       *  and how many there were. */
       let retryFailure: string | undefined;
+      let retryFailureCount = 0;
 
       const countExamined = (session: DistillSessionMeta): void => {
         examined++;
@@ -1485,7 +1494,8 @@ export function createDistiller(options: DistillerOptions): Distiller {
       const strike = (session: DistillSessionMeta, error: unknown): void => {
         const failures = bumpFetchFailure(session.id);
         if (failures < MAX_COLD_PASS_FETCH_FAILURES) {
-          retryFailure = `session ${session.id} fetch failed: ${errmsg(error)}`;
+          retryFailure ??= `session ${session.id} fetch failed: ${errmsg(error)}`;
+          retryFailureCount++;
           return;
         }
         logMsg(
@@ -1667,7 +1677,10 @@ export function createDistiller(options: DistillerOptions): Distiller {
       if (retryFailure !== undefined) {
         // Some sessions still fail: the rest is indexed, and a follow-up pass
         // (which skips everything up to date) retries them later.
-        lastError = retryFailure;
+        lastError =
+          retryFailureCount > 1
+            ? `${retryFailure} (and ${retryFailureCount - 1} more)`
+            : retryFailure;
         scheduleColdPassRetry(true);
       }
     } catch (error) {
