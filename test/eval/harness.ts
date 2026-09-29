@@ -30,6 +30,7 @@ import { createDistiller, type Distiller } from "../../src/distill.js";
 import { createCardsRuntime, cardsLiteFromSessions } from "../../src/cards.js";
 import { createDrill } from "../../src/drill.js";
 import type { HistorySource } from "../../src/history/source.js";
+import type { HistorySession } from "../../src/history/model.js";
 import { createV1HistorySource } from "../../src/history/v1.js";
 import { search, type SearchDeps, type SemanticSearchConfig } from "../../src/search.js";
 import { makeEvalCorpus, type EvalCorpus } from "./corpus.js";
@@ -125,6 +126,29 @@ export async function makeEvalSearch(
   // The whole eval path (cold pass, drill, expansion) must be bounded.
   setStrictNoLimitMessages(true);
   const { unscoped, source } = makeEvalClients(corpus);
+  return makeEvalSearchOver(
+    source,
+    async () => {
+      const resp = await unscoped.experimental.session.list({ limit: DISCOVERY_LIMIT });
+      return (resp.data ?? []) as Session[];
+    },
+    semantic,
+    limits,
+  );
+}
+
+/**
+ * The eval search over any history source: the same cold pass, card runtime,
+ * drill and `recall` tool as {@link makeEvalSearch}, with the source and the
+ * distiller's discovery supplied by the caller (the v2 parity eval passes a
+ * source over a temp `opencode.db`).
+ */
+export async function makeEvalSearchOver(
+  source: HistorySource,
+  discover: () => Promise<HistorySession[]>,
+  semantic?: SemanticSearchConfig,
+  limits: Limits = TEST_LIMITS,
+): Promise<{ searchTool: ToolDefinition; cleanup: () => void; cardCount: number }> {
   const dir = mkdtempSync(join(tmpdir(), "recall-eval-"));
   const db = await openSqlite(join(dir, "store.db"));
   if (!db) throw new Error("openSqlite returned null in eval harness");
@@ -138,10 +162,7 @@ export async function makeEvalSearch(
     gate,
     limits,
     instanceId: "eval-distiller",
-    discover: async () => {
-      const resp = await unscoped.experimental.session.list({ limit: DISCOVERY_LIMIT });
-      return (resp.data ?? []) as Session[];
-    },
+    discover,
   });
   distiller.start();
   await awaitColdPass(distiller);
@@ -173,6 +194,7 @@ export async function makeEvalSearch(
 
   return {
     searchTool,
+    cardCount: store.allCards().length,
     cleanup: () => {
       db.close();
       rmSync(dir, { recursive: true, force: true });
