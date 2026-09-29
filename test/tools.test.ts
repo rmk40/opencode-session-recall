@@ -94,6 +94,26 @@ describe("recall_sessions", () => {
     const out = await runTool<ErrorOutput>(sessionsTool(errored.source, true, TEST_LIMITS), {});
     expect(out.error).toContain("Failed to list sessions: database unavailable");
   });
+
+  it("reports a non-array listing body as an error in both scopes (v1 behavior)", async () => {
+    // v1 iterated the body with for-of, so a truthy non-array threw and the
+    // tool's outer catch returned it bare (no "Failed to list sessions" prefix).
+    for (const scope of ["project", "global"] as const) {
+      const h = makeFakeHarness({ listBody: { unexpected: true } });
+      const out = await runTool<ErrorOutput>(sessionsTool(h.source, true, TEST_LIMITS), { scope });
+      expect(out).toEqual({ ok: false, error: "session listing response was not an array" });
+    }
+  });
+
+  it("treats an absent listing body as an empty listing in both scopes", async () => {
+    for (const scope of ["project", "global"] as const) {
+      const h = makeFakeHarness({ listBody: undefined });
+      const out = await runTool<SessionsOutput>(sessionsTool(h.source, true, TEST_LIMITS), {
+        scope,
+      });
+      expect(out).toMatchObject({ ok: true, returned: 0, sessions: [] });
+    }
+  });
 });
 
 describe("recall_messages", () => {

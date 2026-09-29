@@ -41,10 +41,17 @@ export interface HistorySource {
    *  client can 404 on a session the unscoped client resolves). Callers that
    *  probe project-then-global skip the second probe when this is false. */
   readonly scopedLookup: boolean;
+  /**
+   * The newest `limit` sessions in `scope`. An empty body is an empty listing.
+   * A successful body of the wrong shape is an empty listing by default (the
+   * distiller's discovery tolerates it); `strict` rejects it instead, so the
+   * `recall_sessions` tool reports an error the way it did before the seam.
+   */
   listSessions(o: {
     scope: SessionScope;
     limit: number;
     search?: string;
+    strict?: boolean;
   }): Promise<Listing<HistorySession>>;
   getSession(id: string, o: { scope: SessionScope }): Promise<Lookup<HistorySession>>;
   /** Direct children of a session (non-array host payloads become empty). */

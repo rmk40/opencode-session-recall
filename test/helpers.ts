@@ -93,6 +93,9 @@ export type FakeCalls = {
 export type FakeOptions = {
   projectListError?: string;
   globalListError?: string;
+  /** Both session listings (project and global) succeed with this raw `data`
+   *  body instead of the fixture rows (divergent-payload tests). */
+  listBody?: unknown;
   messageErrors?: Record<string, string>;
   messageThrows?: Set<string>;
   noMessageData?: Set<string>;
@@ -529,6 +532,7 @@ export function makeFakeHarness(options: FakeOptions = {}): FakeHarness {
           limit: params?.limit,
         });
         if (options.projectListError) return { error: apiFailure(options.projectListError) };
+        if ("listBody" in options) return { data: options.listBody as Session[] };
         return {
           data: filtered(fixture.sessions, params?.search, params?.limit),
         };
@@ -584,6 +588,7 @@ export function makeFakeHarness(options: FakeOptions = {}): FakeHarness {
             limit: params?.limit,
           });
           if (options.globalListError) return { error: apiFailure(options.globalListError) };
+          if ("listBody" in options) return { data: options.listBody as GlobalSession[] };
           return {
             data: filtered(fixture.globalSessions, params?.search, params?.limit),
           };

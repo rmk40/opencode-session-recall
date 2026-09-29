@@ -38,6 +38,25 @@ describe("v1 history source", () => {
     });
   });
 
+  it("rejects a non-array listing body only under strict, in both scopes", async () => {
+    for (const scope of ["project", "global"] as const) {
+      const h = makeFakeHarness({ listBody: { unexpected: true } });
+      const source = createV1HistorySource({ scoped: h.client, unscoped: h.unscoped });
+      // Discovery (not strict) keeps v1's `Array.isArray(data) ? data : []`.
+      expect(await source.listSessions({ scope, limit: 5 })).toEqual({ ok: true, items: [] });
+      await expect(source.listSessions({ scope, limit: 5, strict: true })).rejects.toThrow(
+        "session listing response was not an array",
+      );
+
+      const empty = makeFakeHarness({ listBody: null });
+      const emptySource = createV1HistorySource({ scoped: empty.client, unscoped: empty.unscoped });
+      expect(await emptySource.listSessions({ scope, limit: 5, strict: true })).toEqual({
+        ok: true,
+        items: [],
+      });
+    }
+  });
+
   it("looks sessions up through the client for the requested scope", async () => {
     const h = makeFakeHarness({ unscopedGetThrows: new Set(["s-current"]) });
     const source = createV1HistorySource({ scoped: h.client, unscoped: h.unscoped });

@@ -325,7 +325,12 @@ export function sessions(
         const items: SessionItem[] = [];
 
         if (scope === "global") {
-          const result = await source.listSessions({ scope: "global", search, limit });
+          const result = await source.listSessions({
+            scope: "global",
+            search,
+            limit,
+            strict: true,
+          });
           if (!result.ok) {
             const err: ErrorOutput = {
               ok: false,
@@ -350,7 +355,12 @@ export function sessions(
             );
           }
         } else {
-          const result = await source.listSessions({ scope: "project", search, limit });
+          const result = await source.listSessions({
+            scope: "project",
+            search,
+            limit,
+            strict: true,
+          });
           if (!result.ok) {
             const err: ErrorOutput = {
               ok: false,

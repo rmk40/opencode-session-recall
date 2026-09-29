@@ -81,6 +81,8 @@ function makeDistillFake(
     metadataErrorOnce?: Set<string>;
     /** session.get returns the v2 404 body (`name: "NotFoundError"`). */
     metadataNotFound?: Set<string>;
+    /** session.list succeeds with this raw `data` body instead of the graph. */
+    listBody?: unknown;
   } = {},
 ): { client: OpencodeClient; source: HistorySource; sdk: SdkCalls } {
   const sdk: SdkCalls = { list: 0, get: 0, messages: [] };
@@ -89,6 +91,7 @@ function makeDistillFake(
     session: {
       list: async () => {
         sdk.list++;
+        if ("listBody" in opts) return { data: opts.listBody };
         return { data: [...graph.sessions] };
       },
       get: async ({ sessionID }: { sessionID: string }) => {
@@ -1248,6 +1251,31 @@ describe("cold pass", () => {
     }
     expect(sdk.messages.filter((c) => c.sessionID === "s2").length).toBe(2); // threw once, retried
     expect(sdk.list).toBe(2); // discovery re-ran on the backoff retry
+    distiller.stop();
+    db.close();
+  });
+
+  it("tolerates a non-array discovery listing as zero sessions", async () => {
+    const graph: Graph = {
+      sessions: [session("s1", "One", PROJECT_DIR, 3000)],
+      messagesBySession: {},
+    };
+    const { source, sdk } = makeDistillFake(graph, { listBody: { unexpected: true } });
+    const { db, store } = await freshStore();
+    const { gate } = makeSpyGate();
+    const distiller = createDistiller({
+      source,
+      store,
+      gate,
+      limits: TEST_LIMITS,
+      instanceId: "disc-non-array",
+      coldPassRetryMs: 15,
+    });
+
+    distiller.start();
+    await waitFor(() => distiller.status().coldPass === "done");
+    expect(sdk.list).toBe(1); // no failure, so no backoff retry
+    expect(store.getCard("s1")).toBeUndefined();
     distiller.stop();
     db.close();
   });
