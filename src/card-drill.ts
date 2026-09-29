@@ -194,7 +194,11 @@ export function createCardDrill(cards: CardsRuntime, narrow: CardDrillFilters): 
     }
     return {
       pools,
-      drilledSessions: pools.map((pool) => pool.target.sessionId),
+      // Only a session whose card offered at least one candidate was really
+      // searched; a card-less target (or one its filters emptied) was not.
+      drilledSessions: pools
+        .filter((pool) => pool.candidates.length > 0)
+        .map((pool) => pool.target.sessionId),
       budgetExhausted: false,
       loadErrors: [],
     };

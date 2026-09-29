@@ -227,6 +227,29 @@ describe("unavailable history source", () => {
     }
   });
 
+  it("a deep request by card reports limitedBy deep and counts only sessions with a card", async () => {
+    const h = makeFakeHarness();
+    const { deps, cleanup } = await makeRecallDeps(h, TEST_LIMITS);
+    try {
+      const { source } = countingUnavailable();
+      const drill = createDrill({ source, gate: deps.gate, limits: TEST_LIMITS });
+      const recall = search(source, true, TEST_LIMITS, { ...deps, drill });
+      const out = await runTool<SearchOutput>(recall, {
+        query: "rateLimit",
+        deep: true,
+        // s-no-card has no card at all: nothing of it can be searched.
+        sessions: ["s-project-2", "s-no-card"],
+        excludeCurrentSession: false,
+      });
+      expect(out.ok).toBe(true);
+      expect(out.coverage?.limitedBy).toContain("deep");
+      expect(out.warnings?.some((w) => /deep sweep was skipped/.test(w))).toBe(true);
+      expect(out.coverage?.sessionsSearched).toBe(1);
+    } finally {
+      cleanup();
+    }
+  });
+
   it("recall with no cards returns the empty result with the reason", async () => {
     const h = makeFakeHarness();
     const { deps, store, cleanup } = await makeRecallDeps(h, TEST_LIMITS);

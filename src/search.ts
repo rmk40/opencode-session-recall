@@ -3127,6 +3127,7 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
                 authorshipNarrowed: authorshipFilter !== undefined,
               });
         if (sourceUnavailable !== undefined) {
+          if (deepMode) pushUnique(normalized.limitedBy, "deep");
           normalized.warnings.push(
             `${unavailableHistoryError(sourceUnavailable)}. Results come from the session cards only (title, first statement, last answer, summary)${deepMode ? "; the deep sweep was skipped" : ""}; message content cannot be read until it is available.`,
           );

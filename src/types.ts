@@ -144,6 +144,9 @@ export type SearchCoverage = {
     | "rankingBudget"
     | "timeBudget"
     | "abortSignal"
+    /** A deep sweep was requested but could not run (the history source is
+     *  unavailable); the scoped sessions were searched by card instead. */
+    | "deep"
   >;
   /** Present when some sessions failed to load; samples are capped. */
   loadErrors?: { count: number; samples: string[] };
