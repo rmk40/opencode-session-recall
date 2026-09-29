@@ -2182,6 +2182,50 @@ describe("sync-host poll dispatch", () => {
     await distiller.stop();
     db.close();
   });
+
+  it("stop waits for a poll in flight, so no read happens after it resolves", async () => {
+    const { source } = makeDistillFake({ sessions: [], messagesBySession: {} });
+    let release!: () => void;
+    const blocked = new Promise<void>((resolve) => (release = resolve));
+    let entered = false;
+    const order: string[] = [];
+    const sync: DistillSync = {
+      checkpoint: async () => null,
+      compare: async () => "fresh",
+      missing: async () => [],
+      poll: async () => {
+        entered = true;
+        await blocked;
+        order.push("poll read");
+        return { signals: [], commit: () => {}, failures: [] };
+      },
+      pollIntervalMs: 5,
+      reconcileEveryMs: 1e12,
+    };
+    const { db, store } = await freshStore();
+    const distiller = createDistiller({
+      source,
+      store,
+      gate: createFetchGate({ concurrency: 2 }),
+      limits: { ...TEST_LIMITS, coldPass: false },
+      instanceId: "stop-waits-poll",
+      sync,
+      log: () => {},
+    });
+    distiller.start();
+    await waitFor(() => entered);
+    let stopResolved = false;
+    const stopping = distiller.stop().then(() => {
+      stopResolved = true;
+      order.push("stop resolved");
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(stopResolved).toBe(false);
+    release();
+    await stopping;
+    expect(order).toEqual(["poll read", "stop resolved"]);
+    db.close();
+  });
 });
 
 describe("sync-host unsettled retries", () => {

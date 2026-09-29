@@ -838,6 +838,9 @@ export function createDistiller(options: DistillerOptions): Distiller {
   let coldPassRetryTimer: Timer | undefined;
   const debounceTimers = new Map<string, Timer>();
   let coldPassPromise: Promise<void> | undefined;
+  /** The poll in flight, if any: stop() waits for it, so no read of the
+   *  history outlives the stop (the host closes the handle after it). */
+  let pollPromise: Promise<void> | undefined;
   const inFlight = new Map<string, Promise<void>>();
   const pendingRerun = new Set<string>();
   /** Sync hosts only: sessions waiting for a re-distill slot. A poll can
@@ -1764,7 +1767,11 @@ export function createDistiller(options: DistillerOptions): Distiller {
     clearTimer(pollTimer);
     pollTimer = setTimeout(() => {
       pollTimer = undefined;
-      void runPoll().finally(schedulePoll);
+      const running = runPoll().finally(() => {
+        if (pollPromise === running) pollPromise = undefined;
+        schedulePoll();
+      });
+      pollPromise = running;
     }, sync.pollIntervalMs);
   }
 
@@ -1959,7 +1966,7 @@ export function createDistiller(options: DistillerOptions): Distiller {
         }
       }
       leaseHeld = false;
-      const running = [coldPassPromise, ...inFlight.values()].filter(
+      const running = [coldPassPromise, pollPromise, ...inFlight.values()].filter(
         (promise): promise is Promise<void> => promise !== undefined,
       );
       stopPromise = Promise.allSettled(running).then(() => {});
