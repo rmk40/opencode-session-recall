@@ -309,7 +309,7 @@ describe("v2 history source", () => {
     const page = await source.messagePage({ sessionID: "ses_b", limit: 10 });
     expect(page.items.map((m) => m.info.id)).toEqual([badCompaction, badReply, good]);
     expect(page.items.map((m) => m.info.role)).toEqual(["assistant", "assistant", "user"]);
-    expect(partText(page.items[1])).toMatch(/^\[message omitted .*not valid JSON\]$/);
+    expect(partText(page.items[1])).toBe("[unavailable: data is not valid JSON]");
     await expect(
       source.messagePage({ sessionID: "ses_b", limit: 10, strict: true }),
     ).rejects.toBeInstanceOf(MalformedSessionError);
@@ -365,7 +365,9 @@ describe("v2 history source", () => {
     const { source } = await capped(t);
     const first = await source.messagePage({ sessionID: "ses_mb", limit: 10 });
     expect(first.items.map((m) => m.info.id)).toEqual([wide, newer]);
-    expect(partText(first.items[0])).toMatch(/message omitted .* bytes exceeds the 1500-byte/);
+    expect(partText(first.items[0])).toMatch(
+      /^\[unavailable: \d+-byte row over the 1500-byte cap\]$/,
+    );
     expect(partText(first.items[1])).toBe("é".repeat(500));
     const second = await source.messagePage({
       sessionID: "ses_mb",
@@ -418,9 +420,7 @@ describe("v2 history source", () => {
     expect(page.nextCursor).toBeNull();
     const placeholder = page.items[1]!;
     expect(placeholder.info.role).toBe("assistant");
-    expect(partText(placeholder)).toMatch(
-      /^\[message omitted by opencode-session-recall: \d+ bytes/,
-    );
+    expect(partText(placeholder)).toMatch(/^\[unavailable: \d+-byte row over the 1500-byte cap\]$/);
     expect(partText(placeholder)).not.toContain("zzz");
 
     const lookup = await source.getMessage("ses_big", huge);
@@ -532,7 +532,11 @@ describe("v2 history source", () => {
   it("lets the distiller card a session past an oversized row, indexing the placeholder", async () => {
     const t = await fresh();
     session(t, "ses_dist");
+    // The first user row and the last reply are placeholders: neither may
+    // become the card's summary or outcome head.
+    message(t, "ses_dist", "user", text("p".repeat(5_000)));
     message(t, "ses_dist", "user", text("tiny prompt about widgets"));
+    message(t, "ses_dist", "assistant", reply("real answer about gears"));
     message(t, "ses_dist", "assistant", reply("q".repeat(5_000)));
     const { source } = await capped(t);
     const dir = mkdtempSync(join(tmpdir(), "recall-v2-distill-"));
@@ -560,10 +564,15 @@ describe("v2 history source", () => {
 
     expect(distiller.status().quarantinedCount).toBe(0);
     expect(store.getCard("ses_dist")?.distillState).toBe("full");
-    const hit = (term: string) =>
-      store.ftsSearch({ strong: [term], weak: [] }).map((h) => h.sessionId);
+    const hit = (term: string) => [
+      ...new Set(store.ftsSearch({ strong: [term], weak: [] }).map((h) => h.sessionId)),
+    ];
     expect(hit("widgets")).toEqual(["ses_dist"]);
-    expect(hit("omitted")).toEqual(["ses_dist"]);
+    expect(hit("unavailable")).toEqual(["ses_dist"]);
+    expect(store.getCard("ses_dist")).toMatchObject({
+      summaryHead: "tiny prompt about widgets",
+      outcomeHead: "real answer about gears",
+    });
   });
 
   it("re-checks a row's size when it grows between the size read and the body read", async () => {
@@ -582,7 +591,7 @@ describe("v2 history source", () => {
     yields.calls = 0;
     const page = await source.messagePage({ sessionID: "ses_grow", limit: 10 });
     expect(page.items.map((m) => m.info.id)).toEqual([growing]);
-    expect(partText(page.items[0])).toMatch(/message omitted/);
+    expect(partText(page.items[0])).toMatch(/^\[unavailable: /);
   });
 
   it("enforces the page budget on sizes grown after the plan", async () => {
@@ -634,7 +643,7 @@ describe("v2 history source", () => {
       modelID: "m-big",
       providerID: "pb",
     });
-    expect(partText(page.items[0])).toMatch(/message omitted/);
+    expect(partText(page.items[0])).toMatch(/^\[unavailable: /);
 
     const point = await source.getMessage("ses_id", user);
     expect(point.ok && point.value.info).toMatchObject(expected);

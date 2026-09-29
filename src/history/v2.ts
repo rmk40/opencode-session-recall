@@ -1,4 +1,5 @@
 import { openSqliteReadOnly, type ReadOnlyDb, type Row, type SqlValue } from "../sqlite.js";
+import { unavailableText } from "../digest.js";
 import type { HistoryMessage, HistorySession } from "./model.js";
 import {
   assertBoundedLimit,
@@ -235,15 +236,17 @@ function byteLengthSql(db: ReadOnlyDb): string {
   }
 }
 
-/** The text a placeholder carries in place of a row too large to load. */
+/** The text a placeholder carries in place of a row too large to load.
+ *  Worded without domain words (see {@link unavailableText}). */
 export function oversizedNote(bytes: number, ceiling: number): string {
-  return `[message omitted by opencode-session-recall: ${bytes} bytes exceeds the ${ceiling}-byte read limit]`;
+  return unavailableText(`${bytes}-byte row over the ${ceiling}-byte cap`);
 }
 
 /** The text a placeholder carries in place of a row whose data cannot be
- *  decoded (outside `strict`, which rejects instead). */
+ *  decoded (outside `strict`, which rejects instead): the decoder's reason
+ *  without its `message <id>` lead. */
 export function malformedNote(reason: string): string {
-  return `[message omitted by opencode-session-recall: ${reason}]`;
+  return unavailableText(reason.replace(/^message \S+ /, ""));
 }
 
 /**

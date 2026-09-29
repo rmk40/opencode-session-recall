@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { buildSessionDigest } from "../src/corpus.js";
+import { unavailableText } from "../src/digest.js";
 import { buildCandidates } from "../src/candidates.js";
 import {
   PROJECT_DIR,
@@ -72,6 +73,23 @@ describe("buildSessionDigest", () => {
     // count as statement vocabulary after it.
     expect(digest.startsWith("Map the websocket module ")).toBe(true);
     expect(digest).not.toContain("You are a subagent");
+  });
+
+  it("never takes a placeholder for an unloadable message as the head or vocabulary", () => {
+    const digest = digestOf([
+      {
+        info: { id: "m1", role: "user", time: { created: 100 } },
+        parts: [
+          textPart("p1", "s", "m1", unavailableText("9000000-byte row over the 4194304-byte cap")),
+        ],
+      },
+      {
+        info: { id: "m2", role: "user", time: { created: 200 } },
+        parts: [textPart("p2", "s", "m2", "Profile the thumbnail pipeline")],
+      },
+    ] as never);
+    expect(digest.startsWith("Profile the thumbnail pipeline")).toBe(true);
+    expect(digest).not.toContain("unavailable");
   });
 
   it("gives no digest credit to read/skill tools or JSON pseudo-commands", () => {

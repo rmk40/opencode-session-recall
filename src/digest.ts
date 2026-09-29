@@ -11,6 +11,24 @@
 export const DIGEST_HEAD_CHARS = 200;
 
 /**
+ * Text a history source puts in place of a message it cannot load (a row over
+ * the read cap, or one whose stored data does not decode). It is still indexed
+ * and shown, so the gap is visible, but it is never a session's head: its
+ * wording avoids domain words so it does not pull unrelated queries, and it
+ * says nothing about what the session was for.
+ */
+const UNAVAILABLE_PREFIX = "[unavailable: ";
+
+export function unavailableText(reason: string): string {
+  return `${UNAVAILABLE_PREFIX}${reason}]`;
+}
+
+/** Whether `text` is a placeholder from {@link unavailableText}. */
+export function isUnavailableText(text: string | undefined): boolean {
+  return text !== undefined && text.startsWith(UNAVAILABLE_PREFIX) && text.endsWith("]");
+}
+
+/**
  * The line opencode v2 prepends to a subagent's first prompt
  * (`core/src/tool/plugin/subagent.ts:206-211`, `core/src/config/plugin/command.ts:110`).
  * Session parentage already classifies that prompt as delegated, so the line

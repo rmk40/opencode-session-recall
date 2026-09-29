@@ -1,7 +1,12 @@
 import type { Candidate } from "./candidates.js";
 import { tokenize } from "./normalize.js";
 import { toolNameMatches } from "./extract.js";
-import { DIGEST_HEAD_CHARS, isDigestToken, stripSubagentPrefix } from "./digest.js";
+import {
+  DIGEST_HEAD_CHARS,
+  isDigestToken,
+  isUnavailableText,
+  stripSubagentPrefix,
+} from "./digest.js";
 
 /**
  * Session-digest derivation and the embedder surface — the two survivors of the
@@ -45,7 +50,11 @@ export function buildSessionDigest(candidates: Candidate[]): string {
   let firstUserText: Candidate | undefined;
 
   for (const candidate of candidates) {
-    const isStatement = candidate.partType === "text" || candidate.partType === "subtask";
+    // A placeholder for an unloadable message is neither the head nor
+    // identity vocabulary.
+    const isStatement =
+      (candidate.partType === "text" || candidate.partType === "subtask") &&
+      !isUnavailableText(candidate.rawText);
     if (isStatement && candidate.role === "user") {
       // Candidates are newest-first; the last matching one is the earliest.
       firstUserText = candidate;

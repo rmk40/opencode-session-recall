@@ -7,7 +7,12 @@ import type { FetchGate } from "./fetch-gate.js";
 import { isSelfToolPart, toolNameMatches, isSummarizerTitle } from "./extract.js";
 import { tokenize } from "./normalize.js";
 import { extractCodeTokens } from "./query.js";
-import { isDigestToken, DIGEST_HEAD_CHARS, stripSubagentPrefix } from "./digest.js";
+import {
+  isDigestToken,
+  isUnavailableText,
+  DIGEST_HEAD_CHARS,
+  stripSubagentPrefix,
+} from "./digest.js";
 import { containsErrorPattern } from "./bm25.js";
 
 /**
@@ -217,10 +222,11 @@ function isRecallAutoText(part: Part): boolean {
 }
 
 /** The statement text a summary head is drawn from: user/assistant text or a
- *  subtask's description+prompt. Excludes the synthetic recall-auto sentinel. */
+ *  subtask's description+prompt. Excludes the synthetic recall-auto sentinel
+ *  and a history source's placeholder for an unloadable message. */
 function statementText(part: Part): string | undefined {
   if (part.type === "text") {
-    if (isRecallAutoText(part)) return undefined;
+    if (isRecallAutoText(part) || isUnavailableText(part.text)) return undefined;
     return part.text || undefined;
   }
   if (part.type === "subtask") {
@@ -232,7 +238,14 @@ function statementText(part: Part): string | undefined {
 /** The first genuine text part of a message (for the outcome head). */
 function firstTextPartText(msg: HistoryMessage): string | undefined {
   for (const part of msg.parts) {
-    if (part.type === "text" && !isRecallAutoText(part) && part.text) return part.text;
+    if (
+      part.type === "text" &&
+      !isRecallAutoText(part) &&
+      !isUnavailableText(part.text) &&
+      part.text
+    ) {
+      return part.text;
+    }
   }
   return undefined;
 }
