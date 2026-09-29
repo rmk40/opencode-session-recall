@@ -16,8 +16,15 @@ import type { Hooks } from "../host/opencode-v1-types.js";
 /** Sentinel substring used to detect an already-injected nudge. */
 export const NUDGE_SENTINEL = "[recall-nudge]";
 
-/** Kept short on purpose: it is paid on every request. */
-export const NUDGE_TEXT = `${NUDGE_SENTINEL} You have recall tools that search this and prior opencode sessions. When the user refers to earlier work, a previous session, a past decision, or uses vague back-references ("that bug", "same as before", "what did we decide", "like last time"), call recall before answering or re-deriving — the answer may already exist in history. If a subagent Task was cancelled or interrupted after starting and returned no task_id, list this session's children with recall_sessions({ parentID: "current" }) to find their IDs.`;
+/** The host-neutral nudge. Kept short on purpose: it is paid on every
+ *  request. The opencode v2 host injects exactly this: its subagent tool
+ *  reports the child session id on success, failure and cancel, so the v1
+ *  recovery clause below has nothing to recover there. */
+export const NUDGE_BASE_TEXT = `${NUDGE_SENTINEL} You have recall tools that search this and prior opencode sessions. When the user refers to earlier work, a previous session, a past decision, or uses vague back-references ("that bug", "same as before", "what did we decide", "like last time"), call recall before answering or re-deriving — the answer may already exist in history.`;
+
+/** The v1 nudge: the base text plus subagent recovery (a cancelled v1 Task
+ *  returns no task_id). */
+export const NUDGE_TEXT = `${NUDGE_BASE_TEXT} If a subagent Task was cancelled or interrupted after starting and returned no task_id, list this session's children with recall_sessions({ parentID: "current" }) to find their IDs.`;
 
 export function systemNudge(): NonNullable<Hooks["experimental.chat.system.transform"]> {
   return async (_input, output) => {

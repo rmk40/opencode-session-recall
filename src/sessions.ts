@@ -181,11 +181,11 @@ export function sessions(
       try {
         // ── Unreadable history source: serve from the card index ──
         // v2 with opencode.db unavailable: no listing can be read live, but a
-        // card store from an earlier run still knows the sessions. Without one
-        // there is nothing to list.
+        // card store from an earlier run still knows the sessions. Without
+        // cards there is nothing to list.
         if (source.unavailable !== undefined) {
           const unavailable = unavailableHistoryError(source.unavailable);
-          if (!allCards) {
+          if (!allCards || allCards.length === 0) {
             const err: ErrorOutput = { ok: false, error: unavailable };
             return JSON.stringify(err);
           }
