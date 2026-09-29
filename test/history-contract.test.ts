@@ -970,6 +970,46 @@ describe("v2 history source", () => {
     });
   });
 
+  it("skips a switch row whose data is not a JSON object", async () => {
+    const t = await fresh();
+    session(t, "ses_sw", { agent: "sess-agent" });
+    message(t, "ses_sw", "agent-switched", { agent: "alpha", time: { created: 0 } });
+    // Valid JSON, but not an object: it must not hide the switch before it.
+    message(t, "ses_sw", "agent-switched", "[1, 2]");
+    const u = message(t, "ses_sw", "user", text("prompt"));
+    const { source } = await open(t);
+    const page = await source.messagePage({ sessionID: "ses_sw", limit: 5 });
+    expect(page.items[0]?.info).toMatchObject({ id: u, agent: "alpha" });
+    const point = await source.getMessage("ses_sw", u);
+    expect(point.ok && point.value.info).toMatchObject({ agent: "alpha" });
+  });
+
+  it("retries below a planned range that became ineligible between the two reads", async () => {
+    const t = await fresh();
+    session(t, "ses_retry");
+    const older = message(t, "ses_retry", "user", text("older prompt"));
+    const done = { status: "completed", reason: "auto", summary: "s", recent: "" };
+    const c1 = message(t, "ses_retry", "compaction", done);
+    const c2 = message(t, "ses_retry", "compaction", done);
+    let flipped = false;
+    // After the first size read plans [c2, c1], both compactions become
+    // running again, so the body read finds nothing in the planned range.
+    const { source } = await counted(t, (sql) => {
+      if (flipped || !/AS bytes FROM session_message/.test(sql)) return;
+      flipped = true;
+      for (const id of [c1, c2]) {
+        t.db.run("UPDATE session_message SET data = ? WHERE id = ?", [
+          JSON.stringify({ ...done, status: "running" }),
+          id,
+        ]);
+      }
+    });
+    const page = await source.messagePage({ sessionID: "ses_retry", limit: 2 });
+    expect(flipped).toBe(true);
+    expect(page.items.map((m) => m.info.id)).toEqual([older]);
+    expect(page.nextCursor).toBeNull();
+  });
+
   it("round-trips its opaque cursor and rejects foreign ones", () => {
     expect(decodeV2Cursor(encodeV2Cursor(42))).toBe(42);
     // The encoder and decoder agree on the full safe-integer range.

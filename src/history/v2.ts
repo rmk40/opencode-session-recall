@@ -196,6 +196,10 @@ const ROWS_PER_YIELD = 25;
 const SWITCH_SCAN_LIMIT = 64;
 
 type SwitchType = "agent-switched" | "model-switched";
+/** A switch row whose data is a JSON object; anything else (bad JSON, an
+ *  array, a scalar) is skipped in SQL, so it cannot hide an older valid
+ *  switch. Nested CASE: `json_type` rejects malformed JSON. */
+const SWITCH_OBJECT = "CASE WHEN json_valid(data) THEN json_type(data) = 'object' ELSE 0 END";
 const NO_CURSOR_SEQ = Number.MAX_SAFE_INTEGER;
 /** Page plans retried when a whole planned range turns ineligible between the
  *  size read and the body read. */
@@ -490,7 +494,7 @@ export function createV2HistorySource(db: ReadOnlyDb, opts: V2SourceOptions = {}
     const row = read("switch", () =>
       db.get(
         `SELECT ${MESSAGE_COLUMNS} FROM session_message
-         WHERE session_id = ? AND type = ? AND seq < ? AND json_valid(data)
+         WHERE session_id = ? AND type = ? AND seq < ? AND ${SWITCH_OBJECT}
          ORDER BY seq DESC LIMIT ?`,
         [sessionID, type, seq, 1],
       ),
@@ -524,7 +528,7 @@ export function createV2HistorySource(db: ReadOnlyDb, opts: V2SourceOptions = {}
     const range = read("switch range", () =>
       db.all(
         `SELECT ${MESSAGE_COLUMNS} FROM session_message
-         WHERE session_id = ? AND type = ? AND seq > ? AND seq < ? AND json_valid(data)
+         WHERE session_id = ? AND type = ? AND seq > ? AND seq < ? AND ${SWITCH_OBJECT}
          ORDER BY seq DESC LIMIT ?`,
         [sessionID, type, oldest, newest, SWITCH_SCAN_LIMIT + 1],
       ),

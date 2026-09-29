@@ -63,6 +63,16 @@ describe("recall_sessions", () => {
     expect(h.calls.projectList).toEqual([{ search: undefined, limit: 20 }]);
   });
 
+  it("pins the fake's deliberate divergence: its global listing includes an archived session", async () => {
+    // The real v1 server's listGlobal hides archived sessions; this fixture
+    // does not, and the tests above rely on that. If the fake changes, they
+    // need revisiting.
+    const h = makeFakeHarness();
+    const listing = await h.source.listSessions({ scope: "global", limit: 20 });
+    const archived = listing.ok ? listing.items.find((s) => s.id === "s-project-2") : undefined;
+    expect(archived?.time.archived).toEqual(expect.any(Number));
+  });
+
   it("lists global sessions, normalizes blank search, and exposes archived/project metadata", async () => {
     // The fake's global list includes an archived session, which the real v1
     // server's `listGlobal` would hide; this checks the tool's mapping only.
