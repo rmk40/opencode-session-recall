@@ -1,4 +1,4 @@
-import type { Hooks } from "@opencode-ai/plugin";
+import type { Hooks } from "../host/opencode-v1-types.js";
 import type { Part } from "@opencode-ai/sdk/v2";
 import type { SearchDeps } from "../search.js";
 import { cardRecall, type CardRecallHit } from "./card-recall.js";

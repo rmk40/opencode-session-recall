@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { tool, type Hooks, type PluginInput, type ToolDefinition } from "@opencode-ai/plugin";
+import { tool } from "../src/tool-def.js";
+import type { Hooks, PluginInput, ToolDefinition } from "../src/host/opencode-v1-types.js";
 import { mkdtempSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";

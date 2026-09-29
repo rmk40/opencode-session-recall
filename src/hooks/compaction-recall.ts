@@ -1,4 +1,4 @@
-import type { Hooks } from "@opencode-ai/plugin";
+import type { Hooks } from "../host/opencode-v1-types.js";
 import type { SearchDeps } from "../search.js";
 import type { Card } from "../store.js";
 

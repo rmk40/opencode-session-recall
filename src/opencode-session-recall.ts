@@ -1,4 +1,4 @@
-import type { Plugin, ToolDefinition } from "@opencode-ai/plugin";
+import type { Plugin, ToolDefinition } from "./host/opencode-v1-types.js";
 import { sessions, type SessionEnrichment } from "./sessions.js";
 import { search, DISCOVERY_LIMIT, type SearchDeps, type SemanticSearchConfig } from "./search.js";
 import { get } from "./get.js";

@@ -1,4 +1,5 @@
-import { tool, type ToolDefinition, type ToolContext } from "@opencode-ai/plugin";
+import { tool } from "./tool-def.js";
+import type { ToolDefinition, ToolContext } from "./host/opencode-v1-types.js";
 import {
   errmsg,
   coerceInt,

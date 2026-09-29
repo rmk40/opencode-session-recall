@@ -2,7 +2,8 @@ import { expect } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { tool, type ToolContext, type ToolDefinition } from "@opencode-ai/plugin";
+import { tool } from "../src/tool-def.js";
+import type { ToolContext, ToolDefinition } from "../src/host/opencode-v1-types.js";
 import type {
   AssistantMessage,
   GlobalSession,
