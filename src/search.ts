@@ -3248,7 +3248,11 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
           if (budgetExhausted) pushUnique(normalized.limitedBy, "rankingBudget");
           const drillSkipped = Math.max(0, drillTargets.length - drilledSessions.length);
           if (drillSkipped > 0) {
-            skippedByReason.rankingBudget = (skippedByReason.rankingBudget ?? 0) + drillSkipped;
+            // Under the card drill (history unavailable) a target goes unsearched
+            // because it has no card, or no card field its filters allow; no
+            // budget was involved.
+            const reason = sourceUnavailable !== undefined ? "noCardCandidate" : "rankingBudget";
+            skippedByReason[reason] = (skippedByReason[reason] ?? 0) + drillSkipped;
           }
           const sessionsSkipped = Object.values(skippedByReason).reduce((a, b) => a + b, 0);
           const coverage: SearchCoverage = {

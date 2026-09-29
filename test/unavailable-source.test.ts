@@ -274,6 +274,9 @@ describe("unavailable history source", () => {
       expect(out.coverage?.limitedBy).toContain("deep");
       expect(out.warnings?.some((w) => /deep sweep was skipped/.test(w))).toBe(true);
       expect(out.coverage?.sessionsSearched).toBe(1);
+      // Not a budget skip: the card-less session simply has nothing to search.
+      expect(out.coverage?.skippedByReason?.noCardCandidate).toBe(1);
+      expect(out.coverage?.skippedByReason?.rankingBudget).toBeUndefined();
     } finally {
       cleanup();
     }
