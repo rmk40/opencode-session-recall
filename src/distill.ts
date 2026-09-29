@@ -1059,6 +1059,10 @@ export function createDistiller(options: DistillerOptions): Distiller {
       // Nothing appended. A sync host still refreshes the card's metadata and
       // checkpoint, or the cold pass would keep finding it stale.
       if (sync) {
+        // A title or directory change also changes the embedded text, so the
+        // persisted vector is dropped with it (as patchCardMeta does).
+        const identityChanged =
+          oldCard.title !== session.title || oldCard.directory !== session.directory;
         store.upsertCard(
           withCheckpoint(
             {
@@ -1067,6 +1071,7 @@ export function createDistiller(options: DistillerOptions): Distiller {
               directory: session.directory,
               projectId: session.projectId,
               timeUpdated: session.timeUpdated,
+              ...(identityChanged && { embedding: null, embeddingGen: null }),
             },
             tail,
           ),

@@ -97,6 +97,7 @@ async function waitFor(pred: () => boolean, timeoutMs = 3_000): Promise<void> {
 function startDistiller(
   sync: V2SyncOptions = {},
   wrap: (inner: DistillSync) => DistillSync = (inner) => inner,
+  extra: { appendThresholdParts?: number } = {},
 ): Distiller {
   const source = createV2HistorySource(reader, { yieldBetween: async () => {} });
   const created = createDistiller({
@@ -120,6 +121,7 @@ function startDistiller(
     ),
     idleDebounceMs: 5,
     yieldBetween: async () => {},
+    ...extra,
   });
   created.start();
   distiller = created;
@@ -479,6 +481,50 @@ describe("v2 poll queries", () => {
     });
     const signals = await sync.poll(memoryMeta());
     expect(signals.map((s) => s.sessionID)).toEqual(["ses_new"]);
+  });
+});
+
+describe("persisted vectors across metadata changes", () => {
+  const vector = new Uint8Array([1, 2, 3, 4]);
+
+  async function embeddedCard(extra: { appendThresholdParts?: number } = {}) {
+    const at = Date.now();
+    addSession("ses_1", at - 70_000);
+    addRow("ses_1", "user", user("rhoneedle", at - 69_000), at - 69_000);
+    const d = startDistiller({ sessionScanEveryMs: 1e12 }, undefined, extra);
+    await waitFor(() => d.status().coldPass === "done");
+    const card = store.getCard("ses_1")!;
+    store.writeCardEmbeddings("model", 4, [
+      { sessionId: "ses_1", embedding: vector, expectedSummaryHash: card.summaryHash },
+    ]);
+    expect(store.getCard("ses_1")?.embedding).toEqual(vector);
+    return d;
+  }
+
+  it("patchCardMeta drops the vector only when title or directory change", async () => {
+    const d = await embeddedCard();
+    await d.stop();
+    expect(store.patchCardMeta("ses_1", { projectId: "prj_other" })).toBe(true);
+    expect(store.patchCardMeta("ses_1", { title: "Title ses_1" })).toBe(true); // unchanged
+    expect(store.getCard("ses_1")?.embedding).toEqual(vector);
+    const rev = Number(store.getMeta("cards_rev"));
+    expect(store.patchCardMeta("ses_1", { title: "Renamed" })).toBe(true);
+    expect(store.getCard("ses_1")).toMatchObject({
+      title: "Renamed",
+      embedding: null,
+      embeddingGen: null,
+    });
+    expect(Number(store.getMeta("cards_rev"))).toBe(rev + 1);
+  });
+
+  it("drops the vector when an empty append refreshes a renamed card", async () => {
+    // Append-eligible, with the session scan off: the rename reaches the card
+    // only through the empty append a non-content row triggers.
+    await embeddedCard({ appendThresholdParts: 0 });
+    v2db.db.run("UPDATE session_v2 SET title = ? WHERE id = ?", ["Renamed quietly", "ses_1"]);
+    addRow("ses_1", "idle", { outcome: "succeeded", time: { created: 0 } }, Date.now());
+    await waitFor(() => store.getCard("ses_1")?.title === "Renamed quietly");
+    expect(store.getCard("ses_1")).toMatchObject({ embedding: null, embeddingGen: null });
   });
 });
 

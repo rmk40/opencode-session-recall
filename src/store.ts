@@ -924,9 +924,22 @@ class SqliteStore implements Store {
     patch: { title?: string; directory?: string; projectId?: string },
   ): boolean {
     return this.db.tx(() => {
+      // Title and directory feed the embedded text (embeddingTextOf), so an
+      // actual change to either drops the persisted vector and its generation;
+      // the semantic layer recomputes it on the next load. (The right-hand
+      // sides of an UPDATE see the old row.)
+      const title = patch.title ?? null;
+      const directory = patch.directory ?? null;
+      const changed =
+        "(coalesce(?, title) IS NOT title OR coalesce(?, directory) IS NOT directory)";
       const { changes } = this.db.run(
-        "UPDATE card SET title=coalesce(?, title), directory=coalesce(?, directory), project_id=coalesce(?, project_id) WHERE session_id=?",
-        [patch.title ?? null, patch.directory ?? null, patch.projectId ?? null, sessionId],
+        `UPDATE card SET
+           embedding=CASE WHEN ${changed} THEN NULL ELSE embedding END,
+           embedding_gen=CASE WHEN ${changed} THEN NULL ELSE embedding_gen END,
+           title=coalesce(?, title), directory=coalesce(?, directory),
+           project_id=coalesce(?, project_id)
+         WHERE session_id=?`,
+        [title, directory, title, directory, title, directory, patch.projectId ?? null, sessionId],
       );
       if (changes === 0) return false;
       this.setMeta("cards_rev", String((Number(this.getMeta("cards_rev")) || 0) + 1));
