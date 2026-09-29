@@ -232,6 +232,9 @@ export type StoreOptions = {
  *  - `error`: the open or schema check threw. */
 export type StoreRefusal = "newer" | "host-mismatch" | "source-mismatch" | "error";
 
+/** The refusals the fence decides; `error` is anything that threw instead. */
+type FenceRefusal = Exclude<StoreRefusal, "error">;
+
 export type OpenStoreResult = { ok: true; store: Store } | { ok: false; reason: StoreRefusal };
 
 export type Store = {
@@ -671,7 +674,7 @@ function checkIdentity(
   legacy: boolean,
   host: StoreHost,
   source: string | undefined,
-): StoreRefusal | null {
+): FenceRefusal | null {
   const stampedHost = legacy ? LEGACY_HOST : readMetaValue(db, STORE_HOST_KEY);
   if (stampedHost !== host) return "host-mismatch";
   if (readMetaValue(db, SOURCE_DB_KEY) !== source) return "source-mismatch";
@@ -699,40 +702,61 @@ export function openStore(db: SqliteDb, host: StoreHost, opts?: StoreOptions): O
   const source = opts?.source;
   try {
     db.exec(PRE_FENCE_PRAGMAS);
-    const outcome = db.tx((): "ok" | StoreRefusal => {
-      // Stamp first: a store that names another owner is refused before its
-      // schema stamp is read, so no schema state (missing, unparseable, or
-      // pre-fence) can lead to rebuilding or migrating another host's file.
-      const stamped = readStampedIdentity(db);
-      if (stamped.host !== undefined) {
-        if (stamped.host !== host) return "host-mismatch";
-        if (stamped.source !== source) return "source-mismatch";
-      }
+    db.tx((): void => {
+      // A refusal throws so the transaction rolls back rather than commits:
+      // the refusal path is non-writing by construction, not by care.
+      const refusal = fenceRefusal(db, host, source);
+      if (refusal) throw new StoreRefused(refusal);
       const current = readSchemaVersion(db);
-      // Newer than this build understands: refuse (degrade), never misread it.
-      if (current !== null && current > SCHEMA_VERSION) return "newer";
       const legacy = current === 1 || current === 2 || current === 3;
       if (current === SCHEMA_VERSION || legacy) {
-        const refusal = checkIdentity(db, legacy, host, source);
-        if (refusal) return refusal;
         // v1, v2 and v3 upgrade additively in place, keeping all data, each
         // chaining through every later step.
         if (current === 1) migrateV1ToV2(db);
         if (current === 1 || current === 2) migrateV2ToV3(db);
         if (legacy) migrateV3ToV4(db);
-        return "ok";
+        return;
       }
       // Anything else older (absent stamp or a foreign layout) is dropped and
       // rebuilt fresh for this host.
       rebuild(db, host, source);
-      return "ok";
     });
-    if (outcome !== "ok") return { ok: false, reason: outcome };
     db.exec(ACCEPTED_PRAGMAS);
     return { ok: true, store: new SqliteStore(db, now) };
-  } catch {
-    return { ok: false, reason: "error" };
+  } catch (error) {
+    return { ok: false, reason: error instanceof StoreRefused ? error.reason : "error" };
   }
+}
+
+/** A deliberate refusal, thrown inside the fence transaction to roll it back. */
+class StoreRefused extends Error {
+  constructor(readonly reason: FenceRefusal) {
+    super(`store refused: ${reason}`);
+  }
+}
+
+/**
+ * Every refusal {@link openStore} makes, in order, or null to proceed. Reads
+ * only. Stamp first: a store that names another owner is refused before its
+ * schema stamp is read, so no schema state (missing, unparseable, or
+ * pre-fence) can lead to rebuilding or migrating another host's file.
+ */
+function fenceRefusal(
+  db: SqliteDb,
+  host: StoreHost,
+  source: string | undefined,
+): FenceRefusal | null {
+  const stamped = readStampedIdentity(db);
+  if (stamped.host !== undefined) {
+    if (stamped.host !== host) return "host-mismatch";
+    if (stamped.source !== source) return "source-mismatch";
+  }
+  const current = readSchemaVersion(db);
+  // Newer than this build understands: refuse (degrade), never misread it.
+  if (current !== null && current > SCHEMA_VERSION) return "newer";
+  const legacy = current === 1 || current === 2 || current === 3;
+  if (current === SCHEMA_VERSION || legacy) return checkIdentity(db, legacy, host, source);
+  return null;
 }
 
 // ── Store implementation ─────────────────────────────────────────────────────

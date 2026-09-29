@@ -166,6 +166,35 @@ async function expectRefusal(
 }
 
 /**
+ * Wrap a real connection to observe how {@link openStore} ends its transaction
+ * and, optionally, make `exec` throw on a statement matching `failExec`.
+ */
+function instrument(
+  db: SqliteDb,
+  failExec?: RegExp,
+): { db: SqliteDb; txOutcomes: Array<"committed" | "rolled-back"> } {
+  const txOutcomes: Array<"committed" | "rolled-back"> = [];
+  const wrapped: SqliteDb = {
+    ...db,
+    exec(sql) {
+      if (failExec?.test(sql)) throw new Error(`injected failure: ${sql}`);
+      db.exec(sql);
+    },
+    tx(fn) {
+      try {
+        const result = db.tx(fn);
+        txOutcomes.push("committed");
+        return result;
+      } catch (error) {
+        txOutcomes.push("rolled-back");
+        throw error;
+      }
+    },
+  };
+  return { db: wrapped, txOutcomes };
+}
+
+/**
  * Hand-build a populated schema-3 store (the last pre-fence layout: the current
  * DDL minus `card.distill_cursor`, no host stamp) carrying one card with a
  * summary and a current-generation vector, its slim-index and FTS rows, the
@@ -655,6 +684,17 @@ describe("store migration", () => {
     expect(sessions(opened.store.ftsSearch({ strong: ["keeper_marker"], weak: [] }))).toEqual([
       "s1",
     ]);
+    db.close();
+  });
+
+  it("rolls the fence transaction back on a refusal instead of committing it", async () => {
+    const path = freshDbPath();
+    await buildV4Store(path, "opencode-v2", "/data/opencode.db");
+    const db = await openSqlite(path);
+    if (!db) throw new Error("reopen failed");
+    const spy = instrument(db);
+    expect(openStore(spy.db, "opencode-v1")).toEqual({ ok: false, reason: "host-mismatch" });
+    expect(spy.txOutcomes).toEqual(["rolled-back"]);
     db.close();
   });
 
