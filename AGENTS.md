@@ -114,7 +114,9 @@ reproduce live** rather than theorize:
 
 - Temporarily `appendFileSync` a JSON line to `/tmp/...` capturing the raw arg
   values and array lengths at each stage (fetched → filtered → sliced). Use a
-  dynamic `import("node:fs")` inside the tool so it bundles. Rebuild, restart the
+  dynamic `import("node:fs")` inside the tool so it bundles. Lint rejects a
+  literal `node:` import outside `src/sqlite.ts` and `src/node-import.ts`, so
+  this instrumentation cannot be committed by accident. Rebuild, restart the
   session, reproduce, then `cat` the file.
 - This is how the defaults bug was nailed: the debug showed `dataLen: 590,
 filteredLen: 0` with `role` absent — proving the SDK returned 590 messages and
@@ -215,16 +217,20 @@ write path, gate it on the lease or two processes will double-write.
 The two original live incidents were an unpaginated `session.messages({ sessionID })`
 that pulled a whole (up to 77MB) session into memory. That is the legacy
 full-session fetch, and it must never run. The single allowed entry point is
-`fetchMessagePage()` in `src/distill.ts` (re-exported by `fetch-window.ts`), which
-ALWAYS sends a `limit` and reads the next-page cursor from the `X-Next-Cursor`
-header. Drill, deep, the browse/context tools, and the distiller all page through
-it. Tests enforce this: the fake client throws `UNBOUNDED_MESSAGES_ERROR` on any
-no-limit call when strict mode is on (`setStrictNoLimitMessages(true)` in
-`test/helpers.ts`), and the `runTool` helpers hard-fail if a tool swallows that
-throw into an error output. Suites that intentionally exercise the legacy
-full-return path (some distiller fixtures) opt out by leaving strict mode off. If
-you add a new fetch site, route it through `fetchMessagePage` and cover it under a
-strict-mode suite.
+`HistorySource.messagePage()` (`src/history/source.ts`): its `limit` is required
+and checked at runtime (`assertBoundedLimit`). Drill, deep, the browse/context
+tools, and the distiller all page through it. Under v1 it is backed by
+`fetchMessagePage()` in `src/history/v1.ts`, the one place that calls
+`session.messages`: it runs the same limit check before any request, ALWAYS sends
+`limit`, and reads the next-page cursor from the `X-Next-Cursor` header. Only the
+v1 entry may import `src/history/v1.ts` (an ESLint `no-restricted-imports` rule),
+so the core cannot reach the SDK call directly. Tests enforce this: the fake
+client throws `UNBOUNDED_MESSAGES_ERROR` on any no-limit call when strict mode is
+on (`setStrictNoLimitMessages(true)` in `test/helpers.ts`), and the `runTool`
+helpers hard-fail if a tool swallows that throw into an error output. Suites that
+intentionally exercise the legacy full-return path (some distiller fixtures) opt
+out by leaving strict mode off. If you add a new fetch site, route it through
+`source.messagePage` and cover it under a strict-mode suite.
 
 ## Perf gates are behind `RECALL_PERF=1`
 

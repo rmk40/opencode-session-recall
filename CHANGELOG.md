@@ -28,9 +28,10 @@ All notable changes to this project are documented here. This project follows
 ### Changed
 
 - Plugin log lines now go through an internal log sink (`src/log.ts`)
-  instead of calling `console.log` directly. Under opencode v1 the output
-  is the same `[recall] ...` lines on the console. The sink is groundwork
-  for opencode v2, which discards plugin console output.
+  instead of calling `console.log` directly. v1 output is unchanged: the
+  same `[recall] ...` lines reach the console, and there is no new option.
+  The sink is groundwork for opencode v2, which discards plugin console
+  output.
 - **The store moves to schema 4.** An existing `store-v1.db` upgrades in
   place on first open, keeping every card, index row, vector and summary. The
   store now records which opencode host writes it (`meta.store_host`), so a

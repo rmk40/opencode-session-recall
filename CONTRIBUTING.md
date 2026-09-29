@@ -45,6 +45,11 @@ flowchart TB
         Sessions["recall_sessions"]
     end
 
+    subgraph "History seam"
+        Source["HistorySource (history/source.ts)"]
+        V1["v1 adapter (history/v1.ts)"]
+    end
+
     subgraph "OpenCode"
         SDK["OpenCode SDK v2"]
         DB["SQLite Database"]
@@ -55,26 +60,37 @@ flowchart TB
     Entry --> Context
     Entry --> Messages
     Entry --> Sessions
+    Entry -->|builds| V1
 
-    Recall --> SDK
-    Get --> SDK
-    Context --> SDK
-    Messages --> SDK
-    Sessions --> SDK
+    Recall --> Source
+    Get --> Source
+    Context --> Source
+    Messages --> Source
+    Sessions --> Source
 
+    Source -.->|implemented by| V1
+    V1 --> SDK
     SDK --> DB
 ```
 
-The plugin registers five tools via the OpenCode plugin API, plus optional event hooks for proactive recall (see [Invocation hooks](#invocation-hooks)). All data access goes through the OpenCode SDK — no direct database queries.
+The plugin registers five tools via the OpenCode plugin API, plus optional event hooks for proactive recall (see [Invocation hooks](#invocation-hooks)). The tools, drill, and distiller read opencode history only through the host-neutral `HistorySource` interface (`src/history/source.ts`): session listings and lookups, children, bounded message pages, and single messages. The entry builds the v1 implementation (`src/history/v1.ts`), which calls the OpenCode SDK over the host's in-process transport; nothing queries opencode's database directly. Only the entry may import the v1 adapter, and only the adapter may import SDK values (both enforced by ESLint), so a second host can supply its own `HistorySource` without touching the core.
 
 ### Module map
 
 | Module                       | Purpose                                                                                                                                                                                                                           |
 | ---------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `opencode-session-recall.ts` | Plugin entry point. Creates SDK clients, the shared fetch gate, card store, drill, and distiller; registers tools and hooks                                                                                                       |
+| `opencode-session-recall.ts` | Plugin entry point for the v1 host. Parses options, builds the v1 history source, the shared fetch gate, card store, drill, and distiller; registers tools and hooks                                                              |
 | `search.ts`                  | `recall` tool. Orchestrates the tiers (cards → slim FTS → drill), deep-sweep mode, literal/regex/smart paths, filters, expansion, grouping                                                                                        |
 | `store.ts`                   | SQLite card + slim-FTS store: schema v4, additive migrations (v1→v2→v3→v4)/rebuild, host fence (`store_host`, `source_db`), per-session transactional replace, FTS query, card-vector persistence with per-row generations, lease |
-| `distill.ts`                 | The distiller: human-layer extractor, card builder, resumable cold pass, event-driven incremental updates, and `fetchMessagePage()`                                                                                               |
+| `distill.ts`                 | The distiller: human-layer extractor, card builder, resumable cold pass, and incremental updates driven by host-neutral `DistillSignal`s                                                                                          |
+| `history/source.ts`          | The `HistorySource` seam: the one interface the core reads opencode history through (listings, lookups, children, bounded pages, single messages), plus `assertBoundedLimit`                                                      |
+| `history/model.ts`           | Host-neutral history shapes (`HistoryMessage`, `HistorySession`) and `compareMessages` ordering                                                                                                                                   |
+| `history/v1.ts`              | The v1 `HistorySource` over the HTTP SDK: builds the scoped and unscoped clients and owns `fetchMessagePage()`, the only `session.messages` call. Imported only by the entry                                                      |
+| `history/v1-events.ts`       | Maps v1 bus events to the distiller's host-neutral `DistillSignal`s                                                                                                                                                               |
+| `host/opencode-v1-types.ts`  | Vendored v1 plugin types (`Hooks`, `ToolContext`, `PluginInput`, and the rest), checked against `@opencode-ai/plugin` by `test/host-v1-types.test.ts`                                                                             |
+| `tool-def.ts`                | Local `tool()` drop-in with `tool.schema` (zod), so the bundle imports no host package at runtime                                                                                                                                 |
+| `options.ts`                 | `parseOptions()`: pure plugin option parsing shared by hosts; returns warnings instead of logging                                                                                                                                 |
+| `log.ts`                     | Plugin logging through a host-chosen sink (`consoleSink` on v1); adds the `[recall]` prefix and swallows sink failures                                                                                                            |
 | `summarize.ts`               | Opt-in Path B summarizer: a worker-session that batches card digests through a cheap model, content-hash gated, driven by the distiller                                                                                           |
 | `embedding-text.ts`          | `embeddingTextOf()`: the natural-language projection embedded for each card, plus the persisted-vector representation stamp                                                                                                       |
 | `cards.ts`                   | Tier-1 card runtime: MiniSearch over card fields (incl. `nl_summary`), metadata filters, family exclusion, optional semantic blend + rescue                                                                                       |
@@ -399,7 +415,7 @@ All ranking constants are at the top of `bm25.ts`:
 #### Adding a new tool
 
 1. Create a new file in `src/` following the pattern in `get.ts` or `context.ts`
-2. Export a function that takes SDK clients and returns a `ToolDefinition`
+2. Export a function that takes the `HistorySource` (plus the fetch gate and limits it needs) and returns a tool built with `tool()` from `tool-def.ts`
 3. Register it in `opencode-session-recall.ts`
 4. Add the tool name to the `TOOLS` array in `types.ts`
 
