@@ -9,6 +9,7 @@ import { openSqlite, type ReadOnlyDb, type SqliteDb } from "../src/sqlite.js";
 import { createV2HistorySource, openOpencodeDb } from "../src/history/v2.js";
 import {
   createV2Sync,
+  POLL_CURSOR_KEY,
   POLL_WATERMARK_KEY,
   SESSION_WATERMARK_KEY,
   type V2SyncOptions,
@@ -326,7 +327,7 @@ describe("v2 poll queries", () => {
     expect(metaIds.sort()).toEqual(["ses_idle", "ses_null"]);
   });
 
-  it("advances the message watermark only as far as the rows it returned", async () => {
+  it("pages a window by (time, session) and moves the watermark once it drains", async () => {
     const at = Date.now();
     addSession("ses_a", at - 10_000);
     addSession("ses_b", at - 10_000);
@@ -342,9 +343,95 @@ describe("v2 poll queries", () => {
     meta.set(POLL_WATERMARK_KEY, String(at - 5_000));
     const first = await sync.poll(meta);
     expect(first.map((s) => s.sessionID)).toEqual(["ses_a"]);
-    expect(meta.values.get(POLL_WATERMARK_KEY)).toBe(String(at - 3_000));
+    // A full page keeps the watermark and records its position.
+    expect(meta.values.get(POLL_WATERMARK_KEY)).toBe(String(at - 5_000));
+    expect(meta.values.get(POLL_CURSOR_KEY)).toBe(JSON.stringify([at - 3_000, "ses_a"]));
     const second = await sync.poll(meta);
     expect(second.map((s) => s.sessionID)).toEqual(["ses_b"]);
+    expect(meta.values.get(POLL_WATERMARK_KEY)).toBe(String(at - 1_000));
+    expect(meta.values.get(POLL_CURSOR_KEY)).toBe("");
+  });
+
+  /** Poll until every id in `want` has been signalled, or give up after `max`. */
+  async function drain(
+    sync: ReturnType<typeof createV2Sync>,
+    meta: PollMeta,
+    type: "turn-ended" | "meta",
+    want: string[],
+    max = 20,
+  ): Promise<string[]> {
+    const seen = new Set<string>();
+    for (let i = 0; i < max && want.some((id) => !seen.has(id)); i++) {
+      for (const signal of await sync.poll(meta)) {
+        if (signal.type === type) seen.add(signal.sessionID);
+      }
+    }
+    return [...seen].sort();
+  }
+
+  it("never stalls on a page filled by the overlap window, even with equal timestamps", async () => {
+    const at = Date.now();
+    const ids = ["ses_a", "ses_b", "ses_c", "ses_d"];
+    for (const id of ids) addSession(id, at - 20_000);
+    // Three sessions share one timestamp inside the overlap; one is later.
+    for (const id of ids.slice(0, 3)) addRow(id, "user", user(id, at - 2_000), at - 2_000);
+    addRow("ses_d", "user", user("d", at - 1_000), at - 1_000);
+    const sync = createV2Sync(reader, {
+      pollSessionLimit: 1,
+      sessionScanEveryMs: 1e12,
+      overlapMs: 5_000,
+      yieldBetween: async () => {},
+    });
+    const meta = memoryMeta();
+    meta.set(POLL_WATERMARK_KEY, String(at - 4_000));
+    expect(await drain(sync, meta, "turn-ended", ids)).toEqual(ids);
+    expect(Number(meta.values.get(POLL_WATERMARK_KEY))).toBe(at - 1_000);
+  });
+
+  it("never stalls the session scan on equal recency either", async () => {
+    const at = Date.now();
+    const ids = ["ses_a", "ses_b", "ses_c"];
+    for (const id of ids) addSession(id, at - 2_000);
+    const sync = createV2Sync(reader, {
+      sessionScanLimit: 1,
+      sessionScanEveryMs: 0,
+      overlapMs: 5_000,
+      yieldBetween: async () => {},
+    });
+    const meta = memoryMeta();
+    meta.set(SESSION_WATERMARK_KEY, String(at - 4_000));
+    expect(await drain(sync, meta, "meta", ids)).toEqual(ids);
+    expect(Number(meta.values.get(SESSION_WATERMARK_KEY))).toBe(at - 2_000);
+  });
+
+  it("keys a checkpoint on the same recency the session scan uses", async () => {
+    const at = Date.now();
+    addSession("ses_k", at - 20_000);
+    addRow("ses_k", "user", user("k", at - 19_000), at - 19_000);
+    const sync = createV2Sync(reader, { yieldBetween: async () => {} });
+    const cp = await sync.checkpoint("ses_k");
+    expect(await sync.compare("ses_k", cp?.cursor)).toBe("fresh");
+    // Only time_compacting moves: the scan sees the session as changed, so the
+    // checkpoint must too.
+    v2db.db.run("UPDATE session_v2 SET time_compacting = ? WHERE id = ?", [at, "ses_k"]);
+    expect(await sync.compare("ses_k", cp?.cursor)).toBe("grown");
+  });
+
+  it("applies the overlap once on a first poll with no watermark", async () => {
+    const at = Date.now();
+    addSession("ses_old", at - 20_000);
+    addSession("ses_new", at - 20_000);
+    // Inside one overlap of now, and inside two but not one.
+    addRow("ses_new", "user", user("n", at - 3_000), at - 3_000);
+    addRow("ses_old", "user", user("o", at - 7_000), at - 7_000);
+    const sync = createV2Sync(reader, {
+      sessionScanEveryMs: 1e12,
+      overlapMs: 5_000,
+      now: () => at,
+      yieldBetween: async () => {},
+    });
+    const signals = await sync.poll(memoryMeta());
+    expect(signals.map((s) => s.sessionID)).toEqual(["ses_new"]);
   });
 });
 

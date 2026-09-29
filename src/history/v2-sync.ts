@@ -29,7 +29,11 @@ import type {
  *   `session_message_time_created_idx` finds sessions with new rows past a
  *   persisted watermark; every 5 minutes a bounded scan of `session_v2`
  *   catches renames, moves and other metadata-only changes. Both watermarks
- *   carry an overlap for late commits.
+ *   carry an overlap for late commits. Each window is read in bounded pages
+ *   keyed by `(time, session id)`, with the key persisted between polls, and
+ *   the watermark moves only once the window is drained. So a page that
+ *   fills up (more changed sessions than the page limit, or many sharing one
+ *   timestamp inside the overlap) always moves forward on the next poll.
  *
  * Every `session_message` statement binds `LIMIT ?`, reads happen one
  * statement at a time with a macrotask between them, and nothing here writes
@@ -38,6 +42,10 @@ import type {
 
 export const POLL_WATERMARK_KEY = "v2_poll_watermark";
 export const SESSION_WATERMARK_KEY = "v2_session_watermark";
+/** The keyset position `[time, sessionId]` inside a window being drained;
+ *  empty when the window starts fresh. */
+export const POLL_CURSOR_KEY = "v2_poll_cursor";
+export const SESSION_CURSOR_KEY = "v2_session_cursor";
 
 export type V2SyncOptions = {
   /** Message poll interval. Default 30 s. */
@@ -49,9 +57,10 @@ export type V2SyncOptions = {
   /** A watermark older than this is clamped (the cold pass covers the rest).
    *  Default 1 hour. */
   maxLookbackMs?: number;
-  /** Sessions returned by one message poll. Default 500. */
+  /** Sessions returned by one message poll (one page of its window).
+   *  Default 500. */
   pollSessionLimit?: number;
-  /** Sessions returned by one `session_v2` scan. Default 2,000. */
+  /** Sessions returned by one `session_v2` scan (one page). Default 2,000. */
   sessionScanLimit?: number;
   /** Rows inspected for an unsettled tail. Default 20. */
   tailRows?: number;
@@ -83,6 +92,26 @@ function num(value: SqlValue | undefined): number | null {
 
 function str(value: SqlValue | undefined): string | null {
   return typeof value === "string" ? value : null;
+}
+
+type KeysetPos = { t: number; id: string };
+
+function parsePos(stored: string | undefined): KeysetPos | null {
+  if (!stored) return null;
+  try {
+    const value = JSON.parse(stored) as unknown;
+    if (
+      Array.isArray(value) &&
+      typeof value[0] === "number" &&
+      Number.isFinite(value[0]) &&
+      typeof value[1] === "string"
+    ) {
+      return { t: value[0], id: value[1] };
+    }
+  } catch {
+    // A garbled position restarts the window.
+  }
+  return null;
 }
 
 function parseCheckpoint(stored: string | null | undefined): Checkpoint | null {
@@ -140,11 +169,10 @@ export function createV2Sync(db: ReadOnlyDb, opts: V2SyncOptions = {}): DistillS
     return recencyExpr;
   }
 
+  /** The session's recency, by the same expression the session scan uses,
+   *  so a scan and a checkpoint agree on what "changed" means. */
   function sessionKey(sessionID: string): number | null {
-    const row = db.get(
-      "SELECT max(time_updated, coalesce(time_idle, 0)) AS k FROM session_v2 WHERE id = ?",
-      [sessionID],
-    );
+    const row = db.get(`SELECT ${recency()} AS k FROM session_v2 WHERE id = ?`, [sessionID]);
     return row ? (num(row.k) ?? 0) : null;
   }
 
@@ -240,11 +268,45 @@ export function createV2Sync(db: ReadOnlyDb, opts: V2SyncOptions = {}): DistillS
     return gone;
   }
 
-  /** The persisted watermark, clamped to the lookback; unset starts now. */
+  /** The persisted watermark, clamped to the lookback. Unset starts at `at`:
+   *  the query subtracts the overlap once. */
   function watermark(meta: PollMeta, key: string, at: number): number {
     const stored = Number(meta.get(key));
-    const start = Number.isFinite(stored) && stored > 0 ? stored : at - overlapMs;
+    const start = Number.isFinite(stored) && stored > 0 ? stored : at;
     return Math.max(start, at - maxLookbackMs);
+  }
+
+  /**
+   * One page of a window: rows whose key `k` is past `mark - overlap` and past
+   * the persisted keyset position, ordered by `(k, id)`. A full page stores
+   * its last key and leaves the watermark alone; a short page means the
+   * window is drained, so the watermark moves to the newest key seen and the
+   * position clears. Every poll therefore moves forward, even when one
+   * timestamp is shared by more rows than a page holds.
+   */
+  async function page(
+    meta: PollMeta,
+    keys: { mark: string; pos: string },
+    at: number,
+    limit: number,
+    query: (lower: number, pos: KeysetPos | null, limit: number) => Row[],
+    keyOf: (row: Row) => { t: number | null; id: string | null },
+  ): Promise<Row[]> {
+    const mark = watermark(meta, keys.mark, at);
+    const pos = parsePos(meta.get(keys.pos));
+    await pause();
+    // One row past the page tells a full page from a drained window.
+    const fetched = query(mark - overlapMs, pos, limit + 1);
+    const rows = fetched.slice(0, limit);
+    const last = rows.length > 0 ? keyOf(rows[rows.length - 1]!) : undefined;
+    if (fetched.length > limit && last && last.t !== null && last.id !== null) {
+      meta.set(keys.pos, JSON.stringify([last.t, last.id]));
+      return rows;
+    }
+    const newest = last?.t ?? pos?.t ?? null;
+    meta.set(keys.mark, String(Math.max(mark, newest ?? mark)));
+    meta.set(keys.pos, "");
+    return rows;
   }
 
   async function poll(meta: PollMeta): Promise<DistillSignal[]> {
@@ -252,33 +314,44 @@ export function createV2Sync(db: ReadOnlyDb, opts: V2SyncOptions = {}): DistillS
     const at = now();
 
     // New messages, through the time_created index.
-    const messageMark = watermark(meta, POLL_WATERMARK_KEY, at);
-    await pause();
-    const changed = db.all(
-      `SELECT session_id, max(time_created) AS t FROM session_message
-       WHERE time_created > ? GROUP BY session_id ORDER BY t ASC LIMIT ?`,
-      [messageMark - overlapMs, pollSessionLimit],
+    const changed = await page(
+      meta,
+      { mark: POLL_WATERMARK_KEY, pos: POLL_CURSOR_KEY },
+      at,
+      pollSessionLimit,
+      (lower, pos, n) =>
+        db.all(
+          `SELECT session_id, max(time_created) AS t FROM session_message
+           WHERE time_created > ? GROUP BY session_id
+           ${pos ? "HAVING max(time_created) > ? OR (max(time_created) = ? AND session_id > ?)" : ""}
+           ORDER BY t ASC, session_id ASC LIMIT ?`,
+          pos ? [lower, pos.t, pos.t, pos.id, n] : [lower, n],
+        ),
+      (row) => ({ t: num(row.t), id: str(row.session_id) }),
     );
     for (const row of changed) {
       const id = str(row.session_id);
       if (id) signals.push({ type: "turn-ended", sessionID: id });
     }
-    // Ascending by each session's newest row: a truncated result still covers
-    // every row up to its last value, so the watermark may move exactly there.
-    const newestMessage = num(changed[changed.length - 1]?.t);
-    const nextMessageMark = Math.max(messageMark, newestMessage ?? messageMark);
-    meta.set(POLL_WATERMARK_KEY, String(nextMessageMark));
 
     // Metadata-only changes, through a bounded scan of session_v2.
     if (at - lastScanAt >= sessionScanEveryMs) {
       lastScanAt = at;
-      const sessionMark = watermark(meta, SESSION_WATERMARK_KEY, at);
       const expr = recency();
-      await pause();
-      const sessions = db.all(
-        `SELECT id, title, directory, project_id, ${expr} AS r FROM session_v2
-         WHERE ${expr} > ? ORDER BY r ASC LIMIT ?`,
-        [sessionMark - overlapMs, sessionScanLimit],
+      const sessions = await page(
+        meta,
+        { mark: SESSION_WATERMARK_KEY, pos: SESSION_CURSOR_KEY },
+        at,
+        sessionScanLimit,
+        (lower, pos, n) =>
+          db.all(
+            `SELECT id, title, directory, project_id, ${expr} AS r FROM session_v2
+             WHERE ${expr} > ?
+             ${pos ? `AND (${expr} > ? OR (${expr} = ? AND id > ?))` : ""}
+             ORDER BY r ASC, id ASC LIMIT ?`,
+            pos ? [lower, pos.t, pos.t, pos.id, n] : [lower, n],
+          ),
+        (row) => ({ t: num(row.r), id: str(row.id) }),
       );
       for (const row of sessions) {
         const id = str(row.id);
@@ -294,8 +367,6 @@ export function createV2Sync(db: ReadOnlyDb, opts: V2SyncOptions = {}): DistillS
         });
         signals.push({ type: "turn-ended", sessionID: id });
       }
-      const newestSession = num(sessions[sessions.length - 1]?.r);
-      meta.set(SESSION_WATERMARK_KEY, String(Math.max(sessionMark, newestSession ?? sessionMark)));
     }
     return signals;
   }
