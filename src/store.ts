@@ -77,7 +77,13 @@ const EXPIRED_SENTINEL = JSON.stringify({
   ttl: 0,
 });
 
-const PRAGMAS = "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA busy_timeout=5000;";
+/** Connection-only PRAGMA, safe before the fence: it changes nothing on disk. */
+const PRE_FENCE_PRAGMAS = "PRAGMA busy_timeout=5000;";
+/** Applied only once the fence accepts the store. `journal_mode=WAL` is
+ *  persistent (it rewrites the file header), so a refused file must never see
+ *  it; it also cannot change inside a transaction, so it runs after the
+ *  fence's transaction commits. */
+const ACCEPTED_PRAGMAS = "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;";
 
 // Current-version (v4) DDL for a fresh store; older stores reach the same shape
 // through the additive migrations below. No `prefix=` index: anchors are matched
@@ -660,9 +666,9 @@ function checkIdentity(
 }
 
 /**
- * Open a {@link Store} for `host` over an already-open {@link SqliteDb}. Applies
- * the connection PRAGMAs, then checks the fence and migrates or rebuilds under
- * one transaction.
+ * Open a {@link Store} for `host` over an already-open {@link SqliteDb}. Sets
+ * the busy timeout, checks the fence and migrates or rebuilds under one
+ * transaction, and only then switches an accepted store to WAL.
  *
  * Refuses, leaving the file untouched (no migration, no rebuild, no write), when
  * the schema stamp is newer than this build, when another host owns the store
@@ -676,7 +682,7 @@ export function openStore(db: SqliteDb, host: StoreHost, opts?: StoreOptions): O
   const now = opts?.now ?? Date.now;
   const source = opts?.source;
   try {
-    db.exec(PRAGMAS);
+    db.exec(PRE_FENCE_PRAGMAS);
     const outcome = db.tx((): "ok" | StoreRefusal => {
       const current = readSchemaVersion(db);
       // Newer than this build understands: refuse (degrade), never misread it.
@@ -698,6 +704,7 @@ export function openStore(db: SqliteDb, host: StoreHost, opts?: StoreOptions): O
       return "ok";
     });
     if (outcome !== "ok") return { ok: false, reason: outcome };
+    db.exec(ACCEPTED_PRAGMAS);
     return { ok: true, store: new SqliteStore(db, now) };
   } catch {
     return { ok: false, reason: "error" };

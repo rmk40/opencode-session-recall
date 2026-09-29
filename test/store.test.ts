@@ -658,6 +658,28 @@ describe("store migration", () => {
     db.close();
   });
 
+  it("leaves a refused file's journal mode alone and switches an accepted one to WAL", async () => {
+    const path = freshDbPath();
+    await buildV4Store(path, "opencode-v2", "/data/opencode.db");
+    const raw = await openSqlite(path);
+    if (!raw) throw new Error("reopen failed");
+    raw.exec("PRAGMA journal_mode=DELETE;");
+    raw.close();
+
+    await expectRefusal(path, "opencode-v1", "host-mismatch");
+    const after = await openSqlite(path);
+    if (!after) throw new Error("reopen failed");
+    expect(after.get("PRAGMA journal_mode")?.journal_mode).toBe("delete");
+    after.close();
+
+    const db = await openSqlite(path);
+    if (!db) throw new Error("reopen failed");
+    const opened = openStore(db, "opencode-v2", { source: "/data/opencode.db" });
+    expect(opened.ok).toBe(true);
+    expect(db.get("PRAGMA journal_mode")?.journal_mode).toBe("wal");
+    db.close();
+  });
+
   it("refuses a store whose schema is newer than the code, for either host", async () => {
     const path = freshDbPath();
     await buildV4Store(path, "opencode-v1");
