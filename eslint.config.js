@@ -32,6 +32,35 @@ const boundaries = [
     },
     exempt: ["src/opencode-session-recall.ts", "src/history/v1.ts"],
   },
+  {
+    // The plugin package is v1-host only and absent from a v2-only install.
+    // Its types are vendored in src/host/opencode-v1-types.ts (checked by
+    // test/host-v1-types.test.ts) and `tool()` is replaced by src/tool-def.ts,
+    // so nothing in src/ imports it, not even types (the emitted .d.ts would
+    // reference a package the consumer may not have).
+    pattern: {
+      group: [
+        "@opencode-ai/plugin",
+        "@opencode-ai/plugin/*",
+        "@opencode/plugin",
+        "@opencode/plugin/*",
+      ],
+      message:
+        "src/ must not import the opencode plugin package; use src/host/opencode-v1-types.ts and src/tool-def.ts.",
+    },
+    exempt: [],
+  },
+  {
+    // src/ is runtime-agnostic (no Node types; Bun or Node at runtime). Only
+    // the driver adapter and the builtin loaders touch runtime modules, and
+    // they do it through dynamic import() behind a variable specifier.
+    pattern: {
+      group: ["node:*", "bun:*"],
+      message:
+        "Only src/sqlite.ts and src/node-import.ts may import node:/bun: modules; use the loaders in src/node-import.ts.",
+    },
+    exempt: ["src/sqlite.ts", "src/node-import.ts"],
+  },
 ];
 
 function restrictedImports(files) {
@@ -58,4 +87,20 @@ export default tseslint.config(
     ignores: ["dist/", "node_modules/"],
   },
   ...restrictedImports(["src/**/*.ts"]),
+  {
+    // no-restricted-imports sees static imports only; also catch a literal
+    // dynamic import("node:fs") outside the two runtime-aware files.
+    files: ["src/**/*.ts"],
+    ignores: ["src/sqlite.ts", "src/node-import.ts"],
+    rules: {
+      "no-restricted-syntax": [
+        "error",
+        {
+          selector: "ImportExpression[source.value=/^(node|bun):/]",
+          message:
+            "Only src/sqlite.ts and src/node-import.ts may import node:/bun: modules; use the loaders in src/node-import.ts.",
+        },
+      ],
+    },
+  },
 );
