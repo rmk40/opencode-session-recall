@@ -1536,6 +1536,51 @@ describe("incremental", () => {
     db.close();
   });
 
+  it("re-distills on a meta signal without forcing the full path", async () => {
+    const graph: Graph = {
+      sessions: [session("s1", "Alpha", PROJECT_DIR, 3000)],
+      messagesBySession: {
+        s1: [
+          bundle(userMessage("m1", "s1", 100), [textPart("p1", "s1", "m1", "stalemarker content")]),
+        ],
+      },
+    };
+    const { source } = makeDistillFake(graph);
+    const { db, store } = await freshStore();
+    const { gate } = makeSpyGate();
+    // Append-eligible, as in the removal test above; only a removal flag
+    // would force the full path.
+    const distiller = createDistiller({
+      source,
+      store,
+      gate,
+      limits: TEST_LIMITS,
+      instanceId: "holder",
+      idleDebounceMs: 5,
+      appendThresholdParts: 0,
+    });
+    distiller.start();
+    await waitFor(() => distiller.status().coldPass === "done");
+
+    // Rewrite m1 in place (a full re-distill would drop "stalemarker"), add a
+    // newer message, and rename the session.
+    graph.sessions = [session("s1", "Alpha renamed", PROJECT_DIR, 6000)];
+    graph.messagesBySession.s1 = [
+      bundle(userMessage("m1", "s1", 100), [textPart("p1", "s1", "m1", "rewritten content")]),
+      bundle(userMessage("m9", "s1", 5000), [textPart("p9", "s1", "m9", "freshmarker content")]),
+    ];
+    distiller.onEvent({ type: "meta", sessionID: "s1" });
+    await waitFor(
+      () => ftsSessions(store.ftsSearch({ strong: ["freshmarker"], weak: [] })).length > 0,
+    );
+
+    expect(store.getCard("s1")?.title).toBe("Alpha renamed"); // metadata picked up
+    // Appended, not replaced: the meta signal did not set the removal flag.
+    expect(ftsSessions(store.ftsSearch({ strong: ["stalemarker"], weak: [] }))).toEqual(["s1"]);
+    distiller.stop();
+    db.close();
+  });
+
   it("deletes the card and its rows and refreshes the root rollup", async () => {
     const root = session("R", "Root Session", PROJECT_DIR, 9000);
     const child = session("C", "Child Session", PROJECT_DIR, 4000, undefined, "R");

@@ -33,7 +33,17 @@ function sortArguments(source: string): string[] {
   return out;
 }
 
-/** Whether a source file orders messages by `time.created` itself. */
+/**
+ * Whether a source file orders messages by `time.created` itself.
+ *
+ * A text heuristic, not a parse: it catches the shapes a comparator is
+ * normally written in (a `time.created` subtraction anywhere, or `time.created`
+ * inside `.sort(`/`.toSorted(` arguments). It misses a comparator defined
+ * elsewhere and passed by name, a destructured field (`({ created }) =>`), a
+ * bracket access (`time["created"]`), or ordering done without sort (a manual
+ * insertion, a heap). Treat a pass as "no obvious hand-rolled sort", and route
+ * any new message ordering through `compareMessages` regardless.
+ */
 function sortsMessagesByTime(source: string): boolean {
   if (TIME_CREATED_SUBTRACTION.test(source)) return true;
   return sortArguments(source).some((args) => /\btime\.created\b/.test(args));

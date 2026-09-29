@@ -2,6 +2,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest
 import type { ToolDefinition } from "../src/host/opencode-v1-types.js";
 import type { Part, Session } from "@opencode-ai/sdk/v2";
 import { search } from "../src/search.js";
+import { createV1HistorySource } from "../src/history/v1.js";
 import { deriveCard, type DistillSessionMeta } from "../src/distill.js";
 import type { Store } from "../src/store.js";
 import type { Drill } from "../src/drill.js";
@@ -536,6 +537,35 @@ describe("parentage plumbing", () => {
     });
     expect(out.ok).toBe(true);
     expect(authorshipOfResult(out, "p-uc-1")).toBe("delegated");
+  });
+
+  it("probes once when the source has a single lookup scope", async () => {
+    // One client for both scopes (scopedLookup false): a global retry would ask
+    // the same client again, so the probe skips it. The scoped get throws, so
+    // the id is admitted unverified after exactly one probe.
+    const h = makeAuthorshipHarness({ getThrows: new Set(["s-uncarded-child"]) });
+    const { deps, cleanup } = await makeRecallDeps(h, TEST_LIMITS);
+    cleanups.push(cleanup);
+    const single = createV1HistorySource({ scoped: h.client, unscoped: h.client });
+    expect(single.scopedLookup).toBe(false);
+    const recall = search(single, true, TEST_LIMITS, deps);
+    const probed = addSession(h, "s-uncarded-child", "Uncarded Child", NOW - 5_000, "s-root-human");
+    h.messagesBySession[probed.id] = [
+      bundle(userMessage("m-uc-1", probed.id, NOW - 5_500), [
+        textPart("p-uc-1", probed.id, "m-uc-1", "quarkbeam behind a single-scope probe"),
+      ]),
+    ];
+
+    const out = await runTool<SearchOutput>(recall, {
+      query: "quarkbeam",
+      match: "smart",
+      results: 50,
+      explain: true,
+      sessions: ["s-uncarded-child"],
+    });
+    expect(out.ok).toBe(true);
+    expect(h.calls.get.filter((c) => c.sessionID === "s-uncarded-child")).toHaveLength(1);
+    expect(authorshipOfResult(out, "p-uc-1")).toBe("unknown");
   });
 
   it("a double probe failure yields unknown, not human", async () => {
