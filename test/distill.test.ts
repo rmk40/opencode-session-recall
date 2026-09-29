@@ -1173,6 +1173,9 @@ describe("cold pass", () => {
     await waitFor(() => distiller.status().lastError !== undefined);
     expect(distiller.status().coldPass).toBe("idle");
     expect(store.getCard("s6")).toBeUndefined(); // never reached: the pass aborted
+    // The abort charged a strike to each of the five, so a repeating outage
+    // still reaches the skip limit.
+    expect(distiller.status().failingCount).toBe(5);
     await distiller.stop();
     db.close();
   });
@@ -1351,8 +1354,219 @@ describe("cold pass", () => {
     expect(s2Reads).toBe(6);
     expect(distiller.status().failingCount).toBe(0);
     expect(store.getMeta("coldpass_cursor")).toBe("1000");
-    expect(logs.some((line) => line.includes("session s2 skipped for this cold pass"))).toBe(true);
+    expect(logs.some((line) => line.includes("session s2 skipped: 3 cold passes failed"))).toBe(
+      true,
+    );
     distiller.stop();
+    db.close();
+  });
+
+  /** A graph of healthy sessions plus `bad` ones whose fetch always fails,
+   *  newest first in the order given. */
+  function failingGraph(order: Array<{ id: string; bad?: boolean }>): {
+    graph: Graph;
+    failTimes: Record<string, number>;
+  } {
+    const graph: Graph = { sessions: [], messagesBySession: {} };
+    const failTimes: Record<string, number> = {};
+    order.forEach(({ id, bad }, i) => {
+      graph.sessions.push(session(id, id, PROJECT_DIR, 100_000 - i * 1000));
+      graph.messagesBySession[id] = [
+        bundle(userMessage(`m-${id}`, id, 100), [textPart(`p-${id}`, id, `m-${id}`, id)]),
+      ];
+      if (bad) failTimes[id] = Number.MAX_SAFE_INTEGER;
+    });
+    return { graph, failTimes };
+  }
+
+  it("skips sessions that always fail among healthy ones and stops scheduling passes", async () => {
+    // Pass 1 sets the five aside (healthy fetches in between reset the outage
+    // streak). On follow-up passes every healthy session is up to date, so the
+    // five are fetched back to back: as known-bad sessions they must not read
+    // as an outage, or the pass aborts forever and never reaches three strikes.
+    const order = Array.from({ length: 10 }, (_, i) => ({ id: `s${i}`, bad: i % 2 === 1 }));
+    const { graph, failTimes } = failingGraph(order);
+    const { source, sdk } = makeDistillFake(graph, { failTimes });
+    const { db, store } = await freshStore();
+    const distiller = createDistiller({
+      source,
+      store,
+      gate: makeSpyGate().gate,
+      limits: { ...TEST_LIMITS, distillConcurrency: 1 },
+      instanceId: "always-failing",
+      coldPassRetryMs: 5,
+      log: () => {},
+    });
+    distiller.start();
+    await waitFor(
+      () => distiller.status().skippedCount === 5 && distiller.status().coldPass === "done",
+    );
+    expect(distiller.status().failingCount).toBe(0);
+    for (const { id, bad } of order) {
+      if (!bad) expect(store.getCard(id)?.distillState).toBe("full");
+    }
+    // Three passes, then no follow-up is scheduled.
+    const passes = sdk.list;
+    expect(passes).toBe(3);
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    expect(sdk.list).toBe(passes);
+    await distiller.stop();
+    db.close();
+  });
+
+  it("indexes older sessions within a few passes when the newest five always fail", async () => {
+    // Cold start: the five newest fail first, which reads as an outage and
+    // aborts pass 1. The abort charges each a strike, so pass 2 no longer
+    // counts them toward an outage and reaches the healthy older sessions.
+    const order = [
+      ...Array.from({ length: 5 }, (_, i) => ({ id: `bad${i}`, bad: true })),
+      ...Array.from({ length: 4 }, (_, i) => ({ id: `ok${i}` })),
+    ];
+    const { graph, failTimes } = failingGraph(order);
+    const { source, sdk } = makeDistillFake(graph, { failTimes });
+    const { db, store } = await freshStore();
+    const distiller = createDistiller({
+      source,
+      store,
+      gate: makeSpyGate().gate,
+      limits: { ...TEST_LIMITS, distillConcurrency: 1 },
+      instanceId: "newest-failing",
+      coldPassRetryMs: 5,
+      log: () => {},
+    });
+    distiller.start();
+    await waitFor(() => store.getCard("ok3")?.distillState === "full");
+    expect(sdk.list).toBe(2);
+    await waitFor(
+      () => distiller.status().skippedCount === 5 && distiller.status().coldPass === "done",
+    );
+    expect(sdk.list).toBeLessThanOrEqual(4);
+    await distiller.stop();
+    db.close();
+  });
+
+  it("stops end-of-pass retries after five fail in a row; the rest take a strike unfetched", async () => {
+    const order = Array.from({ length: 14 }, (_, i) => ({ id: `s${i}`, bad: i % 2 === 1 }));
+    const { graph, failTimes } = failingGraph(order);
+    const { source, sdk } = makeDistillFake(graph, { failTimes });
+    const { db, store } = await freshStore();
+    const distiller = createDistiller({
+      source,
+      store,
+      gate: makeSpyGate().gate,
+      limits: { ...TEST_LIMITS, distillConcurrency: 1 },
+      instanceId: "retry-stop",
+      coldPassRetryMs: 60_000,
+      log: () => {},
+    });
+    distiller.start();
+    await waitFor(() => distiller.status().coldPass === "done");
+    const fetches = (id: string) => sdk.messages.filter((c) => c.sessionID === id).length;
+    const bad = order.filter((o) => o.bad).map((o) => o.id);
+    // Seven failing sessions: the first five are retried, the last two not.
+    expect(bad.map(fetches)).toEqual([2, 2, 2, 2, 2, 1, 1]);
+    expect(distiller.status().failingCount).toBe(7);
+    await distiller.stop();
+    db.close();
+  });
+
+  it("does not finish the pass when stopped or demoted during the end-of-pass retry", async () => {
+    for (const how of ["stop", "lease"] as const) {
+      const { graph } = failingGraph([{ id: "ok" }, { id: "bad" }]);
+      const { source: inner } = makeDistillFake(graph);
+      let badReads = 0;
+      let release!: () => void;
+      const blocked = new Promise<void>((resolve) => (release = resolve));
+      const source: HistorySource = {
+        ...inner,
+        messagePage: async (o) => {
+          if (o.sessionID === "bad") {
+            badReads++;
+            if (badReads === 2) await blocked; // the end-of-pass retry
+            throw new Error("bad session");
+          }
+          return inner.messagePage(o);
+        },
+      };
+      const { db, store } = await freshStore();
+      let done = 0;
+      const distiller = createDistiller({
+        source,
+        store,
+        gate: makeSpyGate().gate,
+        limits: { ...TEST_LIMITS, distillConcurrency: 1 },
+        instanceId: `retry-${how}`,
+        coldPassRetryMs: 60_000,
+        onColdPassDone: () => done++,
+        log: () => {},
+      });
+      distiller.start();
+      await waitFor(() => badReads === 2);
+      let stopping: Promise<void> | undefined;
+      if (how === "stop") stopping = distiller.stop();
+      else {
+        store.setMeta(
+          "distill_lease",
+          JSON.stringify({
+            holder: "rival",
+            heartbeat: Date.now(),
+            ttl: 30_000,
+            build: "x",
+            gen: 1,
+          }),
+        );
+      }
+      release();
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(distiller.status().coldPass, how).toBe("idle");
+      expect(done, how).toBe(0);
+      await (stopping ?? distiller.stop());
+      db.close();
+    }
+  });
+
+  it("clears a session's failing state when it distills, is deleted, or is no longer discovered", async () => {
+    const { graph, failTimes } = failingGraph([
+      { id: "a", bad: true },
+      { id: "ok1" },
+      { id: "b", bad: true },
+      { id: "ok2" },
+      { id: "c", bad: true },
+    ]);
+    const { source, sdk } = makeDistillFake(graph, { failTimes });
+    const { db, store } = await freshStore();
+    const distiller = createDistiller({
+      source,
+      store,
+      gate: makeSpyGate().gate,
+      limits: { ...TEST_LIMITS, distillConcurrency: 1 },
+      instanceId: "failing-cleared",
+      // The follow-up pass comes after the events below.
+      coldPassRetryMs: 300,
+      idleDebounceMs: 1,
+      log: () => {},
+    });
+    distiller.start();
+    await waitFor(() => distiller.status().coldPass === "done");
+    expect(distiller.status().failingCount).toBe(3);
+
+    // a recovers and an event re-distills it.
+    failTimes.a = 0;
+    distiller.onEvent({ type: "turn-ended", sessionID: "a" });
+    await waitFor(() => distiller.status().failingCount === 2);
+    expect(store.getCard("a")?.distillState).toBe("full");
+
+    // b is deleted.
+    graph.sessions = graph.sessions.filter((s) => s.id !== "b");
+    distiller.onEvent({ type: "deleted", sessionID: "b" });
+    expect(distiller.status().failingCount).toBe(1);
+
+    // c is gone from the host by the follow-up pass, which prunes it.
+    graph.sessions = graph.sessions.filter((s) => s.id !== "c");
+    await waitFor(() => sdk.list === 2 && distiller.status().coldPass === "done", 3_000);
+    expect(distiller.status().failingCount).toBe(0);
+    expect(distiller.status().skippedCount).toBe(0);
+    await distiller.stop();
     db.close();
   });
 

@@ -60,8 +60,22 @@ const MAX_UNSETTLED_FAILURES = 3;
  *  retry) may fail before the session is skipped. */
 const MAX_COLD_PASS_FETCH_FAILURES = 3;
 /** Distinct sessions failing in a row that mean an outage rather than a few
- *  bad sessions: the cold pass aborts and retries later. */
+ *  bad sessions: the cold pass aborts and retries later. Only sessions with
+ *  no strike yet count: a known-bad session is not evidence of an outage. */
 const MAX_CONSECUTIVE_FETCH_FAILURES = 5;
+/** Sessions a pass sets aside for its end-of-pass retry; failures past this
+ *  take a strike without a retry and wait for the follow-up pass. */
+const MAX_RETRY_SET = 200;
+/** End-of-pass retries failing in a row before the rest of the retry set
+ *  takes a strike without being fetched again. */
+const MAX_CONSECUTIVE_RETRY_FAILURES = 5;
+/** An end-of-pass retry that failed (its strike is already recorded). */
+class RetryFailed extends Error {
+  constructor() {
+    super("end-of-pass retry failed");
+  }
+}
+
 /** With `yieldBetween`, long store sweeps pause after this many writes. */
 const YIELD_EVERY_WRITES = 50;
 /** With `yieldBetween`, a poll's dispatch pauses after this many signals. */
@@ -861,11 +875,45 @@ export function createDistiller(options: DistillerOptions): Distiller {
    *  a transport failure, a host error, anything). A failing session no longer
    *  stops the pass: it is set aside, the pass goes on, and it is retried once
    *  at the end. A failed retry counts one strike and asks for a follow-up
-   *  pass after `coldPassRetryMs`; at the limit the session is skipped (still
-   *  tried by events and later passes). Only several distinct sessions failing
-   *  in a row, an outage signal, aborts the pass. FIFO-bounded like the
-   *  quarantine. */
+   *  pass after `coldPassRetryMs`; at the limit the session is skipped (a
+   *  later pass fetches it once, with no retry, and events still re-distill
+   *  it). Only several sessions with no strike failing in a row, an outage
+   *  signal, aborts the pass, and that charges a strike to each session that
+   *  failed in it. Cleared when the session distills or is found current, is
+   *  deleted, or is no longer discovered. FIFO-bounded like the quarantine. */
   const coldPassFetchFailures = new Map<string, number>();
+  /** Entries of {@link coldPassFetchFailures} at or past the skip limit, and
+   *  below it: kept at every mutation so status() never walks the map. */
+  let skippedSessions = 0;
+  let failingSessions = 0;
+
+  /** Set (or with `undefined`, clear) a session's strike count, keeping the
+   *  two counters in step and the map FIFO-bounded like the quarantine. */
+  function setStrikes(sessionId: string, strikes: number | undefined): void {
+    const old = coldPassFetchFailures.get(sessionId);
+    if (old !== undefined) {
+      if (old >= MAX_COLD_PASS_FETCH_FAILURES) skippedSessions--;
+      else failingSessions--;
+      coldPassFetchFailures.delete(sessionId);
+    }
+    if (strikes === undefined) return;
+    // Reinsertion keeps FIFO eviction aligned with the latest failure.
+    coldPassFetchFailures.set(sessionId, strikes);
+    if (strikes >= MAX_COLD_PASS_FETCH_FAILURES) skippedSessions++;
+    else failingSessions++;
+    while (coldPassFetchFailures.size > MAX_QUARANTINED_SESSIONS) {
+      const oldest = coldPassFetchFailures.keys().next().value;
+      if (oldest === undefined) break;
+      setStrikes(oldest, undefined);
+    }
+  }
+
+  /** One more strike for a session whose fetch failed; returns the count. */
+  function bumpFetchFailure(sessionId: string): number {
+    const strikes = (coldPassFetchFailures.get(sessionId) ?? 0) + 1;
+    setStrikes(sessionId, strikes);
+    return strikes;
+  }
   let stopPromise: Promise<void> | undefined;
   /** Sessions that saw a removal-shaped event since their last full distill, so
    *  the next re-distill takes the full path rather than appending. */
@@ -1342,8 +1390,17 @@ export function createDistiller(options: DistillerOptions): Distiller {
   async function runColdPass(): Promise<void> {
     if (coldPassState === "running") return;
     coldPassState = "running";
+    // A new pass's progress starts from nothing: never report the previous
+    // pass's counts while this one is still discovering.
+    examinedCount = 0;
+    knownCount = 0;
     lastError = undefined;
     logMsg("cold pass started");
+    /** Sessions whose fetch failed this pass, retried once at its end. Also
+     *  what an outage abort charges a strike to (see the catch below). */
+    const failedThisPass: DistillSessionMeta[] = [];
+    /** Set when the pass aborts as an outage (not a stop or a lost lease). */
+    let outageAbort = false;
     try {
       const discovered = await discoverSessions();
       knownCount = discovered.length;
@@ -1353,18 +1410,44 @@ export function createDistiller(options: DistillerOptions): Distiller {
         // retried below; a deleted one no longer consumes retained state.
         if (liveUpdates.get(sessionId) !== timeUpdated) quarantined.delete(sessionId);
       }
+      // A session gone from the host no longer counts as failing or skipped.
+      for (const sessionId of [...coldPassFetchFailures.keys()]) {
+        if (!liveUpdates.has(sessionId)) setStrikes(sessionId, undefined);
+      }
       const parentById = new Map(discovered.map((s) => [s.id, s.parentId] as const));
       const sorted = [...discovered].sort(
         (a, b) => b.timeUpdated - a.timeUpdated || a.id.localeCompare(b.id),
       );
       let examined = 0;
       let distilled = 0;
-      examinedCount = 0;
-      /** Sessions whose fetch failed this pass, retried once at its end. */
-      const failedThisPass: DistillSessionMeta[] = [];
+      /** Fetch failures in a row of sessions with no strike yet. Only fetches
+       *  move it: an up-to-date or quarantined session is not a fetch and
+       *  leaves it as is, and a known-bad session's failure does not add to
+       *  it (it is not evidence of an outage). A successful fetch resets it. */
       let consecutiveFailures = 0;
-      /** Set when an end-of-pass retry failed short of the skip limit. */
+      /** Set when a session still fails short of the skip limit: the pass
+       *  completes, and a follow-up pass retries it. */
       let retryFailure: string | undefined;
+
+      const countExamined = (session: DistillSessionMeta): void => {
+        examined++;
+        examinedCount = examined;
+        recordProgress(session.timeUpdated);
+      };
+
+      /** A failure this pass will not retry again: one strike, then either a
+       *  follow-up pass (below the limit) or a skip. */
+      const strike = (session: DistillSessionMeta, error: unknown): void => {
+        const failures = bumpFetchFailure(session.id);
+        if (failures < MAX_COLD_PASS_FETCH_FAILURES) {
+          retryFailure = `session ${session.id} fetch failed: ${errmsg(error)}`;
+          return;
+        }
+        logMsg(
+          `session ${session.id} skipped: ${failures} cold passes failed to fetch it (${errmsg(error)}); later passes and changes to it still try it, without holding a pass back`,
+        );
+        countExamined(session);
+      };
 
       const processSession = async (session: DistillSessionMeta, retry: boolean): Promise<void> => {
         if (stopped || !leaseHeld) return; // paused / lost lease — resume on next start
@@ -1387,9 +1470,7 @@ export function createDistiller(options: DistillerOptions): Distiller {
         }
         if (!upToDate) {
           if (quarantined.get(session.id) === session.timeUpdated) {
-            examined++;
-            examinedCount = examined;
-            recordProgress(session.timeUpdated);
+            countExamined(session);
             return;
           }
 
@@ -1406,42 +1487,39 @@ export function createDistiller(options: DistillerOptions): Distiller {
             // other throw from the fetch or checkpoint reads too.
             if (!(error instanceof MalformedSessionError)) {
               if (stopped || !leaseHeld) throw error;
-              if (!retry) {
-                // Several distinct sessions failing in a row is an outage:
-                // abort and retry the whole pass later, as before.
+              if (retry) {
+                strike(session, error);
+                throw new RetryFailed();
+              }
+              const strikes = coldPassFetchFailures.get(session.id) ?? 0;
+              if (strikes >= MAX_COLD_PASS_FETCH_FAILURES) {
+                // Already past the limit: no end-of-pass retry either.
+                strike(session, error);
+                return;
+              }
+              if (strikes === 0) {
+                // Several sessions with no history of failing, failing in a
+                // row, is an outage: abort and retry the whole pass later.
                 consecutiveFailures++;
-                if (consecutiveFailures >= MAX_CONSECUTIVE_FETCH_FAILURES) throw error;
-                failedThisPass.push(session);
+                if (consecutiveFailures >= MAX_CONSECUTIVE_FETCH_FAILURES) {
+                  failedThisPass.push(session);
+                  outageAbort = true;
+                  throw error;
+                }
+              }
+              if (failedThisPass.length >= MAX_RETRY_SET) {
+                strike(session, error);
                 return;
               }
-              const failures = (coldPassFetchFailures.get(session.id) ?? 0) + 1;
-              coldPassFetchFailures.delete(session.id);
-              coldPassFetchFailures.set(session.id, failures);
-              while (coldPassFetchFailures.size > MAX_QUARANTINED_SESSIONS) {
-                const oldest = coldPassFetchFailures.keys().next().value;
-                if (oldest === undefined) break;
-                coldPassFetchFailures.delete(oldest);
-              }
-              if (failures < MAX_COLD_PASS_FETCH_FAILURES) {
-                retryFailure = `session ${session.id} fetch failed: ${errmsg(error)}`;
-                return;
-              }
-              logMsg(
-                `session ${session.id} skipped for this cold pass after ${failures} consecutive fetch failures: ${errmsg(error)}`,
-              );
-              examined++;
-              examinedCount = examined;
-              recordProgress(session.timeUpdated);
+              failedThisPass.push(session);
               return;
             }
             quarantine(session, error);
-            examined++;
-            examinedCount = examined;
-            recordProgress(session.timeUpdated);
+            countExamined(session);
             return;
           }
           consecutiveFailures = 0;
-          coldPassFetchFailures.delete(session.id);
+          setStrikes(session.id, undefined);
 
           let card: Card;
           let rows: PartTextRow[];
@@ -1467,9 +1545,7 @@ export function createDistiller(options: DistillerOptions): Distiller {
               throw error;
             }
             quarantine(session, error);
-            examined++;
-            examinedCount = examined;
-            recordProgress(session.timeUpdated);
+            countExamined(session);
             return;
           }
           // The lease can drop (heartbeat takeover) during the fetch above; a
@@ -1484,18 +1560,33 @@ export function createDistiller(options: DistillerOptions): Distiller {
           noteSettled(session.id, checkpoint, moved);
           distilled++;
           distilledCount = distilled; // status counts only sessions actually distilled
+        } else {
+          // Indexed and current (perhaps by another holder): not failing.
+          setStrikes(session.id, undefined);
         }
-        examined++;
-        examinedCount = examined;
-        recordProgress(session.timeUpdated);
+        countExamined(session);
       };
 
       await runPool(sorted, limits.distillConcurrency, (session) => processSession(session, false));
       // Sessions that failed are retried once, now that the rest is indexed.
+      // Several retries failing in a row stop the retries: the rest take a
+      // strike unfetched and wait for the follow-up pass.
+      let retryFailures = 0;
       for (const session of failedThisPass) {
         if (stopped || !leaseHeld) break;
-        await processSession(session, true);
+        if (retryFailures >= MAX_CONSECUTIVE_RETRY_FAILURES) {
+          strike(session, new Error("not retried: earlier retries in this pass kept failing"));
+          continue;
+        }
+        try {
+          await processSession(session, true);
+          retryFailures = 0;
+        } catch (error) {
+          if (!(error instanceof RetryFailed)) throw error;
+          retryFailures++;
+        }
       }
+      failedThisPass.length = 0;
 
       // Losing the lease (a takeover) or stopping mid-pass must NOT finish the
       // pass or recompute rollups as if complete — leave it idle so the new
@@ -1528,12 +1619,19 @@ export function createDistiller(options: DistillerOptions): Distiller {
         // Some sessions still fail: the rest is indexed, and a follow-up pass
         // (which skips everything up to date) retries them later.
         lastError = retryFailure;
-        scheduleFollowUpPass();
+        scheduleColdPassRetry(true);
       }
     } catch (error) {
       lastError = errmsg(error);
       coldPassState = "idle"; // resumable: per-card skip resumes on the next run
       logMsg(`cold pass aborted: ${lastError}`);
+      // An outage abort charges a strike to every session that failed this
+      // pass, so a failure that repeats pass after pass still reaches the
+      // skip limit instead of aborting forever. Their failures are known from
+      // then on and no longer count toward the next outage.
+      if (outageAbort && !stopped && leaseHeld) {
+        for (const session of failedThisPass) bumpFetchFailure(session.id);
+      }
       // A transient failure must not kill the pass for the process lifetime;
       // re-arm on a backoff while we still hold the lease.
       scheduleColdPassRetry();
@@ -1583,24 +1681,19 @@ export function createDistiller(options: DistillerOptions): Distiller {
     return running;
   }
 
-  /** A later pass for sessions whose fetch failed in a completed pass. */
-  function scheduleFollowUpPass(): void {
+  /** Re-arm a cold pass after `coldPassRetryMs`: after an aborted pass
+   *  (`lastError` set, state idle), or as a follow-up for sessions still
+   *  failing after a completed one. */
+  function scheduleColdPassRetry(followUp = false): void {
     if (stopped || !leaseHeld) return;
     clearTimer(coldPassRetryTimer);
     coldPassRetryTimer = setTimeout(() => {
       coldPassRetryTimer = undefined;
-      if (stopped || !leaseHeld) return;
-      if (coldPassState !== "running") void startColdPass();
-    }, coldPassRetryMs);
-  }
-
-  function scheduleColdPassRetry(): void {
-    if (stopped || !leaseHeld) return;
-    clearTimer(coldPassRetryTimer);
-    coldPassRetryTimer = setTimeout(() => {
-      coldPassRetryTimer = undefined;
-      if (stopped || !leaseHeld) return;
-      if (coldPassState === "idle" && lastError !== undefined) void startColdPass();
+      if (stopped || !leaseHeld || coldPassState === "running") return;
+      // An abort's retry is moot once some other pass has run to the end.
+      if (followUp || (coldPassState === "idle" && lastError !== undefined)) {
+        void startColdPass();
+      }
     }, coldPassRetryMs);
   }
 
@@ -1712,6 +1805,7 @@ export function createDistiller(options: DistillerOptions): Distiller {
         if (stored && stored.rootId !== sessionID) recomputeRootRollup(stored.rootId);
         succeeded = true;
         reDistillFailures.delete(sessionID);
+        setStrikes(sessionID, undefined); // it fetched fine: no longer failing
         options.onSessionDistilled?.(sessionID);
       }
     } catch (error) {
@@ -1750,6 +1844,7 @@ export function createDistiller(options: DistillerOptions): Distiller {
     unsettled.delete(sessionID);
     reDistillQueue.delete(sessionID);
     reDistillFailures.delete(sessionID);
+    setStrikes(sessionID, undefined);
     if (rootId && rootId !== sessionID) recomputeRootRollup(rootId);
   }
 
@@ -1992,12 +2087,8 @@ export function createDistiller(options: DistillerOptions): Distiller {
         knownCount,
         examinedCount,
         quarantinedCount: quarantined.size,
-        skippedCount: [...coldPassFetchFailures.values()].filter(
-          (n) => n >= MAX_COLD_PASS_FETCH_FAILURES,
-        ).length,
-        failingCount: [...coldPassFetchFailures.values()].filter(
-          (n) => n < MAX_COLD_PASS_FETCH_FAILURES,
-        ).length,
+        skippedCount: skippedSessions,
+        failingCount: failingSessions,
         ...(lastError !== undefined ? { lastError } : {}),
         ...(lease ? { lease } : {}),
       };

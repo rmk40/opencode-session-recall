@@ -109,17 +109,20 @@ All notable changes to this project are documented here. This project follows
 
 ### Fixed
 
-- **The cold pass no longer stalls on one session the host keeps failing
+- **The cold pass no longer stalls on sessions the host keeps failing
   on.** If opencode could not serve a session (seen live on 1.18.33, where
   booting that session's project directory failed with
   `no such column: project_id`), every cold pass aborted on it and retried
-  it every 60 s, so older sessions were never indexed. A failing session now
-  no longer stops the pass: it is set aside, the pass indexes everything
-  else, and the session is retried once at the end. If that retry fails too,
-  a follow-up pass tries it again after 60 s; after three such passes it is
-  skipped with one log line (still tried when it changes). Only five
-  different sessions failing in a row, which looks like an outage, aborts
-  the pass as before.
+  it every 60 s, so older sessions were never indexed. A failing session
+  now no longer stops the pass: it is set aside, the pass indexes
+  everything else, and the session is retried once at the end. If that
+  retry fails too, a follow-up pass tries again after 60 s; after three
+  passes the session is skipped with one log line, so passes stop being
+  scheduled for it (a later pass still tries it once, and so does any
+  change to it). Five sessions failing in a row still abort the pass as
+  an outage, but only sessions not already known to fail count toward
+  that, and an aborted pass counts against every session that failed in
+  it, so a failure that repeats cannot abort passes forever.
 
 ## 2.3.0
 
