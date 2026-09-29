@@ -239,7 +239,9 @@ async function createV2Runtime(
   // opencode.db refuses (`source-mismatch`) instead of being reconciled
   // against the wrong history. No source path, or one that could not be
   // canonicalized, means no store: the file is not even opened, so nothing
-  // is stamped with a spelling a later run would refuse.
+  // is stamped with a spelling a later run would refuse. (So an unresolvable
+  // source, `:memory:` or an empty override, loses the card tier as well;
+  // see createUnavailableSource.)
   let store: Store | null = null;
   let db: SqliteDb | null = null;
   if (identity.store !== null && identity.source !== null && identity.sourceCanonical !== true) {

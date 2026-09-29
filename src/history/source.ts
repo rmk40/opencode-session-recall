@@ -109,6 +109,15 @@ export function unavailableHistoryError(reason: string): string {
  * A source that reads nothing: every method fails with
  * {@link unavailableHistoryError}. Message pages reject (the tools turn that
  * into `{ ok: false, error }`); listings and lookups return the error.
+ *
+ * On v2 there are two ways to be unavailable, and they differ in whether the
+ * card tier survives. An `opencode.db` that resolves to a path but cannot be
+ * read (missing, unreadable, unknown schema) still opens the derived store,
+ * so `recall` and `recall_sessions` answer from cards an earlier run built.
+ * A path that cannot be resolved at all (`:memory:`, an empty override) opens
+ * no store: there is no source identity to check a store against, so the
+ * card tier is lost too. Reading the last stamped source instead is a
+ * deliberate non-goal for now.
  */
 export function createUnavailableSource(
   kind: HistorySource["kind"],

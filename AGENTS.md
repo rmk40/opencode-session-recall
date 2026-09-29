@@ -237,10 +237,11 @@ write path, gate it on the lease or two processes will double-write.
 
 The two original live incidents were an unpaginated `session.messages({ sessionID })`
 that pulled a whole (up to 77MB) session into memory. That is the legacy
-full-session fetch, and it must never run. The single allowed entry point is
-`HistorySource.messagePage()` (`src/history/source.ts`): its `limit` is required
-and checked at runtime (`assertBoundedLimit`). Drill, deep, the browse/context
-tools, and the distiller all page through it. Under v1 it is backed by
+full-session fetch, and it must never run. There are exactly two sanctioned readers
+of message history. The first and general one is `HistorySource.messagePage()`
+(`src/history/source.ts`): its `limit` is required and checked at runtime
+(`assertBoundedLimit`). Drill, deep, the browse/context tools, and the distiller all
+page through it. Under v1 it is backed by
 `fetchMessagePage()` in `src/history/v1.ts`, the one place that calls
 `session.messages`: it runs the same limit check before any request, ALWAYS sends
 `limit`, and reads the next-page cursor from the `X-Next-Cursor` header. Only the
@@ -252,6 +253,14 @@ helpers hard-fail if a tool swallows that throw into an error output. Suites tha
 intentionally exercise the legacy full-return path (some distiller fixtures) opt
 out by leaving strict mode off. If you add a new fetch site, route it through
 `source.messagePage` and cover it under a strict-mode suite.
+
+The second is `src/history/v2-sync.ts`, the v2 distiller's poll and checkpoint
+reads, which query opencode v2's `session_message` table directly (the v2 history
+source in `src/history/v2.ts` does too, behind `messagePage`). There the rule is
+"every `session_message` statement binds `LIMIT ?`", enforced by the `limitSpy`
+wrapper in `test/v2-db.ts`, which fails any such statement without it. Any new
+suite that exercises code reading `session_message` must hand it a `limitSpy`-wrapped
+handle, and new code must not add a third reader.
 
 ## Perf gates are behind `RECALL_PERF=1`
 
