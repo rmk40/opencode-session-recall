@@ -61,6 +61,8 @@ const MAX_UNSETTLED_FAILURES = 3;
 const MAX_COLD_PASS_FETCH_FAILURES = 3;
 /** With `yieldBetween`, long store sweeps pause after this many writes. */
 const YIELD_EVERY_WRITES = 50;
+/** With `yieldBetween`, a poll's dispatch pauses after this many signals. */
+const DISPATCH_YIELD_EVERY = 50;
 
 // ── Shared shapes ────────────────────────────────────────────────────────────
 
@@ -166,14 +168,20 @@ export type PollMeta = {
  * `history/v2-sync.ts`). With it the distiller checkpoints each session's
  * tail, trusts a card only while its tail is unchanged, polls for changes
  * while holding the lease, re-reads unsettled tails on every poll, and
- * removes cards whose session no longer exists at the end of a cold pass.
+ * removes cards whose session no longer exists, at the end of a cold pass
+ * and every `reconcileEveryMs` from the poll.
  */
 /**
  * One poll's outcome. `commit` persists the watermarks and keyset positions
  * the poll advanced; the distiller calls it only after dispatching `signals`,
- * so a crash or a lost lease in between re-reads the window instead of
- * skipping it. A window that failed contributes no signals and nothing to
- * commit, and is named in `failures`; the other window's work stands.
+ * so anything that stops the poll before dispatch finishes (a throw, a lost
+ * lease, a crash) leaves the windows where they were and the next poll
+ * re-reads them. Dispatch only schedules debounced re-distills in memory, so
+ * a crash after the commit but before those run does lose the signals; the
+ * next process's cold pass covers that, since it re-checks every card's tail
+ * against opencode.db. A window that failed contributes no signals and
+ * nothing to commit, and is named in `failures`; the other window's work
+ * stands.
  */
 export type PollResult = {
   signals: DistillSignal[];
@@ -1697,7 +1705,16 @@ export function createDistiller(options: DistillerOptions): Distiller {
         return sync.poll(meta);
       });
       if (!result || stopped || !leaseHeld) return;
-      for (const signal of result.signals) dispatch(signal);
+      // Metadata signals each run a patchCardMeta transaction: yield every
+      // DISPATCH_YIELD_EVERY so a large session scan cannot hold the loop.
+      for (let i = 0; i < result.signals.length; i++) {
+        if (pause && i > 0 && i % DISPATCH_YIELD_EVERY === 0) {
+          await pause();
+          // Stopped or demoted mid-dispatch: commit nothing, re-read next time.
+          if (stopped || !leaseHeld) return;
+        }
+        dispatch(result.signals[i]!);
+      }
       // Only now that every signal is dispatched may the windows move on.
       result.commit();
       for (const failure of result.failures) {

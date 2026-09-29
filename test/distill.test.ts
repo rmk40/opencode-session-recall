@@ -2098,6 +2098,52 @@ describe("sync-host re-distill queue across a lease handoff", () => {
   });
 });
 
+describe("sync-host poll dispatch", () => {
+  it("yields every 50 dispatched signals and commits after the last one", async () => {
+    const { source } = makeDistillFake({ sessions: [], messagesBySession: {} });
+    let polled = false;
+    let committed = false;
+    const sync: DistillSync = {
+      checkpoint: async () => null,
+      compare: async () => "fresh",
+      missing: async () => [],
+      poll: async () => {
+        const signals: DistillSignal[] = polled
+          ? []
+          : Array.from({ length: 120 }, (_, i) => ({
+              type: "meta" as const,
+              sessionID: `s${i}`,
+              patch: { title: `t${i}` },
+            }));
+        polled = true;
+        return { signals, commit: () => void (committed = true), failures: [] };
+      },
+      pollIntervalMs: 5,
+      reconcileEveryMs: 1e12,
+    };
+    let yields = 0;
+    const { db, store } = await freshStore();
+    const distiller = createDistiller({
+      source,
+      store,
+      gate: createFetchGate({ concurrency: 2 }),
+      limits: { ...TEST_LIMITS, coldPass: false },
+      instanceId: "dispatch-yields",
+      sync,
+      yieldBetween: async () => {
+        yields++;
+      },
+      log: () => {},
+    });
+    distiller.start();
+    await waitFor(() => committed);
+    // 120 signals: a pause after the 50th and the 100th.
+    expect(yields).toBe(2);
+    await distiller.stop();
+    db.close();
+  });
+});
+
 describe("sync-host unsettled retries", () => {
   it("stops re-reading an unsettled session on every poll after repeated failures", async () => {
     const graph: Graph = {

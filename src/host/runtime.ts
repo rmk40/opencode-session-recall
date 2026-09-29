@@ -198,6 +198,10 @@ function retire<R>(state: BuildState, core: Core<R>): Promise<void> {
   if (core.store !== null) {
     const retiring = runtimeRegistry().retiring;
     const store = core.store;
+    // Two runtimes on one store can retire close together (two builds, or a
+    // quick reload): the later disposal overwrites the earlier one here, so a
+    // new runtime waits on the later only. That is safe: the earlier one's
+    // writes are lease-guarded, exactly as two processes sharing a store.
     retiring.set(store, disposal);
     void disposal.then(() => {
       if (retiring.get(store) === disposal) retiring.delete(store);

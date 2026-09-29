@@ -192,7 +192,7 @@ On opencode v2 (checked against 2.0.18) the plugin registers the same five tools
 
 **How the index stays current.** v2 events are only a hint, so a background poll keeps the store fresh without them: new messages show up within about 30 seconds, and renames, moves and other metadata-only changes within about 5 minutes. A turn that is still streaming is re-read on every poll until it settles.
 
-**A separate store.** The v2 index lives in `~/.cache/opencode-session-recall/store-opencode-v2.db`, next to the v1 `store-v1.db`. Each store records which opencode and which history database it was built from, and refuses to be used by the other, so the two never overwrite each other. One v2 process indexes every project into that one file.
+**A separate store.** The v2 index lives in `~/.cache/opencode-session-recall/store-opencode-v2.db`, next to the v1 `store-v1.db`. Each store records which opencode and which history database it was built from, and refuses to be used by the other, so the two never overwrite each other. One v2 process indexes every project into that one file. If you set `storePath` (or `opencodeDbPath`) on v2, give an absolute path: the plugin runs inside opencode's background service, so a relative path resolves against the service's working directory, not your project.
 
 **What is different.**
 

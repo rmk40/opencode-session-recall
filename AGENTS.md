@@ -97,6 +97,9 @@ import `bun:*` or `node:*` directly.
   reaches the TUI log. v2 discards plugin console output, so it logs only when
   `RECALL_DEBUG=1` is set in the service's environment, to
   `~/.cache/opencode-session-recall/recall.log` (size-capped, one rotation).
+- On v2, give `storePath` and `opencodeDbPath` as absolute paths in live test
+  configs: both resolve against the working directory of the background service
+  the plugin runs in, not the project the TUI was started from.
 - `files: ["dist"]` in `package.json` means only `dist/` is published to npm;
   CHANGELOG, AGENTS.md, src, etc. never ship.
 

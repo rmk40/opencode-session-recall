@@ -292,14 +292,6 @@ export function createV2Sync(db: ReadOnlyDb, opts: V2SyncOptions = {}): DistillS
     return Math.max(start, at - maxLookbackMs);
   }
 
-  /**
-   * One page of a window: rows whose key `k` is past `mark - overlap` and past
-   * the persisted keyset position, ordered by `(k, id)`. A full page stores
-   * its last key and leaves the watermark alone; a short page means the
-   * window is drained, so the watermark moves to the newest key seen and the
-   * position clears. Every poll therefore moves forward, even when one
-   * timestamp is shared by more rows than a page holds.
-   */
   type Page = { rows: Row[]; commit: Array<[string, string]> };
 
   /**
