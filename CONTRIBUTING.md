@@ -13,7 +13,7 @@ npm run dev          # run in opencode plugin dev mode
 
 ### Requirements
 
-- Node.js 20+
+- Node.js 22.5+ (the tests use `node:sqlite`)
 - TypeScript 6+
 - An [OpenCode](https://github.com/opencode-ai/opencode) installation (for live testing)
 
@@ -33,47 +33,56 @@ Output goes to `dist/`. The single entry point is `src/opencode-session-recall.t
 
 ```mermaid
 flowchart TB
-    subgraph "Plugin Entry"
-        Entry["opencode-session-recall.ts"]
+    Entry["opencode-session-recall.ts<br/>{ id, server, setup }"]
+
+    subgraph "Host adapters"
+        HostV1["host/v1.ts<br/>server()"]
+        HostV2["host/v2.ts<br/>setup()"]
+        Runtime["host/runtime.ts<br/>one v2 runtime per process"]
     end
 
-    subgraph "Five Tools"
-        Recall["recall (search)"]
-        Get["recall_get"]
-        Context["recall_context"]
-        Messages["recall_messages"]
-        Sessions["recall_sessions"]
+    subgraph "Core"
+        Tools["Five recall tools"]
+        Distiller["distill.ts"]
+        Store["Derived store<br/>(store.ts)"]
+        Source["HistorySource<br/>(history/source.ts)"]
     end
 
-    subgraph "History seam"
-        Source["HistorySource (history/source.ts)"]
-        V1["v1 adapter (history/v1.ts)"]
+    subgraph "History adapters"
+        V1["history/v1.ts"]
+        V2["history/v2.ts"]
+        Sync["history/v2-sync.ts<br/>poll + checkpoints"]
     end
 
-    subgraph "OpenCode"
-        SDK["OpenCode SDK v2"]
-        DB["SQLite Database"]
-    end
+    SDK["OpenCode SDK (HTTP)"]
+    DB1["opencode v1 database"]
+    DB2["opencode.db (v2)<br/>read-only"]
 
-    Entry --> Recall
-    Entry --> Get
-    Entry --> Context
-    Entry --> Messages
-    Entry --> Sessions
-    Entry -->|builds| V1
-
-    Recall --> Source
-    Get --> Source
-    Context --> Source
-    Messages --> Source
-    Sessions --> Source
-
-    Source -.->|implemented by| V1
+    Entry --> HostV1
+    Entry --> HostV2
+    HostV2 --> Runtime
+    HostV1 --> Tools
+    Runtime --> Tools
+    HostV1 --> Distiller
+    Runtime --> Distiller
+    Tools --> Source
+    Tools --> Store
+    Distiller --> Source
+    Distiller --> Store
+    Distiller --> Sync
+    Source -.->|v1| V1
+    Source -.->|v2| V2
     V1 --> SDK
-    SDK --> DB
+    SDK --> DB1
+    V2 --> DB2
+    Sync --> DB2
 ```
 
-The plugin registers five tools via the OpenCode plugin API, plus optional event hooks for proactive recall (see [Invocation hooks](#invocation-hooks)). The tools, drill, and distiller read opencode history only through the host-neutral `HistorySource` interface (`src/history/source.ts`): session listings and lookups, children, bounded message pages, and single messages. The v1 host entry (`src/host/v1.ts`) loads the v1 implementation (`src/history/v1.ts`) lazily; it calls the OpenCode SDK over the host's in-process transport. Only `src/host/v1.ts` may load the v1 adapter, and only the adapter may import SDK values (both enforced by ESLint), so a second host can supply its own `HistorySource` without touching the core.
+One package serves both opencode generations. opencode v1 (`@opencode-ai/plugin` 1.3.4+) calls `server()` in `src/host/v1.ts`; opencode v2 (`@opencode/plugin` 2.0.x) calls `setup()` in `src/host/v2.ts`, which stays inert unless a capability probe finds a real v2 context (v1.18 also calls `setup`, with a partial one). Both register the same five tools, plus hooks (see [Invocation hooks](#invocation-hooks)).
+
+The tools, drill, and distiller read opencode history only through the host-neutral `HistorySource` interface (`src/history/source.ts`): session listings and lookups, children, bounded message pages, and single messages. On v1 the implementation is `src/history/v1.ts`, loaded lazily by `src/host/v1.ts`, which calls the OpenCode SDK over the host's in-process transport. Only `src/host/v1.ts` may load it, and only it may import SDK values (both enforced by ESLint). On v2 the plugin API cannot page history, so `src/history/v2.ts` reads opencode's `opencode.db` directly through a read-only handle and projects its rows into the same read model (`src/history/v2-project.ts`).
+
+On v2, everything stateful lives in one process runtime (`src/host/runtime.ts`, `src/host/v2-runtime.ts`) that every location's `setup` attaches to: the store, the distiller, the card runtime and the `opencode.db` handle exist once per process, and each instance gets a history facade bound to its own project. v2 events are only a latency hint there; `src/history/v2-sync.ts` keeps the store fresh by polling `opencode.db` and checkpointing each session's tail. When `opencode.db` cannot be read, the source reports it (`unavailable`), `recall` answers from the cards through `src/card-drill.ts`, and responses carry `coverage.source`.
 
 ### Module map
 
@@ -98,6 +107,10 @@ The plugin registers five tools via the OpenCode plugin API, plus optional event
 | `history/v1-events.ts`       | Maps v1 bus events to the distiller's host-neutral `DistillSignal`s                                                                                                                                                                   |
 | `history/v2-events.ts`       | Maps v2 bus events to `DistillSignal`s (step throttle, metadata patches); a latency hint only                                                                                                                                         |
 | `history/v2-sync.ts`         | The v2 distiller's freshness from `opencode.db`: tail checkpoints, unsettled tails, the message poll and `session_v2` scan, deletion checks                                                                                           |
+| `history/v2.ts`              | The v2 `HistorySource` over a read-only `opencode.db` handle: listings, lookups, byte-bounded pages with placeholders for rows it will not load, per-user agent/model attribution                                                     |
+| `history/v2-project.ts`      | Projects v2 `session_v2` and `session_message` rows into the host-neutral read model                                                                                                                                                  |
+| `history/v2-path.ts`         | Resolves the v2 `opencode.db` path the way opencode does (`OPENCODE_DB`, build channel, `XDG_DATA_HOME`), or the `opencodeDbPath` option                                                                                              |
+| `card-drill.ts`              | A drill that reads nothing: builds each target session's pool from its card, used by `recall` when the history source is unavailable                                                                                                  |
 | `host/opencode-v1-types.ts`  | Vendored v1 plugin types (`Hooks`, `ToolContext`, `PluginInput`, and the rest), checked against `@opencode-ai/plugin` by `test/host-v1-types.test.ts`                                                                                 |
 | `tool-def.ts`                | Local `tool()` drop-in with `tool.schema` (zod), so the bundle imports no host package at runtime                                                                                                                                     |
 | `options.ts`                 | `parseOptions()`: pure plugin option parsing shared by hosts; returns warnings instead of logging                                                                                                                                     |
@@ -107,9 +120,9 @@ The plugin registers five tools via the OpenCode plugin API, plus optional event
 | `cards.ts`                   | Tier-1 card runtime: MiniSearch over card fields (incl. `nl_summary`), metadata filters, family exclusion, optional semantic blend + rescue                                                                                           |
 | `drill.ts`                   | Tier-2 bounded drill and the deep sweep: paginated fetch, budgets, drilled-session LRU, deep continuation cursor                                                                                                                      |
 | `rerank.ts`                  | Two-stage drilled rerank (`mergeShortlistHits`): broad pass plus a shortlist-local deep pass over drilled candidates                                                                                                                  |
-| `fetch-gate.ts`              | Shared fetch semaphore all SDK calls pass through; foreground queries have priority over the background distiller                                                                                                                     |
+| `fetch-gate.ts`              | Shared semaphore every history read passes through; foreground queries have priority over the background distiller                                                                                                                    |
 | `fetch-window.ts`            | Bounded newest-first message-window fetch for `recall_context` and inline expansion                                                                                                                                                   |
-| `sqlite.ts`                  | Runtime-detected driver adapter: `bun:sqlite`, else `node:sqlite`, else null (degraded)                                                                                                                                               |
+| `sqlite.ts`                  | Runtime-detected driver adapter: `bun:sqlite`, else `node:sqlite`, else null (degraded); `openSqliteReadOnly` returns the get/all/close-only handle v2 reads `opencode.db` through                                                    |
 | `corpus.ts`                  | Session-digest derivation and the embedder surface (the surviving remnant of the deleted CorpusCache)                                                                                                                                 |
 | `extract.ts`                 | Text extraction from message parts. `searchableFields()`, `matches()`, `evidenceClassFor()`, `isSelfTool()`, `isSummarizerTitle()`                                                                                                    |
 | `types.ts`                   | Shared types and `Limits`/`DEFAULTS`; defensive coercers (`coerceEnum`/`coerceInt`)                                                                                                                                                   |
@@ -123,7 +136,7 @@ The plugin registers five tools via the OpenCode plugin API, plus optional event
 | `digest.ts`                  | Digest-token rules (`isDigestToken`, stopwords) shared by the distiller and session digests                                                                                                                                           |
 | `bm25.ts`                    | BM25 relevance ranking (MiniSearch) with structural boosts/penalties, applied within drilled sessions                                                                                                                                 |
 | `node-import.ts`             | Dynamic `node:fs`/`node:path`/`node:os` loaders, so `src/` stays free of Node type deps                                                                                                                                               |
-| `semantic/embedder.ts`       | Opt-in static-embedding model: download, load, embed (the only Node-touching module)                                                                                                                                                  |
+| `semantic/embedder.ts`       | Opt-in static-embedding model: download, load, embed (Node builtins only through `node-import.ts` loaders)                                                                                                                            |
 | `semantic/similarity.ts`     | Brute-force cosine similarity over card embeddings                                                                                                                                                                                    |
 | `regex.ts`                   | `regex` match mode: pattern compile, bounded scan, match snippet                                                                                                                                                                      |
 | `route.ts`                   | Query-shape classification (`looksLikeRegex`, `classifyQuery`) that drives mode suggestions                                                                                                                                           |
@@ -136,7 +149,7 @@ The plugin registers five tools via the OpenCode plugin API, plus optional event
 
 ### Search paths
 
-Every search resolves a shortlist of sessions from the card store (tier 1) plus the slim FTS index (tier 1.5), then drills those sessions through the SDK under budgets (tier 2) and runs the match path over the drilled candidates. Query-time filters (`type`, `role`, `before`/`after`, `toolName`) are applied by the pure predicate `candidateEligible()` on each drilled session's candidates. `deep: true` replaces tier-1 selection with an exhaustive sweep of an explicitly scoped session set (see [Deep mode](#deep-mode)). From there, three distinct execution paths, selected by `match`:
+Every search resolves a shortlist of sessions from the card store (tier 1) plus the slim FTS index (tier 1.5), then drills those sessions through the history source under budgets (tier 2) and runs the match path over the drilled candidates. Query-time filters (`type`, `role`, `before`/`after`, `toolName`) are applied by the pure predicate `candidateEligible()` on each drilled session's candidates. `deep: true` replaces tier-1 selection with an exhaustive sweep of an explicitly scoped session set (see [Deep mode](#deep-mode)). From there, three distinct execution paths, selected by `match`:
 
 ```mermaid
 flowchart TB
@@ -177,13 +190,15 @@ flowchart TB
 
 ### Invocation hooks
 
-Besides the five tools, the plugin optionally registers OpenCode event hooks so the agent uses recall proactively. They are wired in `host/v1.ts` and gated by plugin options. Each hook is fully wrapped in `try/catch`: OpenCode runs hooks through `Effect.promise`, where a thrown hook becomes a fatal defect, so the hooks must never throw.
+Besides the five tools, the plugin optionally registers hooks so the agent uses recall proactively, gated by plugin options. The v1 hooks are wired in `host/v1.ts`, the v2 hook in `host/v2.ts`. Each hook is fully wrapped in `try/catch`: OpenCode runs hooks through `Effect.promise`, where a thrown hook becomes a fatal defect, so the hooks must never throw.
 
-| Hook                                 | Option (default)         | Module                       | Behavior                                                                                                  |
-| ------------------------------------ | ------------------------ | ---------------------------- | --------------------------------------------------------------------------------------------------------- |
-| `experimental.chat.system.transform` | `nudge` (on)             | `hooks/system-nudge.ts`      | Pushes one reminder string onto `output.system`; idempotent via a sentinel; guards entry types            |
-| `chat.message`                       | `autoRecall` (off)       | `hooks/auto-recall.ts`       | Cue-gated card-tier recall; injects a cited synthetic text part into `output.parts`                       |
-| `experimental.session.compacting`    | `compactionRecall` (off) | `hooks/compaction-recall.ts` | Reads the session's own distilled card; appends one cited block to `output.context` (never sets `prompt`) |
+| Host | Hook                                 | Option (default)                 | Module                       | Behavior                                                                                                  |
+| ---- | ------------------------------------ | -------------------------------- | ---------------------------- | --------------------------------------------------------------------------------------------------------- |
+| v1   | `experimental.chat.system.transform` | `nudge` (on)                     | `hooks/system-nudge.ts`      | Pushes one reminder string onto `output.system`; idempotent via a sentinel; guards entry types            |
+| v1   | `chat.message`                       | `autoRecall` (off)               | `hooks/auto-recall.ts`       | Cue-gated card-tier recall; injects a cited synthetic text part into `output.parts`                       |
+| v1   | `experimental.session.compacting`    | `compactionRecall` (off)         | `hooks/compaction-recall.ts` | Reads the session's own distilled card; appends one cited block to `output.context` (never sets `prompt`) |
+| v2   | `session.hook("context")`            | `nudge` (on), `primary` (on)     | `host/v2.ts`                 | Removes the recall tools for a child session (`primary`); otherwise adds the nudge once per request       |
+| v2   | none yet                             | `autoRecall`, `compactionRecall` | none                         | Deferred on v2: enabling either logs one line and registers nothing                                       |
 
 Both proactive hooks query the card tier directly through `cardRecall()` (`hooks/card-recall.ts`) and make zero message fetches. `autoRecall` ranks cards for a cue-derived query (excluding the current session's family) and injects the top few as a cited block; `compactionRecall` reads the current session's own card and preserves its durable fields (focus, outcome, errors, identifiers, files). There is no search-tool instance, no wall-clock timeout, and no shared cache to warm, so the `prewarm` option is now a retained no-op. `autoRecall` injects a `synthetic: true` text part carrying a real `prt_` id from `hooks/part-id.ts`, because the hook fires after OpenCode has already assigned ids to the message's other parts.
 
@@ -305,14 +320,16 @@ flowchart LR
 
 ### Dependencies
 
-| Package               | Version | Purpose                                                           |
-| --------------------- | ------- | ----------------------------------------------------------------- |
-| `@opencode-ai/sdk`    | ^1.3.2  | OpenCode API client                                               |
-| `minisearch`          | ^7.2.0  | BM25 relevance ranking for smart/fuzzy search                     |
-| `fastest-levenshtein` | ^1.0.16 | Edit-distance for matched-term detection                          |
-| `zod`                 | ^4.3.6  | Schema validation backing the `tool.schema` builder for tool args |
+| Package               | Version | Kind               | Purpose                                                                       |
+| --------------------- | ------- | ------------------ | ----------------------------------------------------------------------------- |
+| `@opencode-ai/sdk`    | ^1.3.2  | runtime (v1 only)  | OpenCode HTTP client, used only by `src/history/v1.ts`; types elsewhere       |
+| `minisearch`          | ^7.2.0  | runtime            | BM25 relevance ranking for smart/fuzzy search                                 |
+| `fastest-levenshtein` | ^1.0.16 | runtime            | Edit-distance for matched-term detection                                      |
+| `zod`                 | ^4.3.6  | runtime            | Schema validation backing the `tool.schema` builder for tool args             |
+| `@opencode-ai/plugin` | >=1.3.4 | optional peer, dev | v1 plugin types; `src/` vendors them, and a test checks the copy against this |
+| `@opencode/plugin`    | 2.0.18  | dev only           | v2 plugin types; `src/` vendors them, and a test checks the copy against this |
 
-Peer dependency: `@opencode-ai/plugin` >= 1.2.0
+Nothing in `src/` imports either plugin package (ESLint enforces it), so a v2-only install needs neither.
 
 ### Type hierarchy
 
@@ -427,7 +444,7 @@ All ranking constants are at the top of `bm25.ts`:
 
 1. Create a new file in `src/` following the pattern in `get.ts` or `context.ts`
 2. Export a function that takes the `HistorySource` (plus the fetch gate and limits it needs) and returns a tool built with `tool()` from `tool-def.ts`
-3. Register it in `host/v1.ts`
+3. Register it for both hosts: in `host/v1.ts`, and in `buildToolSet()` in `host/v2-tools.ts`
 4. Add the tool name to the `TOOLS` array in `types.ts`
 
 ## Commit conventions
