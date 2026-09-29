@@ -7,7 +7,7 @@ import type {
   V2ToolResult,
 } from "./opencode-v2-types.js";
 import { createFileSink, createLogger, type Logger } from "../log.js";
-import { parseOptions } from "../options.js";
+import { parseOptions, type ResolvedOptions } from "../options.js";
 import { errmsg, settleWithin, TOOLS, type ErrorOutput } from "../types.js";
 import { NUDGE_BASE_TEXT, NUDGE_SENTINEL } from "../hooks/system-nudge.js";
 import { v2ToolContext } from "./tool-io.js";
@@ -199,6 +199,28 @@ async function start(ctx: V2PluginContext): Promise<V2Cleanup> {
     v2Log,
   );
 
+  // Everything after the attach runs guarded: a throw anywhere below must
+  // release the attachment, or the runtime would be built and never disposed.
+  const events = new AbortController();
+  try {
+    return await wire(ctx, parsed, attachment, events);
+  } catch (error) {
+    v2Log(`setup failed after attaching: ${errmsg(error)}`);
+    const instance = instances.get(ctx);
+    if (instance) instance.disposed = true;
+    events.abort();
+    await attachment.detach();
+    return async () => {};
+  }
+}
+
+/** Register one instance's hooks, tools and event pump over its attachment. */
+async function wire(
+  ctx: V2PluginContext,
+  parsed: ResolvedOptions,
+  attachment: Attachment<V2Runtime>,
+  events: AbortController,
+): Promise<V2Cleanup> {
   // ── Parent lookups (primary) ──
   const parents = lru<string, string | null>(PARENT_CACHE_SIZE);
   const isChild = async (sessionID: string): Promise<boolean | undefined> => {
@@ -228,7 +250,6 @@ async function start(ctx: V2PluginContext): Promise<V2Cleanup> {
   const instance: V2Instance = { attachment, disposed: false, isChild };
   instances.set(ctx, instance);
 
-  const events = new AbortController();
   pumpEvents(ctx, instance, events.signal);
 
   // ── Tools ──
