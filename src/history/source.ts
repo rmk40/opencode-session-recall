@@ -46,6 +46,13 @@ export interface HistorySource {
    *  probe project-then-global skip the second probe when this is false. */
   readonly scopedLookup: boolean;
   /**
+   * Set when this source cannot read history at all (v2: `opencode.db` is
+   * missing, unreadable, in memory, or has an unknown schema), to the reason.
+   * Every read then fails with {@link unavailableHistoryError}; `recall` skips
+   * its drill and deep sweep and `recall_sessions` serves from cards.
+   */
+  readonly unavailable?: string;
+  /**
    * The newest `limit` sessions in `scope`. An empty body is an empty listing.
    * A successful body of the wrong shape is an empty listing by default (the
    * distiller's discovery tolerates it); `strict` rejects it instead, so the
@@ -90,4 +97,33 @@ export function assertBoundedLimit(limit: unknown): asserts limit is number {
   if (typeof limit !== "number" || !Number.isInteger(limit) || limit < 1) {
     throw new Error(`message page limit must be a positive integer, got ${String(limit)}`);
   }
+}
+
+/** The error every read of an unavailable source reports. */
+export function unavailableHistoryError(reason: string): string {
+  return `opencode history unavailable: ${reason}`;
+}
+
+/**
+ * A source that reads nothing: every method fails with
+ * {@link unavailableHistoryError}. Message pages reject (the tools turn that
+ * into `{ ok: false, error }`); listings and lookups return the error.
+ */
+export function createUnavailableSource(
+  kind: HistorySource["kind"],
+  reason: string,
+): HistorySource {
+  const error = unavailableHistoryError(reason);
+  return {
+    kind,
+    scopedLookup: false,
+    unavailable: reason,
+    listSessions: async () => ({ ok: false, error }),
+    getSession: async () => ({ ok: false, reason: "error", error }),
+    listChildren: async () => ({ ok: false, error }),
+    messagePage: async () => {
+      throw new Error(error);
+    },
+    getMessage: async () => ({ ok: false, reason: "error", error }),
+  };
 }
