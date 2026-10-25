@@ -1,0 +1,515 @@
+import type { Hooks, ToolDefinition } from "./tool.js";
+import type { OpencodeClient, Session } from "@opencode-ai/sdk/v2";
+import { sessions, type SessionEnrichment } from "./sessions.js";
+import { search, DISCOVERY_LIMIT, type SearchDeps, type SemanticSearchConfig } from "./search.js";
+import { get } from "./get.js";
+import { context } from "./context.js";
+import { messages } from "./messages.js";
+import { systemNudge } from "./hooks/system-nudge.js";
+import { autoRecall } from "./hooks/auto-recall.js";
+import { compactionRecall } from "./hooks/compaction-recall.js";
+import { createFetchGate } from "./fetch-gate.js";
+import { openSqlite, type SqliteDb } from "./sqlite.js";
+import {
+  openStore,
+  defaultStorePath,
+  SCHEMA_VERSION,
+  SEMANTIC_MODEL_KEY,
+  VECTORS_REV_KEY,
+  type Store,
+  type Card,
+} from "./store.js";
+import { EMBED_REPRESENTATION } from "./embedding-text.js";
+import { createCardsRuntime, cardsLiteFromSessions, type CardSource } from "./cards.js";
+import { createLiteRefresh, type LiteRefreshController } from "./lite-refresh.js";
+import { createDrill } from "./drill.js";
+import { createDistiller } from "./distill.js";
+import { createSummarizer, parseModelId, type Summarizer } from "./summarize.js";
+import {
+  DEFAULTS,
+  optionalString,
+  errmsg,
+  settleWithin,
+  type ErrorOutput,
+  type Limits,
+} from "./types.js";
+
+/** Per-phase bound on dispose()'s awaited waits. The host awaits dispose as a
+ *  shutdown finalizer with no timeout of its own, so a never-settling in-flight
+ *  SDK request must not hang shutdown forever. Two bounded phases (distiller
+ *  stop, tracked operations) after the summarizer's own 15s bound keep total
+ *  dispose under ~20s worst case. Timed-out work is detached, not cancelled;
+ *  every store write path re-checks stopped/finalized/lease ownership before
+ *  writing, so closing SQLite with a detached fetch pending is safe. */
+const SHUTDOWN_TIMEOUT_MS = 2_500;
+
+/** Guarded, Node-free logger: `console` is a std global, but `src/` declares no
+ *  types, so reach it defensively. */
+function pluginLog(message: string): void {
+  try {
+    (globalThis as { console?: { log?: (msg: string) => void } }).console?.log?.(
+      `[recall] ${message}`,
+    );
+  } catch {
+    // Logging is best-effort; never let it throw into plugin init.
+  }
+}
+
+/** Opt-in semantic layer defaults (plugin options, off unless enabled). */
+const DEFAULT_SEMANTIC_MODEL = "minishlab/potion-base-8M";
+const DEFAULT_SEMANTIC_WEIGHT = 0.35;
+const MIN_SEMANTIC_WEIGHT = 0.05;
+const MAX_SEMANTIC_WEIGHT = 0.95;
+
+/**
+ * Plugin build tag — recorded in the distill lease and surfaced in
+ * `coverage.semantic.pluginVersion`, so a store shared by mixed-version processes
+ * can be diagnosed from one lease read / one tool response.
+ *
+ * DEVIATION (see the plan's build-tag decision): this is NOT the package.json
+ * semver. `src/` cannot read package.json cleanly — `tsconfig` sets `rootDir` to
+ * `./src` and leaves `resolveJsonModule` off, so importing `../package.json` fails
+ * `tsc`, and a hand-copied version const would drift silently on release (the
+ * `npm version` flow only touches package.json). The tag is instead derived from
+ * the two constants that actually gate mixed-version safety — the schema version
+ * and the embedding representation generation — so it never lies about the fence
+ * dimensions and needs no release-step upkeep. Swap in a real version here if one
+ * can ever be sourced without a Node import.
+ */
+const PLUGIN_BUILD = `schema${SCHEMA_VERSION}.gen${EMBED_REPRESENTATION}`;
+
+type Options = {
+  /** Deprecated in V2: registered tools follow normal agent permissions. */
+  primary?: boolean;
+  global?: boolean;
+  /** `"ephemeral"` runs the plugin with no persistent store and zero disk
+   *  artifacts: cards are metadata-only (built live from the session list),
+   *  content recall comes from drill/deep at query time, and the semantic
+   *  layer is forced off (its embedder writes model weights to the cache dir).
+   *  Anything else (including absence) is persistent mode. */
+  mode?: "persistent" | "ephemeral";
+  /** Inject a system-prompt reminder to use recall (R1a). Default: true. */
+  nudge?: boolean;
+  /** Run gated automatic recall on each user message (R1b). Default: false. */
+  autoRecall?: boolean;
+  /** Preserve durable findings into the compaction summary (R1c). Default: false. */
+  compactionRecall?: boolean;
+  /** Deprecated no-op: the card store persists across processes, so there is
+   *  nothing to prewarm. Retained so existing configs do not error. */
+  prewarm?: boolean;
+  /** Override the card-store file path (default
+   *  `~/.cache/opencode-session-recall/store-v1.db`). */
+  storePath?: string;
+  /** Enable the opt-in, local-only semantic layer. Default: false. */
+  semantic?: boolean;
+  /** Blend weight for the semantic signal, clamped to [0.05, 0.95]. Default: 0.35. */
+  semanticWeight?: number;
+  /** HuggingFace model id for static embeddings. Default: minishlab/potion-base-8M. */
+  semanticModel?: string;
+  /** Opt-in Path B LLM card summaries (off by default; spends the user's tokens).
+   *  `model` is required as "providerID/modelID" — no model disables it. `agent`
+   *  optionally prompts as a restricted opencode agent (the enforced tool block). */
+  summaries?: { enabled?: boolean; model?: string; agent?: string; maxPromptsPerPass?: number };
+} & Partial<Limits>;
+
+export async function createRuntime(
+  client: OpencodeClient,
+  unscoped: OpencodeClient,
+  options: Record<string, unknown>,
+): Promise<Hooks> {
+  const opts = (options ?? {}) as Options;
+  const global = opts.global !== false;
+  const nudge = opts.nudge !== false;
+  const autoRecallEnabled = opts.autoRecall === true;
+  const compactionRecallEnabled = opts.compactionRecall === true;
+  // Hand-coerced like every other option (options carry no Zod schema — the
+  // value arrives as untyped JSON): only the literal string "ephemeral"
+  // enables the mode; anything else — including a typo — is persistent, with a
+  // one-time log line as the tell.
+  const modeRaw: unknown = opts.mode;
+  const ephemeral = modeRaw === "ephemeral";
+  if (!ephemeral && typeof modeRaw === "string" && modeRaw !== "" && modeRaw !== "persistent") {
+    pluginLog(`unrecognized mode ${JSON.stringify(modeRaw)}; running in persistent mode`);
+  }
+  if (ephemeral) {
+    if (optionalString(opts.storePath)) {
+      pluginLog("ephemeral mode: storePath is ignored (no store is opened)");
+    }
+    if (opts.semantic === true) {
+      pluginLog(
+        "ephemeral mode: semantic is forced off (the embedder caches model weights on disk)",
+      );
+    }
+    if (opts.summaries?.enabled === true) {
+      pluginLog("ephemeral mode: summaries are inert (they require the persistent store)");
+    }
+    if (opts.compactionRecall === true) {
+      pluginLog("ephemeral mode: compactionRecall is inert (it reads the persistent store)");
+    }
+  }
+  let disposed = false;
+  let disposePromise: Promise<void> | undefined;
+  const operations = new Set<Promise<unknown>>();
+
+  const track = <T>(operation: Promise<T>): Promise<T> => {
+    operations.add(operation);
+    void operation.then(
+      () => operations.delete(operation),
+      () => operations.delete(operation),
+    );
+    return operation;
+  };
+
+  const clamp = (val: number | undefined, fallback: number, min = 1) =>
+    Math.max(min, Math.floor(val ?? fallback));
+
+  const limits: Limits = {
+    concurrency: clamp(opts.concurrency, DEFAULTS.concurrency),
+    maxSessions: clamp(opts.maxSessions, DEFAULTS.maxSessions),
+    maxResults: clamp(opts.maxResults, DEFAULTS.maxResults),
+    maxSessionList: clamp(opts.maxSessionList, DEFAULTS.maxSessionList),
+    maxMessages: clamp(opts.maxMessages, DEFAULTS.maxMessages),
+    maxWindow: clamp(opts.maxWindow, DEFAULTS.maxWindow),
+    defaultWidth: clamp(opts.defaultWidth, DEFAULTS.defaultWidth, 50),
+    cacheMaxChars: clamp(opts.cacheMaxChars, DEFAULTS.cacheMaxChars),
+    distillConcurrency: clamp(opts.distillConcurrency, DEFAULTS.distillConcurrency),
+    distillDelayMs: Math.max(0, Math.floor(opts.distillDelayMs ?? DEFAULTS.distillDelayMs)),
+    ftsRowsPerSession: clamp(opts.ftsRowsPerSession, DEFAULTS.ftsRowsPerSession),
+    inventoryTokens: clamp(opts.inventoryTokens, DEFAULTS.inventoryTokens),
+    coldPass: opts.coldPass !== false,
+    drillSessions: clamp(opts.drillSessions, DEFAULTS.drillSessions),
+    // Reserved semantic slots: min 0 (0 disables the reservation), never more
+    // than the drill fan-out itself.
+    semanticSlots: Math.min(
+      clamp(opts.drillSessions, DEFAULTS.drillSessions),
+      Math.max(0, Math.floor(opts.semanticSlots ?? DEFAULTS.semanticSlots)),
+    ),
+    drillPageMessages: clamp(opts.drillPageMessages, DEFAULTS.drillPageMessages),
+    drillCharsPerSession: clamp(opts.drillCharsPerSession, DEFAULTS.drillCharsPerSession),
+    drillCharsPerQuery: clamp(opts.drillCharsPerQuery, DEFAULTS.drillCharsPerQuery),
+    deepCharsPerQuery: clamp(opts.deepCharsPerQuery, DEFAULTS.deepCharsPerQuery),
+  };
+
+  // Opt-in, local-only semantic layer. Off by default; any failure to load the
+  // embedder module or construct the model degrades to a plain cache with no
+  // semantic signal (lexical-only). init() is fired and forgotten — it never
+  // throws to callers, and searches stay lexical until the model warms.
+  let semantic: SemanticSearchConfig | undefined;
+  let semanticModel: string | undefined;
+  let semanticReady: Promise<void> | undefined;
+  // Ephemeral force-disables the semantic layer: SemanticEmbedder.init() runs
+  // BEFORE the store block and eagerly writes model weights under the cache
+  // dir, which would violate the mode's zero-artifact contract.
+  if (opts.semantic === true && !ephemeral) {
+    try {
+      const { SemanticEmbedder } = await import("./semantic/embedder.js");
+      const model = optionalString(opts.semanticModel) ?? DEFAULT_SEMANTIC_MODEL;
+      const embedder = new SemanticEmbedder(model);
+      // Idempotent: start loading and keep the promise so the card runtime can
+      // run its first embed pass the moment the model is ready.
+      semanticReady = embedder.init();
+      const weight =
+        typeof opts.semanticWeight === "number" && Number.isFinite(opts.semanticWeight)
+          ? Math.max(MIN_SEMANTIC_WEIGHT, Math.min(MAX_SEMANTIC_WEIGHT, opts.semanticWeight))
+          : DEFAULT_SEMANTIC_WEIGHT;
+      semantic = { embedder, weight };
+      semanticModel = model;
+    } catch {
+      // Plain cache, no semantic.
+    }
+  }
+
+  // Session discovery for the distiller cold pass: global scope reads the
+  // unscoped experimental list, otherwise the directory-scoped list. Always
+  // sends an explicit limit (the server defaults to 100 rows).
+  const discover = async (): Promise<Session[]> => {
+    const resp = global
+      ? await unscoped.experimental.session.list({ limit: DISCOVERY_LIMIT })
+      : await client.session.list({ limit: DISCOVERY_LIMIT });
+    if (resp.error) throw new Error(errmsg(resp.error));
+    return Array.isArray(resp.data) ? (resp.data as Session[]) : [];
+  };
+
+  // ── Card store (Tier 0) ──
+  // The derived, versioned store is the sole persistence. If SQLite is
+  // unavailable (no driver, unwritable dir) or the schema is newer than this
+  // build understands, `store` stays null and the plugin degrades to ephemeral
+  // cards-lite built from the session list. In configured ephemeral mode the
+  // whole open sequence — including defaultStorePath(), which mkdirs the cache
+  // dir — is skipped: `store`/`db` stay null by construction.
+  let store: Store | null = null;
+  let db: SqliteDb | null = null;
+  if (!ephemeral) {
+    const defaultPath = optionalString(opts.storePath) ? undefined : await defaultStorePath();
+    // V1 and V2 host histories are different corpora, even when IDs overlap.
+    const storePath =
+      optionalString(opts.storePath) ??
+      (options.hostV2
+        ? defaultPath?.replace(/store-v1\.db$/, "store-opencode-v2.db")
+        : defaultPath);
+    if (storePath) {
+      db = await openSqlite(storePath);
+      if (db) store = openStore(db);
+    }
+  }
+
+  // Degraded cards-lite: fetch the session list once (best-effort) and keep
+  // metadata-only cards in memory. The tier-1 runtime reads the live array.
+  // Configured ephemeral mode additionally wires the refresh controller so
+  // the snapshot self-heals (sessions created after init become visible); the
+  // accidental driver-missing degraded path keeps the frozen one-shot snapshot.
+  let liteCards: Card[] = [];
+  const cardSource: CardSource = store
+    ? {
+        getCards: (embOpts) => store.allCards(embOpts),
+        revision: () => store.getMeta("cards_rev"),
+        vectorsRevision: () => store.getMeta(VECTORS_REV_KEY),
+        semanticModel: () => store.getMeta(SEMANTIC_MODEL_KEY),
+        writeEmbeddings: (model, gen, rows) => store.writeCardEmbeddings(model, gen, rows),
+      }
+    : { getCards: () => liteCards, revision: () => undefined, degraded: true };
+  let liteRefresh: LiteRefreshController | undefined;
+  if (!store) {
+    if (ephemeral) {
+      liteRefresh = createLiteRefresh({
+        list: async () =>
+          cardsLiteFromSessions((await discover()) as Parameters<typeof cardsLiteFromSessions>[0]),
+        assign: (next) => {
+          liteCards = next;
+        },
+        // `cards` and `gate` are declared BELOW this block (the CardSource
+        // literal must exist before the runtime, and the gate block follows) —
+        // resolve them lazily in closures that only run after init completes.
+        // Capturing either eagerly here would hit the TDZ; do not reorder.
+        invalidate: () => cards.invalidate(),
+        runQuery: (fn) => gate.runQuery(fn),
+        track,
+        disposed: () => disposed,
+      });
+      void liteRefresh.initialRefresh();
+    } else {
+      void track(
+        discover()
+          .then((list) => {
+            if (!disposed)
+              liteCards = cardsLiteFromSessions(
+                list as Parameters<typeof cardsLiteFromSessions>[0],
+              );
+          })
+          .catch(() => {
+            // Best-effort; a failed list just leaves cards-lite empty until retried.
+          }),
+      );
+    }
+  }
+
+  // One shared fetch gate gates every SDK call in the query/distill paths so the
+  // plugin never opens more than `concurrency` server connections at once.
+  const gate = createFetchGate({ concurrency: limits.concurrency });
+
+  const cards = createCardsRuntime({
+    source: cardSource,
+    embedder: semantic?.embedder,
+    semanticWeight: semantic?.weight,
+    semanticModel,
+    semanticReady,
+    pluginVersion: PLUGIN_BUILD,
+  });
+  const drill = createDrill({ client, gate, limits });
+
+  const instanceId =
+    globalThis.crypto?.randomUUID?.() ??
+    `recall-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+
+  // Path B summarizer (opt-in). The distiller drives it — after the cold pass and
+  // on the idle-debounce re-distill path — so it only ever runs while this
+  // process holds the distill lease.
+  let summarizer: Summarizer | undefined;
+  const distiller = createDistiller({
+    client,
+    store,
+    gate,
+    limits,
+    instanceId,
+    build: PLUGIN_BUILD,
+    gen: EMBED_REPRESENTATION,
+    discover,
+    onColdPassDone: () => {
+      if (!disposed && summarizer) {
+        // Summarizer.stop() owns the bounded shutdown of this drain. Do not add
+        // it to the plugin's general operation set, which is intentionally
+        // unbounded for DB-capable hooks and distiller work.
+        void summarizer
+          .runColdPass()
+          .catch((error) => pluginLog(`summarizer cold pass failed: ${errmsg(error)}`));
+      }
+    },
+    onSessionDistilled: (sessionId) => {
+      if (!disposed) summarizer?.queue(sessionId);
+    },
+  });
+  if (store && opts.summaries?.enabled === true) {
+    const model = optionalString(opts.summaries.model);
+    const parsed = model ? parseModelId(model) : undefined;
+    if (parsed) {
+      const maxPromptsPerPass =
+        typeof opts.summaries.maxPromptsPerPass === "number" &&
+        Number.isFinite(opts.summaries.maxPromptsPerPass) &&
+        opts.summaries.maxPromptsPerPass > 0
+          ? Math.floor(opts.summaries.maxPromptsPerPass)
+          : undefined;
+      const agent = optionalString(opts.summaries.agent);
+      summarizer = createSummarizer({
+        client,
+        store,
+        gate,
+        config: {
+          ...parsed,
+          ...(agent != null && { agent }),
+          ...(maxPromptsPerPass != null && { maxPromptsPerPass }),
+        },
+        ownerToken: instanceId,
+        leaseHeld: () => distiller.ownsLease(),
+        log: pluginLog,
+      });
+    } else {
+      // Never guess a model; disable with a one-time note.
+      pluginLog(
+        'summaries enabled but "model" is missing or malformed (expected "providerID/modelID"); summaries disabled',
+      );
+    }
+  }
+  if (limits.coldPass) distiller.start();
+
+  const liteRefreshHook = liteRefresh;
+  const deps: SearchDeps = {
+    gate,
+    store,
+    cards,
+    drill,
+    semantic,
+    // Configured, never derived from store === null: the accidental degraded
+    // path must keep its existing behavior and wording.
+    ...(ephemeral && { mode: "ephemeral" as const }),
+    ...(liteRefreshHook && { maybeRefresh: () => liteRefreshHook.maybeRefresh() }),
+  };
+  // recall_sessions serves the card store directly when it exists (digest, top
+  // files/tools, family rollups); degraded mode leaves listings bare.
+  const enrichment: SessionEnrichment | undefined = store
+    ? { cards: () => store.allCards() }
+    : undefined;
+
+  const guardTool = (definition: ToolDefinition): ToolDefinition => ({
+    ...definition,
+    execute: (args, context) => {
+      if (disposed) {
+        // Match every other failure in this codebase: a JSON error output, not
+        // a rejection.
+        const err: ErrorOutput = {
+          ok: false,
+          error: "opencode-session-recall: plugin has been disposed",
+        };
+        return Promise.resolve(JSON.stringify(err));
+      }
+      return track(definition.execute(args, context));
+    },
+  });
+
+  const guardHook =
+    <TArgs extends unknown[]>(
+      hook: (...args: TArgs) => Promise<void>,
+    ): ((...args: TArgs) => Promise<void>) =>
+    async (...args) => {
+      if (disposed) return;
+      await track(hook(...args));
+    };
+
+  const nudgeHook = nudge ? systemNudge() : undefined;
+  const autoRecallHook = autoRecallEnabled ? autoRecall(deps) : undefined;
+  const compactionHook = compactionRecallEnabled ? compactionRecall(deps) : undefined;
+
+  return {
+    tool: {
+      recall_sessions: guardTool(sessions(client, unscoped, global, limits, enrichment)),
+      recall: guardTool(search(client, unscoped, global, limits, deps)),
+      recall_get: guardTool(get(client, gate)),
+      recall_context: guardTool(context(client, gate, limits)),
+      recall_messages: guardTool(messages(client, gate, limits)),
+    },
+    event: async ({ event }) => {
+      if (disposed) return;
+      // The plugin `event` hook is typed against the default SDK vintage; the
+      // distiller compiles against the v2 event union the live bus actually
+      // delivers. Bridge the vintage gap at this one boundary.
+      distiller.onEvent(event as unknown as Parameters<typeof distiller.onEvent>[0]);
+    },
+    ...(nudgeHook && {
+      "experimental.chat.system.transform": guardHook(nudgeHook),
+    }),
+    ...(autoRecallHook && {
+      "chat.message": guardHook(autoRecallHook),
+    }),
+    ...(compactionHook && {
+      "experimental.session.compacting": guardHook(compactionHook),
+    }),
+    dispose: () => {
+      if (disposePromise) return disposePromise;
+      disposed = true;
+      // Phase 1 is synchronous: no distill/retry/incremental work can start
+      // after dispose() returns its promise. The heartbeat deliberately remains
+      // active so lease-owned summarizer cleanup can finish safely.
+      distiller.quiesce();
+      cards.dispose();
+      disposePromise = (async () => {
+        // Summarizer.stop() is internally bounded (its own 15s shutdown
+        // timeout). Its late SDK promises are detached and ownership/lease
+        // guarded, so phase 2 may safely release the lease once this settles
+        // even when an SDK request itself never does. The catch covers the rare
+        // rejecting drain (e.g. a store write threw) — shutdown must not care.
+        if (summarizer) await summarizer.stop().catch(() => {});
+        // Bound the remaining waits: an SDK request that never settles would
+        // otherwise hang the host's shutdown (dispose is awaited untimed).
+        //
+        // The two waits differ in what protects a detached continuation:
+        // - Distiller work is finalized/lease-guarded before every store
+        //   read/write, so a distiller fetch that settles after the timeout can
+        //   never reach SQLite. Closing after a distiller timeout is safe.
+        // - `operations` tracks FOREGROUND tool executions, which have no such
+        //   guards: a paused recall/drill fetch can resume straight into card
+        //   coverage reads. If they have not all settled within the bound,
+        //   DEFER the close instead: it fires after disposePromise has resolved
+        //   (cannot hang the host), only once every straggler has settled
+        //   (never closes under a live reader), and so closes eventually — no
+        //   handle leak when opencode disposes a cached per-directory instance
+        //   without the process exiting. A straggler that truly never settles
+        //   degrades to an unclosed handle on a derived, rebuildable store —
+        //   harmless, unlike a use-after-close.
+        const closeDb = (): void => {
+          try {
+            db?.close();
+          } catch {
+            // Best-effort: a throwing close must not reject disposePromise
+            // (or escape the detached deferral) into the host.
+          }
+          db = null;
+        };
+        await settleWithin(distiller.stop(), SHUTDOWN_TIMEOUT_MS);
+        const ops = await settleWithin(Promise.allSettled([...operations]), SHUTDOWN_TIMEOUT_MS);
+        if (ops.timedOut) {
+          // Diagnosable, not silent: until the stragglers settle, the SQLite
+          // handle stays open — this line is the marker if it never closes.
+          pluginLog(
+            `dispose: ${operations.size} operation(s) outlived the ${SHUTDOWN_TIMEOUT_MS}ms bound; deferring SQLite close until they settle`,
+          );
+          void Promise.allSettled([...operations]).then(() => {
+            pluginLog("dispose: deferred SQLite close firing (stragglers settled)");
+            closeDb();
+          });
+        } else {
+          closeDb();
+        }
+      })();
+      return disposePromise;
+    },
+  };
+}

@@ -28,6 +28,7 @@ export type OsLike = { homedir(): string };
 const NODE_FS: string = "node:fs";
 const NODE_PATH: string = "node:path";
 const NODE_OS: string = "node:os";
+const NODE_PROCESS: string = "node:process";
 
 export async function loadFs(): Promise<FsLike> {
   return (await import(NODE_FS)) as unknown as FsLike;
@@ -37,4 +38,8 @@ export async function loadPath(): Promise<PathLike> {
 }
 export async function loadOs(): Promise<OsLike> {
   return (await import(NODE_OS)) as unknown as OsLike;
+}
+
+export async function loadProcess(): Promise<{ env: Record<string, string | undefined> }> {
+  return (await import(NODE_PROCESS)) as unknown as { env: Record<string, string | undefined> };
 }

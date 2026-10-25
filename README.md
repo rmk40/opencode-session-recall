@@ -82,25 +82,99 @@ One call returns the matching sessions across all your projects, each with a `hi
 
 ## Install
 
+This checkout supports **OpenCode V1 and V2 from the same build**. The combined
+entrypoint exposes V1's `server()` and V2's `setup()` separately and loads only
+the selected host adapter. V1 requires the object-plugin loader introduced in
+1.18.29; host checks use local V1 1.18.35 and V2 2.0.26. Older V1 versions are
+not supported by this combined entrypoint. Use this local build, not the
+upstream V1-only npm release.
+
 ```bash
-opencode plugin opencode-session-recall
+npm install
+npm run compile
 ```
 
-Or add it to your `opencode.json`:
+Merge this into your global `~/.config/opencode/opencode.json(c)` (preserve
+existing settings). For **V2**, use the absolute path to this checkout:
 
 ```jsonc
 {
-  "plugin": ["opencode-session-recall"],
+  "$schema": "https://opencode.ai/config.json",
+  "plugins": ["/absolute/path/opencode-session-recall"],
 }
 ```
 
-That's the whole setup. The agent picks up the tools on the next session and uses them on its own; you don't have to teach it the syntax. To disable cross-project search:
+This also applies when starting your source checkout with `bun dev ..`.
+Local V2 directory discovery uses the root `server.js` bridge, which forwards to
+the built plugin in `dist/`; keep both. Package exports alone do not make a local
+directory discoverable. The host must also tolerate missing optional entrypoints
+under Bun. Hosts that abort on missing optional entrypoints need the corresponding
+OpenCode loader fix; this package cannot patch its host's loader.
+Rebuild after source edits and reload the plugin/server before testing. A new
+session alone does not guarantee that the background server reloads a package.
+Start with `recall_sessions` and `recall_messages` to verify the five tools load.
+
+For **V1**, use its `plugin` key (and tuple-form options when needed):
 
 ```jsonc
 {
-  "plugin": [["opencode-session-recall", { "global": false }]],
+  "plugin": ["/absolute/path/opencode-session-recall"],
 }
 ```
+
+The V1 adapter reuses the host's supplied fetch transport and authentication;
+it does not discover or start a service. It preserves V1 hooks and the `primary`
+option. These are host-specific config examples, not instructions to add both
+keys to a shared global config. Keep unrelated settings intact.
+
+After compiling, run a V1 loader/API smoke test from this plugin checkout:
+
+```powershell
+bun scripts/test-v1-host.mjs /path/to/opencode-v1
+```
+
+This uses the V1 checkout's real directory loader and in-process HTTP API with
+temporary configuration and an in-memory OpenCode database. It checks all five
+tools, session/message browsing, and cleanup in both cache modes without
+connecting to the live service. Unit tests additionally cover message content,
+authentication, scoping, and hooks (`npm test -- test/v1.test.ts test/v2.test.ts`).
+
+The V2 regression suite exercises native registration and real HTTP-client
+history reads. For full host testing, use a standalone server with temporary
+configuration/storage and the explicit endpoint option below. A separate git
+worktree alone does **not** isolate the shared background service—do not use plain
+`bun dev ..` as an isolated test.
+
+History reads use the public V2 client. The V2 plugin context in this release
+does not expose paginated history APIs, so the plugin lazily discovers the
+matching-version background service; it never starts or replaces one. For an
+OpenCode source checkout, discovery follows `ctx.app.channel` (for example,
+`local` uses `service-local.json` instead of the release `service.json`). For an
+explicit or standalone server, pass `server: { "url": "http://localhost:4096" }`
+in plugin options, with `headers` if authentication is required. This endpoint
+must be the **same server** running the plugin. Do not put plaintext credentials
+in tracked configuration; use OpenCode environment substitutions in headers.
+
+To disable cross-project search, use the object form:
+
+```jsonc
+{
+  "plugins": [
+    {
+      "package": "/absolute/path/opencode-session-recall",
+      "options": { "global": false },
+    },
+  ],
+}
+```
+
+V1 uses `~/.cache/opencode-session-recall/store-v1.db`; V2 uses
+`~/.cache/opencode-session-recall/store-opencode-v2.db` by default so
+V1 and V2 histories cannot contaminate one another's index. Existing V1 caches
+are left untouched. Do not explicitly point both hosts at the same `storePath`.
+Each adapter reads only its own host's history; dual support does not merge or
+import databases across versions. V1 loads the legacy SDK only when `server()`
+is called. V2 uses the public V2 client and never constructs a legacy transport.
 
 ## Getting the agent to actually use it
 
@@ -114,7 +188,12 @@ A search tool only helps if the agent reaches for it. The plugin has three featu
 
 ```jsonc
 {
-  "plugin": [["opencode-session-recall", { "autoRecall": true, "compactionRecall": true }]],
+  "plugins": [
+    {
+      "package": "/absolute/path/opencode-session-recall",
+      "options": { "autoRecall": true, "compactionRecall": true },
+    },
+  ],
 }
 ```
 
@@ -122,44 +201,44 @@ A search tool only helps if the agent reaches for it. The plugin has three featu
 
 ## Options
 
-| Option             | Type      | Default                    | Description                                                                                                                                   |
-| ------------------ | --------- | -------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
-| `primary`          | `boolean` | `true`                     | Register tools as primary (available to all agents)                                                                                           |
-| `global`           | `boolean` | `true`                     | Allow cross-project search via `scope: "global"`                                                                                              |
-| `nudge`            | `boolean` | `true`                     | Inject a short system-prompt reminder to use recall for past work                                                                             |
-| `autoRecall`       | `boolean` | `false`                    | On user messages that reference prior work, auto-run a bounded recall and inject the top cited hits                                           |
-| `compactionRecall` | `boolean` | `false`                    | Before compaction, preserve the session's distilled card into the summary                                                                     |
-| `prewarm`          | `boolean` | `false`                    | Deprecated no-op, kept so existing configs don't error; the card store persists across processes                                              |
-| `semantic`         | `boolean` | `false`                    | Enable the opt-in local [semantic layer](#semantic-search-opt-in)                                                                             |
-| `semanticWeight`   | `number`  | `0.35`                     | Blend weight for the semantic signal, clamped to 0.05–0.95                                                                                    |
-| `semanticModel`    | `string`  | `minishlab/potion-base-8M` | Hugging Face model id for the static-embedding model                                                                                          |
-| `summaries`        | `object`  | off                        | Opt-in LLM card summaries: `{ enabled, model: "providerID/modelID", agent?, maxPromptsPerPass? }`. See [LLM summaries](#llm-summaries-opt-in) |
-| `mode`             | `string`  | `"persistent"`             | `"ephemeral"` runs with no store and no on-disk artifacts. See [Ephemeral mode](#ephemeral-mode-opt-in)                                       |
+| Option             | Type      | Default                     | Description                                                                                                                                   |
+| ------------------ | --------- | --------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
+| `primary`          | `boolean` | `true` in V1; ignored in V2 | V1 adds recall tools to `experimental.primary_tools`; V2 follows normal agent permissions                                                     |
+| `global`           | `boolean` | `true`                      | Allow cross-project search via `scope: "global"`                                                                                              |
+| `nudge`            | `boolean` | `true`                      | Inject a short system-prompt reminder to use recall for past work                                                                             |
+| `autoRecall`       | `boolean` | `false`                     | On user messages that reference prior work, auto-run a bounded recall and inject the top cited hits                                           |
+| `compactionRecall` | `boolean` | `false`                     | Before compaction, preserve the session's distilled card into the summary                                                                     |
+| `prewarm`          | `boolean` | `false`                     | Deprecated no-op, kept so existing configs don't error; the card store persists across processes                                              |
+| `semantic`         | `boolean` | `false`                     | Enable the opt-in local [semantic layer](#semantic-search-opt-in)                                                                             |
+| `semanticWeight`   | `number`  | `0.35`                      | Blend weight for the semantic signal, clamped to 0.05–0.95                                                                                    |
+| `semanticModel`    | `string`  | `minishlab/potion-base-8M`  | Hugging Face model id for the static-embedding model                                                                                          |
+| `summaries`        | `object`  | off                         | Opt-in LLM card summaries: `{ enabled, model: "providerID/modelID", agent?, maxPromptsPerPass? }`. See [LLM summaries](#llm-summaries-opt-in) |
+| `mode`             | `string`  | `"persistent"`              | `"ephemeral"` runs with no store and no on-disk artifacts. See [Ephemeral mode](#ephemeral-mode-opt-in)                                       |
 
 Advanced limits (all have sensible defaults):
 
-| Option                 | Default                                        | Description                                                                    |
-| ---------------------- | ---------------------------------------------- | ------------------------------------------------------------------------------ |
-| `storePath`            | `~/.cache/opencode-session-recall/store-v1.db` | Path to the derived SQLite store                                               |
-| `coldPass`             | `true`                                         | Run the background distiller cold pass that builds the store                   |
-| `concurrency`          | `3`                                            | Max concurrent SDK fetches shared by drill and distiller                       |
-| `drillSessions`        | `12`                                           | How many shortlisted sessions a query drills into                              |
-| `semanticSlots`        | `2`                                            | Drill slots reserved for the top pure-semantic cards (semantic on); 0 disables |
-| `drillPageMessages`    | `25`                                           | Messages per page during an untargeted drill                                   |
-| `drillCharsPerSession` | `1,500,000`                                    | Retained-chars budget per drilled session                                      |
-| `drillCharsPerQuery`   | `20,000,000`                                   | Retained-chars budget across all sessions in one drill                         |
-| `deepCharsPerQuery`    | `30,000,000`                                   | Retained-chars budget for one deep (output-inclusive) sweep                    |
-| `cacheMaxChars`        | `24,000,000`                                   | Retained-chars budget for the drilled-session LRU; keeps repeat queries warm   |
-| `distillConcurrency`   | `2`                                            | Sessions the cold pass distills in parallel                                    |
-| `distillDelayMs`       | `25`                                           | Politeness delay between a session's page fetches during distillation          |
-| `ftsRowsPerSession`    | `5000`                                         | Per-session slim-index row cap; giant sessions keep their newest rows          |
-| `inventoryTokens`      | `200`                                          | Card inventory token cap (code anchors plus digest tokens)                     |
-| `maxSessions`          | unlimited                                      | Hard max sessions per search; caps `recall.sessionLimit`                       |
-| `maxResults`           | `50`                                           | Max results per search                                                         |
-| `maxSessionList`       | `100`                                          | Max sessions in a listing                                                      |
-| `maxMessages`          | `50`                                           | Max messages per browse page                                                   |
-| `maxWindow`            | `10`                                           | Max context window size                                                        |
-| `defaultWidth`         | `200`                                          | Default snippet width                                                          |
+| Option                 | Default                                                 | Description                                                                    |
+| ---------------------- | ------------------------------------------------------- | ------------------------------------------------------------------------------ |
+| `storePath`            | `~/.cache/opencode-session-recall/store-opencode-v2.db` | Path to the derived SQLite store                                               |
+| `coldPass`             | `true`                                                  | Run the background distiller cold pass that builds the store                   |
+| `concurrency`          | `3`                                                     | Max concurrent SDK fetches shared by drill and distiller                       |
+| `drillSessions`        | `12`                                                    | How many shortlisted sessions a query drills into                              |
+| `semanticSlots`        | `2`                                                     | Drill slots reserved for the top pure-semantic cards (semantic on); 0 disables |
+| `drillPageMessages`    | `25`                                                    | Messages per page during an untargeted drill                                   |
+| `drillCharsPerSession` | `1,500,000`                                             | Retained-chars budget per drilled session                                      |
+| `drillCharsPerQuery`   | `20,000,000`                                            | Retained-chars budget across all sessions in one drill                         |
+| `deepCharsPerQuery`    | `30,000,000`                                            | Retained-chars budget for one deep (output-inclusive) sweep                    |
+| `cacheMaxChars`        | `24,000,000`                                            | Retained-chars budget for the drilled-session LRU; keeps repeat queries warm   |
+| `distillConcurrency`   | `2`                                                     | Sessions the cold pass distills in parallel                                    |
+| `distillDelayMs`       | `25`                                                    | Politeness delay between a session's page fetches during distillation          |
+| `ftsRowsPerSession`    | `5000`                                                  | Per-session slim-index row cap; giant sessions keep their newest rows          |
+| `inventoryTokens`      | `200`                                                   | Card inventory token cap (code anchors plus digest tokens)                     |
+| `maxSessions`          | unlimited                                               | Hard max sessions per search; caps `recall.sessionLimit`                       |
+| `maxResults`           | `50`                                                    | Max results per search                                                         |
+| `maxSessionList`       | `100`                                                   | Max sessions in a listing                                                      |
+| `maxMessages`          | `50`                                                    | Max messages per browse page                                                   |
+| `maxWindow`            | `10`                                                    | Max context window size                                                        |
+| `defaultWidth`         | `200`                                                   | Default snippet width                                                          |
 
 ## Recall is not memory
 
@@ -298,7 +377,7 @@ This plugin reads them back through the OpenCode SDK:
 
 ### The derived store
 
-Everything in this section describes the default persistent mode; [ephemeral mode](#ephemeral-mode-opt-in) opts out of all of it. A background distiller reads history through the SDK once and writes a compact index to a local SQLite file (`~/.cache/opencode-session-recall/store-v1.db`). The first cold pass walks every session one at a time, distills each into a card plus a set of slim index rows, and checkpoints as it goes; after that, opencode's `session.idle` and related events drive incremental updates, so the store stays current without polling. It is derived and versioned: delete the file and it rebuilds itself in the background, and a store written by a newer build than yours makes the plugin fall back to a degraded metadata-only mode rather than misread it. Multiple opencode processes share the file safely through a single-writer lease. The store uses the runtime's built-in SQLite (`bun:sqlite`, with `node:sqlite` for tests), so it adds no npm dependency; if neither driver is available, the plugin degrades to in-memory metadata cards with no persistence.
+Everything in this section describes persistent mode; [ephemeral mode](#ephemeral-mode-opt-in) opts out. The V2 distiller reads history through bounded public-client pages and writes `~/.cache/opencode-session-recall/store-opencode-v2.db`. Its cold pass checkpoints session cards and slim index rows; `session.idle` and related events drive incremental updates afterward. The derived store can be rebuilt, has schema-version fencing, and is shared through a single-writer lease. SQLite uses `bun:sqlite` in OpenCode or `node:sqlite` in tests; without a driver, recall degrades to in-memory metadata cards.
 
 ### Two tiers: cards and the slim index
 
@@ -325,7 +404,12 @@ The plugin always answers something. With no SQLite driver, it serves metadata-o
 
 ```jsonc
 {
-  "plugin": [["opencode-session-recall", { "mode": "ephemeral" }]],
+  "plugins": [
+    {
+      "package": "/absolute/path/opencode-session-recall",
+      "options": { "mode": "ephemeral" },
+    },
+  ],
 }
 ```
 
@@ -353,9 +437,12 @@ The model (`minishlab/potion-base-8M` by default, roughly 30 MB) is downloaded o
 
 ```jsonc
 {
-  "opencode-session-recall": {
-    "summaries": { "enabled": true, "model": "anthropic/claude-haiku-4-5" },
-  },
+  "plugins": [
+    {
+      "package": "/absolute/path/opencode-session-recall",
+      "options": { "summaries": { "enabled": true, "model": "anthropic/claude-haiku-4-5" } },
+    },
+  ],
 }
 ```
 
@@ -363,14 +450,14 @@ The `model` is required as `"providerID/modelID"`; without a valid one the featu
 
 A written summary improves three things when present. It joins both the lexical card index and the semantic embedding text, so a paraphrase query has more to match than raw identifiers (this compounds with the semantic layer). It becomes the `recall_sessions` digest. And the auto-recall and compaction hook payloads prefer it over the mechanical summary head.
 
-The cost is bounded by construction. The SDK has no completion endpoint, so the summarizer drives a throwaway worker session per batch (titled `[recall-summarizer]`, tools disabled, excluded from every recall path) and batches about fifteen cards per prompt. All summary work runs through one serialized queue on the process holding the distill lease, after the distiller cold pass and on the same idle path a re-distill uses, so only one prompt is ever in flight. A content hash skips any card whose fields have not changed. A shared per-pass prompt budget (`summaries.maxPromptsPerPass`, default 200) bounds how many prompts run, a per-prompt timeout aborts a stuck generation (so it caps spend, not just waiting), and the run stops early if the model fails several times in a row. Worker create, delete, and list calls share the recall fetch gate; the long-running prompt itself does not, so it never holds a permit that would stall a foreground query. Changing the prompt template re-summarizes everything once. Summaries do not sync across machines; each machine builds its own from the local store.
+The cost is bounded by construction. The V2 adapter uses transient `session.generate` calls in throwaway worker sessions (titled `[recall-summarizer]`, excluded from every recall path), batching about fifteen cards per prompt. Work runs through one serialized queue on the process holding the distill lease, with content-hash skipping, a per-pass prompt budget (`summaries.maxPromptsPerPass`, default 200), a per-prompt timeout, and early termination on repeated failures. Worker create/delete/list/abort calls share the fetch gate; generation does not hold a permit that would stall foreground recall. Summaries spend tokens and remain opt-in. They do not sync across machines.
 
-On safety: the worker prompt carries only card fields (never message bodies), disables tools two ways best-effort (a disabled-tools map on the prompt and a deny-all permission ruleset on the throwaway session, probed once and dropped if the server rejects the shape), and only its text reply is read. Neither disable is a hard guarantee, because opencode derives tool access from the agent, not the prompt. For an enforced block, define a deny-all agent and point `summaries.agent` at it, so the model behind the summarizer literally cannot run a tool:
+The V2 adapter always creates workers with deny-all session permissions and uses transient generation rather than the agent tool loop. Only card fields (not message bodies) enter the prompt. An optional restricted agent can be configured as well:
 
 ```json title="opencode.json"
 {
-  "agent": {
-    "recall-summarizer": { "permission": { "*": "deny" } }
+  "agents": {
+    "recall-summarizer": { "permissions": [{ "action": "*", "resource": "*", "effect": "deny" }] }
   }
 }
 ```

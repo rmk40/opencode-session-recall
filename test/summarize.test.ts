@@ -2,7 +2,7 @@ import { afterAll, describe, expect, it, vi } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { openSqlite } from "../src/sqlite.js";
+import { openSqlite, type SqliteDb } from "../src/sqlite.js";
 import { openStore, type Card, type PartTextRow, type Store } from "../src/store.js";
 import { createFetchGate, type FetchGate } from "../src/fetch-gate.js";
 import { createDistiller, type Distiller } from "../src/distill.js";
@@ -39,7 +39,9 @@ import {
 import type { OpencodeClient } from "@opencode-ai/sdk/v2";
 
 const tmpDirs: string[] = [];
+const databases: SqliteDb[] = [];
 afterAll(() => {
+  for (const db of databases) db.close();
   for (const dir of tmpDirs) rmSync(dir, { recursive: true, force: true });
 });
 
@@ -48,6 +50,7 @@ async function freshStore(): Promise<Store> {
   tmpDirs.push(dir);
   const db = await openSqlite(join(dir, "store.db"));
   if (!db) throw new Error("openSqlite returned null");
+  databases.push(db);
   const store = openStore(db);
   if (!store) throw new Error("openStore returned null");
   return store;

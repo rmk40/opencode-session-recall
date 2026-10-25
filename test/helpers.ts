@@ -2,7 +2,7 @@ import { expect } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { tool, type ToolContext, type ToolDefinition } from "@opencode-ai/plugin";
+import { tool, type ToolContext, type ToolDefinition } from "../src/tool.js";
 import type {
   AssistantMessage,
   GlobalSession,
@@ -619,9 +619,7 @@ export type SummaryPromptCall = {
  *  past the summarizer's timeout via `delayMs`), `error` returns an SDK error,
  *  `throw` makes the call reject. */
 export type SummaryPromptResult =
-  | { text: string; delayMs?: number }
-  | { error: string }
-  | { throw: true };
+  { text: string; delayMs?: number } | { error: string } | { throw: true };
 
 export type SummarizerClient = {
   client: OpencodeClient;

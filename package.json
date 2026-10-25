@@ -16,7 +16,8 @@
     }
   },
   "files": [
-    "dist"
+    "dist",
+    "server.js"
   ],
   "scripts": {
     "dev": "opencode plugin dev",
@@ -28,7 +29,7 @@
     "test": "vitest run",
     "test:typecheck": "tsc -p tsconfig.test.json --noEmit",
     "typecheck": "tsc --noEmit",
-    "compile": "tsup src/opencode-session-recall.ts --format esm --external bun:sqlite && tsc --emitDeclarationOnly --outDir dist",
+    "compile": "tsup src/opencode-session-recall.ts --format esm --external bun:sqlite --external @opencode/plugin --external @opencode/client && tsc --emitDeclarationOnly --outDir dist",
     "check": "npm run format:check && npm run lint && npm run test:typecheck && npm run test && npm run typecheck && npm run compile",
     "check:clean": "git diff --quiet && git diff --cached --quiet",
     "ci": "npm run check",
@@ -63,9 +64,15 @@
   },
   "license": "MIT",
   "peerDependencies": {
-    "@opencode-ai/plugin": ">=1.2.0"
+    "@opencode/plugin": "^2.0.26"
+  },
+  "peerDependenciesMeta": {
+    "@opencode/plugin": {
+      "optional": true
+    }
   },
   "dependencies": {
+    "@opencode/client": "2.0.26",
     "@opencode-ai/sdk": "^1.3.2",
     "fastest-levenshtein": "^1.0.16",
     "minisearch": "^7.2.0",
@@ -73,6 +80,7 @@
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
+    "@opencode/plugin": "2.0.26",
     "@opencode-ai/plugin": "^1.18.23",
     "@types/node": "^25.6.0",
     "eslint": "^10.2.0",

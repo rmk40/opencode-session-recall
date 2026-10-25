@@ -1,5 +1,5 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
-import type { ToolDefinition } from "@opencode-ai/plugin";
+import type { ToolDefinition } from "../src/tool.js";
 import type { Part, Session } from "@opencode-ai/sdk/v2";
 import { search } from "../src/search.js";
 import { deriveCard, type DistillSessionMeta } from "../src/distill.js";

@@ -1,4 +1,5 @@
-import { tool, type ToolDefinition, type ToolContext } from "@opencode-ai/plugin";
+import type { ToolDefinition, ToolContext } from "./tool.js";
+import { tool } from "./tool.js";
 import type { OpencodeClient, Session, GlobalSession, Part, Message } from "@opencode-ai/sdk/v2";
 import {
   errmsg,

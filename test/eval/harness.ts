@@ -10,7 +10,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { OpencodeClient, Session } from "@opencode-ai/sdk/v2";
-import type { ToolContext, ToolDefinition } from "@opencode-ai/plugin";
+import type { ToolContext, ToolDefinition } from "../../src/tool.js";
 import type { EvidenceClass, Limits, SearchOutput } from "../../src/types.js";
 import { DISCOVERY_LIMIT } from "../../src/types.js";
 import {
