@@ -8,14 +8,14 @@ cd opencode-session-recall
 npm install
 npm run typecheck    # type-check without emitting
 npm run compile      # build with tsup + tsc declarations
-npm run dev          # run in opencode plugin dev mode
+# Load the absolute checkout path through V2's `plugins` config after compiling.
 ```
 
 ### Requirements
 
 - Node.js 20+
 - TypeScript 6+
-- An [OpenCode](https://github.com/opencode-ai/opencode) installation (for live testing)
+- OpenCode V1 >=1.18.29 or V2; host smoke tests target V1 1.18.35 and V2 2.0.26
 
 ### Build
 
@@ -26,6 +26,18 @@ npm run typecheck && npm run compile
 ```
 
 Output goes to `dist/`. The single entry point is `src/opencode-session-recall.ts`.
+
+The entrypoint lazily dispatches V1 `server()` to `src/v1-plugin.ts` and V2
+`setup()` to `src/v2-plugin.ts`. V1 reuses the supplied legacy SDK transport;
+V2 registers native tools and context/compaction hooks. `src/runtime.ts` retains
+the shared engine and `src/v2-client.ts` normalizes V2 history. Keep host SDKs
+external and the V2 plugin peer optional; neither host should load the other's
+adapter at import time. Build all generated chunks alongside the root entry.
+
+See README's install section for service discovery and explicit-server options.
+For focused checks, run `npx vitest run test/v1.test.ts test/v2.test.ts`.
+Run `bun scripts/test-v1-host.mjs /path/to/opencode-v1` for V1's real
+loader/API check; use an isolated standalone server for full V2 host testing.
 
 ## Architecture
 

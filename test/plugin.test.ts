@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { tool, type Hooks, type PluginInput, type ToolDefinition } from "@opencode-ai/plugin";
+import type { PluginInput } from "@opencode-ai/plugin";
+import { tool, type Hooks, type ToolDefinition } from "../src/tool.js";
 import { mkdtempSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -85,14 +86,25 @@ vi.mock("../src/semantic/embedder.js", () => ({
   },
 }));
 
-const plugin = await import("../src/opencode-session-recall.js");
+const plugin = await import("../src/runtime.js");
 const activeHooks: Hooks[] = [];
 
 // Every entry call opens a card store and (with coldPass) starts a background
 // distiller. Default tests use an in-memory store with the cold pass off so they
 // exercise only wiring, with no filesystem side effect or leaked timers.
 async function server(input: PluginInput, opts: Record<string, unknown> = {}) {
-  const hooks = await plugin.default.server(input, {
+  const config = (
+    input.client as unknown as {
+      _client: {
+        getConfig(): { baseUrl?: string; fetch?: unknown; headers?: Record<string, string> };
+      };
+    }
+  )._client.getConfig();
+  const headers = { ...config.headers };
+  delete headers["x-opencode-directory"];
+  const client = createOpencodeClient({ ...config, directory: input.directory });
+  const unscoped = createOpencodeClient({ ...config, headers });
+  const hooks = await plugin.createRuntime(client as never, unscoped as never, {
     storePath: ":memory:",
     coldPass: false,
     ...opts,
@@ -229,13 +241,9 @@ describe("plugin entry", () => {
     expect(hooks["experimental.session.compacting"]).toBeDefined();
   });
 
-  it("deduplicates primary tools and honors primary:false", async () => {
+  it("does not mutate legacy primary_tools configuration in V2", async () => {
     const hooks = await server(ctx({ fetch: vi.fn() }), {});
-    const config = {
-      experimental: { primary_tools: ["existing_tool", "recall"] },
-    };
-    await hooks.config?.(config);
-    expect(config.experimental.primary_tools).toEqual(["existing_tool", ...TOOLS]);
+    expect(hooks.config).toBeUndefined();
 
     const withoutPrimary = await server(ctx({ fetch: vi.fn() }), {
       primary: false,
@@ -913,11 +921,12 @@ describe("plugin entry", () => {
     expect(llmFacingChars(mustTool(hooks.tool?.recall))).toBeLessThan(6_500);
   });
 
-  it("fails clearly if SDK internals needed for transport extraction change", async () => {
-    await expect(server({ client: {} } as unknown as PluginInput, {})).rejects.toThrow(
-      "SDK internals changed",
-    );
-
-    await expect(server(ctx({}), {})).rejects.toThrow("SDK client has no custom fetch");
+  it("accepts injected history clients without private SDK transport internals", async () => {
+    const hooks = await plugin.createRuntime({} as never, {} as never, {
+      storePath: ":memory:",
+      coldPass: false,
+    });
+    activeHooks.push(hooks);
+    expect(Object.keys(hooks.tool ?? {}).sort()).toEqual([...TOOLS].sort());
   });
 });

@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { tool } from "@opencode-ai/plugin";
+import { tool } from "../src/tool.js";
 import { search } from "../src/search.js";
 import type { SearchOutput, ErrorOutput } from "../src/types.js";
 import {

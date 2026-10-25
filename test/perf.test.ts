@@ -20,7 +20,7 @@
  */
 import { describe, expect, it } from "vitest";
 import type { OpencodeClient, Message, Part, Session } from "@opencode-ai/sdk/v2";
-import type { ToolContext, ToolDefinition } from "@opencode-ai/plugin";
+import type { ToolContext, ToolDefinition } from "../src/tool.js";
 import { openSqlite } from "../src/sqlite.js";
 import { openStore, type Card, type PartTextRow } from "../src/store.js";
 import { createCardsRuntime } from "../src/cards.js";

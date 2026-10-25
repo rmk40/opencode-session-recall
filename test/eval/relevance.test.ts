@@ -1,5 +1,5 @@
 import { afterAll, beforeAll, describe, it, expect } from "vitest";
-import type { ToolDefinition } from "@opencode-ai/plugin";
+import type { ToolDefinition } from "../../src/tool.js";
 import type { SearchOutput } from "../../src/types.js";
 import { EVAL_CASES } from "./cases.js";
 import { evalContext, makeDegradedEvalSearch, makeEvalSearch, runEval } from "./harness.js";

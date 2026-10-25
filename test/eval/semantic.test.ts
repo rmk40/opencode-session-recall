@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { ToolDefinition } from "@opencode-ai/plugin";
+import type { ToolDefinition } from "../../src/tool.js";
 import { SemanticEmbedder } from "../../src/semantic/embedder.js";
 import { cosineSimilarity } from "../../src/semantic/similarity.js";
 import type { SearchOutput } from "../../src/types.js";

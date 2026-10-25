@@ -1,5 +1,5 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
-import type { ToolDefinition } from "@opencode-ai/plugin";
+import type { ToolDefinition } from "../src/tool.js";
 import { buildSuggestions, search, type SearchDeps } from "../src/search.js";
 import { cardsLiteFromSessions, createCardsRuntime } from "../src/cards.js";
 import { createDrill } from "../src/drill.js";

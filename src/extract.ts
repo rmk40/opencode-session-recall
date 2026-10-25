@@ -252,7 +252,8 @@ export function formatMsg(msg: { info: Message; parts: Array<Part> }): MessageIt
   const info = msg.info;
   let model: string | undefined;
   if (info.role === "assistant") model = (info as AssistantMessage).modelID;
-  else model = (info as UserMessage).model.modelID;
+  // V2 user messages do not carry a model selection.
+  else model = (info as UserMessage).model?.modelID;
 
   return {
     message: {

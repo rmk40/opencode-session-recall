@@ -6,6 +6,26 @@ All notable changes to this project are documented here. This project follows
 
 ## Unreleased
 
+### Dual-host OpenCode fork
+
+- Add a native V2 plugin entrypoint, JSON Schema tool registration, context and
+  compaction hooks, event subscription cleanup, and public V2 history client.
+- Preserve bounded newest-first message pagination and paginate session discovery.
+- Normalize V2 text, reasoning, tool output, shell and compaction records for the
+  existing search engine; tolerate user messages without a model selection.
+- Discover the existing matching-version background service lazily, with an
+  explicit-server option; never start or replace a service from plugin setup.
+- Isolate the V2 derived store as `store-opencode-v2.db`; V1 caches are untouched.
+- Expose lazy V1 `server()` and V2 `setup()` from one default export. V1 >=1.18.29
+  can use the same built directory; V1 1.18.35 and V2 2.0.26 have host smoke tests.
+- Restore V1 supplied-transport/authentication handling, primary-tools opt-out,
+  hooks and cleanup. Keep `primary` a no-op in V2 and caches separate by host.
+- Move the legacy SDK to runtime dependencies for the V1 adapter and make the
+  V2 plugin peer optional. Neither adapter loads the other's host API eagerly.
+- Make V2 service discovery channel-aware (`service-local.json` for source runs).
+- Add V2 HTTP/registration regression tests and close summarizer test databases
+  before removing their directories on Windows.
+
 ### Added
 
 - **`authorship` filter on `recall`**: ask for what a human actually typed.

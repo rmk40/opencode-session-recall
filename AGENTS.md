@@ -1,5 +1,32 @@
 # AGENTS.md
 
+## Dual-host fork notes (override the upstream host notes below)
+
+- `src/opencode-session-recall.ts` default-exports one combined object, with lazy
+  V1 `server()` and V2 `setup()`. V1 requires >=1.18.29 (tested with 1.18.35).
+  `src/v1-plugin.ts` supplies the V1 transport and primary-tools config hook;
+  `src/v2-plugin.ts` registers native V2 transforms/hooks. `src/runtime.ts` is shared.
+- `src/v2-client.ts` is the V2 history boundary. Use public V2 APIs and
+  JSON cursors, never private SDK transports or direct OpenCode DB access.
+  V1's SDK is runtime-only in the lazy V1 adapter. The legacy plugin package is
+  still types-only. Keep V2's plugin peer optional so V1 does not require it.
+- Use `plugins` and object-form options in V2 config. The V2 cache defaults to
+  `store-opencode-v2.db`; do not share a cache with V1. `primary` is a retained
+  no-op in V2 because V2 uses normal agent permissions; V1 retains its behavior.
+- Automatic recall and the nudge edit outgoing V2 context, not persisted user
+  input. Compaction preservation edits the compaction request's system context.
+- `test/v2.test.ts` exercises native registration, public client pagination,
+  HTTP retrieval, context hooks, and cleanup. Run the full `npm run check` too.
+- The normal workflow discovers an existing matching-version managed service.
+  Explicit/standalone servers need `options.server.url` (and optional headers).
+  Never call `Service.ensure` from the plugin or modify global config in tests.
+- Build `dist/` before host testing. A new TUI session may still reuse a loaded
+  background-server plugin; reload/restart the server when needed, with the
+  user's approval if live sessions would be affected.
+- Test `test/v1.test.ts` and `test/v2.test.ts`, plus the isolated V1 loader/API
+  probe `bun scripts/test-v1-host.mjs /path/to/opencode-v1`. Never point
+  V1 and V2 at the same explicit storePath; defaults remain separate.
+
 Operational notes for agents working on this plugin. This is the stuff that is
 **not** obvious from the code and cost real time to learn. Architecture, build
 steps, and conventions live in [CONTRIBUTING.md](CONTRIBUTING.md) — read that for
@@ -72,16 +99,16 @@ import `bun:*` or `node:*` directly.
 
 ## How the plugin is loaded (why a rebuild is needed to test live)
 
-- The global opencode config (`~/.config/opencode/opencode.json`) loads this
-  plugin **by directory path**, and opencode resolves it via `package.json`
-  `main` → `dist/opencode-session-recall.js`. **Source changes do nothing until
+- V2 local-directory discovery uses the conventional `server.js` bridge →
+  `dist/opencode-session-recall.js`, not `package.json` exports or `main`.
+  Keep the bridge in the published files too. **Source changes do nothing until
   you rebuild `dist/`** (`npm run compile`, or `npx tsup ... --format esm` for a
   quick JS-only rebuild during debugging).
 - A **running** opencode process has already loaded the old `dist/`. After
   rebuilding you must **restart the session** (or relaunch) for it to pick up
   changes. Live testing loop: edit → rebuild dist → restart the tuistory session
   → reproduce.
-- `files: ["dist"]` in `package.json` means only `dist/` is published to npm;
+- `files: ["dist", "server.js"]` in `package.json` controls what is published to npm;
   CHANGELOG, AGENTS.md, src, etc. never ship.
 
 ## Live end-to-end testing with tuistory (when unit tests can't reach it)
