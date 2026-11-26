@@ -73,9 +73,11 @@ export async function cardRecall(
   // Tier-1.5 needle backfill: sessions whose card missed the anchor but whose
   // slim FTS index carries it. Answered by SQLite — still zero message fetches.
   if (deps.store && (parsed.codeTokens.length > 0 || parsed.phrases.length > 0)) {
+    // The same sessions `rank` excludes: the named family and the one session.
     const excluded = filters.excludeFamilyOf
       ? deps.cards.exclusionFamily(filters.excludeFamilyOf)
       : new Set<string>();
+    if (filters.excludeSessionId) excluded.add(filters.excludeSessionId);
     const rows = deps.store.ftsSearch({
       strong: [...parsed.codeTokens, ...parsed.phrases],
       weak: parsed.tokens,

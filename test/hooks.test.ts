@@ -3,7 +3,8 @@ import { systemNudge, NUDGE_SENTINEL, NUDGE_TEXT } from "../src/hooks/system-nud
 import { shouldAutoRecall, formatAutoRecallBlock, autoRecall } from "../src/hooks/auto-recall.js";
 import { formatPreservationBlock, compactionRecall } from "../src/hooks/compaction-recall.js";
 import { partId } from "../src/hooks/part-id.js";
-import type { CardRecallHit } from "../src/hooks/card-recall.js";
+import { cardRecall, type CardRecallHit } from "../src/hooks/card-recall.js";
+import type { CardFilters } from "../src/cards.js";
 import type { Card } from "../src/store.js";
 import {
   PROJECT_DIR,
@@ -12,6 +13,7 @@ import {
   globalSessionFrom,
   makeFakeHarness,
   makeRecallDeps,
+  reasoningPart,
   session,
   setStrictNoLimitMessages,
   textPart,
@@ -347,6 +349,37 @@ describe("autoRecall hook", () => {
     // The whole point of the card-tier rework: no drill, no fetch.
     expect(h.calls.messages).toHaveLength(0);
     expect(h.calls.message).toHaveLength(0);
+  });
+});
+
+describe("cardRecall slim-index backfill", () => {
+  it("leaves out the session excludeSessionId names, as card ranking does", async () => {
+    // The phrase sits only in reasoning parts, which the cards leave out, so
+    // only the slim-index backfill finds either session.
+    const h = makeFakeHarness();
+    const now = Date.now();
+    for (const id of ["s-fts-a", "s-fts-b"]) {
+      const sess = session(id, `Queue ${id}`, PROJECT_DIR, now - 2_000);
+      h.sessions.push(sess);
+      h.globalSessions.push(globalSessionFrom(sess));
+      h.messagesBySession[id] = [
+        bundle(assistantMessage(`m-${id}`, id, now - 2_000), [
+          reasoningPart(`p-${id}`, id, `m-${id}`, "The zorvanqix eviction stalls under load."),
+        ]),
+      ];
+    }
+    const { deps, cleanup } = await hookDeps(h);
+    const query = '"zorvanqix eviction"';
+    const ids = async (filters?: CardFilters): Promise<string[]> =>
+      (await cardRecall(deps, query, { limit: 5, ...(filters && { filters }) }))
+        .map((hit) => hit.card.sessionId)
+        .sort();
+
+    const all = await ids();
+    const excluded = await ids({ excludeSessionId: "s-fts-a" });
+    cleanup();
+    expect(all).toEqual(["s-fts-a", "s-fts-b"]);
+    expect(excluded).toEqual(["s-fts-b"]);
   });
 });
 
