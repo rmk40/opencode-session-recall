@@ -6,7 +6,7 @@ import { search } from "../src/search.js";
 import { sessions as sessionsTool } from "../src/sessions.js";
 import { createFetchGate, type FetchGate } from "../src/fetch-gate.js";
 import { cardsLiteFromSessions } from "../src/cards.js";
-import { encodeContinuation } from "../src/output.js";
+import { decodeMessagesCursor, encodeContinuation } from "../src/output.js";
 import { createUnavailableSource, type HistorySource } from "../src/history/source.js";
 import { createV2HistorySource, openOpencodeDb, type V2SourceOptions } from "../src/history/v2.js";
 import type {
@@ -663,6 +663,108 @@ describe("recall_messages order", () => {
     });
     expect(conflict.error).toContain("browses newest first");
   });
+});
+
+describe("recall_messages cursors resumed with other arguments", () => {
+  type Args = { role?: "user"; query?: "needle"; limit: number; scan?: number };
+  /** The scan session's ids a call with `args` keeps. */
+  const keeps =
+    (args: Args) =>
+    (id: string): boolean =>
+      (args.role === undefined || isUser(id)) && (args.query === undefined || isNeedle(id));
+
+  // Each first call stops partway through a page it read, so its cursor
+  // names the first message it did not read. The second call reads pages of
+  // a different size: 2 or 4 messages unfiltered, 50 filtered.
+  const cases: Array<{ name: string; first: Args; second: Args }> = [
+    {
+      name: "a filtered call, then an unfiltered one with a smaller limit",
+      first: { role: "user", limit: 3 },
+      second: { limit: 2 },
+    },
+    {
+      name: "an unfiltered call, then a filtered one",
+      first: { limit: 5, scan: 3 },
+      second: { role: "user", limit: 3 },
+    },
+    {
+      name: "a call, then the same call with its filter removed",
+      first: { query: "needle", limit: 4 },
+      second: { limit: 4 },
+    },
+  ];
+
+  it.each(cases.flatMap((c) => (["newest", "oldest"] as const).map((order) => ({ ...c, order }))))(
+    "resumes right after the last message read: $name, $order first",
+    async (c) => {
+      const { source, ids } = await v2ScanSession();
+      const tool = messagesTool(source, gate, TEST_LIMITS);
+      const inOrder = c.order === "oldest" ? ids : [...ids].reverse();
+
+      const one = await runTool<MessagesOutput>(tool, {
+        sessionID: "ses_scan",
+        order: c.order,
+        ...c.first,
+      });
+      const read = one.pagination.scanned;
+      expect(idsOf(one)).toEqual(inOrder.slice(0, read).filter(keeps(c.first)));
+      const cursor = one.pagination.nextCursor!;
+      expect(decodeMessagesCursor(cursor)).toMatchObject({
+        ok: true,
+        value: { at: { message: inOrder[read] } },
+      });
+
+      const two = await runTool<MessagesOutput>(tool, {
+        sessionID: "ses_scan",
+        ...c.second,
+        cursor,
+      });
+      expect(two.pagination.order).toBe(c.order);
+      expect(idsOf(two)).toEqual(
+        inOrder.slice(read).filter(keeps(c.second)).slice(0, c.second.limit),
+      );
+    },
+  );
+
+  it.each(["newest", "oldest"] as const)(
+    "resumes a trimmed output's continuation with other arguments where the output stopped (%s first)",
+    async (order) => {
+      // ~7 KB messages: six needles fill the output budget, so the output
+      // stops in a needle well into its 50-message page.
+      const { source, ids } = await v2ScanSession(SCAN_COUNT, {}, 7_000);
+      const tool = messagesTool(source, gate, TEST_LIMITS);
+      const inOrder = order === "oldest" ? ids : [...ids].reverse();
+      const needles = inOrder.filter(isNeedle);
+
+      const one = await runTool<MessagesOutput>(tool, {
+        sessionID: "ses_scan",
+        query: "needle",
+        limit: 20,
+        order,
+      });
+      expect(one.trimmed).toBe(true);
+      const shown = idsOf(one);
+      expect(shown).toEqual(needles.slice(0, shown.length));
+      const last = one.messages.at(-1)!;
+      const cut = last.parts.find((p) => p.cutAt);
+      const anchor = cut ? last.message.id : needles[shown.length]!;
+      expect(inOrder.indexOf(anchor)).toBeGreaterThan(6);
+
+      const two = await runTool<MessagesOutput>(tool, {
+        sessionID: "ses_scan",
+        limit: 2,
+        cursor: one.continuation,
+      });
+      const from = inOrder.indexOf(anchor);
+      expect(idsOf(two)).toEqual(inOrder.slice(from, from + 2));
+      if (cut) {
+        expect(two.messages[0]!.parts[0]).toMatchObject({
+          id: cut.id,
+          resumedAt: { field: cut.cutAt!.field, offset: cut.cutAt!.offset },
+        });
+      }
+    },
+  );
 });
 
 describe("recall_get", () => {

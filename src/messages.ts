@@ -46,7 +46,9 @@ const SCAN_MAX = 2_000;
 
 /** Pages one call reads at most, whatever its scan budget. A page of large
  *  messages holds few of them and can be as large as the history source's
- *  byte ceiling, so the message count alone does not bound the bytes read. */
+ *  byte ceiling (4 MiB on v2 by default), so the message count alone does
+ *  not bound the bytes read. One call reads at most 40 pages × that ceiling
+ *  (160 MiB at the v2 default), one page at a time. */
 const SCAN_PAGES_MAX = 40;
 
 const ROLES = ["user", "assistant", "all"] as const;
@@ -61,9 +63,14 @@ function msgMatches(msg: { parts: Array<Part> }, query: string): boolean {
   return false;
 }
 
-/** A message the scan kept, as output, with the page cursor it was read
- *  from (null for the first page in the browse's order). */
-type Match = { item: MessageItem; page: string | null };
+/** A page as one read returned it: its cursor (null for the first page in
+ *  the browse's order) and the message count that read asked for. A
+ *  continuation that resumes at a message on it asks for at least that many,
+ *  so the message is on the page it reads whatever this call's arguments. */
+type PageRef = { cursor: string | null; size: number };
+
+/** A message the scan kept, as output, with the page it was read from. */
+type Match = { item: MessageItem; page: PageRef };
 
 export function messages(source: HistorySource, gate: FetchGate, limits: Limits): ToolDefinition {
   return tool({
@@ -116,6 +123,9 @@ export function messages(source: HistorySource, gate: FetchGate, limits: Limits)
       let order: MessagesOrder = requested ?? "newest";
       let pageCursor: string | null = cursor ?? null;
       let resume: MessagePosition | undefined;
+      // The message count of the read that produced the resume message's
+      // page, when the cursor records it.
+      let resumeSize: number | undefined;
       if (cursor && isContinuation(cursor)) {
         const decoded = decodeMessagesCursor(cursor);
         if (!decoded.ok) return writeError(decoded.error);
@@ -133,6 +143,7 @@ export function messages(source: HistorySource, gate: FetchGate, limits: Limits)
         order = made;
         pageCursor = decoded.value.page;
         resume = decoded.value.at;
+        resumeSize = decoded.value.pageLimit;
       }
       const ascending = order === "oldest";
       if (ascending && !source.messagePageAscending) {
@@ -142,23 +153,31 @@ export function messages(source: HistorySource, gate: FetchGate, limits: Limits)
       }
       const filtered = role !== "all" || query !== undefined;
       const pageSize = filtered ? Math.max(limit, SCAN_PAGE) : limit;
+      // The page a continuation resumes on is read at least as large as the
+      // read that produced it, whatever this call's limit and filters, and
+      // never larger than any page this tool asks for.
+      const firstSize =
+        resumeSize === undefined
+          ? pageSize
+          : Math.max(pageSize, Math.min(resumeSize, Math.max(limits.maxMessages, SCAN_PAGE)));
 
       ctx.metadata({ title: "Browsing messages..." });
 
       try {
         // Always a bounded page (limit + cursor), through the shared gate —
         // never an unpaginated fetch and never outside the concurrency budget.
-        const read = (page: string | null, size: number): Promise<MessagePage> =>
-          gate.runQuery(() =>
+        // `ref` is the page `page` was read as.
+        let ref: PageRef = { cursor: pageCursor, size: firstSize };
+        const read = (next: PageRef): Promise<MessagePage> => {
+          ref = next;
+          const before = next.cursor ?? undefined;
+          return gate.runQuery(() =>
             ascending
-              ? source.messagePageAscending!({
-                  sessionID: sid,
-                  limit: size,
-                  after: page ?? undefined,
-                })
-              : source.messagePage({ sessionID: sid, limit: size, before: page ?? undefined }),
+              ? source.messagePageAscending!({ sessionID: sid, limit: next.size, after: before })
+              : source.messagePage({ sessionID: sid, limit: next.size, before }),
           );
-        let page = await read(pageCursor, pageSize);
+        };
+        let page = await read(ref);
         let pages = 1;
         let index = 0;
         if (resume) {
@@ -171,8 +190,7 @@ export function messages(source: HistorySource, gate: FetchGate, limits: Limits)
                 `This cursor's message ${anchor} is no longer where it was; browse again without cursor`,
               );
             }
-            pageCursor = page.nextCursor;
-            page = await read(pageCursor, pageSize);
+            page = await read({ cursor: page.nextCursor, size: pageSize });
             pages++;
           }
         }
@@ -185,7 +203,7 @@ export function messages(source: HistorySource, gate: FetchGate, limits: Limits)
         let scanned = 0;
         let foundBytes = 0;
         let stopped: MessagesStop | undefined;
-        let next: { page: string | null; anchor?: string } | undefined;
+        let next: { page: PageRef; anchor: string } | { page: string } | undefined;
         const budgetStop = (): MessagesStop | undefined =>
           found.length >= limit
             ? "limit"
@@ -203,11 +221,11 @@ export function messages(source: HistorySource, gate: FetchGate, limits: Limits)
             if (role !== "all" && message.info.role !== role) continue;
             if (query && !msgMatches(message, query)) continue;
             const item = messageItem(message);
-            found.push({ item, page: pageCursor });
+            found.push({ item, page: ref });
             foundBytes += utf8Length(JSON.stringify(item));
           }
           if (stopped) {
-            next = { page: pageCursor, anchor: page.items[index]!.info.id };
+            next = { page: ref, anchor: page.items[index]!.info.id };
             break;
           }
           if (page.nextCursor == null) {
@@ -219,11 +237,10 @@ export function messages(source: HistorySource, gate: FetchGate, limits: Limits)
             next = { page: page.nextCursor };
             break;
           }
-          pageCursor = page.nextCursor;
           // Unfiltered, every message matches, so a page asks for only the
           // matches still wanted.
           const wanted = filtered ? pageSize : limit - found.length;
-          page = await read(pageCursor, Math.min(wanted, scan - scanned));
+          page = await read({ cursor: page.nextCursor, size: Math.min(wanted, scan - scanned) });
           pages++;
           index = 0;
         }
@@ -259,14 +276,22 @@ export function messages(source: HistorySource, gate: FetchGate, limits: Limits)
         });
 
         const orderField = ascending ? { order: "oldest" as const } : {};
-        const scanNext = next
-          ? encodeMessagesCursor({
-              session: sid,
-              ...orderField,
-              page: next.page,
-              ...(next.anchor !== undefined && { at: { message: next.anchor } }),
-            })
-          : undefined;
+        // A cursor that resumes at a message names the page it was read on
+        // and the size of that read.
+        const resumeOn = (on: PageRef, at: MessagePosition): string =>
+          encodeMessagesCursor({
+            session: sid,
+            ...orderField,
+            page: on.cursor,
+            at,
+            pageLimit: on.size,
+          });
+        const scanNext =
+          next === undefined
+            ? undefined
+            : "anchor" in next
+              ? resumeOn(next.page, { message: next.anchor })
+              : encodeMessagesCursor({ session: sid, ...orderField, page: next.page });
         return writeOutput<PartPosition>({
           sections: [section("messages", formatted, fitMessage)],
           head: (stop, shown) => {
@@ -274,14 +299,9 @@ export function messages(source: HistorySource, gate: FetchGate, limits: Limits)
             // page that message was read from; otherwise the scan continues
             // after the last message it read.
             const continuation = stop
-              ? encodeMessagesCursor({
-                  session: sid,
-                  ...orderField,
-                  page: found[stop.index]!.page,
-                  at: {
-                    message: formatted[stop.index]!.message.id,
-                    ...(stop.rest && { at: stop.rest }),
-                  },
+              ? resumeOn(found[stop.index]!.page, {
+                  message: formatted[stop.index]!.message.id,
+                  ...(stop.rest && { at: stop.rest }),
                 })
               : undefined;
             const nextCursor = continuation ?? scanNext;

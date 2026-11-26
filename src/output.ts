@@ -738,14 +738,18 @@ export function decodeContextCursor(cursor: string): Decoded<ContextCursor> {
  * A `recall_messages` position: the session, the order it pages in (unset
  * for newest first), the history source's cursor of the page (null for the
  * first page in that order) and, when the output resumes inside that page
- * rather than at its start, the message (and place in it) it resumes at.
- * Token fields: `s`, `o`, `page`, `anchorId`, `part`, `field`, `offset`.
+ * rather than at its start, the message (and place in it) it resumes at,
+ * with the message count of the read that returned that page
+ * (`pageLimit`), so a later read of the page reaches the message whatever
+ * its own arguments. Token fields: `s`, `o`, `page`, `anchorId`, `part`,
+ * `field`, `offset`, `n`.
  */
 export type MessagesCursor = {
   session: string;
   order?: "oldest";
   page: string | null;
   at?: MessagePosition;
+  pageLimit?: number;
 };
 
 export function encodeMessagesCursor(c: MessagesCursor): string {
@@ -755,18 +759,27 @@ export function encodeMessagesCursor(c: MessagesCursor): string {
     page: c.page,
     anchorId: c.at?.message,
     ...positionFields(c.at?.at),
+    n: c.at ? c.pageLimit : undefined,
   });
 }
 
 export function decodeMessagesCursor(cursor: string): Decoded<MessagesCursor> {
   return decodeWith("recall_messages", cursor, (fields) => {
-    const { s: session, o: order } = fields;
+    const { s: session, o: order, n: pageLimit } = fields;
     const page =
       fields.page === null ? null : nonEmptyString(fields.page) ? fields.page : undefined;
     const at = readMessagePosition(fields);
     if (!nonEmptyString(session) || page === undefined || at === null) return null;
     if (order !== undefined && order !== "oldest") return null;
-    return { session, ...(order === "oldest" && { order }), page, ...(at && { at }) };
+    // A read size belongs to the page of the message it resumes at.
+    if (pageLimit !== undefined && (!isOffset(pageLimit) || pageLimit < 1 || !at)) return null;
+    return {
+      session,
+      ...(order === "oldest" && { order }),
+      page,
+      ...(at && { at }),
+      ...(isOffset(pageLimit) && { pageLimit }),
+    };
   });
 }
 
