@@ -13,15 +13,18 @@ import {
   openStore,
   defaultStorePath,
   pluginBuild,
-  SEMANTIC_MODEL_KEY,
-  VECTORS_REV_KEY,
   type Store,
   type StoreHost,
   type StoreIdentity,
   type Card,
 } from "../store.js";
 import { EMBED_REPRESENTATION } from "../embedding-text.js";
-import { createCardsRuntime, cardsLiteFromSessions, type CardSource } from "../cards.js";
+import {
+  createCardsRuntime,
+  cardsLiteFromSessions,
+  storeCardSource,
+  type CardSource,
+} from "../cards.js";
 import { createLiteRefresh, type LiteRefreshController } from "../lite-refresh.js";
 import { createDrill } from "../drill.js";
 import type { HistorySession } from "../history/model.js";
@@ -192,13 +195,7 @@ export const server: Plugin = async (ctx, options) => {
   // accidental driver-missing degraded path keeps the frozen one-shot snapshot.
   let liteCards: Card[] = [];
   const cardSource: CardSource = store
-    ? {
-        getCards: (embOpts) => store.allCards(embOpts),
-        revision: () => store.getMeta("cards_rev"),
-        vectorsRevision: () => store.getMeta(VECTORS_REV_KEY),
-        semanticModel: () => store.getMeta(SEMANTIC_MODEL_KEY),
-        writeEmbeddings: (model, gen, rows) => store.writeCardEmbeddings(model, gen, rows),
-      }
+    ? storeCardSource(store)
     : { getCards: () => liteCards, revision: () => undefined, degraded: true };
   let liteRefresh: LiteRefreshController | undefined;
   if (!store) {

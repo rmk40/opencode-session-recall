@@ -2353,7 +2353,7 @@ describe("explicit shortlist includes uncarded sessions", () => {
 
   it("drills a store-only fresh card the facade snapshot has not seen (refresh window)", async () => {
     const h = makeFakeHarness();
-    // Freeze the facade clock: refreshIfStale never re-checks the revision, so
+    // Freeze the facade clock: the card map never re-checks the revision, so
     // the pre-seed snapshot deterministically survives the second seed below.
     const { recall, store } = await setup(h, TEST_LIMITS, { cardsNow: () => 1_000 });
     // Force the runtime to take its snapshot of the seeded store NOW.
@@ -2728,6 +2728,74 @@ describe("recall drill cache", () => {
     const after = await runTool<SearchOutput>(recall, { ...scoped, query: "marigoldquest" });
     expect(after.results.map((r) => r.partID)).toContain("p-other-2");
     expect(after.coverage?.sessionStops?.sessions[0]).not.toHaveProperty("cached");
+  });
+});
+
+describe("recall card index use", () => {
+  /** A recall tool whose card runtime has a semantic embedder: any build of
+   *  the card index embeds the cards below, and any ranking embeds the query. */
+  async function semanticRecall(h: FakeHarness) {
+    const embed = vi.fn(() => Float32Array.from([1, 0]));
+    const { deps, store, cleanup } = await makeRecallDeps(h, TEST_LIMITS, {
+      semantic: { embedder: { ready: true, embed }, weight: 0.5 },
+    });
+    cleanups.push(cleanup);
+    // Enough distinct content words for the card to earn a vector.
+    store.upsertCard({
+      ...store.getCard("s-project-2")!,
+      inventory:
+        "reticulate splines calibrate manifold turbine gasket flange bearing sprocket lattice quiver zephyr",
+    });
+    return { recall: search(h.source, true, TEST_LIMITS, deps), embed, cards: deps.cards };
+  }
+
+  it.each([
+    { scope: "sessionID", args: { query: "walkthrough", sessionID: "s-other" } },
+    { scope: "the current session", args: { query: "rate-limit", scope: "session" } },
+    { scope: "a sessions list", args: { query: "walkthrough", sessions: ["s-other"] } },
+    {
+      scope: "a deep sessions list",
+      args: { query: "walkthrough", deep: true, sessions: ["s-other"] },
+    },
+  ])("never builds the card index for a search scoped to $scope", async ({ args }) => {
+    const { recall, embed, cards } = await semanticRecall(makeFakeHarness());
+    const out = await runTool<SearchOutput>(recall, args);
+    expect(out.ok).toBe(true);
+    expect(out.results.length).toBeGreaterThan(0);
+    expect(embed).not.toHaveBeenCalled();
+    expect(cards.semanticStatus()?.cardsWithVectors).toBe(0);
+  });
+
+  it("builds the card index for a ranked search", async () => {
+    const { recall, embed, cards } = await semanticRecall(makeFakeHarness());
+    const out = await runTool<SearchOutput>(recall, { query: "walkthrough" });
+    expect(out.ok).toBe(true);
+    expect(embed).toHaveBeenCalled();
+    expect(cards.semanticStatus()?.cardsWithVectors).toBeGreaterThan(0);
+  });
+
+  it("reports how many cards a ranking left out because the index was still updating", async () => {
+    const h = makeFakeHarness();
+    const { deps, cleanup } = await makeRecallDeps(h, TEST_LIMITS);
+    cleanups.push(cleanup);
+    const recallWith = (pending: number): ToolDefinition =>
+      search(h.source, true, TEST_LIMITS, {
+        ...deps,
+        cards: {
+          ...deps.cards,
+          // As when the search stopped waiting while an index update ran.
+          rank: (query, filters, stats) => {
+            const hits = deps.cards.rank(query, filters, stats);
+            if (stats) stats.pending = pending;
+            return hits;
+          },
+        },
+      });
+
+    const left = await runTool<SearchOutput>(recallWith(3), { query: "walkthrough" });
+    expect(left.coverage?.cards?.pending).toBe(3);
+    const none = await runTool<SearchOutput>(recallWith(0), { query: "walkthrough" });
+    expect(none.coverage?.cards).not.toHaveProperty("pending");
   });
 });
 

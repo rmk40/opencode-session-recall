@@ -27,7 +27,7 @@ import {
 import { openSqlite } from "../../src/sqlite.js";
 import { createFetchGate } from "../../src/fetch-gate.js";
 import { createDistiller, type Distiller } from "../../src/distill.js";
-import { createCardsRuntime, cardsLiteFromSessions } from "../../src/cards.js";
+import { createCardsRuntime, cardsLiteFromSessions, storeCardSource } from "../../src/cards.js";
 import { createDrill } from "../../src/drill.js";
 import type { HistorySource } from "../../src/history/source.js";
 import type { HistorySession } from "../../src/history/model.js";
@@ -168,17 +168,12 @@ export async function makeEvalSearchOver(
   await awaitColdPass(distiller);
   distiller.stop();
 
-  // Mirror the plugin's persistent card source so the semantic eval exercises
-  // the Path C vector persistence path (withEmbeddings forwarding + model stamp +
-  // write-back), not just in-memory vectors.
+  // The plugin's own store-backed card source, so the eval ranks through the
+  // incremental runtime and the semantic eval exercises the Path C vector
+  // persistence path (withEmbeddings forwarding + model stamp + write-back),
+  // not just in-memory vectors.
   const cards = createCardsRuntime({
-    source: {
-      getCards: (opts) => store.allCards(opts),
-      revision: () => store.getMeta("cards_rev"),
-      vectorsRevision: () => store.getMeta("vectors_rev"),
-      semanticModel: () => store.getMeta("semantic_model"),
-      writeEmbeddings: (model, gen, rows) => store.writeCardEmbeddings(model, gen, rows),
-    },
+    source: storeCardSource(store),
     embedder: semantic?.embedder,
     semanticWeight: semantic?.weight,
     semanticModel: semantic ? EVAL_SEMANTIC_MODEL : undefined,

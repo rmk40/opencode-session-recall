@@ -372,6 +372,17 @@ export type CardStats = {
   vectorsRev: number;
 };
 
+/** One card's persisted vector from {@link Store.cardVectorsPage}: the
+ *  {@link Card.embedding} and {@link Card.embeddingGen} columns, plus the
+ *  card's {@link Card.writeRev} so a reader can tell whether the row still
+ *  belongs to the card version it holds. */
+export type CardVectorRow = {
+  sessionId: string;
+  embedding: Uint8Array | null;
+  embeddingGen: number | null;
+  writeRev?: number;
+};
+
 /** The store file's page accounting from {@link Store.spaceStats}. Reclaimable
  *  bytes are `freelistCount * pageSize`. */
 export type SpaceStats = { pageCount: number; freelistCount: number; pageSize: number };
@@ -473,6 +484,20 @@ export type Store = {
    * counters that reveal it.
    */
   cardsSince(rev: number, limit: number, opts?: { withEmbeddings?: boolean }): Card[];
+  /**
+   * Cards in session-id order whose id sorts after `after` (from the first
+   * card when undefined), at most `limit` of them (a positive integer;
+   * anything else reads as 1). Paging continues from the last card's id, so
+   * a card written during a walk is never listed twice.
+   */
+  cardsPage(after: string | undefined, limit: number, opts?: { withEmbeddings?: boolean }): Card[];
+  /**
+   * Every card's persisted vector in session-id order after `after`, at most
+   * `limit` rows, read as {@link cardsPage} pages. A card with no vector is
+   * listed with `embedding: null`, so the caller can tell it from a card that
+   * is gone.
+   */
+  cardVectorsPage(after: string | undefined, limit: number): CardVectorRow[];
   /** Card counts plus the revision counters, from one statement. */
   cardStats(): CardStats;
   /** The store file's page count, free-list pages and page size. Read-only. */
@@ -1103,6 +1128,11 @@ function rowToRangeHash(row: Row): RangeHash {
   };
 }
 
+/** A page size from a caller's limit: a positive integer, else 1. */
+function pageLimit(limit: number): number {
+  return Number.isFinite(limit) && limit >= 1 ? Math.floor(limit) : 1;
+}
+
 /** A count from a SQL value or a meta counter string; 0 when absent. */
 function asCount(value: SqlValue | undefined): number {
   if (typeof value === "string") return Number(value) || 0;
@@ -1494,12 +1524,40 @@ class SqliteStore implements Store {
   cardsSince(rev: number, limit: number, opts?: { withEmbeddings?: boolean }): Card[] {
     const columns = opts?.withEmbeddings === true ? CARD_COLUMNS_ALL : CARD_COLUMNS_NO_EMBEDDING;
     const after = Number.isFinite(rev) ? rev : 0;
-    const take = Number.isFinite(limit) && limit >= 1 ? Math.floor(limit) : 1;
     const rows = this.db.all(
       `SELECT ${columns} FROM card WHERE write_rev > ? ORDER BY write_rev, session_id LIMIT ?`,
-      [after, take],
+      [after, pageLimit(limit)],
     );
     return rows.map(rowToCard);
+  }
+
+  /** `columns` of the cards whose id sorts after `after` (every card when
+   *  undefined), in id order, at most `limit` rows. */
+  private keysetPage(columns: string, after: string | undefined, limit: number): Row[] {
+    return after === undefined
+      ? this.db.all(`SELECT ${columns} FROM card ORDER BY session_id LIMIT ?`, [pageLimit(limit)])
+      : this.db.all(
+          `SELECT ${columns} FROM card WHERE session_id > ? ORDER BY session_id LIMIT ?`,
+          [after, pageLimit(limit)],
+        );
+  }
+
+  cardsPage(after: string | undefined, limit: number, opts?: { withEmbeddings?: boolean }): Card[] {
+    const columns = opts?.withEmbeddings === true ? CARD_COLUMNS_ALL : CARD_COLUMNS_NO_EMBEDDING;
+    return this.keysetPage(columns, after, limit).map(rowToCard);
+  }
+
+  cardVectorsPage(after: string | undefined, limit: number): CardVectorRow[] {
+    const rows = this.keysetPage("session_id, embedding, embedding_gen, write_rev", after, limit);
+    return rows.map((row) => {
+      const writeRev = asNullableNumber(row.write_rev);
+      return {
+        sessionId: asString(row.session_id),
+        embedding: row.embedding instanceof Uint8Array ? row.embedding : null,
+        embeddingGen: asNullableNumber(row.embedding_gen),
+        ...(writeRev !== null && { writeRev }),
+      };
+    });
   }
 
   cardStats(): CardStats {

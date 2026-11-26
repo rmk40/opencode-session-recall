@@ -32,14 +32,18 @@ export type CardRecallDeps = {
 const MAX_ANCHORS = 4;
 const MIN_ANCHOR_CHARS = 3;
 
-export function cardRecall(
+export async function cardRecall(
   deps: CardRecallDeps,
   query: string,
   opts: { limit: number; filters?: CardFilters },
-): CardRecallHit[] {
+): Promise<CardRecallHit[]> {
   // Ephemeral cards-lite refresh trigger: fire-and-forget; this query proceeds
   // on the current snapshot (see lite-refresh.ts).
   deps.maybeRefresh?.();
+  // The hits are injected without a drill, so they must come from an index
+  // that holds every card's current content. Waiting also lets a cold start
+  // build in slices instead of in place on the hook's turn.
+  await deps.cards.ready({ index: true });
   const parsed = parseQuery(query);
   const filters = opts.filters ?? {};
 

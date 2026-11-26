@@ -94,9 +94,9 @@ export function createLiteRefresh(deps: LiteRefreshDeps): LiteRefreshController 
           // defaults to identity, so a rejection would surface as unhandled).
           try {
             deps.assign(cards);
-            // Sole rebuild signal: invalidate() sets the runtime's loaded flag
-            // false, so the first subsequent card access rebuilds immediately,
-            // bypassing the runtime's refresh-interval gate.
+            // Sole rebuild signal: invalidate() makes the first subsequent
+            // card access reload the cards before it serves, bypassing the
+            // runtime's refresh-interval gate.
             deps.invalidate();
           } catch {
             // Treated like a failed attempt: window-length backoff applies.

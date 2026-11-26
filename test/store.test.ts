@@ -2720,6 +2720,66 @@ describe("change listing and stats", () => {
     db.close();
   });
 
+  it("cardsPage lists every card in session-id order after a key, stamped or not", async () => {
+    const { db, store } = await fresh();
+    store.replaceSessionParts("s3", [], makeCard("s3"));
+    store.replaceSessionParts("s1", [], makeCard("s1"));
+    store.upsertCard(makeCard("s2"));
+    expect(sessions(store.cardsPage(undefined, 10))).toEqual(["s1", "s2", "s3"]);
+    expect(sessions(store.cardsPage(undefined, 2))).toEqual(["s1", "s2"]);
+    expect(sessions(store.cardsPage("s2", 2))).toEqual(["s3"]);
+    expect(store.cardsPage("s3", 10)).toEqual([]);
+    db.close();
+  });
+
+  it("cardsPage never lists a card rewritten during a walk twice", async () => {
+    const { db, store } = await fresh();
+    for (const id of ["s1", "s2", "s3"]) store.replaceSessionParts(id, [], makeCard(id));
+    const first = store.cardsPage(undefined, 2);
+    store.patchCardMeta("s1", { title: "Again" });
+    const rest = store.cardsPage(first.at(-1)?.sessionId, 2);
+    expect([...sessions(first), ...sessions(rest)]).toEqual(["s1", "s2", "s3"]);
+    db.close();
+  });
+
+  it.each([0, -3, Number.NaN, 1.5])(
+    "cardsPage and cardVectorsPage read a limit of %s as one card",
+    async (limit) => {
+      const { db, store } = await fresh();
+      for (const id of ["s1", "s2", "s3"]) store.replaceSessionParts(id, [], makeCard(id));
+      expect(sessions(store.cardsPage(undefined, limit))).toEqual(["s1"]);
+      expect(sessions(store.cardVectorsPage(undefined, limit))).toEqual(["s1"]);
+      db.close();
+    },
+  );
+
+  it("cardsPage returns vectors only on request", async () => {
+    const { db, store } = await fresh();
+    store.replaceSessionParts("s1", [], makeCard("s1"));
+    embed(store, "s1");
+    expect(store.cardsPage(undefined, 1)[0]?.embedding).toBeNull();
+    expect(store.cardsPage(undefined, 1, { withEmbeddings: true })[0]?.embedding).toEqual(VECTOR);
+    db.close();
+  });
+
+  it("cardVectorsPage lists each card's vector and revision in id order, cards without either included", async () => {
+    const { db, store } = await fresh();
+    store.replaceSessionParts("s2", [], makeCard("s2"));
+    store.replaceSessionParts("s1", [], makeCard("s1"));
+    embed(store, "s1");
+    store.upsertCard(makeCard("s3"));
+
+    const rows = store.cardVectorsPage(undefined, 10);
+    expect(rows).toEqual([
+      { sessionId: "s1", embedding: VECTOR, embeddingGen: 4, writeRev: 2 },
+      { sessionId: "s2", embedding: null, embeddingGen: null, writeRev: 1 },
+      { sessionId: "s3", embedding: null, embeddingGen: null },
+    ]);
+    expect(rows[2]).not.toHaveProperty("writeRev");
+    expect(sessions(store.cardVectorsPage("s1", 1))).toEqual(["s2"]);
+    db.close();
+  });
+
   it("cardStats counts cards, full cards and repair-pending cards, reading unset counters as zero", async () => {
     const { db, store } = await fresh();
     expect(store.cardStats()).toEqual({

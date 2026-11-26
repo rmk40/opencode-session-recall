@@ -1,5 +1,14 @@
 import MiniSearch from "minisearch";
-import type { Card, CardEmbeddingWrite } from "./store.js";
+import {
+  CARDS_REV_KEY,
+  SEMANTIC_MODEL_KEY,
+  VECTORS_REV_KEY,
+  type Card,
+  type CardEmbeddingWrite,
+  type CardStats,
+  type CardVectorRow,
+  type Store,
+} from "./store.js";
 import type { ParsedQuery } from "./query.js";
 import { normalize, tokenizeAll } from "./normalize.js";
 import { embeddingTextOf, cardVectorStamp, EMBED_REPRESENTATION } from "./embedding-text.js";
@@ -16,10 +25,23 @@ import type { DirectoryRelevance } from "./types.js";
  * Ranks whole sessions from their derived cards (the distiller's ~5MB summary
  * layer) so the query path never scans parts to build a shortlist. A MiniSearch
  * BM25 index over card fields (title, heads, inventory, error signatures, file
- * basenames) is rebuilt lazily from the store; each hit is then lifted by exact
+ * basenames) is kept in step with the store; each hit is then lifted by exact
  * code-token presence in the inventory, a recency prior, and — when enabled — a
  * semantic blend over card text. Metadata predicates (since/until, directory
  * scope, agent, current-session family exclusion) filter the ranked hits.
+ *
+ * The runtime keeps two layers. The metadata layer is a map of every card,
+ * which `list`, `get`, `exclusionFamily`, `familyOf`, `coverage` and
+ * `semanticStatus` read. The index layer (the MiniSearch index and the card
+ * vectors) is brought up to date only by `rank` and `ready({ index: true })`.
+ * With a store-backed source ({@link CardSource.store}) a refresh reads the
+ * revision counters and applies only the cards stamped since the last refresh;
+ * the index then swaps each changed card's document (`remove` then `add`, which
+ * keeps term frequencies exact). A full load runs on a cold start, when
+ * `cards_rev` goes backwards, when an older build's unstamped writes widen the
+ * gap between `cards_rev` and `cards_stamped`, and when too many cards changed
+ * at once; it reads in keyset pages and indexes in chunks with a macrotask
+ * between them, so it never holds the event loop for long.
  *
  * This layer only SHORTLISTS which sessions to drill; final result ranking is
  * tier-2's job over the drilled parts. So generous recall here is correct: a
@@ -29,8 +51,24 @@ import type { DirectoryRelevance } from "./types.js";
 
 /** Bounded ancestor walk + descendant collection, matching `exclusionFamily`. */
 const MAX_FAMILY_DEPTH = 16;
-/** Cards reload no more often than this, even as `cards_rev` advances. */
+/** The store is checked for changes no more often than this. */
 const REFRESH_INTERVAL_MS = 5_000;
+/** Cards per keyset page of a full load and per `cardsSince` page: one page
+ *  is one synchronous slice, so it stays small enough to read (vectors
+ *  included) in a few milliseconds. */
+const LOAD_PAGE = 250;
+/** How long a chunked build indexes or embeds before it yields to the event
+ *  loop. A time budget rather than a card count, because a card's cost varies
+ *  with its size and with the machine's load. */
+const SLICE_MS = 8;
+/** Card vectors persisted per write of a chunked build. */
+const VECTOR_WRITE_CHUNK = 200;
+/** Changed cards a synchronous `rank` applies to the index in place; more run
+ *  as a chunked build while the current index serves. */
+const MAX_SYNC_DOCS = 64;
+/** Builds one `ready()` call waits for before it settles for the current state,
+ *  so a store that keeps changing cannot hold a caller forever. */
+const MAX_READY_ROUNDS = 8;
 /** Exact inventory code-token hit: the anchor agents actually query by. */
 const CODE_TOKEN_MULT = 1.25;
 /** Recency-only near-miss fallback size when nothing matches lexically. */
@@ -152,6 +190,10 @@ export type RankStats = {
    *  of which cards would have taken a shortlist slot; that estimate is
    *  explicitly approximate (see the counterfactual merge in `search.ts`). */
   rootOnlySkipped: Array<{ card: Card; score: number }>;
+  /** Cards that passed every filter but were left out unscored because the
+   *  index had yet to take their current content (an index update was still
+   *  running). Set by every `rank` call given this object. */
+  pending?: number;
 };
 
 export type CardsCoverage = {
@@ -172,7 +214,7 @@ export type SemanticStatus = {
   model?: string;
   /** Blend weight for the semantic signal, 0..1. */
   weight: number;
-  /** How many loaded cards currently have a computed vector. */
+  /** How many cards had a computed vector as of the last index update. */
   cardsWithVectors: number;
   /** Representation generation this process embeds at
    *  ({@link EMBED_REPRESENTATION}). Surfaces in `coverage.semantic` so a
@@ -181,6 +223,29 @@ export type SemanticStatus = {
   /** Plugin build tag of this process (from {@link CardsRuntimeDeps.pluginVersion}),
    *  the same tag the distill lease records. Undefined when not configured. */
   pluginVersion?: string;
+};
+
+/**
+ * The store reads a store-backed {@link CardSource} offers so the runtime can
+ * apply changes incrementally. Each maps onto one {@link Store} read (see
+ * {@link storeCardSource}).
+ */
+export type CardStoreReads = {
+  /** Card counts and the revision counters, read in one statement. */
+  stats: () => CardStats;
+  /** Cards stamped after revision `rev`, oldest first ({@link Store.cardsSince}). */
+  cardsSince: (rev: number, limit: number, opts?: { withEmbeddings?: boolean }) => Card[];
+  /** Every card's session id. */
+  cardIds: () => string[];
+  /** Cards in session-id order after `after` ({@link Store.cardsPage}). */
+  cardsPage: (
+    after: string | undefined,
+    limit: number,
+    opts?: { withEmbeddings?: boolean },
+  ) => Card[];
+  /** Persisted card vectors in session-id order after `after`
+   *  ({@link Store.cardVectorsPage}). */
+  vectorsPage: (after: string | undefined, limit: number) => CardVectorRow[];
 };
 
 export type CardSource = {
@@ -194,8 +259,16 @@ export type CardSource = {
    *  static/degraded or a store with no vector writes yet. Watched separately from
    *  `revision` because vector writes deliberately do not bump `cards_rev`; a
    *  change here means another process wrote/cleared vectors, so the in-memory
-   *  snapshot must reload. */
+   *  vectors must reload. */
   vectorsRevision?: () => string | undefined;
+  /**
+   * Store reads for incremental refreshes. With them the runtime applies only
+   * what changed since its last refresh (see the module comment) and reads its
+   * counters from `stats` rather than `revision`. Without them (cards-lite and
+   * static sources) any change to `revision()` or `vectorsRevision()`, or an
+   * `invalidate()`, reloads every card before the next access.
+   */
+  store?: CardStoreReads;
   /** True when cards are metadata-only (degraded, no store). */
   degraded?: boolean;
   /** The store's persisted semantic-model stamp (`meta.semantic_model`), or
@@ -233,15 +306,32 @@ export type CardsRuntimeDeps = {
   semanticReady?: Promise<void>;
   now?: () => number;
   refreshIntervalMs?: number;
+  /** Awaited between the slices of a chunked build. Default: one macrotask
+   *  (`setTimeout(0)`), so other work on the event loop runs in between. */
+  yieldBetween?: () => Promise<void>;
 };
 
 export type CardsRuntime = {
+  /**
+   * Resolves once the card map is loaded and current, and with `index` also
+   * the search index and card vectors. A cold or full load runs in chunks
+   * with a macrotask between them; an async caller awaits this so its later
+   * synchronous calls find everything built. Without `index` it never waits
+   * on index or vector work, which may still be running when it resolves.
+   * Rejects when a load fails.
+   */
+  ready(opts?: { index?: boolean }): Promise<void>;
+  /** Rank cards against a query over the current index, updating the index
+   *  first. Synchronous: while a chunked build runs it ranks over the index it
+   *  had and leaves out every card the index has yet to take, so no hit is
+   *  scored on a document its card no longer has; with no index at all it
+   *  builds one in place. */
   rank(query: ParsedQuery, filters: CardRankFilters, stats?: RankStats): CardHit[];
   /** Every card passing the metadata filters (no query ranking), newest-first.
    *  The deep sweep uses this to enumerate its scoped session set — deep is
    *  exhaustive within scope, so it must not rank/prune by query. */
   list(filters: CardFilters): Card[];
-  /** Single card by id from the loaded snapshot (undefined when unknown). Used
+  /** Single card by id from the card map (undefined when unknown). Used
    *  to build deep targets from an explicit `sessions` list or a resume cursor. */
   get(sessionId: string): Card | undefined;
   exclusionFamily(currentSessionId: string): Set<string>;
@@ -249,13 +339,14 @@ export type CardsRuntime = {
   familyOf(rootId: string): Card[];
   coverage(): CardsCoverage;
   /** Semantic-layer diagnostics, or undefined when semantic is not configured on.
-   *  Reflects live readiness and the current vector count. */
+   *  Reflects live readiness and the vector count as of the last index update. */
   semanticStatus(): SemanticStatus | undefined;
-  /** Force the next card access to rebuild from the source, bypassing the
-   *  refresh-interval gate. Production caller: the ephemeral cards-lite
-   *  refresh controller after a successful list (lite-refresh.ts) — the sole
-   *  rebuild signal for the lite source, whose `revision()` stays a pure
-   *  `() => undefined`. Also used by tests. */
+  /** Force the next card access to reload from the source, bypassing the
+   *  refresh-interval gate; until it has, no access serves the old cards.
+   *  Production caller: the ephemeral cards-lite refresh controller after a
+   *  successful list (lite-refresh.ts) — the sole rebuild signal for the lite
+   *  source, whose `revision()` stays a pure `() => undefined`. Also used by
+   *  tests. */
   invalidate(): void;
   /** Prevent deferred semantic warm-up from touching its source after shutdown. */
   dispose(): void;
@@ -290,7 +381,10 @@ function toDoc(card: Card): CardDoc {
  * self-exclusion keeps working without any part fetch. Exported for the
  * equivalence test.
  */
-export function exclusionFamilyFromCards(cards: Card[], currentSessionId: string): Set<string> {
+export function exclusionFamilyFromCards(
+  cards: Iterable<Card>,
+  currentSessionId: string,
+): Set<string> {
   const byId = new Map<string, Card>();
   const childrenByParent = new Map<string, string[]>();
   for (const card of cards) {
@@ -389,22 +483,117 @@ function blobToVector(blob: Uint8Array): Float32Array {
 }
 
 /**
- * The `vectors_rev` value to cache after an embed pass, given the value sampled
- * BEFORE the snapshot load (`rev0`) and the store's write result (`write`, or
- * `undefined` when we did not call the write API). Trust the returned revision only
- * when the call actually COMMITTED and it is exactly `rev0 + 1` — proof that our
- * own write, and no foreign one, advanced the counter. A rejected write reports
- * `committed:false`, and its unchanged revision may coincide with a foreign
- * higher-gen write that already advanced `rev0` to `rev0 + 1`; keeping `rev0` in
- * that case forces the next refresh to reload and drop the stale snapshot.
+ * The `vectors_rev` value to cache after one of this runtime's own vector
+ * writes, given the cached value before it (`seen`, sampled BEFORE the vectors
+ * it reflects were read) and the store's write result. Trust the returned
+ * revision only when the call actually COMMITTED and it is exactly `seen + 1` —
+ * proof that our own write, and no foreign one, advanced the counter. A
+ * rejected write reports `committed:false`, and its unchanged revision may
+ * coincide with a foreign higher-gen write that already advanced `seen` to
+ * `seen + 1`; keeping `seen` in that case forces the next refresh to reload the
+ * vectors instead of absorbing the foreign write. Applied once per write, in
+ * order, so a pass that writes in several chunks stays exact.
  */
-function ownWriteRevision(
-  rev0: string | undefined,
-  write: CardEmbeddingWrite | undefined,
-): string | undefined {
-  return write?.committed && write.revision === Number(rev0 ?? "0") + 1
-    ? String(write.revision)
-    : rev0;
+function ownWriteRevision(seen: number, write: CardEmbeddingWrite): number {
+  return write.committed && write.revision === seen + 1 ? write.revision : seen;
+}
+
+/** A vectors-revision counter value as a number; 0 when unset. */
+function revisionNumber(value: string | undefined): number {
+  return Number(value ?? 0) || 0;
+}
+
+const macrotask = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0));
+
+/** Runs a build to completion in one synchronous slice. */
+function runSync(steps: Generator<void, void>): void {
+  while (!steps.next().done);
+}
+
+/** Session ids in a fixed order, the last tiebreak of every card sort. */
+function compareIds(a: string, b: string): number {
+  return a.localeCompare(b);
+}
+
+/** Newest first, then by session id. */
+function byRecency(a: Card, b: Card): number {
+  return b.timeUpdated - a.timeUpdated || compareIds(a.sessionId, b.sessionId);
+}
+
+function sameDoc(a: CardDoc | undefined, b: CardDoc | undefined): boolean {
+  if (a === undefined || b === undefined) return a === b;
+  return (
+    a.title === b.title &&
+    a.summary === b.summary &&
+    a.nlSummary === b.nlSummary &&
+    a.outcome === b.outcome &&
+    a.inventory === b.inventory &&
+    a.errors === b.errors &&
+    a.files === b.files
+  );
+}
+
+function sameStrings(a: readonly string[], b: readonly string[]): boolean {
+  return a.length === b.length && a.every((value, i) => value === b[i]);
+}
+
+/** Whether two versions of a card index and embed alike: every field the
+ *  search document ({@link toDoc}) and the embedded text
+ *  ({@link embeddingTextOf}) are made of. */
+function sameIndexedContent(a: Card, b: Card): boolean {
+  return (
+    a.title === b.title &&
+    a.summaryHead === b.summaryHead &&
+    a.outcomeHead === b.outcomeHead &&
+    a.nlSummary === b.nlSummary &&
+    a.inventory === b.inventory &&
+    a.directory === b.directory &&
+    sameStrings(a.files, b.files) &&
+    sameStrings(a.tools, b.tools) &&
+    sameStrings(a.errors, b.errors)
+  );
+}
+
+type EmbeddingRow = { sessionId: string; embedding: Uint8Array; expectedSummaryHash: string };
+
+/** One semantic pass: the vectors it sets, the card version each vector was
+ *  computed or loaded for, the rows it queued to persist, and whether the
+ *  store's model stamp is this model's (when it is not, a write restamps the
+ *  store and clears every stored vector, so the pass persists all it keeps). */
+type VectorPass = {
+  vectors: Map<string, Float32Array>;
+  sources: Map<string, Card>;
+  rows: EmbeddingRow[];
+  stampMatches: boolean;
+};
+
+/** A stored vector as read with its card or its row, and the model stamp it
+ *  was stored under (undefined when that could not be established). */
+type StoredVector = {
+  embedding: Uint8Array | null;
+  embeddingGen: number | null;
+  stamp: string | undefined;
+};
+
+/**
+ * Store-backed {@link CardSource}: the plugin's card source whenever a card
+ * store is open, with the reads incremental refreshes need.
+ */
+export function storeCardSource(store: Store): CardSource {
+  return {
+    getCards: (opts) => store.allCards(opts),
+    revision: () => store.getMeta(CARDS_REV_KEY),
+    vectorsRevision: () => store.getMeta(VECTORS_REV_KEY),
+    semanticModel: () => store.getMeta(SEMANTIC_MODEL_KEY),
+    writeEmbeddings: (model, gen, rows) => store.writeCardEmbeddings(model, gen, rows),
+    store: {
+      stats: () => store.cardStats(),
+      cardsSince: (rev, limit, opts) => store.cardsSince(rev, limit, opts),
+      cardIds: () => store.cardSessionIds(),
+      cardsPage: (after, limit, opts) => store.cardsPage(after, limit, opts),
+      vectorsPage: (after, limit) => store.cardVectorsPage(after, limit),
+    },
+  };
 }
 
 export function createCardsRuntime(deps: CardsRuntimeDeps): CardsRuntime {
@@ -417,130 +606,638 @@ export function createCardsRuntime(deps: CardsRuntimeDeps): CardsRuntime {
   // vectors once (see embedding-text.ts).
   const semanticModelId = deps.semanticModel;
   const configuredModel = semanticModelId != null ? cardVectorStamp(semanticModelId) : undefined;
+  const yieldBetween = deps.yieldBetween ?? macrotask;
+  const source = deps.source;
+  const reads = source.store;
+  /** Semantic is configured on: vectors are kept, though the embedder may
+   *  still be loading. */
+  const semanticOn = embedder != null && semanticWeight > 0;
+  const cardOpts = semanticOn ? { withEmbeddings: true } : undefined;
 
-  let cards: Card[] = [];
+  // Builds and the requests they answer are ordered by one counter: a build
+  // started at tick t satisfies every request made before t, and installs only
+  // over a state built from an older start.
+  let clock = 0;
+  const tick = (): number => ++clock;
+
+  // ── Metadata layer ──
+  let cardById = new Map<string, Card>();
+  /** Start tick of the load the map came from; 0 before the first load. */
+  let metaInstalledAt = 0;
+  /** Latest request for a full load (soft: the current map may still serve). */
+  let metaWantFull = 0;
+  /** Latest request no access may be served before (cold, invalidated, or a
+   *  revision change on a source without store reads). */
+  let metaWantHard = 0;
+  let lastCheck = -Infinity;
+  /** Store counters as of the last applied refresh (store-backed sources). */
+  let counters: CardStats | undefined;
+  /** Highest `writeRev` applied; `cardsSince` resumes after it. */
+  let appliedRev = 0;
+  /** `revision()` as of the last load (sources without store reads). */
+  let installedRevision: string | undefined;
+  let coverageCache: CardsCoverage | undefined;
+
+  /** The model stamp each map card's `embedding` was stored under, recorded
+   *  only when the read that returned the card saw no vector write land (see
+   *  {@link stampedRead}). A blob without one is never reused. */
+  const blobStamp = new WeakMap<Card, string>();
+
+  // ── Index layer ──
   let mini: MiniSearch<CardDoc> | undefined;
+  /** Exactly the documents in `mini`, so a changed card can be removed. */
+  let docById = new Map<string, CardDoc>();
   let cardVectors: Map<string, Float32Array> | undefined;
-  let lastLoad = -Infinity;
-  let lastRevision: string | undefined;
-  let lastVectorsRevision: string | undefined;
-  let loaded = false;
+  /** The card version each in-memory vector was computed or loaded for. */
+  let vectorSource = new Map<string, Card>();
+  /** Start tick of the build `mini` came from; 0 before the first build. */
+  let indexInstalledAt = 0;
+  /** A hard load changed the map: a synchronous `rank` may not serve the
+   *  index until it caught up. */
+  let hardIndexPending = false;
+  /** Tick at which the last hard load installed its map. */
+  let hardLoadInstalledAt = 0;
+  /** Ids whose card changed (or left) in the map since the index took them:
+   *  exactly the cards whose indexed document or vector may be out of date. */
+  const dirty = new Set<string>();
+  /** The vectors were computed by a full pass with the embedder ready, so a
+   *  per-card update keeps them complete. */
+  let vectorsComplete = false;
+  /** Another process wrote vectors since they were read: reload them. */
+  let vectorsStale = false;
+  /** `vectors_rev` reflected in memory: sampled before the vectors were read,
+   *  then advanced only by this runtime's own writes ({@link ownWriteRevision}). */
+  let vectorsRevSeen = 0;
+
+  /** The running chunked builds: at most one that changes the card map and
+   *  one that changes the index or vectors. They may run side by side. */
+  let metaJob: Promise<void> | undefined;
+  let indexJob: Promise<void> | undefined;
   let disposed = false;
 
-  /** Recompute/reuse card vectors and persist newly computed ones. Returns the
-   *  store's `{ revision, committed }` result for the caller's own-write accounting,
-   *  or `undefined` when it did not call the write API at all. */
-  function embedCards(): CardEmbeddingWrite | undefined {
-    if (!embedder || semanticWeight <= 0 || !embedder.ready) {
-      // Semantic off, or the model is still warming (the query path also stays
-      // lexical until the embedder is ready). Nothing to compute or persist.
-      cardVectors = embedder && semanticWeight > 0 ? new Map() : undefined;
-      return undefined;
-    }
+  const readVectorsRev = (): number =>
+    source.vectorsRevision
+      ? revisionNumber(source.vectorsRevision())
+      : (reads?.stats().vectorsRev ?? 0);
+  const vectorsActive = (): boolean => semanticOn && embedder?.ready === true;
 
-    // Reuse persisted vectors when the store's stamp matches this model. A card
-    // whose vector was cleared by a re-distill (embedding null), or a model
-    // change (stamp mismatch), falls through to recompute. Newly computed
-    // vectors are written back under the model stamp so the next start reuses.
-    const stampMatches =
-      configuredModel != null && deps.source.semanticModel?.() === configuredModel;
-    const vectors = new Map<string, Float32Array>();
-    const toWrite: Array<{
-      sessionId: string;
-      embedding: Uint8Array;
-      expectedSummaryHash: string;
-    }> = [];
-
-    for (const card of cards) {
-      // Never embed a stray summarizer worker card (a crash can leave one in the
-      // store); it is excluded from every result anyway.
-      if (isSummarizerTitle(card.title)) continue;
-      // Reuse a persisted vector only when the model stamp matches AND the row was
-      // embedded at THIS process's generation. A null- or lower-generation row
-      // (legacy, or written by an older build) is treated as absent and falls
-      // through to recompute; the write guard then refuses to downgrade a higher-
-      // generation row on disk, so a lagging process recomputes in memory without
-      // clobbering the newer vector.
-      if (stampMatches && card.embedding && card.embeddingGen === EMBED_REPRESENTATION) {
-        vectors.set(card.sessionId, blobToVector(card.embedding));
-        continue;
-      }
-      const text = embeddingTextOf(card);
-      if (!text) continue;
-      const vec = embedder.embed(text);
-      if (!vec) continue;
-      vectors.set(card.sessionId, vec);
-      // Carry the summary hash the vector was embedded from, so the store skips
-      // the write if a summary landed (and cleared the vector) since this snapshot.
-      toWrite.push({
-        sessionId: card.sessionId,
-        embedding: vectorToBlob(vec),
-        expectedSummaryHash: card.summaryHash,
-      });
-    }
-
-    cardVectors = vectors;
-
-    // Persist when anything was (re)computed, or when the stamp must advance to
-    // this model so a later start reuses instead of recomputing. Accepted
-    // cross-process race: this write can lose to a concurrent re-distill that
-    // cleared the same card's embedding, leaving a one-generation-stale vector;
-    // the next re-distill of that card clears it again, so it self-heals.
-    if (
-      configuredModel != null &&
-      deps.source.writeEmbeddings &&
-      (toWrite.length > 0 || !stampMatches)
-    ) {
-      return deps.source.writeEmbeddings(configuredModel, EMBED_REPRESENTATION, toWrite);
-    }
-    return undefined;
-  }
-
-  function rebuild(): void {
-    // Sample the revision BEFORE snapshotting: a summary write (which bumps
-    // cards_rev) that lands during this rebuild must leave the sampled revision
-    // stale, so the next refresh reloads and picks the summary up. Sampling it
-    // after embedding could swallow that bump and serve a summary-less snapshot.
-    const revision = deps.source.revision();
-    // Sample vectors_rev BEFORE the snapshot load too. embedCards returns the
-    // store's { revision, committed } result; ownWriteRevision trusts it only when
-    // the write COMMITTED and is exactly rev0+1 — i.e. our own write, with no
-    // foreign vector write interleaved between this load and it. Otherwise it keeps
-    // rev0, so the next refresh reloads and picks up the foreign write instead of
-    // silently absorbing it (a rejected lower-gen write is committed:false, so its
-    // unchanged revision can never masquerade as our own bump).
-    const vectorsRev0 = deps.source.vectorsRevision?.();
-    const wantEmbeddings = embedder != null && semanticWeight > 0;
-    cards = wantEmbeddings
-      ? deps.source.getCards({ withEmbeddings: true })
-      : deps.source.getCards();
-    const index = new MiniSearch<CardDoc>({
+  function newIndex(): MiniSearch<CardDoc> {
+    return new MiniSearch<CardDoc>({
       idField: "id",
       fields: [...CARD_FIELDS],
       tokenize: (text: string) => tokenizeAll(text),
     });
-    index.addAll(cards.map(toDoc));
-    mini = index;
-    const write = embedCards();
-    lastLoad = now();
-    lastRevision = revision;
-    lastVectorsRevision = ownWriteRevision(vectorsRev0, write);
-    loaded = true;
   }
 
-  function refreshIfStale(): void {
-    if (!loaded) {
-      rebuild();
+  /** Run a build in slices with {@link yieldBetween} between them. The first
+   *  slice runs synchronously; a disposed runtime stops at the next slice. */
+  async function drive(steps: Generator<void, void>): Promise<void> {
+    while (!steps.next().done) {
+      await yieldBetween();
+      if (disposed) return;
+    }
+  }
+
+  /** Start a chunked build of its kind unless one of that kind is running;
+   *  returns the running one. */
+  function startJob(kind: "meta" | "index", steps: Generator<void, void>): Promise<void> {
+    const running = kind === "meta" ? metaJob : indexJob;
+    if (running) return running;
+    const run = drive(steps);
+    if (kind === "meta") metaJob = run;
+    else indexJob = run;
+    // Also marks the promise handled: a build started by a synchronous access
+    // has no awaiting caller, and ready() rethrows its failure on its own.
+    const settle = (): void => {
+      if (metaJob === run) metaJob = undefined;
+      if (indexJob === run) indexJob = undefined;
+    };
+    run.then(settle, settle);
+    return run;
+  }
+
+  /**
+   * Run a read that returns stored vectors, and say which model stamp those
+   * vectors were stored under. Every vector write bumps `vectors_rev` in its own
+   * transaction, and a stamp change clears every stored vector first, so when
+   * `vectors_rev` did not move across the read, every vector it returned was
+   * stored under the stamp read before it. `quiet` is false when a vector
+   * write landed meanwhile; `stamp` is then undefined.
+   */
+  function stampedRead<T>(read: () => T): { value: T; stamp?: string; quiet: boolean } {
+    if (!semanticOn) return { value: read(), quiet: true };
+    const before = readVectorsRev();
+    const stamp = source.semanticModel?.();
+    const value = read();
+    const quiet = readVectorsRev() === before;
+    return quiet && stamp !== undefined ? { value, stamp, quiet } : { value, quiet };
+  }
+
+  /** Record the stamp a read's card blobs were stored under. */
+  function markBlobs(cards: Iterable<Card>, stamp: string | undefined): void {
+    if (stamp === undefined) return;
+    for (const card of cards) blobStamp.set(card, stamp);
+  }
+
+  // ── Metadata loads and refreshes ──
+
+  /**
+   * Load every card into a new map and install it. Paged by session id on a
+   * store-backed source, with a yield between pages. Each page is compared
+   * with the map it replaces, so the index learns exactly which cards changed
+   * (no other map change can land during a load: see {@link metaPlan}).
+   */
+  function* metaLoadSteps(hard: boolean): Generator<void, void> {
+    const startedAt = tick();
+    // Sample every counter BEFORE reading cards: a write that lands during the
+    // load leaves the sample behind it, so the next refresh applies the write
+    // instead of the load absorbing it unseen.
+    const stats = reads?.stats();
+    const revision = reads ? undefined : source.revision();
+    const vectorsRev = stats ? stats.vectorsRev : readVectorsRev();
+    const next = new Map<string, Card>();
+    const changed: string[] = [];
+    /** Cards whose content is unchanged, with the copy they replace. */
+    const same: Array<[old: Card, card: Card]> = [];
+    let quiet = true;
+    const take = (page: Card[], read: { stamp?: string; quiet: boolean }): void => {
+      markBlobs(page, read.stamp);
+      quiet &&= read.quiet;
+      for (const card of page) {
+        next.set(card.sessionId, card);
+        const old = cardById.get(card.sessionId);
+        if (old && sameIndexedContent(old, card)) same.push([old, card]);
+        else changed.push(card.sessionId);
+      }
+    };
+    if (reads) {
+      let after: string | undefined;
+      for (;;) {
+        const read = stampedRead(() => reads.cardsPage(after, LOAD_PAGE, cardOpts));
+        take(read.value, read);
+        if (read.value.length < LOAD_PAGE) break;
+        after = read.value[read.value.length - 1]!.sessionId;
+        yield;
+      }
+    } else {
+      const read = stampedRead(() => source.getCards(cardOpts));
+      take(read.value, read);
+    }
+    if (disposed || startedAt <= metaInstalledAt) return;
+    // Recorded whether or not an index exists yet: a first build that took
+    // its snapshot before this load installs after it, and keeps exactly
+    // these entries (see indexBuildSteps). Without an index or a build, the
+    // first build covers them.
+    for (const id of changed) dirty.add(id);
+    for (const id of cardById.keys()) if (!next.has(id)) dirty.add(id);
+    // A vector belongs to content, not to a copy of the card: move it to the
+    // new copy so semanticScore() keeps finding it by identity.
+    for (const [old, card] of same) {
+      if (vectorSource.get(card.sessionId) === old) vectorSource.set(card.sessionId, card);
+    }
+    if (hard) {
+      hardLoadInstalledAt = tick();
+      if (indexInstalledAt > 0) hardIndexPending = true;
+    }
+    cardById = next;
+    metaInstalledAt = startedAt;
+    counters = stats;
+    appliedRev = stats?.cardsRev ?? 0;
+    installedRevision = revision;
+    lastCheck = now();
+    coverageCache = undefined;
+    if (vectorsRev !== vectorsRevSeen) {
+      // Another process wrote vectors the in-memory ones do not reflect.
+      vectorsStale = true;
+      // Without store reads the new map's blobs are the vectors a reload
+      // uses, so they are current as of the sample, if no write interleaved.
+      if (!reads && quiet) vectorsRevSeen = vectorsRev;
+    }
+  }
+
+  /**
+   * Apply the cards stamped since the last refresh, a `cardsSince` page per
+   * slice, then drop deleted cards when the store counted a deletion, and
+   * record `stats` (sampled before the reads) as the applied counters.
+   */
+  function* applySteps(store: CardStoreReads, stats: CardStats): Generator<void, void> {
+    const loadedAt = metaInstalledAt;
+    for (;;) {
+      const read = stampedRead(() => store.cardsSince(appliedRev, LOAD_PAGE, cardOpts));
+      const page = read.value;
+      markBlobs(page, read.stamp);
+      for (const card of page) {
+        cardById.set(card.sessionId, card);
+        dirty.add(card.sessionId);
+        if (card.writeRev !== undefined && card.writeRev > appliedRev) appliedRev = card.writeRev;
+      }
+      coverageCache = undefined;
+      if (page.length < LOAD_PAGE) break;
+      yield;
+      // A full load replaced the map and its counters meanwhile.
+      if (metaInstalledAt !== loadedAt) return;
+    }
+    if (stats.cardsDeleted !== counters?.cardsDeleted) {
+      const present = new Set(store.cardIds());
+      for (const id of cardById.keys()) {
+        if (present.has(id)) continue;
+        cardById.delete(id);
+        dirty.add(id);
+      }
+    }
+    counters = stats;
+  }
+
+  type MetaPlan =
+    | { kind: "fresh" }
+    | { kind: "load"; hard: boolean }
+    | { kind: "apply"; store: CardStoreReads; stats: CardStats; revisions: number };
+
+  /**
+   * What the map needs before it serves. A full load when it was never
+   * loaded, was invalidated, or (from the store's counters) the store was
+   * reset (a counter went backwards) or an older build wrote without stamping
+   * (`cards_rev` advanced further than `cards_stamped`, a gap later stamped
+   * writes never close). Otherwise the stamped changes to apply, if any.
+   * Checks the store at most once per refresh interval.
+   */
+  function metaPlan(): MetaPlan {
+    if (metaInstalledAt === 0 || metaWantHard > metaInstalledAt)
+      return { kind: "load", hard: true };
+    if (metaWantFull > metaInstalledAt) return { kind: "load", hard: false };
+    // A running load or apply owns the map; whoever waits on it refreshes
+    // after it. An index build never holds the map back.
+    if (metaJob) return { kind: "fresh" };
+    if (now() - lastCheck < refreshIntervalMs) return { kind: "fresh" };
+    lastCheck = now();
+    if (!reads) {
+      // Without store reads only a full reload can apply a change.
+      if (source.revision() === installedRevision && readVectorsRev() === vectorsRevSeen) {
+        return { kind: "fresh" };
+      }
+      metaWantHard = tick();
+      metaWantFull = metaWantHard;
+      return { kind: "load", hard: true };
+    }
+    const stats = reads.stats();
+    if (stats.vectorsRev !== vectorsRevSeen) vectorsStale = true;
+    const last = counters;
+    const revisions = last ? stats.cardsRev - last.cardsRev : 0;
+    const stamped = last ? stats.cardsStamped - last.cardsStamped : 0;
+    if (
+      !last ||
+      revisions < 0 ||
+      stamped < 0 ||
+      stats.cardsDeleted < last.cardsDeleted ||
+      revisions !== stamped
+    ) {
+      metaWantFull = tick();
+      return { kind: "load", hard: false };
+    }
+    if (revisions === 0 && stats.cardsDeleted === last.cardsDeleted) {
+      counters = stats;
+      return { kind: "fresh" };
+    }
+    return { kind: "apply", store: reads, stats, revisions };
+  }
+
+  /** The synchronous accessors' refresh. A hard load runs in place, as does
+   *  an apply that fits one page; a soft load or a larger apply runs as a
+   *  chunked build while the current map serves. */
+  function syncMeta(): void {
+    const plan = metaPlan();
+    if (plan.kind === "load") {
+      if (plan.hard) runSync(metaLoadSteps(true));
+      else void startJob("meta", metaLoadSteps(false));
+    } else if (plan.kind === "apply") {
+      const steps = applySteps(plan.store, plan.stats);
+      if (plan.revisions <= LOAD_PAGE) runSync(steps);
+      else void startJob("meta", steps);
+    }
+  }
+
+  /** {@link syncMeta}'s plan as a build to await, or undefined when fresh. */
+  function metaSteps(): Generator<void, void> | undefined {
+    const plan = metaPlan();
+    if (plan.kind === "load") return metaLoadSteps(plan.hard);
+    if (plan.kind === "apply") return applySteps(plan.store, plan.stats);
+    return undefined;
+  }
+
+  // ── Index builds and updates ──
+
+  function vectorPass(
+    vectors: Map<string, Float32Array>,
+    sources: Map<string, Card>,
+  ): VectorPass | undefined {
+    if (!vectorsActive()) return undefined;
+    return {
+      vectors,
+      sources,
+      rows: [],
+      stampMatches: configuredModel != null && source.semanticModel?.() === configuredModel,
+    };
+  }
+
+  /** A map card's own blob, with the stamp it was read under. */
+  const storedWith = (card: Card): StoredVector => ({
+    embedding: card.embedding,
+    embeddingGen: card.embeddingGen,
+    stamp: blobStamp.get(card),
+  });
+
+  /**
+   * Set one card's vector, never from a vector whose provenance is not this
+   * model at this generation for this card version, and embed only when no
+   * such vector is at hand. In order: a freshly read row (`fresh`) when it
+   * holds one, since it is the store's current vector; the in-memory vector
+   * when it was computed or loaded for the same content, since it is at least
+   * as current as a blob read with the card; the blob `stored` holds when it
+   * was stored under this model's stamp at this generation (a null- or
+   * lower-generation row, legacy or an older build's, never qualifies, and
+   * the store refuses to downgrade a higher one, so a lagging process
+   * recomputes in memory without clobbering it); else the card text is
+   * embedded. Queues a write for every vector the store is not known to hold
+   * under this stamp.
+   */
+  function setVector(
+    pass: VectorPass,
+    card: Card,
+    stored: StoredVector | undefined,
+    fresh: boolean,
+  ): void {
+    const id = card.sessionId;
+    const keep = (vec: Float32Array, write: boolean): void => {
+      pass.vectors.set(id, vec);
+      pass.sources.set(id, card);
+      // Carry the summary hash the vector belongs to, so the store skips the
+      // write if a summary landed (and cleared the vector) since.
+      if (write) {
+        pass.rows.push({
+          sessionId: id,
+          embedding: vectorToBlob(vec),
+          expectedSummaryHash: card.summaryHash,
+        });
+      }
+    };
+    // Never embed a stray summarizer worker card (a crash can leave one in the
+    // store); it is excluded from every result anyway.
+    if (isSummarizerTitle(card.title)) {
+      pass.vectors.delete(id);
+      pass.sources.delete(id);
       return;
     }
-    if (now() - lastLoad < refreshIntervalMs) return;
-    const revision = deps.source.revision();
-    // Either a lexical write (cards_rev, from distill/summary) or a cross-process
-    // vector write (vectors_rev) invalidates the snapshot. The latter is the fix
-    // for silently-stale vector snapshots across processes sharing one store.
-    const vectorsRevision = deps.source.vectorsRevision?.();
-    if (revision !== lastRevision || vectorsRevision !== lastVectorsRevision) rebuild();
-    else lastLoad = now(); // nothing changed; defer the next revision check
+    const blob =
+      stored &&
+      stored.stamp === configuredModel &&
+      stored.embedding &&
+      stored.embeddingGen === EMBED_REPRESENTATION
+        ? stored.embedding
+        : undefined;
+    // A write under another stamp restamps the store and clears every stored
+    // vector, so then even a vector it holds must be written again.
+    if (fresh && blob) return keep(blobToVector(blob), !pass.stampMatches);
+    const from = vectorSource.get(id);
+    const memory = from && sameIndexedContent(from, card) ? cardVectors?.get(id) : undefined;
+    // A fresh row without a usable vector means the store lacks this one.
+    if (memory) return keep(memory, fresh || !pass.stampMatches);
+    if (blob) return keep(blobToVector(blob), !pass.stampMatches);
+    const text = embeddingTextOf(card);
+    const vec = text ? embedder?.embed(text) : undefined;
+    if (!vec) {
+      pass.vectors.delete(id);
+      pass.sources.delete(id);
+      return;
+    }
+    keep(vec, true);
+  }
+
+  /**
+   * Persist a pass's computed vectors in chunks, plus the model stamp when it
+   * must advance so a later start reuses them. Accepted cross-process race: a
+   * write can lose to a concurrent re-distill that cleared the same card's
+   * embedding, leaving a one-generation-stale vector; the next re-distill of
+   * that card clears it again, so it self-heals.
+   */
+  function* writeVectors(pass: VectorPass): Generator<void, void> {
+    const write = source.writeEmbeddings;
+    if (configuredModel == null || !write) return;
+    if (pass.rows.length === 0 && pass.stampMatches) return;
+    for (let i = 0; i === 0 || i < pass.rows.length; i += VECTOR_WRITE_CHUNK) {
+      if (i > 0) yield;
+      if (disposed) return;
+      const result = write(
+        configuredModel,
+        EMBED_REPRESENTATION,
+        pass.rows.slice(i, i + VECTOR_WRITE_CHUNK),
+      );
+      vectorsRevSeen = ownWriteRevision(vectorsRevSeen, result);
+    }
+  }
+
+  /** Build a new index (and vectors) from the current map and install it. */
+  function* indexBuildSteps(): Generator<void, void> {
+    const startedAt = tick();
+    const snapshot = new Map(cardById);
+    const index = newIndex();
+    const docs = new Map<string, CardDoc>();
+    const vectors = new Map<string, Float32Array>();
+    const sources = new Map<string, Card>();
+    const pass = vectorPass(vectors, sources);
+    let slice = performance.now();
+    for (const card of snapshot.values()) {
+      if (performance.now() - slice >= SLICE_MS) {
+        yield;
+        slice = performance.now();
+      }
+      const doc = toDoc(card);
+      index.add(doc);
+      docs.set(card.sessionId, doc);
+      if (pass) setVector(pass, card, storedWith(card), false);
+    }
+    if (disposed || startedAt <= indexInstalledAt) return;
+    mini = index;
+    docById = docs;
+    cardVectors = semanticOn ? vectors : undefined;
+    vectorSource = sources;
+    vectorsComplete = pass !== undefined;
+    indexInstalledAt = startedAt;
+    // A hard load that installed after the snapshot left changes this index
+    // lacks, which a synchronous rank() must still apply before it serves.
+    hardIndexPending = hardLoadInstalledAt > startedAt;
+    // The new index holds every card as of the snapshot. Every change to the
+    // map since is in `dirty` (an apply records it, and so does a full load,
+    // with or without an index), so a card that changed or left since stays
+    // dirty and the rest are covered.
+    for (const id of dirty) if (cardById.get(id) === snapshot.get(id)) dirty.delete(id);
+    if (pass) yield* writeVectors(pass);
+  }
+
+  /**
+   * Re-read every persisted vector and recompute the missing ones, without
+   * touching the index. Runs when another process wrote vectors, and when the
+   * embedder becomes ready after the index was built.
+   */
+  function* vectorReloadSteps(): Generator<void, void> {
+    const startedAt = tick();
+    // Sampled before the reads, like a full load (see metaLoadSteps).
+    const sample = readVectorsRev();
+    /** Each row with the stamp its page was read under; undefined for a page
+     *  a vector write landed during, whose rows are never reused. */
+    const rows = new Map<string, { row: CardVectorRow; stamp: string | undefined }>();
+    let quiet = true;
+    if (reads) {
+      let after: string | undefined;
+      for (;;) {
+        const read = stampedRead(() => reads.vectorsPage(after, LOAD_PAGE));
+        quiet &&= read.quiet;
+        for (const row of read.value) rows.set(row.sessionId, { row, stamp: read.stamp });
+        if (read.value.length < LOAD_PAGE) break;
+        after = read.value[read.value.length - 1]!.sessionId;
+        yield;
+      }
+    }
+    const vectors = new Map<string, Float32Array>();
+    const sources = new Map<string, Card>();
+    const pass = vectorPass(vectors, sources);
+    if (!pass) return;
+    let slice = performance.now();
+    for (const card of [...cardById.values()]) {
+      if (performance.now() - slice >= SLICE_MS) {
+        yield;
+        slice = performance.now();
+      }
+      // Without store reads the map was just reloaded, so its own blobs are
+      // the freshest stored vectors.
+      if (!reads) {
+        setVector(pass, card, storedWith(card), true);
+        continue;
+      }
+      const id = card.sessionId;
+      const found = rows.get(id);
+      // Gone from the store: the next refresh drops the card.
+      if (!found) continue;
+      const { row, stamp } = found;
+      if (row.writeRev !== card.writeRev) {
+        // Rewritten since the map read it: the next refresh brings the new
+        // card, so keep what this version had rather than embed stale text.
+        const kept = cardVectors?.get(id);
+        const from = vectorSource.get(id);
+        if (kept && from) {
+          vectors.set(id, kept);
+          sources.set(id, from);
+        }
+        continue;
+      }
+      // A row from a page a write landed during says nothing for sure about
+      // the store, so it is neither reused nor taken as missing: the vector
+      // this card has in memory serves, and only a card without one embeds.
+      const stored = { embedding: row.embedding, embeddingGen: row.embeddingGen, stamp };
+      setVector(pass, card, stored, stamp !== undefined);
+    }
+    // A newer index build computed its own vectors.
+    if (disposed || indexInstalledAt > startedAt) return;
+    cardVectors = vectors;
+    vectorSource = sources;
+    vectorsComplete = true;
+    // Installed even when a write landed during a page, so a busy writer
+    // cannot keep vectors from ever installing; those pages read again on
+    // the next pass.
+    vectorsStale = !quiet;
+    // Without store reads the vectors came from the map, read before `sample`,
+    // so the sample would absorb a write that landed in between.
+    if (reads) vectorsRevSeen = sample;
+    yield* writeVectors(pass);
+  }
+
+  /**
+   * Apply the dirty cards to the index and vectors in place, in time slices.
+   * Each changed card's old document is removed and its new one added, which
+   * keeps every term's document frequency exact; a card whose document is
+   * unchanged costs no index work.
+   */
+  function* applyDirtySteps(): Generator<void, void> {
+    const index = mini;
+    if (!index) return;
+    const builtAt = indexInstalledAt;
+    let pass = vectorsComplete && cardVectors ? vectorPass(cardVectors, vectorSource) : undefined;
+    if (pass && !pass.stampMatches) {
+      // The store holds another model's vectors: only a full pass may restamp
+      // it, since a stamp change clears every stored vector.
+      vectorsStale = true;
+      pass = undefined;
+    }
+    let slice = performance.now();
+    for (const id of [...dirty]) {
+      if (performance.now() - slice >= SLICE_MS) {
+        yield;
+        slice = performance.now();
+        // An index built meanwhile covers every card.
+        if (indexInstalledAt !== builtAt) return;
+      }
+      // Read the card now, not when the slice began: it may have changed.
+      if (!dirty.delete(id)) continue;
+      const card = cardById.get(id);
+      const next = card ? toDoc(card) : undefined;
+      const prev = docById.get(id);
+      if (!sameDoc(prev, next)) {
+        if (prev) index.remove(prev);
+        if (next) {
+          index.add(next);
+          docById.set(id, next);
+        } else docById.delete(id);
+      }
+      if (!pass) continue;
+      if (card) setVector(pass, card, storedWith(card), false);
+      else {
+        pass.vectors.delete(id);
+        pass.sources.delete(id);
+      }
+    }
+    if (dirty.size === 0) hardIndexPending = false;
+    if (pass) yield* writeVectors(pass);
+  }
+
+  /** A full build is due: no index yet, or so many cards changed that
+   *  rebuilding costs less than removing and re-adding each one. */
+  function indexNeedsBuild(): boolean {
+    return indexInstalledAt === 0 || dirty.size > Math.max(MAX_SYNC_DOCS, docById.size / 2);
+  }
+
+  function vectorsNeedReload(): boolean {
+    return vectorsActive() && (vectorsStale || !vectorsComplete);
+  }
+
+  /** The index work {@link ready} awaits next, or undefined when current. */
+  function indexSteps(): Generator<void, void> | undefined {
+    if (indexNeedsBuild()) return indexBuildSteps();
+    if (dirty.size > 0) return applyDirtySteps();
+    if (vectorsNeedReload()) return vectorReloadSteps();
+    return undefined;
+  }
+
+  /**
+   * `rank`'s refresh: the map first, then the index. With no index it builds
+   * in place, as it does after a hard load changed more cards than it applies
+   * in place or while another index build runs (a full build supersedes that
+   * one; an in-place update beside it could be lost when it installs). A few
+   * changed cards apply in place; anything larger runs as a chunked build
+   * while the current index serves.
+   */
+  function syncIndex(): void {
+    syncMeta();
+    if (
+      indexInstalledAt === 0 ||
+      (hardIndexPending && (indexJob !== undefined || dirty.size > MAX_SYNC_DOCS))
+    ) {
+      runSync(indexBuildSteps());
+    }
+    if (indexJob) return;
+    if (!indexNeedsBuild() && dirty.size > 0 && dirty.size <= MAX_SYNC_DOCS) {
+      runSync(applyDirtySteps());
+    }
+    const steps = indexSteps();
+    if (steps) void startJob("index", steps);
   }
 
   function directoryRelevance(
@@ -589,9 +1286,12 @@ export function createCardsRuntime(deps: CardsRuntimeDeps): CardsRuntime {
       prefix: (term) => term.length > 3,
       fuzzy: (term) => (term.length >= 4 ? 0.2 : false),
     });
-    const top = raw[0]?.score || 1;
+    // A card waiting in `dirty` was scored on a document it no longer has, so
+    // it neither scores nor sets the scale the others are measured against.
+    const current = raw.filter((hit) => !dirty.has(String(hit.id)));
+    const top = current[0]?.score || 1;
     const scores = new Map<string, number>();
-    for (const hit of raw) scores.set(String(hit.id), clamp01(hit.score / top));
+    for (const hit of current) scores.set(String(hit.id), clamp01(hit.score / top));
     return scores;
   }
 
@@ -601,25 +1301,34 @@ export function createCardsRuntime(deps: CardsRuntimeDeps): CardsRuntime {
     const queryVec = embedder.embed(query.raw);
     if (!queryVec) return scores;
     for (const [sessionId, vec] of cardVectors) {
+      // Like lexicalHits: a card waiting in `dirty` has a vector for a version
+      // it no longer is.
+      if (dirty.has(sessionId)) continue;
+      // A card the index has taken may still wait for its vector (a pass that
+      // could not write under another model's stamp left it to a reload), so
+      // a vector scores only for the content it was computed from.
+      const card = cardById.get(sessionId);
+      const from = vectorSource.get(sessionId);
+      if (!card || !from) continue;
+      if (from !== card) {
+        if (!sameIndexedContent(from, card)) continue;
+        vectorSource.set(sessionId, card);
+      }
       scores.set(sessionId, clamp01((cosineSimilarity(queryVec, vec) + 1) / 2));
     }
     return scores;
   }
 
   // Warm-store activation: when the embedder is still loading, hook its init
-  // completion to run one embed pass the moment it is ready, so semantic turns
-  // on without waiting for a distill (`cards_rev`) bump. Single-flight: the init
-  // promise resolves once, and the pass is skipped when vectors already exist or
-  // no snapshot is loaded yet (the next query then rebuilds and embeds).
-  if (embedder && semanticWeight > 0 && deps.semanticReady) {
+  // completion to run one vector pass the moment it is ready, so semantic turns
+  // on without waiting for a card change. The init promise resolves once; the
+  // pass is skipped when no index is built yet (its build computes the vectors)
+  // or a full pass already ran. When another build is running, the next index
+  // update starts the pass instead.
+  if (semanticOn && deps.semanticReady) {
     void deps.semanticReady.then(() => {
-      if (disposed || !embedder.ready || !loaded) return;
-      if (cardVectors && cardVectors.size > 0) return;
-      // Deliberately leave lastVectorsRevision untouched: this pass writes vectors
-      // (bumping vectors_rev past the cached value), so the next refresh reloads
-      // once and reconciles through rebuild()'s accounting. Caching a value here
-      // could absorb a foreign write that landed since the last snapshot.
-      embedCards();
+      if (disposed || !embedder?.ready || indexInstalledAt === 0 || vectorsComplete) return;
+      void startJob("index", vectorReloadSteps());
     });
   }
 
@@ -628,10 +1337,36 @@ export function createCardsRuntime(deps: CardsRuntimeDeps): CardsRuntime {
       disposed = true;
     },
 
+    async ready(opts): Promise<void> {
+      const withIndex = opts?.index === true;
+      for (let round = 0; round < MAX_READY_ROUNDS && !disposed; round++) {
+        // The map first. A caller that reads only the map never waits on the
+        // index or the vectors.
+        if (metaJob) {
+          await metaJob;
+          continue;
+        }
+        const meta = metaSteps();
+        if (meta) {
+          await startJob("meta", meta);
+          continue;
+        }
+        if (!withIndex) return;
+        if (indexJob) {
+          await indexJob;
+          continue;
+        }
+        const index = indexSteps();
+        if (!index) return;
+        await startJob("index", index);
+      }
+    },
+
     rank(query, filters, stats): CardHit[] {
-      refreshIfStale();
+      syncIndex();
+      const cards = cardById.values();
       const excluded = filters.excludeFamilyOf
-        ? exclusionFamilyFromCards(cards, filters.excludeFamilyOf)
+        ? exclusionFamilyFromCards(cardById.values(), filters.excludeFamilyOf)
         : new Set<string>();
 
       const lexical = lexicalHits(query);
@@ -656,7 +1391,15 @@ export function createCardsRuntime(deps: CardsRuntimeDeps): CardsRuntime {
       };
 
       const hits: CardHit[] = [];
+      const skipped: Array<{ card: Card; score: number }> = [];
+      let pending = 0;
       for (const card of cards) {
+        if (dirty.has(card.sessionId)) {
+          // Unscored (see lexicalHits); counted only when a filter would
+          // have let it compete.
+          if (passesFilters(card, filters, excluded)) pending++;
+          continue;
+        }
         if (!passesFilters(card, filters, excluded)) {
           // Count only cards the restriction ALONE removed and that would have
           // become hits: the contention set every other skippedByReason key is
@@ -669,7 +1412,7 @@ export function createCardsRuntime(deps: CardsRuntimeDeps): CardsRuntime {
               // Same score a real hit would get, so the caller can rank these
               // against the hits and keep only the ones that would have taken a
               // shortlist slot. See RankStats for why the bare count is useless.
-              stats!.rootOnlySkipped.push({ card, score: scoreOf(card, skippedLex, skippedSem) });
+              skipped.push({ card, score: scoreOf(card, skippedLex, skippedSem) });
             }
           }
           continue;
@@ -688,14 +1431,26 @@ export function createCardsRuntime(deps: CardsRuntimeDeps): CardsRuntime {
         });
       }
 
-      hits.sort((a, b) => b.score - a.score || b.card.timeUpdated - a.card.timeUpdated);
+      // Map order follows load and update history, so every order here ends
+      // in the session id and an updated runtime ranks like a fresh one.
+      if (stats && skipped.length > 0) {
+        skipped.sort((a, b) => byRecency(a.card, b.card));
+        stats.rootOnlySkipped.push(...skipped);
+      }
+      if (stats) stats.pending = pending;
+      hits.sort(
+        (a, b) =>
+          b.score - a.score ||
+          b.card.timeUpdated - a.card.timeUpdated ||
+          compareIds(a.sessionId, b.sessionId),
+      );
       if (hits.length > 0) return hits;
 
       // No lexical/semantic signal: fall back to recency-ranked near-misses so a
       // broad paraphrase still returns something honest (labeled by the caller).
-      return cards
+      return [...cardById.values()]
         .filter((card) => passesFilters(card, filters, excluded))
-        .sort((a, b) => b.timeUpdated - a.timeUpdated)
+        .sort(byRecency)
         .slice(0, NEAR_MISS_LIMIT)
         .map((card) => ({
           sessionId: card.sessionId,
@@ -706,53 +1461,55 @@ export function createCardsRuntime(deps: CardsRuntimeDeps): CardsRuntime {
     },
 
     list(filters): Card[] {
-      refreshIfStale();
+      syncMeta();
       const excluded = filters.excludeFamilyOf
-        ? exclusionFamilyFromCards(cards, filters.excludeFamilyOf)
+        ? exclusionFamilyFromCards(cardById.values(), filters.excludeFamilyOf)
         : new Set<string>();
-      return cards
+      return [...cardById.values()]
         .filter((card) => passesFilters(card, filters, excluded))
-        .sort((a, b) => b.timeUpdated - a.timeUpdated || a.sessionId.localeCompare(b.sessionId));
+        .sort(byRecency);
     },
 
     get(sessionId): Card | undefined {
-      refreshIfStale();
-      const card = cards.find((c) => c.sessionId === sessionId);
+      syncMeta();
+      const card = cardById.get(sessionId);
       // A worker card is never a valid drill/deep target (see passesFilters).
       return card && !isSummarizerTitle(card.title) ? card : undefined;
     },
 
     exclusionFamily(currentSessionId): Set<string> {
-      refreshIfStale();
-      return exclusionFamilyFromCards(cards, currentSessionId);
+      syncMeta();
+      return exclusionFamilyFromCards(cardById.values(), currentSessionId);
     },
 
     familyOf(rootId): Card[] {
-      refreshIfStale();
-      return cards.filter((card) => card.rootId === rootId);
+      syncMeta();
+      return [...cardById.values()].filter((card) => card.rootId === rootId).sort(byRecency);
     },
 
     coverage(): CardsCoverage {
-      refreshIfStale();
+      syncMeta();
+      if (coverageCache) return { ...coverageCache };
       let full = 0;
       let recency = 0;
-      for (const card of cards) {
+      for (const card of cardById.values()) {
         if (card.distillState === "full") {
           full++;
           if (card.timeUpdated > recency) recency = card.timeUpdated;
         }
       }
-      return {
-        totalCards: cards.length,
+      coverageCache = {
+        totalCards: cardById.size,
         fullCards: full,
         storeRecency: recency,
-        degraded: deps.source.degraded === true,
+        degraded: source.degraded === true,
       };
+      return { ...coverageCache };
     },
 
     semanticStatus(): SemanticStatus | undefined {
       if (!embedder || semanticWeight <= 0) return undefined;
-      refreshIfStale();
+      syncMeta();
       return {
         ready: embedder.ready,
         ...(semanticModelId != null && { model: semanticModelId }),
@@ -764,7 +1521,9 @@ export function createCardsRuntime(deps: CardsRuntimeDeps): CardsRuntime {
     },
 
     invalidate(): void {
-      loaded = false;
+      const at = tick();
+      metaWantFull = at;
+      metaWantHard = at;
     },
   };
 }
