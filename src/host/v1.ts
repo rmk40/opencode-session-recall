@@ -317,12 +317,17 @@ export const server: Plugin = async (ctx, options) => {
     ? { cards: () => store.allCards(), indexing: () => distiller.indexing() }
     : undefined;
 
-  // The backstop: whatever a tool returns, OpenCode never receives a result
-  // it would cut (see `boundResult`).
+  // The backstop: whatever a tool returns or rejects with, OpenCode never
+  // receives a result it would cut (see `boundResult`). A rejection becomes
+  // a JSON error output like every other failure.
   const bounded = (result: ToolResult): ToolResult =>
     typeof result === "string"
       ? boundResult(result)
       : { ...result, output: boundResult(result.output) };
+  const rejected = (error: unknown): ToolResult => {
+    const err: ErrorOutput = { ok: false, error: errmsg(error) };
+    return boundResult(JSON.stringify(err));
+  };
 
   const guardTool = (definition: ToolDefinition): ToolDefinition => ({
     ...definition,
@@ -336,7 +341,7 @@ export const server: Plugin = async (ctx, options) => {
         };
         return Promise.resolve(JSON.stringify(err));
       }
-      return track(definition.execute(args, context)).then(bounded);
+      return track(definition.execute(args, context)).then(bounded, rejected);
     },
   });
 

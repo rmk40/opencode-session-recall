@@ -249,7 +249,8 @@ function plan<P>(
  * stops at the first record that does not fit (showing the piece of it its
  * section's `fit` returns) and the head gets that stop, so it can set the
  * continuation. When not even part of the first record fits, the output is an
- * error with `trimmed: true`.
+ * error with `trimmed: true`, naming the header and its largest field when
+ * the header is what leaves no room.
  */
 export function writeOutput<P>(spec: OutputSpec<P>): WrittenOutput<P> {
   const budget = spec.budget ?? OUTPUT_BUDGET;
@@ -268,7 +269,8 @@ export function writeOutput<P>(spec: OutputSpec<P>): WrittenOutput<P> {
   let structure = 2;
   for (const key of keys) structure += utf8Length(`${JSON.stringify(key)}:[`) + 1 + 3;
   const fixedLines = 2 + 2 * keys.length;
-  let reserve = utf8Length(headLine(wholeHead, keys.length)) + HEAD_RESERVE;
+  const headBytes = utf8Length(headLine(wholeHead, keys.length));
+  let reserve = headBytes + HEAD_RESERVE;
   for (let attempt = 0; attempt < FIT_ATTEMPTS; attempt++) {
     const planned = plan(
       spec.sections,
@@ -285,13 +287,27 @@ export function writeOutput<P>(spec: OutputSpec<P>): WrittenOutput<P> {
   }
   const none: Record<string, number> = {};
   for (const key of keys) none[key] = 0;
-  return {
-    text: writeError(
-      "the output's first record does not fit within the output budget, even in part",
-      { trimmed: true },
-    ),
-    shown: none,
-  };
+  // A header that leaves no room is the cause whatever the records hold.
+  const cause =
+    headBytes + structure + HEAD_RESERVE > budget.bytes
+      ? headerTooLarge(wholeHead, headBytes, budget)
+      : "the output's first record does not fit within the output budget, even in part";
+  return { text: writeError(cause, { trimmed: true }), shown: none };
+}
+
+/** Why a header left no room: its size and its largest field. */
+function headerTooLarge(head: OutputHead, headBytes: number, budget: OutputBudget): string {
+  let largest = "";
+  let largestBytes = 0;
+  for (const [key, value] of Object.entries(head.fields)) {
+    const bytes = utf8Length(JSON.stringify(value) ?? "");
+    if (bytes > largestBytes) {
+      largest = key;
+      largestBytes = bytes;
+    }
+  }
+  const field = largest ? `, ${largestBytes} of them in its "${largest}" field` : "";
+  return `the output's header alone is ${headBytes} bytes${field}, which leaves no room for any record within the ${budget.bytes}-byte output budget`;
 }
 
 // ── Parts and messages ───────────────────────────────────────────────────────

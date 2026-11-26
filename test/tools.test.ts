@@ -6,6 +6,7 @@ import { search } from "../src/search.js";
 import { sessions as sessionsTool } from "../src/sessions.js";
 import { createFetchGate, type FetchGate } from "../src/fetch-gate.js";
 import { cardsLiteFromSessions } from "../src/cards.js";
+import type { HistorySource } from "../src/history/source.js";
 import type {
   ContextOutput,
   ErrorOutput,
@@ -317,6 +318,27 @@ describe("recall_get", () => {
     expect(ok.ok).toBe(true);
     expect(ok.context.sessionTitle).toBeUndefined();
     expect(ok.context.directory).toBeUndefined();
+  });
+
+  it("names an oversized header, not the records, when the header leaves no room", async () => {
+    // The session title rides in the header's `context`; one over the whole
+    // output budget leaves no room for any part.
+    const h = makeFakeHarness();
+    const source: HistorySource = {
+      ...h.source,
+      getSession: async () => ({
+        ok: true,
+        value: session("s-current", "T".repeat(45_000), PROJECT_DIR, 1_000),
+      }),
+    };
+    const out = await runTool<ErrorOutput & { trimmed?: true }>(getTool(source, gate), {
+      sessionID: "s-current",
+      messageID: "m-current-1",
+    });
+    expect(out).toMatchObject({ ok: false, trimmed: true });
+    expect(out.error).toContain("header alone is");
+    expect(out.error).toContain('"context" field');
+    expect(out.error).not.toContain("first record");
   });
 
   it("survives a raw non-string or blank cursor (host path): reads the whole message", async () => {

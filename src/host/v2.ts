@@ -217,9 +217,11 @@ function lru<K, V>(size: number) {
   };
 }
 
+/** An error result, bounded like every other result: a rejection's message
+ *  can be as large as anything a tool returns. */
 function errorContent(error: string): V2ToolResult {
   const out: ErrorOutput = { ok: false, error };
-  return { content: JSON.stringify(out) };
+  return { content: boundResult(JSON.stringify(out)) };
 }
 
 async function start(ctx: V2PluginContext): Promise<V2Cleanup> {
@@ -372,8 +374,9 @@ async function wire(
       const result = runtime
         ? await runtime.track(liveTools(runtime)[name].execute(args, toolContext))
         : await standIn[name].execute(args, toolContext);
-      // The backstop: whatever a tool returns, OpenCode never receives a
-      // result it would cut (see `boundResult`).
+      // The backstop: whatever a tool returns or rejects with (through
+      // `errorContent`), OpenCode never receives a result it would cut (see
+      // `boundResult`).
       return {
         content: boundResult(typeof result === "string" ? result : JSON.stringify(result)),
       };
