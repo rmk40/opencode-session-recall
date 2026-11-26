@@ -461,12 +461,15 @@ describe("the suggestion naming excluded sessions that match", () => {
       expect(findSuggestion(asked, "current session")).toBeUndefined();
     });
 
-    it("says nothing about the exclusion when the current session does not match", async () => {
+    it("still names the exclusion on an empty result the current session did not match", async () => {
       const { tool } = await recallOver(makeFakeHarness());
       const out = await runTool<SearchOutput>(tool, { query: "zzqnomatchword", match: "smart" });
       expect(out.results).toEqual([]);
       expect(out.coverage?.skippedByReason?.excludedSession).toBe(1);
-      expect(findSuggestion(out, "current session")).toBeUndefined();
+      expect(findSuggestion(out, CURRENT_DEFAULT)).toBeUndefined();
+      expect(findSuggestion(out, "This search excluded the current session.")?.example).toEqual({
+        excludeCurrentSession: false,
+      });
     });
 
     it("keeps the unmeasured zero-result hint for a search over named sessions", async () => {
@@ -637,11 +640,27 @@ describe("the suggestion naming excluded sessions that match", () => {
       ]);
     });
 
-    it("says nothing when no excluded session matched", () => {
-      expect(suggest({ excludedMatches: { current: false, relatives: 0 } })).toEqual([]);
-      expect(
-        suggest({ excludeFamily: true, excludedMatches: { current: false, relatives: 0 } }),
-      ).toEqual([]);
+    it("names the exclusion on an empty result when no excluded session was measured to match", () => {
+      // The measurement can miss the current session (its card waiting for
+      // the index, or a match only in text the cards leave out).
+      const none = { current: false, relatives: 0 };
+      expect(suggest({ excludedMatches: none })).toEqual([
+        {
+          reason: "This search excluded the current session.",
+          action: "Pass excludeCurrentSession:false if you meant to search this conversation.",
+          example: { excludeCurrentSession: false },
+        },
+      ]);
+      expect(suggest({ excludeFamily: true, excludedMatches: none })).toEqual([
+        {
+          reason: "This search excluded the current session and its family.",
+          action: "Drop excludeFamily to search its parent, siblings and subagents.",
+          example: { excludeFamily: false },
+        },
+      ]);
+      // A result, or a current session that was not excluded, gets nothing.
+      expect(suggest({ results: results(1), excludedMatches: none })).toEqual([]);
+      expect(suggest({ currentSessionExcluded: false, excludedMatches: none })).toEqual([]);
     });
 
     describe("without a measurement of what matched", () => {

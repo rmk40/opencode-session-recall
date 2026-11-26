@@ -1662,28 +1662,13 @@ type ExcludedHintInput = {
 };
 
 /** The suggestion naming the argument that includes the excluded sessions
- *  matching the query, on zero or few results. Without a measurement (a
- *  search over listed or named sessions), only an empty result after the
- *  current session was excluded gets one. */
+ *  measured to match the query, on zero or few results; otherwise, on an
+ *  empty result after the current session was excluded, the one naming that
+ *  exclusion. */
 function excludedHint(input: ExcludedHintInput): SearchSuggestion | undefined {
   const matched = input.excludedMatches;
-  if (!matched) {
-    if (input.results.length > 0 || !input.currentSessionExcluded) return undefined;
-    return input.excludeFamily
-      ? {
-          reason: "This search excluded the current session and its family.",
-          action: "Drop excludeFamily to search its parent, siblings and subagents.",
-          example: { excludeFamily: false },
-        }
-      : {
-          reason: "This search excluded the current session.",
-          action: "Pass excludeCurrentSession:false if you meant to search this conversation.",
-          example: { excludeCurrentSession: false },
-        };
-  }
   const few = input.results.length < Math.min(FEW_RESULTS, input.requested ?? FEW_RESULTS);
-  if (!few) return undefined;
-  if (matched.relatives > 0) {
+  if (matched && few && matched.relatives > 0) {
     const n = matched.relatives;
     return {
       reason: `${plural(n, "session")} in the current session's family (its parent, siblings or subagents) ${n === 1 ? "matches" : "match"} the query, but excludeFamily:true left ${n === 1 ? "it" : "them"} out.`,
@@ -1691,16 +1676,35 @@ function excludedHint(input: ExcludedHintInput): SearchSuggestion | undefined {
       example: { excludeFamily: false },
     };
   }
-  if (!matched.current) return undefined;
+  if (matched && few && matched.current) {
+    return input.excludeFamily
+      ? {
+          reason: "The current session matches the query, but excludeFamily:true left it out.",
+          action:
+            "Drop excludeFamily and pass excludeCurrentSession:false if you meant to search this conversation.",
+          example: { excludeFamily: false, excludeCurrentSession: false },
+        }
+      : {
+          reason: "The current session matches the query, but recall excludes it by default.",
+          action: "Pass excludeCurrentSession:false if you meant to search this conversation.",
+          example: { excludeCurrentSession: false },
+        };
+  }
+  // An empty result after the current session was excluded names the
+  // exclusion even when no match was measured, because the measurement can
+  // miss one: the current session's card is the one most likely to be
+  // waiting for the index, which ranking leaves unscored, and the cards and
+  // the slim index leave out much of what assistant replies and tool output
+  // say.
+  if (input.results.length > 0 || !input.currentSessionExcluded) return undefined;
   return input.excludeFamily
     ? {
-        reason: "The current session matches the query, but excludeFamily:true left it out.",
-        action:
-          "Drop excludeFamily and pass excludeCurrentSession:false if you meant to search this conversation.",
-        example: { excludeFamily: false, excludeCurrentSession: false },
+        reason: "This search excluded the current session and its family.",
+        action: "Drop excludeFamily to search its parent, siblings and subagents.",
+        example: { excludeFamily: false },
       }
     : {
-        reason: "The current session matches the query, but recall excludes it by default.",
+        reason: "This search excluded the current session.",
         action: "Pass excludeCurrentSession:false if you meant to search this conversation.",
         example: { excludeCurrentSession: false },
       };
