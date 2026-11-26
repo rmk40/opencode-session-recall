@@ -16,6 +16,7 @@ import type {
   LeaseInfo,
   PartTextRow,
   RangeHash,
+  RollupFields,
   SettledBase,
   Store,
 } from "./store.js";
@@ -55,6 +56,9 @@ const ERRORS_CAP = 8;
 const ERROR_SIG_CHARS = 200;
 const ROLLUP_CAP = 12;
 const ROLLUP_HINT_CHARS = 120;
+/** Cards a rollup recompute reads per page. With `yieldBetween`, it yields
+ *  between pages. */
+const ROLLUP_PAGE = 500;
 const ROOT_MAX_DEPTH = 16;
 const DEFAULT_FTS_ROWS_PER_SESSION = 5_000;
 const DEFAULT_INVENTORY_TOKENS = 200;
@@ -1486,6 +1490,18 @@ export function createDistiller(options: DistillerOptions): Distiller {
   let sweepProgress: RepairProgress | undefined;
   const inFlight = new Map<string, Promise<void>>();
   const pendingRerun = new Set<string>();
+  /** Roots a {@link recomputeRootRollup} is running for, and those of them a
+   *  later change asked to recompute again once it is done. A recompute reads
+   *  the family across yields, so two at once could finish out of order and
+   *  leave the older rollup. */
+  const rollupRunning = new Set<string>();
+  const rollupAgain = new Set<string>();
+  /** Recomputes no caller waits for; stop() waits for them. */
+  const rollupDetached = new Set<Promise<void>>();
+  /** One set per running {@link recomputeAllRootRollups}: the roots written
+   *  by a recompute that started after the pass began. That recompute read
+   *  the family no earlier than the pass, so the pass leaves its rollup. */
+  const rollupPasses = new Set<Set<string>>();
   /** Sessions whose metadata a patch changed while a distill of them was in
    *  progress: that distill read the metadata before the patch and writes it
    *  back over it, so their metadata is read again once it is done. The
@@ -2187,7 +2203,7 @@ export function createDistiller(options: DistillerOptions): Distiller {
     return map;
   }
 
-  function buildRollup(children: Card[]): FamilyRollup[] {
+  function buildRollup(children: RollupFields[]): FamilyRollup[] {
     return [...children]
       .sort((a, b) => b.timeUpdated - a.timeUpdated || a.sessionId.localeCompare(b.sessionId))
       .slice(0, ROLLUP_CAP)
@@ -2198,17 +2214,58 @@ export function createDistiller(options: DistillerOptions): Distiller {
       });
   }
 
-  function recomputeRootRollup(rootId: string): void {
-    // Rollup writes change the root card row; verify authoritative ownership
-    // once per rollup batch (callers reach here after awaited fetches, so the
-    // cached flag alone can be stale after a >TTL suspension).
-    if (!ownsLease()) return;
-    const root = store.getCard(rootId);
-    if (!root) return;
-    const children = store
-      .allCards()
-      .filter((card) => card.rootId === rootId && card.sessionId !== rootId);
-    store.setFamilyRollup(rootId, buildRollup(children));
+  /**
+   * Recompute one root's rollup from its family, read a page at a time with
+   * a yield between pages. A call while one runs for the root asks that one
+   * to run again once it is done. Without `yieldBetween` it finishes before
+   * it returns.
+   */
+  async function recomputeRootRollup(rootId: string): Promise<void> {
+    if (rollupRunning.has(rootId)) {
+      rollupAgain.add(rootId);
+      return;
+    }
+    rollupRunning.add(rootId);
+    const passes = [...rollupPasses];
+    try {
+      // Rollup writes change the root card row; verify authoritative ownership
+      // once per rollup batch and after each yield (callers reach here after
+      // awaited fetches, so the cached flag alone can be stale after a >TTL
+      // suspension).
+      if (stopped || !ownsLease()) return;
+      // Keyed by session: a card deleted and written again during the walk
+      // is listed twice, the newer listing last.
+      const family = new Map<string, RollupFields>();
+      let after: number | undefined;
+      for (;;) {
+        const page = store.familyPage(rootId, after, ROLLUP_PAGE);
+        for (const card of page.cards) family.set(card.sessionId, card);
+        if (page.next === undefined) break;
+        after = page.next;
+        if (pause) {
+          await pause();
+          if (stopped || !ownsLease()) return;
+        }
+      }
+      if (!family.has(rootId)) return; // the root has no card
+      family.delete(rootId);
+      for (const touched of passes) touched.add(rootId);
+      store.setFamilyRollup(rootId, buildRollup([...family.values()]));
+    } finally {
+      rollupRunning.delete(rootId);
+      if (rollupAgain.delete(rootId) && !stopped) refreshRootRollup(rootId);
+    }
+  }
+
+  /** {@link recomputeRootRollup} for a caller that does not wait for it. */
+  function refreshRootRollup(rootId: string): void {
+    const running = recomputeRootRollup(rootId)
+      .catch((error: unknown) => {
+        lastError = errmsg(error);
+        logMsg(`root ${rootId} rollup failed: ${lastError}`);
+      })
+      .finally(() => rollupDetached.delete(running));
+    rollupDetached.add(running);
   }
 
   async function recomputeAllRootRollups(): Promise<void> {
@@ -2217,30 +2274,53 @@ export function createDistiller(options: DistillerOptions): Distiller {
     // no additional safety. A host that yields mid-sweep re-checks after each
     // pause instead.
     if (!ownsLease()) return;
-    const rootCards = new Map<string, Card>();
-    const childrenByRoot = new Map<string, Card[]>();
-    for (const card of store.allCards()) {
-      if (card.rootId === card.sessionId) rootCards.set(card.sessionId, card);
-      else {
-        const siblings = childrenByRoot.get(card.rootId);
-        if (siblings) siblings.push(card);
-        else childrenByRoot.set(card.rootId, [card]);
-      }
-    }
-    // Counts every setFamilyRollup call, including those that skip an
-    // unchanged rollup: each still runs a transaction.
-    let rollupCalls = 0;
-    for (const [rootId, root] of rootCards) {
-      const rollup = buildRollup(childrenByRoot.get(rootId) ?? []);
-      if (rollup.length > 0 || root.familyRollup.length > 0) {
-        if (pause && ++rollupCalls % YIELD_EVERY_WRITES === 0) {
+    const touched = new Set<string>();
+    rollupPasses.add(touched);
+    try {
+      const rootCards = new Map<string, RollupFields>();
+      const childrenByRoot = new Map<string, RollupFields[]>();
+      let after: string | undefined;
+      for (;;) {
+        const page = store.rollupFieldsPage(after, ROLLUP_PAGE);
+        for (const card of page) {
+          if (card.rootId === card.sessionId) rootCards.set(card.sessionId, card);
+          else {
+            const siblings = childrenByRoot.get(card.rootId);
+            if (siblings) siblings.push(card);
+            else childrenByRoot.set(card.rootId, [card]);
+          }
+        }
+        if (page.length < ROLLUP_PAGE) break;
+        after = page[page.length - 1]!.sessionId;
+        if (pause) {
           await pause();
           if (stopped || !ownsLease()) return;
         }
-        // Writes only the rollup column, so a card re-distilled during a pause
-        // keeps its new content.
-        store.setFamilyRollup(rootId, rollup);
       }
+      // Counts every setFamilyRollup call, including those that skip an
+      // unchanged rollup: each still runs a transaction.
+      let rollupCalls = 0;
+      for (const [rootId, root] of rootCards) {
+        const rollup = buildRollup(childrenByRoot.get(rootId) ?? []);
+        if (rollup.length > 0 || root.familyRollup.length > 0) {
+          if (pause && ++rollupCalls % YIELD_EVERY_WRITES === 0) {
+            await pause();
+            if (stopped || !ownsLease()) return;
+          }
+          if (touched.has(rootId)) continue;
+          // A recompute still running may have read part of the family
+          // before this pass did: it runs again once it is done.
+          if (rollupRunning.has(rootId)) {
+            rollupAgain.add(rootId);
+            continue;
+          }
+          // Writes only the rollup column, so a card re-distilled during a pause
+          // keeps its new content.
+          store.setFamilyRollup(rootId, rollup);
+        }
+      }
+    } finally {
+      rollupPasses.delete(touched);
     }
   }
 
@@ -3736,7 +3816,10 @@ export function createDistiller(options: DistillerOptions): Distiller {
         if (result.changed) {
           // Keep the root's family highlights current with its live children.
           const stored = store.getCard(sessionID);
-          if (stored && stored.rootId !== sessionID) recomputeRootRollup(stored.rootId);
+          if (stored && stored.rootId !== sessionID) {
+            await recomputeRootRollup(stored.rootId);
+            if (stopped || !leaseHeld) return;
+          }
           options.onSessionDistilled?.(sessionID);
         }
       }
@@ -3783,7 +3866,7 @@ export function createDistiller(options: DistillerOptions): Distiller {
       clearTimeout(retry);
       metaRetryTimers.delete(sessionID);
     }
-    if (rootId && rootId !== sessionID) recomputeRootRollup(rootId);
+    if (rootId && rootId !== sessionID) refreshRootRollup(rootId);
   }
 
   function handleMeta(sessionID: string, patch: SessionMetaPatch): void {
@@ -4007,6 +4090,7 @@ export function createDistiller(options: DistillerOptions): Distiller {
     for (const timer of metaRetryTimers.values()) clearTimeout(timer);
     metaRetryTimers.clear();
     pendingRerun.clear();
+    rollupAgain.clear();
     reDistillQueue.clear();
     // Wake any inter-page politeness sleep immediately: with a long
     // distillDelayMs those timers would otherwise keep the runtime alive past
@@ -4045,9 +4129,13 @@ export function createDistiller(options: DistillerOptions): Distiller {
         }
       }
       leaseHeld = false;
-      const running = [coldPassPromise, pollPromise, sweepPromise, ...inFlight.values()].filter(
-        (promise): promise is Promise<void> => promise !== undefined,
-      );
+      const running = [
+        coldPassPromise,
+        pollPromise,
+        sweepPromise,
+        ...inFlight.values(),
+        ...rollupDetached,
+      ].filter((promise): promise is Promise<void> => promise !== undefined);
       stopPromise = Promise.allSettled(running).then(() => {});
       return stopPromise;
     },
