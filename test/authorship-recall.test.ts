@@ -1187,6 +1187,10 @@ describe("authorship compatibility", () => {
       const base = { query: "quarkbeam", match: "smart" as const, results: 50, ...shape.args };
 
       const { absent, explicitAny, explicitUndefined } = await withFrozenClock(async () => ({
+        // Warm the drill cache first: coverage.sessionStops reports a session
+        // read entirely from the cache as `cached`, so every compared call
+        // must find it warm.
+        warm: await runTool<SearchOutput>(recall, base),
         absent: await runTool<SearchOutput>(recall, base),
         explicitAny: await runTool<SearchOutput>(recall, { ...base, authorship: "any" }),
         explicitUndefined: await runToolRaw<SearchOutput>(recall, {
@@ -1214,6 +1218,8 @@ describe("authorship compatibility", () => {
     const base = { query: "quarkbeam", match: "smart" as const, results: 50 };
 
     const { absent, any } = await withFrozenClock(async () => ({
+      // Warm the drill cache first (see the test above).
+      warm: await runTool<SearchOutput>(recall, base),
       absent: await runTool<SearchOutput>(recall, base),
       any: await runTool<SearchOutput>(recall, { ...base, authorship: "any" }),
     }));

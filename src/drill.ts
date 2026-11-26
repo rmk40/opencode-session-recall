@@ -1,4 +1,4 @@
-import { errmsg, type Limits } from "./types.js";
+import { errmsg, type DrillSessionStats, type DrillStop, type Limits } from "./types.js";
 import type { FetchGate } from "./fetch-gate.js";
 import type { ParsedQuery } from "./query.js";
 import { compareMessages, type HistoryMessage } from "./history/model.js";
@@ -100,6 +100,8 @@ export type DrillInput = {
 export type DrilledPool = {
   target: DrillTarget;
   candidates: Candidate[];
+  /** What was read for this session and why reading stopped. */
+  stats: DrillSessionStats;
   /** Per-bucket counts of candidates the authorship stage removed. Present only
    *  when an authorship filter ran. The title candidate is deliberately NOT
    *  attributed: a title is dropped by definition under any set that excludes
@@ -113,18 +115,27 @@ export type DrilledPool = {
   authorshipRemoved?: number;
 };
 
+/** A target's {@link DrillSessionStats}, with the session it describes. */
+export type DrillTargetStats = DrillSessionStats & { sessionId: string };
+
 export type DrillOutput = {
   hits: Bm25Hit[];
   /** The drilled candidate pools the hits were scored over (coverage counts). */
   pools: DrilledPool[];
   /** See {@link DrillPoolsOutput.drilledSessions}. */
   drilledSessions: string[];
+  /** See {@link DrillPoolsOutput.targets}. */
+  targets: DrillTargetStats[];
   budgetExhausted: boolean;
   loadErrors: string[];
 };
 
 export type DrillPoolsOutput = {
   pools: DrilledPool[];
+  /** Every target in drill order, read or not: a drilled one with its
+   *  pool's stats, one never read with zero counts and the reason
+   *  (`queryBudget`, `aborted`, `loadError`). */
+  targets: DrillTargetStats[];
   /**
    * The targets that were searched, in drill order. The two drills differ:
    * the history drill lists every target whose history loaded, even if its
@@ -182,6 +193,11 @@ export type DeepContinuation = {
 export type DeepOutput = {
   pools: DrilledPool[];
   drilledSessions: string[];
+  /** Every scoped session in sweep order: swept ones with their pool's
+   *  stats (`end`, or the budget that stopped the sweep inside one), and
+   *  those never reached with zero counts and the reason the sweep stopped
+   *  (`budget`, `wallClock`, `aborted`). */
+  targets: DrillTargetStats[];
   loadErrors: string[];
   coverage: DeepCoverage;
   continuation?: DeepContinuation;
@@ -299,12 +315,22 @@ type DrilledMessage = {
 /** One cached newest-first page and the cursor it returned. */
 type CachedPage = { items: DrilledMessage[]; nextCursor: string | null };
 
-/** The messages one query's slice of a session holds (see `sliceFor`). */
+/** Why a slice's walk stopped (see {@link DrillStop}). */
+type SliceStop = Extract<DrillStop, "anchor" | "sessionBudget" | "end" | "targetsCut">;
+
+/** The messages one query's slice of a session holds (see `sliceFor`).
+ *  `fetches` counts the history reads building it took (0 when the cache
+ *  held everything). */
 type Slice = {
   messages: DrilledMessage[];
   signature: string;
   points: Array<[string, DrilledMessage]>;
+  stop: SliceStop;
+  fetches: number;
 };
+
+/** History reads a slice made, counted as `pageAt` and `pointAt` fetch. */
+type SliceReads = { fetches: number };
 
 /**
  * The candidates one query's slice of a session builds to. `signature` names
@@ -349,6 +375,31 @@ type SessionEntry = {
 };
 
 const MAX_LOAD_ERROR_SAMPLES = 5;
+
+/** Distinct messages among `candidates`; a title candidate is not a message
+ *  and is left out. */
+export function countMessages(candidates: readonly Candidate[]): number {
+  const ids = new Set<string>();
+  for (const candidate of candidates) {
+    if (candidate.partType !== "title") ids.add(candidate.messageID);
+  }
+  return ids.size;
+}
+
+/** Zero-count stats for `targets` from `from` on, none of which was read. */
+export function unreadTargets(
+  targets: readonly DrillTarget[],
+  from: number,
+  stop: DrillStop,
+): DrillTargetStats[] {
+  return targets.slice(from).map((target) => ({
+    sessionId: target.sessionId,
+    fetched: 0,
+    candidate: 0,
+    eligible: 0,
+    stop,
+  }));
+}
 
 function anchorNeedles(query: ParsedQuery): string[] {
   return [...query.tokens, ...query.phrases, ...query.codeTokens.map((t) => t.toLowerCase())];
@@ -496,10 +547,12 @@ export function createDrill(deps: DrillDeps): Drill {
     entry: SessionEntry,
     target: DrillTarget,
     before: string | undefined,
+    reads: SliceReads,
   ): Promise<CachedPage> {
     const key = before ?? "";
     const hit = entry.pages.get(key);
     if (hit) return hit;
+    reads.fetches++;
     const page = await gate.runQuery(() =>
       source.messagePage({
         sessionID: target.sessionId,
@@ -539,9 +592,11 @@ export function createDrill(deps: DrillDeps): Drill {
     target: DrillTarget,
     messageID: string,
     own: ReadonlySet<string>,
+    reads: SliceReads,
   ): Promise<DrilledMessage | null> {
     const hit = entry.points.get(messageID);
     if (hit !== undefined) return hit;
+    reads.fetches++;
     const lookup = await gate.runQuery(() => source.getMessage(target.sessionId, messageID));
     const raced = entry.points.get(messageID);
     if (raced !== undefined) return raced;
@@ -576,7 +631,11 @@ export function createDrill(deps: DrillDeps): Drill {
    * the pages walked and the point lookups added; with the entry's pages fixed
    * for its lifetime, equal signatures mean equal slices. `points` lists the
    * lookups added, by requested id, so the caller can tell whether the entry
-   * still holds them all.
+   * still holds them all. `stop` says why the walk ended: the session's end
+   * when its last page was read (even if that page also missed every
+   * anchor), else the anchor stop or the per-session budget, and
+   * `targetsCut` when paging ended otherwise but the budget then left point
+   * lookups unread.
    */
   async function sliceFor(
     entry: SessionEntry,
@@ -585,13 +644,15 @@ export function createDrill(deps: DrillDeps): Drill {
     ftsHits: FtsHit[] | undefined,
   ): Promise<Slice> {
     const byId = new Map<string, DrilledMessage>();
+    const reads: SliceReads = { fetches: 0 };
     let retained = 0;
 
     // Untargeted: bounded newest-first paging.
     let cursor: string | undefined;
     let pagesWalked = 0;
+    let anchorStop = false;
     do {
-      const page = await pageAt(entry, target, cursor);
+      const page = await pageAt(entry, target, cursor, reads);
       pagesWalked++;
       for (const msg of page.items) {
         const id = msg.message.info.id;
@@ -602,8 +663,12 @@ export function createDrill(deps: DrillDeps): Drill {
       }
       cursor = page.nextCursor ?? undefined;
       // Stop once a non-first page stops matching any anchor (nothing more to gain).
-      if (pagesWalked > 1 && !partsMatchAnchor(page.items, needles)) break;
+      if (pagesWalked > 1 && !partsMatchAnchor(page.items, needles)) {
+        anchorStop = true;
+        break;
+      }
     } while (cursor && retained < limits.drillCharsPerSession);
+    let stop: SliceStop = !cursor ? "end" : anchorStop ? "anchor" : "sessionBudget";
 
     // Targeted: point-fetch each FTS hit's message plus its stored neighbors,
     // charging their retained chars against the SAME per-session budget as the
@@ -619,10 +684,13 @@ export function createDrill(deps: DrillDeps): Drill {
       }
       const asked = new Set<string>();
       for (const messageID of wanted) {
-        if (retained >= limits.drillCharsPerSession) break;
         if (byId.has(messageID)) continue;
+        if (retained >= limits.drillCharsPerSession) {
+          if (stop !== "sessionBudget") stop = "targetsCut";
+          break;
+        }
         asked.add(messageID);
-        const msg = await pointAt(entry, target, messageID, asked);
+        const msg = await pointAt(entry, target, messageID, asked, reads);
         if (!msg) continue;
         byId.set(msg.message.info.id, msg);
         retained += msg.retained;
@@ -634,6 +702,8 @@ export function createDrill(deps: DrillDeps): Drill {
       messages: [...byId.values()],
       signature: [String(pagesWalked), ...points.map(([id]) => id)].join("\n"),
       points,
+      stop,
+      fetches: reads.fetches,
     };
   }
 
@@ -680,16 +750,22 @@ export function createDrill(deps: DrillDeps): Drill {
     return { signature: slice.signature, candidates, chars, parentID: target.parentID };
   }
 
+  /** One target's slice built to candidates, with the messages it holds and
+   *  why its walk stopped (`cached` when it fetched nothing). */
   async function candidatesFor(
     target: DrillTarget,
     needles: string[],
     ftsHits: FtsHit[] | undefined,
-  ): Promise<SliceBuild> {
+  ): Promise<{ build: SliceBuild; fetched: number; stop: DrillStop }> {
     const entry = entryFor(target);
     try {
       const slice = await sliceFor(entry, target, needles, ftsHits);
+      const read = {
+        fetched: slice.messages.length,
+        stop: slice.fetches === 0 ? ("cached" as const) : slice.stop,
+      };
       if (entry.build?.signature === slice.signature) {
-        return restamped(entry.build, target.parentID);
+        return { build: restamped(entry.build, target.parentID), ...read };
       }
       const build = assemble(target, slice);
       // A concurrent query may have evicted some of this slice's lookups
@@ -697,7 +773,7 @@ export function createDrill(deps: DrillDeps): Drill {
       // their candidates reachable with their chars no longer charged.
       // Page messages need no check: a live entry never drops a page.
       if (slice.points.every(([id, msg]) => entry.points.get(id) === msg)) entry.build = build;
-      return build;
+      return { build, ...read };
     } finally {
       evict();
     }
@@ -706,39 +782,49 @@ export function createDrill(deps: DrillDeps): Drill {
   /** Shared bounded fetch loop for both the BM25 and scan paths: drills each
    *  shortlisted session under the per-query budget and returns its candidate
    *  pool plus which sessions were reached in the card-supported deep set. */
-  async function collectPools(input: DrillInput): Promise<{
-    pools: DrilledPool[];
-    drilledSessions: string[];
-    loadErrors: string[];
-    budgetExhausted: boolean;
-  }> {
+  async function collectPools(input: DrillInput): Promise<DrillPoolsOutput> {
     const needles = anchorNeedles(input.query);
     const pools: DrilledPool[] = [];
     const drilledSessions: string[] = [];
+    const targets: DrillTargetStats[] = [];
     const loadErrors: string[] = [];
     let queryRetained = 0;
     let budgetExhausted = false;
 
-    for (const target of input.sessions) {
-      if (input.abort?.aborted) break;
-      if (queryRetained >= limits.drillCharsPerQuery) {
-        budgetExhausted = true;
+    for (let i = 0; i < input.sessions.length; i++) {
+      const target = input.sessions[i]!;
+      if (input.abort?.aborted) {
+        targets.push(...unreadTargets(input.sessions, i, "aborted"));
         break;
       }
-      let build: SliceBuild;
+      if (queryRetained >= limits.drillCharsPerQuery) {
+        budgetExhausted = true;
+        targets.push(...unreadTargets(input.sessions, i, "queryBudget"));
+        break;
+      }
+      let read: Awaited<ReturnType<typeof candidatesFor>>;
       try {
-        build = await candidatesFor(target, needles, input.ftsBySession?.get(target.sessionId));
+        read = await candidatesFor(target, needles, input.ftsBySession?.get(target.sessionId));
       } catch (error) {
         if (loadErrors.length < MAX_LOAD_ERROR_SAMPLES) {
           loadErrors.push(`${target.sessionId}: ${errmsg(error)}`);
         }
+        targets.push(...unreadTargets([target], 0, "loadError"));
         continue;
       }
-      queryRetained += build.chars;
+      queryRetained += read.build.chars;
       drilledSessions.push(target.sessionId);
-      pools.push({ target, ...poolFor(target, build.candidates, input) });
+      const pool = poolFor(target, read.build.candidates, input);
+      const stats: DrillSessionStats = {
+        fetched: read.fetched,
+        candidate: countMessages(read.build.candidates),
+        eligible: countMessages(pool.candidates),
+        stop: read.stop,
+      };
+      pools.push({ target, ...pool, stats });
+      targets.push({ sessionId: target.sessionId, ...stats });
     }
-    return { pools, drilledSessions, loadErrors, budgetExhausted };
+    return { pools, drilledSessions, targets, loadErrors, budgetExhausted };
   }
 
   /**
@@ -818,10 +904,10 @@ export function createDrill(deps: DrillDeps): Drill {
 
   return {
     async drill(input): Promise<DrillOutput> {
-      const { pools, drilledSessions, loadErrors, budgetExhausted } = await collectPools(input);
+      const collected = await collectPools(input);
       const broadPool: Candidate[] = [];
       const deepPool: Candidate[] = [];
-      for (const pool of pools) {
+      for (const pool of collected.pools) {
         broadPool.push(...pool.candidates);
         if (input.deepSet.has(pool.target.sessionId)) deepPool.push(...pool.candidates);
       }
@@ -829,12 +915,11 @@ export function createDrill(deps: DrillDeps): Drill {
       const broad = bm25Search(broadPool, input.query, input.mode, input.explain);
       const deep = bm25Search(deepPool, input.query, input.mode, input.explain);
       const hits = mergeShortlistHits(broad, deep, input.explain);
-      return { hits, pools, drilledSessions, budgetExhausted, loadErrors };
+      return { hits, ...collected };
     },
 
     async pools(input): Promise<DrillPoolsOutput> {
-      const { pools, drilledSessions, loadErrors, budgetExhausted } = await collectPools(input);
-      return { pools, drilledSessions, budgetExhausted, loadErrors };
+      return collectPools(input);
     },
 
     async deep(input): Promise<DeepOutput> {
@@ -846,33 +931,39 @@ export function createDrill(deps: DrillDeps): Drill {
       const budget = { retained: 0 };
       const pools: DrilledPool[] = [];
       const drilledSessions: string[] = [];
+      const targetStats: DrillTargetStats[] = [];
       const loadErrors: string[] = [];
       let sessionsCovered = 0;
       let sessionsPartial = 0;
       let continuation: DeepContinuation | undefined;
 
-      const overBudget = (): boolean =>
-        budget.retained >= charsPerQuery || now() >= deadline || input.abort?.aborted === true;
+      type SweepStop = Extract<DrillStop, "aborted" | "budget" | "wallClock">;
+      /** What stops the sweep now, if anything. */
+      const overBudget = (): SweepStop | undefined => {
+        if (input.abort?.aborted === true) return "aborted";
+        if (budget.retained >= charsPerQuery) return "budget";
+        if (now() >= deadline) return "wallClock";
+        return undefined;
+      };
 
       /** Sweep one session exhaustively from `startBefore`, stopping cleanly on a
        *  budget. Always fetches at least one page so the sweep makes progress. */
       const sweepSession = async (
         target: DeepTarget,
         startBefore: string | null,
-      ): Promise<{ candidates: Candidate[]; nextBefore: string | null; stopped: boolean }> => {
+      ): Promise<{
+        candidates: Candidate[];
+        fetched: number;
+        nextBefore: string | null;
+        stopped: SweepStop | undefined;
+      }> => {
         const messages: HistoryMessage[] = [];
         let cursor: string | undefined = startBefore ?? undefined;
-        let stopped = false;
+        let stopped: SweepStop | undefined;
         let fetchedAny = false;
         for (;;) {
-          if (fetchedAny && overBudget()) {
-            stopped = true;
-            break;
-          }
-          if (!fetchedAny && input.abort?.aborted) {
-            stopped = true;
-            break;
-          }
+          stopped = fetchedAny ? overBudget() : input.abort?.aborted ? "aborted" : undefined;
+          if (stopped) break;
           const before = cursor;
           const page = await gate.runQuery(() =>
             source.messagePage({
@@ -901,7 +992,12 @@ export function createDrill(deps: DrillDeps): Drill {
         const digestText = buildSessionDigest(candidates);
         const normalizedDigest = digestText ? normalize(digestText) : "";
         for (const candidate of candidates) candidate.digestText = normalizedDigest;
-        return { candidates, nextBefore: stopped ? (cursor ?? null) : null, stopped };
+        return {
+          candidates,
+          fetched: messages.length,
+          nextBefore: stopped ? (cursor ?? null) : null,
+          stopped,
+        };
       };
 
       const targets = input.sessions;
@@ -911,8 +1007,10 @@ export function createDrill(deps: DrillDeps): Drill {
       for (let i = 0; i < targets.length; i++) {
         const target = targets[i]!;
         // Budget spent between sessions: this session and the rest are untouched.
-        if (overBudget()) {
+        const between = overBudget();
+        if (between) {
           continuation = { current: null, before: null, remaining: remainingFrom(i) };
+          targetStats.push(...unreadTargets(targets, i, between));
           break;
         }
         const startBefore = i === 0 ? (input.resume?.before ?? null) : null;
@@ -923,9 +1021,18 @@ export function createDrill(deps: DrillDeps): Drill {
           if (loadErrors.length < MAX_LOAD_ERROR_SAMPLES) {
             loadErrors.push(`${target.sessionId}: ${errmsg(error)}`);
           }
+          targetStats.push(...unreadTargets([target], 0, "loadError"));
           continue;
         }
-        pools.push({ target, ...poolFor(target, swept.candidates, input) });
+        const pool = poolFor(target, swept.candidates, input);
+        const stats: DrillSessionStats = {
+          fetched: swept.fetched,
+          candidate: countMessages(swept.candidates),
+          eligible: countMessages(pool.candidates),
+          stop: swept.stopped ?? "end",
+        };
+        pools.push({ target, ...pool, stats });
+        targetStats.push({ sessionId: target.sessionId, ...stats });
         drilledSessions.push(target.sessionId);
         if (swept.stopped) {
           sessionsPartial++;
@@ -934,6 +1041,7 @@ export function createDrill(deps: DrillDeps): Drill {
             before: swept.nextBefore,
             remaining: remainingFrom(i + 1),
           };
+          targetStats.push(...unreadTargets(targets, i + 1, swept.stopped));
           break;
         }
         sessionsCovered++;
@@ -943,6 +1051,7 @@ export function createDrill(deps: DrillDeps): Drill {
       return {
         pools,
         drilledSessions,
+        targets: targetStats,
         loadErrors,
         coverage: {
           sessionsCovered,

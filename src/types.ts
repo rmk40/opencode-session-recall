@@ -1,4 +1,5 @@
 import type { Authorship } from "./authorship.js";
+import type { HistoryReadCounts } from "./history/source.js";
 
 export const TOOLS = [
   "recall",
@@ -107,6 +108,116 @@ export type SearchSuggestion = {
   example?: Record<string, unknown>;
 };
 
+/**
+ * Why a drill stopped reading one target session.
+ *
+ * - `anchor`: a page after the first matched none of the query's anchors.
+ * - `sessionBudget`: the per-session retained-chars budget ran out while
+ *   paging.
+ * - `targetsCut`: paging stopped for another reason, then the per-session
+ *   budget ran out before every point lookup the slim index asked for (a hit
+ *   message and its neighbors) was read.
+ * - `end`: the whole session was read.
+ * - `cached`: every page and point lookup came from the drill cache, so
+ *   nothing was fetched (whatever stopped the walk).
+ * - `queryBudget`: the per-query budget ran out before this session was read.
+ * - `loadError`: reading the session failed.
+ * - `aborted`: the query was cancelled before (or, in a deep sweep, while)
+ *   this session was read.
+ * - `budget` / `wallClock`: a deep sweep's retained-chars or wall-clock
+ *   budget ran out before (or while) this session was swept.
+ *
+ * A session the card drill (history unavailable) searched reports `end`.
+ */
+export type DrillStop =
+  | "anchor"
+  | "sessionBudget"
+  | "end"
+  | "cached"
+  | "queryBudget"
+  | "loadError"
+  | "aborted"
+  | "targetsCut"
+  | "budget"
+  | "wallClock";
+
+/**
+ * What a drill read for one target session. `fetched` counts the messages
+ * read (from the history source or the drill cache; the card drill reads
+ * none), `candidate` those that built at least one candidate before the
+ * query's filters, and `eligible` those with a candidate left after the
+ * filters and the authorship stage (the session's title candidate is not a
+ * message and counts in neither).
+ */
+export type DrillSessionStats = {
+  fetched: number;
+  candidate: number;
+  eligible: number;
+  stop: DrillStop;
+};
+
+/** One drilled (or not drilled) target in `coverage.sessionStops`. */
+export type SessionStop = DrillSessionStats & { sessionID: string };
+
+/** The repair sweep's progress as `coverage.history.repair` reports it. */
+export type HistoryRepairCoverage = {
+  /** Cards built under an older history reader not yet rebuilt. */
+  pending: number;
+  /** Cards that could not be rebuilt (each has a repair reason). */
+  repairPending: number;
+  /** Cards the running (or last) sweep rebuilt. */
+  done: number;
+  running: boolean;
+  /** Set when the sweep's progress has not been refreshed for a while:
+   *  the process running it went away. */
+  stalled?: true;
+  /** When the progress was last shared (ms epoch). */
+  at: number;
+};
+
+/** The range check's progress as `coverage.history.reconcile` reports it. */
+export type HistoryReconcileCoverage = {
+  /** Completed sweeps over every checkable card. */
+  sweeps: number;
+  /** The running sweep's position: the card it is walking (null at the
+   *  start of a sweep) and the `seq` after which that card's next range
+   *  starts (null at the start of the card). Everything from here on is
+   *  unchecked in this sweep. */
+  oldestUnchecked: { session: string | null; after: number | null };
+  /** When the last sweep completed (ms epoch); null before one has. */
+  lastSweepCompletedAt: number | null;
+  /** Every range not yet checked in the running sweep was checked or
+   *  recorded no earlier than this (ms epoch), which bounds how long a
+   *  change only the range check can find waits; null before a sweep has
+   *  completed. */
+  checkedSince: number | null;
+  /** When the last range was checked (ms epoch; 0 before the first). */
+  lastCheckAt: number;
+};
+
+/**
+ * How the host's history database differs from what this build reads, and
+ * how far card repair has got (opencode v2 only). See `HistoryDrift` in
+ * `history/source.ts` for the fields shared with it.
+ */
+export type HistoryCoverage = {
+  capabilities: { parts: boolean };
+  migration: { newest: string | null; tested: boolean };
+  unknownTables: string[];
+  /** Columns an optional capability needs that the database lacks; present
+   *  only when some are missing. */
+  missingColumns?: string[];
+  /** Part types read that this build does not know; present only when some
+   *  were read. */
+  unknownPartTypeNames?: string[];
+  /** Message reads recorded since the process started. */
+  reads: number;
+  /** What those reads could not project faithfully, summed. */
+  counts: HistoryReadCounts;
+  repair?: HistoryRepairCoverage;
+  reconcile?: HistoryReconcileCoverage;
+};
+
 export type SearchCoverage = {
   /** Present only when the plugin is configured in ephemeral mode: cards are
    *  metadata-quality by configuration (no persistent index), not by failure.
@@ -117,8 +228,20 @@ export type SearchCoverage = {
   sessionsDiscovered: number;
   sessionsEligible: number;
   sessionsSearched: number;
-  messagesSearched: number;
+  /** Messages the drill read across the searched sessions (see
+   *  {@link DrillSessionStats}). */
+  messagesFetched: number;
+  /** Of those, messages that built at least one candidate before the
+   *  query's filters. */
+  messagesCandidate: number;
+  /** Of those, messages with a candidate left after the filters and the
+   *  authorship stage: what the match path searched. */
+  messagesEligible: number;
   partsSearched: number;
+  /** Why the drill stopped reading each target session, in drill order:
+   *  `count` targets in all (drilled or not), the first 10 of them
+   *  listed. */
+  sessionStops?: { count: number; sessions: SessionStop[] };
   sessionsSkipped: number;
   skippedByReason?: Record<string, number>;
   directoryBucketsSearched?: Array<"exact" | "project" | "global">;
@@ -189,6 +312,9 @@ export type SearchCoverage = {
    *  `opencode.db` unavailable): results came from the session cards alone
    *  (no drill, no deep sweep) for `reason`. */
   source?: { kind: "v1-http" | "v2-sqlite"; available: false; reason: string };
+  /** Present on opencode v2 while `opencode.db` can be read: how it differs
+   *  from what this build reads and how far card repair has got. */
+  history?: HistoryCoverage;
   /** Present only for a deep sweep: how much of the scoped session set the sweep
    *  actually covered. `sessionsCovered` were fully swept, `sessionsPartial`
    *  stopped mid-session on a budget, `sessionsRemaining` were never reached,
@@ -276,7 +402,11 @@ export type SearchResult = {
   };
 };
 
-export type SearchOutput = {
+/** `recall`'s output. When it does not fit the output budget it is
+ *  `trimmed`: the results come first and the expansions after them, and the
+ *  `continuation` (passed back as `cursor` with the same arguments) resumes
+ *  at the first record not shown, inside an expansion when one was cut. */
+export type SearchOutput = TrimmedFields & {
   ok: true;
   results: SearchResult[];
   expanded?: ExpandedResult[];
@@ -300,7 +430,10 @@ export type SearchOutput = {
    *  continuation token; pass it back as `deepCursor` to resume exactly where
    *  coverage stopped. If the original request named uncarded sessions via
    *  `sessions:[...]`, repeat that arg alongside the cursor — the untrusted
-   *  cursor alone only readmits ids the card store knows. */
+   *  cursor alone only readmits ids the card store knows. Independent of
+   *  `continuation`, which returns the rest of this output: following a
+   *  trimmed deep output's continuation re-runs the same sweep (same
+   *  `deepCursor`), and each output carries that run's `nextCursor`. */
   nextCursor?: string;
 };
 

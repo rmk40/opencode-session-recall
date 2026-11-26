@@ -267,7 +267,7 @@ describe("recall", () => {
       });
       expect(last.results.map((r) => r.sessionID)).toEqual(["s-recent-window"]);
       expect(since.results.map((r) => r.sessionID)).toEqual(last.results.map((r) => r.sessionID));
-      expect(since.coverage?.messagesSearched).toBe(last.coverage?.messagesSearched);
+      expect(since.coverage?.messagesEligible).toBe(last.coverage?.messagesEligible);
 
       const fromTo = await runTool<SearchOutput>(await recallTool(h), {
         query: "window-token",
@@ -906,6 +906,26 @@ describe("recall", () => {
     expect(warnings.some((w) => w.includes("Ignored width:Infinity"))).toBe(true);
   });
 
+  it("reads a raw non-string or blank cursor as none, and rejects a garbage one", async () => {
+    const recall = await recallTool(makeFakeHarness());
+    const plain = await runToolRaw<SearchOutput>(recall, { query: "rate", scope: "project" });
+    for (const cursor of [42, null, { at: 1 }, "   "]) {
+      const out = await runToolRaw<SearchOutput>(recall, {
+        query: "rate",
+        scope: "project",
+        cursor,
+      });
+      expect(out.ok).toBe(true);
+      expect(out.results).toEqual(plain.results);
+    }
+    const garbage = await runToolRaw<ErrorOutput>(recall, {
+      query: "rate",
+      scope: "project",
+      cursor: "@@@garbage@@@",
+    });
+    expect(garbage).toEqual({ ok: false, error: "Invalid cursor: @@@garbage@@@" });
+  });
+
   it("clamps below-min and invalid out-of-range numeric inputs with warnings", async () => {
     const out = await runToolRaw<SearchOutput>(await recallTool(makeFakeHarness()), {
       query: "rate",
@@ -1106,7 +1126,7 @@ describe("recall", () => {
     expect(out.nearMisses?.[0]).toHaveProperty("sessionID");
   });
 
-  it("counts messagesSearched and partsSearched over the drilled sessions", async () => {
+  it("counts messagesEligible and partsSearched over the drilled sessions", async () => {
     const h = makeFakeHarness();
     // "rate" matches both project sessions, so both are drilled. Coverage counts
     // their searchable messages/parts: s-current has 6 messages but m-current-4
@@ -1118,10 +1138,10 @@ describe("recall", () => {
       excludeCurrentSession: false,
     });
 
-    expect(projectOut.coverage?.messagesSearched).toBe(8);
+    expect(projectOut.coverage?.messagesEligible).toBe(8);
     expect(projectOut.coverage?.partsSearched).toBeGreaterThan(0);
     expect(projectOut.coverage?.partsSearched).toBeGreaterThanOrEqual(
-      projectOut.coverage?.messagesSearched ?? 0,
+      projectOut.coverage?.messagesEligible ?? 0,
     );
     // Coverage also reports the card store's tier-0 state.
     expect(projectOut.coverage?.cards?.total).toBe(3);
@@ -1145,8 +1165,8 @@ describe("recall", () => {
       type: "tool",
     });
 
-    expect(all.coverage?.messagesSearched).toBeGreaterThan(0);
-    expect(userOnly.coverage?.messagesSearched).toBeLessThan(all.coverage?.messagesSearched ?? 0);
+    expect(all.coverage?.messagesEligible).toBeGreaterThan(0);
+    expect(userOnly.coverage?.messagesEligible).toBeLessThan(all.coverage?.messagesEligible ?? 0);
     expect(toolOnly.coverage?.partsSearched).toBeLessThan(all.coverage?.partsSearched ?? 0);
   });
 
@@ -1556,7 +1576,9 @@ describe("recall", () => {
         sessionsDiscovered: 3,
         sessionsEligible: 3,
         sessionsSearched: 3,
-        messagesSearched: 10,
+        messagesFetched: 10,
+        messagesCandidate: 10,
+        messagesEligible: 10,
         partsSearched: 20,
         sessionsSkipped: 0,
         cards: { total: 3, full: 0, storeRecency: 0, degraded: true },
@@ -1584,7 +1606,9 @@ describe("recall", () => {
         sessionsDiscovered: 0,
         sessionsEligible: 0,
         sessionsSearched: 0,
-        messagesSearched: 0,
+        messagesFetched: 0,
+        messagesCandidate: 0,
+        messagesEligible: 0,
         partsSearched: 0,
         sessionsSkipped: 0,
       };
@@ -1770,11 +1794,9 @@ describe("recall", () => {
       expect(out.coverage?.limitedBy ?? []).not.toContain("providerLimit");
     });
 
-    // (Removed "reports providerLimit when discovery fills the completeness
-    //  window": discovery is now the distiller's cold pass, not a search-time
-    //  session.list. providerLimit fires when the card store holds >=
-    //  DISCOVERY_LIMIT cards — a store-size condition, not practically seeded in
-    //  a unit fixture. The accounting path is exercised by the distiller.)
+    // Discovery is the distiller's cold pass, not a search-time session.list:
+    // providerLimit fires only when the host reports that its last discovery
+    // stopped at its limit (SearchDeps.discoveryTruncated, wired by v1).
   });
 
   describe("exclusion family", () => {
