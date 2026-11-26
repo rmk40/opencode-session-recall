@@ -71,6 +71,27 @@ describe("unavailable history source", () => {
     await expect(source.messagePage({ sessionID: "s", limit: 5 })).rejects.toThrow(ERROR);
   });
 
+  it("pages oldest first only as a v2 source, failing with the unavailable error", async () => {
+    const v2 = createUnavailableSource("v2-sqlite", REASON);
+    await expect(v2.messagePageAscending!({ sessionID: "s", limit: 5 })).rejects.toThrow(ERROR);
+    expect(createUnavailableSource("v1-http", REASON).messagePageAscending).toBeUndefined();
+  });
+
+  it("recall_messages oldest first reports the outage on v2 and the missing capability on v1", async () => {
+    const gate = createFetchGate({ concurrency: 2 });
+    const args = { sessionID: "s-current", order: "oldest" };
+    const { source } = countingUnavailable();
+    expect(await runTool(messages(source, gate, TEST_LIMITS), args)).toEqual({
+      ok: false,
+      error: ERROR,
+    });
+    const v1 = createUnavailableSource("v1-http", REASON);
+    expect(await runTool(messages(v1, gate, TEST_LIMITS), args)).toEqual({
+      ok: false,
+      error: expect.stringContaining('order "oldest" is not supported'),
+    });
+  });
+
   it("recall answers from the cards, reads nothing, and names the reason", async () => {
     const h = makeFakeHarness();
     const { deps, cleanup } = await makeRecallDeps(h, TEST_LIMITS);

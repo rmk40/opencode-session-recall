@@ -9,7 +9,9 @@ import { MalformedSessionError, type HistorySource } from "../src/history/source
 import {
   checkV2Schema,
   createV2HistorySource,
+  decodeV2AscendingCursor,
   decodeV2Cursor,
+  encodeV2AscendingCursor,
   encodeV2Cursor,
   openOpencodeDb,
 } from "../src/history/v2.js";
@@ -116,6 +118,22 @@ async function walk(source: HistorySource, sessionID: string, limit: number) {
   return { seen, pages };
 }
 
+/** Every message of a session through `messagePageAscending`, oldest first. */
+async function walkOldest(source: HistorySource, sessionID: string, limit: number) {
+  const items: HistoryMessage[] = [];
+  let after: string | undefined;
+  let pages = 0;
+  do {
+    const page = await source.messagePageAscending!({ sessionID, limit, after });
+    expect(page.items.length).toBeLessThanOrEqual(limit);
+    items.push(...page.items);
+    after = page.nextCursor ?? undefined;
+    if (after !== undefined) expect(after).toMatch(/^[A-Za-z0-9_-]+$/);
+    if (++pages > 100) throw new Error("oldest-first walk did not terminate");
+  } while (after !== undefined);
+  return { items, seen: items.map((m) => m.info.id), pages };
+}
+
 describe.each([
   ["v1 adapter (fake SDK clients)", v1Adapter],
   ["v2 adapter (opencode.db)", () => v2Adapter()],
@@ -158,6 +176,25 @@ describe.each([
     });
     expect(rest.items).toHaveLength(1);
     expect(rest.nextCursor).toBeNull();
+  });
+
+  it("pages oldest first on v2 only, reading each message as the newest-first page does", async () => {
+    const { source, ids } = await adapter();
+    if (source.kind === "v1-http") {
+      expect(source.messagePageAscending).toBeUndefined();
+      return;
+    }
+    const newest = await source.messagePage({ sessionID: "s-current", limit: 50 });
+    const count = ids["s-current"]!.length;
+    for (const limit of [1, 2, 4, 50]) {
+      const { items, pages } = await walkOldest(source, "s-current", limit);
+      expect(
+        items.map((m) => m.info.id),
+        String(limit),
+      ).toEqual(ids["s-current"]);
+      expect(items, String(limit)).toEqual([...newest.items].reverse());
+      expect(pages, String(limit)).toBe(Math.ceil(count / limit));
+    }
   });
 
   it("rejects a garbled cursor instead of restarting", async () => {
@@ -1018,6 +1055,168 @@ describe("v2 history source", () => {
     expect(page.nextCursor).toBeNull();
   });
 
+  describe("oldest first", () => {
+    it("skips non-content rows and ends on the last content row", async () => {
+      const t = await fresh();
+      session(t, "ses_asc");
+      const content: string[] = [];
+      for (let i = 0; i < 5; i++) {
+        message(t, "ses_asc", "system", { text: "tools changed", time: { created: 0 } });
+        content.push(
+          i % 2 === 0
+            ? message(t, "ses_asc", "user", text(`prompt ${i}`))
+            : message(t, "ses_asc", "assistant", reply(`reply ${i}`)),
+        );
+        message(t, "ses_asc", "compaction", { status: "running", reason: "auto", summary: "" });
+      }
+      for (let i = 0; i < 10; i++) {
+        message(t, "ses_asc", "idle", { outcome: "succeeded", time: { created: 0 } });
+      }
+      const { source } = await open(t);
+      for (const limit of [1, 2, 5]) {
+        const { seen, pages } = await walkOldest(source, "ses_asc", limit);
+        expect(seen, String(limit)).toEqual(content);
+        expect(pages, String(limit)).toBe(Math.ceil(content.length / limit));
+      }
+    });
+
+    it("pages an empty session as one empty page, and rejects a bad limit or an unknown session", async () => {
+      const t = await fresh();
+      session(t, "ses_none");
+      const { source } = await open(t);
+      expect(await source.messagePageAscending!({ sessionID: "ses_none", limit: 5 })).toEqual({
+        items: [],
+        nextCursor: null,
+      });
+      for (const limit of [0, -1, 1.5, Number.NaN, undefined]) {
+        await expect(
+          source.messagePageAscending!({ sessionID: "ses_none", limit: limit as number }),
+        ).rejects.toThrow(/limit/);
+      }
+      await expect(source.messagePageAscending!({ sessionID: "s-nope", limit: 5 })).rejects.toThrow(
+        "Session not found: s-nope",
+      );
+    });
+
+    it("refuses a newest-first cursor, and messagePage refuses an oldest-first one", async () => {
+      const t = await fresh();
+      session(t, "ses_cur");
+      const ids = [0, 1, 2].map((i) => message(t, "ses_cur", "user", text(`${i}`)));
+      const { source } = await open(t);
+      const newest = await source.messagePage({ sessionID: "ses_cur", limit: 1 });
+      const oldest = await source.messagePageAscending!({ sessionID: "ses_cur", limit: 1 });
+      expect(newest.items.map((m) => m.info.id)).toEqual([ids[2]]);
+      expect(oldest.items.map((m) => m.info.id)).toEqual([ids[0]]);
+      await expect(
+        source.messagePageAscending!({ sessionID: "ses_cur", limit: 1, after: newest.nextCursor! }),
+      ).rejects.toThrow(/Invalid message cursor/);
+      await expect(
+        source.messagePage({ sessionID: "ses_cur", limit: 1, before: oldest.nextCursor! }),
+      ).rejects.toThrow(/Invalid message cursor/);
+      for (const after of ["!!not-a-cursor!!", "bm9wZQ", "%%%"]) {
+        await expect(
+          source.messagePageAscending!({ sessionID: "ses_cur", limit: 1, after }),
+        ).rejects.toThrow(/Invalid message cursor/);
+      }
+    });
+
+    it("excludes rows a fork copied from its parent", async () => {
+      const t = await fresh();
+      session(t, "ses_parent");
+      session(t, "ses_fork", { fork_session_id: "ses_parent", time_created: 5_000 });
+      message(t, "ses_fork", "user", text("copied prompt"), 2_000);
+      message(t, "ses_fork", "assistant", reply("copied reply"), 2_000);
+      const own = [
+        message(t, "ses_fork", "user", text("fork prompt"), 6_000),
+        message(t, "ses_fork", "assistant", reply("fork reply"), 6_000),
+      ];
+      const { source } = await open(t);
+      expect((await walkOldest(source, "ses_fork", 1)).seen).toEqual(own);
+    });
+
+    it("resumes from the newest returned row when a row turns eligible mid-page", async () => {
+      const t = await fresh();
+      session(t, "ses_race_asc");
+      const u1 = message(t, "ses_race_asc", "user", text("one"));
+      const u2 = message(t, "ses_race_asc", "user", text("two"));
+      const pending = message(t, "ses_race_asc", "compaction", {
+        status: "running",
+        reason: "auto",
+        summary: "",
+        recent: "",
+      });
+      const u3 = message(t, "ses_race_asc", "user", text("three"));
+      const u4 = message(t, "ses_race_asc", "user", text("four"));
+      let completed = false;
+      // The first size read plans every content row as one last page; then
+      // the compaction completes, so the body read's LIMIT stops a row short
+      // of the planned newest row (u4), which must lead a further page.
+      const { source } = await counted(t, (sql) => {
+        if (completed || !/AS bytes FROM session_message/.test(sql)) return;
+        completed = true;
+        t.db.run("UPDATE session_message SET data = ? WHERE id = ?", [
+          JSON.stringify({ status: "completed", reason: "auto", summary: "done", recent: "" }),
+          pending,
+        ]);
+      });
+      const { seen, pages } = await walkOldest(source, "ses_race_asc", 4);
+      expect(completed).toBe(true);
+      expect(seen).toEqual([u1, u2, pending, u3, u4]);
+      expect(pages).toBe(2);
+    });
+
+    it("continues past a planned range that became ineligible between the two reads", async () => {
+      const t = await fresh();
+      session(t, "ses_retry_asc");
+      const done = { status: "completed", reason: "auto", summary: "s", recent: "" };
+      const c1 = message(t, "ses_retry_asc", "compaction", done);
+      const c2 = message(t, "ses_retry_asc", "compaction", done);
+      const newer = message(t, "ses_retry_asc", "user", text("newer prompt"));
+      let flipped = false;
+      // After the first size read plans [c1, c2], both compactions become
+      // running again, so the body read finds nothing in the planned range.
+      const { source } = await counted(t, (sql) => {
+        if (flipped || !/AS bytes FROM session_message/.test(sql)) return;
+        flipped = true;
+        for (const id of [c1, c2]) {
+          t.db.run("UPDATE session_message SET data = ? WHERE id = ?", [
+            JSON.stringify({ ...done, status: "running" }),
+            id,
+          ]);
+        }
+      });
+      const page = await source.messagePageAscending!({ sessionID: "ses_retry_asc", limit: 2 });
+      expect(flipped).toBe(true);
+      expect(page.items.map((m) => m.info.id)).toEqual([newer]);
+      expect(page.nextCursor).toBeNull();
+    });
+
+    it("caps a page by summed data bytes, a row over the ceiling costing it nothing", async () => {
+      const t = await fresh();
+      session(t, "ses_cap_asc");
+      const ids = [
+        message(t, "ses_cap_asc", "user", text("a".repeat(600))),
+        message(t, "ses_cap_asc", "user", text("b".repeat(600))),
+        message(t, "ses_cap_asc", "user", text("c".repeat(1_000))),
+        message(t, "ses_cap_asc", "assistant", reply("z".repeat(5_000))),
+        message(t, "ses_cap_asc", "user", text("d".repeat(300))),
+      ];
+      const { source } = await capped(t);
+      const first = await source.messagePageAscending!({ sessionID: "ses_cap_asc", limit: 10 });
+      expect(first.items.map((m) => m.info.id)).toEqual([ids[0], ids[1]]);
+      const second = await source.messagePageAscending!({
+        sessionID: "ses_cap_asc",
+        limit: 10,
+        after: first.nextCursor!,
+      });
+      expect(second.items.map((m) => m.info.id)).toEqual([ids[2], ids[3], ids[4]]);
+      expect(second.nextCursor).toBeNull();
+      expect(partText(second.items[1])).toMatch(
+        /^\[unavailable: \d+-byte row over the 1500-byte cap\]$/,
+      );
+    });
+  });
+
   it("round-trips its opaque cursor and rejects foreign ones", () => {
     expect(decodeV2Cursor(encodeV2Cursor(42))).toBe(42);
     // The encoder and decoder agree on the full safe-integer range.
@@ -1038,6 +1237,27 @@ describe("v2 history source", () => {
     }
   });
 
+  it("round-trips its oldest-first cursor and keeps it apart from the newest-first one", () => {
+    for (const seq of [0, 42, Number.MAX_SAFE_INTEGER]) {
+      expect(decodeV2AscendingCursor(encodeV2AscendingCursor(seq))).toBe(seq);
+      expect(() => decodeV2Cursor(encodeV2AscendingCursor(seq)), String(seq)).toThrow(
+        /Invalid message cursor/,
+      );
+      expect(() => decodeV2AscendingCursor(encodeV2Cursor(seq)), String(seq)).toThrow(
+        /Invalid message cursor/,
+      );
+    }
+    expect(encodeV2AscendingCursor(7)).toMatch(/^[A-Za-z0-9_-]+$/);
+    for (const bad of [-1, 1.5, Number.NaN, Number.MAX_SAFE_INTEGER + 1]) {
+      expect(() => encodeV2AscendingCursor(bad), String(bad)).toThrow(/non-negative safe integer/);
+    }
+    const raw = (text: string) =>
+      btoa(text).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+    for (const bad of [raw("v2a:"), raw("v2a:-1"), raw("v2a:x"), raw("v2a:9999999999999999")]) {
+      expect(() => decodeV2AscendingCursor(bad), bad).toThrow(/Invalid message cursor/);
+    }
+  });
+
   it("binds LIMIT on every session_message statement it runs", async () => {
     const h = makeFakeHarness();
     const t = await makeV2Db();
@@ -1045,6 +1265,7 @@ describe("v2 history source", () => {
     writeV1Corpus(t.db, h.globalSessions, h.messagesBySession);
     const { source, spy } = await open(t, "project-main");
     await walk(source, "s-current", 2);
+    await walkOldest(source, "s-current", 2);
     await source.getMessage("s-current", "m-current-1");
     await source.listSessions({ scope: "project", limit: 5 });
     await source.listChildren("s-current");

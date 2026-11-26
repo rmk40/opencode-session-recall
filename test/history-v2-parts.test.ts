@@ -221,6 +221,24 @@ async function pages(
   return out;
 }
 
+/** Every page of a session, oldest first. */
+async function pagesOldest(
+  source: HistorySource,
+  sessionID: string,
+  limit: number,
+  strict = false,
+): Promise<MessagePage[]> {
+  const out: MessagePage[] = [];
+  let after: string | undefined;
+  do {
+    const page = await source.messagePageAscending!({ sessionID, limit, after, strict });
+    out.push(page);
+    after = page.nextCursor ?? undefined;
+    if (out.length > 500) throw new Error("page walk did not terminate");
+  } while (after !== undefined);
+  return out;
+}
+
 async function point(
   source: HistorySource,
   sessionID: string,
@@ -940,6 +958,401 @@ describe("v2 source: a first message over the page", () => {
   });
 });
 
+// ── Oldest-first pages ───────────────────────────────────────────────────────
+
+describe("v2 source: oldest-first pages", () => {
+  it("keeps every page within the ceiling and the cap, and every message readable whole", async () => {
+    const f = await partsFixture();
+    f.session("ses_asc");
+    const sizes = [40, 120, 260, 300, 90, 210, 300, 30];
+    let k = 0;
+    const filler = (n: number) => txt(`${"x".repeat(n - 30)}é`);
+    for (let i = 0; i < 14; i++) {
+      if (i % 3 === 0) {
+        f.user("ses_asc", `prompt ${i} ${"p".repeat(sizes[i % sizes.length]!)}`);
+        continue;
+      }
+      const count = (i * 7) % 6;
+      const parts = Array.from({ length: count }, () => filler(sizes[k++ % sizes.length]!));
+      const inline = i % 4 === 1 ? [txt(`inline tail ${i}`)] : [];
+      f.assistant("ses_asc", { parts, inline });
+    }
+    const all = [...f.sizes.keys()];
+    const whole = await open(f.t);
+    const seen = { partial: 0, shared: 0 };
+
+    /** Bytes and part rows a read of `m` loaded. */
+    const loaded = (m: HistoryMessage) => {
+      const own = f.sizes.get(m.info.id)!;
+      const ordinals = [...own.parts.keys()].sort((a, b) => a - b);
+      let bytes = own.envelope;
+      let rows = 0;
+      for (const suffix of suffixes(m)) {
+        const pos = Number(suffix);
+        if (!Number.isInteger(pos) || pos >= ordinals.length) continue;
+        bytes += own.parts.get(ordinals[pos]!)!;
+        rows++;
+      }
+      return { bytes, rows };
+    };
+
+    for (const ceiling of [700, 2_000, 50_000]) {
+      for (const cap of [2, 2_000]) {
+        for (const limit of [1, 3, 50]) {
+          const label = `ceiling ${ceiling} cap ${cap} limit ${limit}`;
+          const { source } = await open(f.t, { pageByteCeiling: ceiling, pagePartRows: cap });
+          const walk = await pagesOldest(source, "ses_asc", limit);
+          expect(
+            walk.flatMap((p) => p.items.map((m) => m.info.id)),
+            label,
+          ).toEqual(all);
+          for (const page of walk) {
+            const sum = page.items
+              .map(loaded)
+              .reduce((acc, x) => ({ bytes: acc.bytes + x.bytes, rows: acc.rows + x.rows }), {
+                bytes: 0,
+                rows: 0,
+              });
+            expect(sum.bytes, label).toBeLessThanOrEqual(ceiling);
+            expect(sum.rows, label).toBeLessThanOrEqual(cap);
+            expect(page.items.length, label).toBeLessThanOrEqual(limit);
+            // Only a page's first message is ever cut, and it then ends the page.
+            page.items.forEach((m, i) => {
+              if (m.partial) expect([i, page.items.length], label).toEqual([0, 1]);
+            });
+            if (page.items.length > 1) seen.shared++;
+          }
+          for (const m of walk.flatMap((p) => p.items)) {
+            if (m.partial) seen.partial++;
+            const { parts } = await complete(source, "ses_asc", m);
+            expect(parts, `${label} ${m.info.id}`).toEqual(
+              (await point(whole.source, "ses_asc", m.info.id)).parts,
+            );
+          }
+        }
+      }
+    }
+    expect(seen.partial).toBeGreaterThan(0);
+    expect(seen.shared).toBeGreaterThan(0);
+  });
+
+  it("reads each message as the newest-first walk does when nothing is cut", async () => {
+    const f = await partsFixture();
+    f.session("ses_same", { agent: "sess-agent" });
+    f.user("ses_same", "first prompt");
+    f.assistant("ses_same", { parts: [txt("a1"), { type: "patch", files: [] }], inline: [] });
+    f.user("ses_same", "second prompt");
+    f.assistant("ses_same", { parts: [txt("b1")], inline: [txt("b2")] });
+    f.assistant("ses_same", { inline: [{ type: "reasoning", text: "b3" }] });
+    f.user("ses_same", "unanswered prompt");
+    const { source } = await open(f.t);
+    for (const limit of [1, 2, 10]) {
+      const newest = (await pages(source, "ses_same", limit)).flatMap((p) => p.items);
+      const oldest = (await pagesOldest(source, "ses_same", limit)).flatMap((p) => p.items);
+      expect(oldest, String(limit)).toEqual([...newest].reverse());
+    }
+  });
+
+  it("cuts a first message by bytes, ends the page with it and continues it through getMessage", async () => {
+    const f = await partsFixture();
+    f.session("ses_cut_asc");
+    // A ~95-byte envelope and six ~405-byte parts: three fit 1,500 bytes.
+    const items = Array.from({ length: 6 }, (_, i) => txt(`${i}`.repeat(380)));
+    const long = f.assistant("ses_cut_asc", { parts: items });
+    const later = f.user("ses_cut_asc", "later prompt");
+    const restBytes = items.slice(3).reduce((sum, item) => sum + bytesOf(item), 0);
+    const { source } = await open(f.t, { pageByteCeiling: 1_500 });
+    const whole = await open(f.t);
+
+    for (const strict of [false, true]) {
+      const first = await source.messagePageAscending!({
+        sessionID: "ses_cut_asc",
+        limit: 10,
+        strict,
+      });
+      expect(first.items.map((m) => m.info.id)).toEqual([long]);
+      expect(first.counts).toEqual(counts({ partialMessages: 1 }));
+      const m = first.items[0]!;
+      expect(m.partial).toEqual({ nextOrdinal: 3, omittedParts: 3, omittedBytes: restBytes });
+      expect(m.parts.at(-1)).toMatchObject({ type: "text", text: cutNote(3, restBytes, 3) });
+      const second = await source.messagePageAscending!({
+        sessionID: "ses_cut_asc",
+        limit: 10,
+        after: first.nextCursor!,
+        strict,
+      });
+      expect(second.items.map((x) => x.info.id)).toEqual([later]);
+      expect(second.nextCursor).toBeNull();
+      const { parts } = await complete(source, "ses_cut_asc", m);
+      expect(parts).toEqual((await point(whole.source, "ses_cut_asc", long)).parts);
+    }
+  });
+
+  it("ends a page before a newer message whose parts grew past it, which leads the next page", async () => {
+    const f = await partsFixture();
+    f.session("ses_grow_asc");
+    const older = f.assistant("ses_grow_asc", { parts: [txt("a".repeat(300))] });
+    const newer = f.assistant("ses_grow_asc", { parts: [txt("b".repeat(300))] });
+    const opened = await openOpencodeDb(f.t.path);
+    if (!opened.ok) throw new Error(opened.reason);
+    cleanups.push(() => opened.db.close());
+    const spy = limitSpy(opened.db);
+    let grown = false;
+    // Right after the first part statement (the size plan, under which both
+    // messages fit), the newer message's part grows so the two no longer fit
+    // together.
+    const db: typeof spy = {
+      ...spy,
+      all: (sql, params) => {
+        const rows = spy.all(sql, params);
+        if (!grown && /\bsession_part\b/.test(sql)) {
+          grown = true;
+          f.t.db.run("UPDATE session_part SET data = ? WHERE message_id = ? AND ordinal = 0", [
+            JSON.stringify(txt("g".repeat(1_000))),
+            newer,
+          ]);
+        }
+        return rows;
+      },
+    };
+    const source = createV2HistorySource(db, { pageByteCeiling: 1_500, yieldBetween: noYield });
+    const walk = await pagesOldest(source, "ses_grow_asc", 10);
+    expect(grown).toBe(true);
+    expect(walk.map((p) => p.items.map((m) => m.info.id))).toEqual([[older], [newer]]);
+    expect(walk[0]).not.toHaveProperty("counts");
+    expect(walk[1]!.items[0]!.partial).toBeUndefined();
+    expect(partText(walk[1]!.items[0]!.parts[0])).toBe("g".repeat(1_000));
+  });
+
+  it("projects a part row over the ceiling as a placeholder that costs the page nothing", async () => {
+    const f = await partsFixture();
+    f.session("ses_big_asc");
+    const prompt = f.user("ses_big_asc", "small prompt");
+    const big = txt("z".repeat(2_000));
+    const reply = f.assistant("ses_big_asc", { parts: [txt("before"), big, txt("after")] });
+    const { source } = await open(f.t, { pageByteCeiling: 1_500 });
+    for (const strict of [false, true]) {
+      const page = await source.messagePageAscending!({
+        sessionID: "ses_big_asc",
+        limit: 10,
+        strict,
+      });
+      expect(page.items.map((m) => m.info.id)).toEqual([prompt, reply]);
+      expect(page.nextCursor).toBeNull();
+      expect(page.items[1]!.parts.map(partText)).toEqual([
+        "before",
+        oversizedNote(bytesOf(big), 1_500),
+        "after",
+      ]);
+      expect(page.counts).toEqual(counts({ oversizedParts: 1 }));
+    }
+  });
+});
+
+// ── Capped continuations ─────────────────────────────────────────────────────
+
+describe("v2 source: a continuation capped with maxBytes", () => {
+  /** A source whose reads total the body bytes every statement returned. */
+  async function metered(t: V2TestDb, opts: V2SourceOptions = {}) {
+    const opened = await openOpencodeDb(t.path);
+    if (!opened.ok) throw new Error(opened.reason);
+    cleanups.push(() => opened.db.close());
+    const spy = limitSpy(opened.db);
+    const meter = { bytes: 0 };
+    const count = (row: Row | undefined): void => {
+      for (const column of ["data", "meta", "content"]) {
+        const value = row?.[column];
+        if (typeof value === "string") meter.bytes += bytesOf(value);
+      }
+    };
+    const db: typeof spy = {
+      ...spy,
+      get: (sql, params) => {
+        const row = spy.get(sql, params);
+        count(row);
+        return row;
+      },
+      all: (sql, params) => {
+        const rows = spy.all(sql, params);
+        rows.forEach(count);
+        return rows;
+      },
+    };
+    return { source: createV2HistorySource(db, { yieldBetween: noYield, ...opts }), meter };
+  }
+
+  async function capped(
+    source: HistorySource,
+    sessionID: string,
+    messageID: string,
+    partOrdinal: number,
+    maxBytes: number,
+  ) {
+    const got = await source.getMessage(sessionID, messageID, { partOrdinal, maxBytes });
+    if (!got.ok) throw new Error(`${got.reason}: ${got.error ?? ""}`);
+    return got;
+  }
+
+  /** The reads of a message from `from` on, each capped at `maxBytes`, until
+   *  one is not partial; `parts` drops each partial read's closing note. */
+  async function walkCapped(
+    source: HistorySource,
+    sessionID: string,
+    messageID: string,
+    maxBytes: number,
+    from = 0,
+  ) {
+    const reads: HistoryMessage[] = [];
+    let ordinal: number | undefined = from;
+    while (ordinal !== undefined) {
+      const { value } = await capped(source, sessionID, messageID, ordinal, maxBytes);
+      reads.push(value);
+      ordinal = value.partial?.nextOrdinal;
+      if (reads.length > 200) throw new Error("capped continuation did not terminate");
+    }
+    const parts = reads.flatMap((m) => (m.partial ? m.parts.slice(0, -1) : m.parts));
+    return { parts, reads };
+  }
+
+  /** Eight ~1,000-byte part rows at ordinals 0, 10, ..., 70. */
+  async function eightRows(sessionID: string, inline: unknown[] = []) {
+    const f = await partsFixture();
+    f.session(sessionID);
+    const ordinals = Array.from({ length: 8 }, (_, i) => i * 10);
+    const items = ordinals.map((o) => txt(`${o} ${"r".repeat(970)}`));
+    const id = f.assistant(sessionID, { parts: items, ordinals, inline });
+    const bytes = (from: number) =>
+      items.filter((_, i) => ordinals[i]! >= from).reduce((sum, item) => sum + bytesOf(item), 0);
+    return { f, id, items, bytes };
+  }
+
+  it("reads ahead at most maxBytes, ends partial where it stops and counts no drift", async () => {
+    const { f, id, bytes } = await eightRows("ses_cap8");
+    const { source, meter } = await metered(f.t);
+    // The metadata and two ~1,000-byte rows fit 2,600 bytes; a third does not.
+    const got = await capped(source, "ses_cap8", id, 20, 2_600);
+    expect(meter.bytes).toBeLessThanOrEqual(2_600);
+    expect(got.value.partial).toEqual({
+      nextOrdinal: 40,
+      omittedParts: 4,
+      omittedBytes: bytes(40),
+    });
+    expect(suffixes(got.value).slice(0, -1)).toEqual(["2", "3"]);
+    expect(partText(got.value.parts.at(-1))).toBe(cutNote(4, bytes(40), 40));
+    expect(source.history!().counts.partialMessages).toBe(0);
+
+    // The same cut made by the source's own ceiling is drift.
+    const { source: small } = await metered(f.t, { pageByteCeiling: 2_600 });
+    const uncapped = await small.getMessage("ses_cap8", id, { partOrdinal: 20 });
+    expect(uncapped.ok && uncapped.value.partial).toEqual(got.value.partial);
+    expect(small.history!().counts.partialMessages).toBe(1);
+  });
+
+  it("loads its first part row whole when that row alone is over maxBytes, so a walk always moves on", async () => {
+    const { f, id } = await eightRows("ses_cap1");
+    const whole = await point((await open(f.t)).source, "ses_cap1", id);
+    const { source } = await open(f.t);
+    const first = await capped(source, "ses_cap1", id, 0, 1);
+    expect(first.value.parts.map(partText).slice(0, -1)).toEqual([partText(whole.parts[0])]);
+    expect(first.value.partial?.nextOrdinal).toBe(10);
+    const { parts, reads } = await walkCapped(source, "ses_cap1", id, 1);
+    expect(reads).toHaveLength(8);
+    expect(parts).toEqual(whole.parts);
+  });
+
+  it("keeps inline content that fits beside the part rows, and leaves larger inline content for a read of its own", async () => {
+    for (const size of [300, 5_000]) {
+      const label = `inline ${size}`;
+      const { f, id } = await eightRows(`ses_inl${size}`, [txt("i".repeat(size))]);
+      const whole = await point((await open(f.t)).source, `ses_inl${size}`, id);
+      const { source } = await open(f.t);
+      const { parts, reads } = await walkCapped(source, `ses_inl${size}`, id, 2_600, 60);
+      expect(parts, label).toEqual(whole.parts.slice(6));
+      expect(source.history!().counts.partialMessages, label).toBe(0);
+      if (size === 300) {
+        // Rows 60 and 70 and the inline item in one read.
+        expect(
+          reads.map((r) => suffixes(r)),
+          label,
+        ).toEqual([["6", "7", "8"]]);
+      } else {
+        // The inline item does not fit beside the metadata under the cap: the
+        // rows take the read, and the inline item is read whole on its own.
+        expect(
+          reads.map((r) => r.partial?.nextOrdinal),
+          label,
+        ).toEqual([71, undefined]);
+        expect(suffixes(reads[1]!), label).toEqual(["8"]);
+        expect(partText(reads[1]!.parts[0]), label).toBe("i".repeat(size));
+      }
+    }
+  });
+
+  it("keeps the ceiling for a maxBytes that is not a positive number or is above it, and ignores it without a part ordinal", async () => {
+    const { f, id } = await eightRows("ses_capx");
+    const { source } = await open(f.t, { pageByteCeiling: 2_600 });
+    const plain = await source.getMessage("ses_capx", id, { partOrdinal: 20 });
+    expect(plain.ok && plain.value.partial?.nextOrdinal).toBe(40);
+    const before = source.history!().counts.partialMessages;
+    const odd = [0, -5, 0.5, Number.NaN, Number.POSITIVE_INFINITY, 1_000_000];
+    for (const maxBytes of odd) {
+      expect(
+        await source.getMessage("ses_capx", id, { partOrdinal: 20, maxBytes }),
+        String(maxBytes),
+      ).toEqual(plain);
+    }
+    // Each of them was a read under the ceiling, so each cut counts.
+    expect(source.history!().counts.partialMessages).toBe(before + odd.length);
+    expect(await source.getMessage("ses_capx", id, { maxBytes: 10 })).toEqual(
+      await source.getMessage("ses_capx", id),
+    );
+  });
+
+  it("names the row ordinal of each part read from a part row, which a continuation starts at", async () => {
+    const f = await partsFixture();
+    f.session("ses_ord");
+    const prompt = f.user("ses_ord", "a prompt");
+    const id = f.assistant("ses_ord", {
+      parts: [txt("zero"), txt("ten"), txt("twenty")],
+      ordinals: [0, 10, 20],
+      inline: [txt("inline tail")],
+    });
+    const inlineOnly = f.assistant("ses_ord", { inline: [txt("inline only")] });
+    const { source } = await open(f.t);
+
+    const whole = await source.getMessage("ses_ord", id);
+    if (!whole.ok) throw new Error(whole.reason);
+    // The inline item has no row, so no ordinal.
+    expect(suffixes(whole.value)).toEqual(["0", "1", "2", "3"]);
+    expect(whole.partOrdinals).toEqual(
+      new Map([
+        [`${id}:0`, 0],
+        [`${id}:1`, 10],
+        [`${id}:2`, 20],
+      ]),
+    );
+    const rest = await source.getMessage("ses_ord", id, { partOrdinal: 10 });
+    if (!rest.ok) throw new Error(rest.reason);
+    expect(rest.partOrdinals).toEqual(
+      new Map([
+        [`${id}:1`, 10],
+        [`${id}:2`, 20],
+      ]),
+    );
+    // A continuation from a part's ordinal starts at that part.
+    const from = await source.getMessage("ses_ord", id, {
+      partOrdinal: whole.partOrdinals!.get(`${id}:2`)!,
+    });
+    expect(from.ok && suffixes(from.value)).toEqual(["2", "3"]);
+
+    for (const other of [prompt, inlineOnly]) {
+      const got = await source.getMessage("ses_ord", other);
+      expect(got.ok, other).toBe(true);
+      expect(got, other).not.toHaveProperty("partOrdinals");
+    }
+  });
+});
+
 // ── A row rewritten while it is read ─────────────────────────────────────────
 
 describe("v2 source: a row opencode rewrites between the envelope and the part read", () => {
@@ -1179,6 +1592,68 @@ describe("v2 source: a row opencode rewrites between the envelope and the part r
       expect(meter.bytes, kind).toBeLessThanOrEqual(ceiling);
       expect(source.history!().counts.changedMessages, kind).toBe(1);
     }
+  });
+
+  it("reads a continuation again when the row changed, leaving out metadata over the maximum as a first read does", async () => {
+    const f = await partsFixture();
+    f.session("ses_bigmeta", { agent: "sess-agent" });
+    const id = f.assistant("ses_bigmeta", {
+      parts: [txt("row zero"), txt("row one")],
+      inline: [txt("inline two")],
+      extra: { padding: "m".repeat(CONTINUATION_METADATA_MAX + 4_000) },
+    });
+    const before = await point((await open(f.t)).source, "ses_bigmeta", id);
+    let touched = 0;
+    // The row changes once, under the first attempt's part read.
+    const source = await hooked(f.t, (sql) => {
+      if (touched > 0 || !/json_remove/.test(sql)) return;
+      touched++;
+      touch(f, id);
+    });
+    const rest = await point(source, "ses_bigmeta", id, 0);
+    expect(touched).toBe(1);
+    expect(rest.partial).toBeUndefined();
+    expect(rest.parts).toEqual(before.parts);
+    expect(rest.info).toMatchObject({ agent: "sess-agent" });
+    expect(source.history!().counts.changedMessages).toBe(0);
+  });
+
+  it("settles a continuation whose metadata grew past what is left of the ceiling", async () => {
+    const ceiling = 3_000;
+    const f = await partsFixture();
+    f.session("ses_growmeta");
+    const id = f.assistant("ses_growmeta", {
+      parts: [txt("p".repeat(500))],
+      inline: [txt("i".repeat(300))],
+    });
+    const before = await point((await open(f.t)).source, "ses_growmeta", id);
+    let grown = false;
+    // After the first attempt's envelope read, the row's metadata grows to
+    // ~2,400 bytes: within the maximum, but past the ~2,000 bytes the first
+    // attempt leaves of the ceiling.
+    const { source, meter } = await metered(
+      f.t,
+      (sql) => {
+        if (grown || !/json_remove/.test(sql)) return;
+        grown = true;
+        const row = f.t.db.get("SELECT data FROM session_message WHERE id = ?", [id]);
+        const data = JSON.parse(String(row?.data)) as Item;
+        f.t.db.run(
+          "UPDATE session_message SET data = ?, time_updated = time_updated + 1 WHERE id = ?",
+          [JSON.stringify({ ...data, padding: "m".repeat(2_300) }), id],
+        );
+      },
+      { pageByteCeiling: ceiling },
+    );
+    const first = await point(source, "ses_growmeta", id, 0);
+    expect(grown).toBe(true);
+    expect(first.partial).toEqual({ nextOrdinal: 1, omittedParts: 1, omittedBytes: 0 });
+    expect(partText(first.parts.at(-1))).toBe(changedNote(1, 1));
+    expect(first.parts.slice(0, -1)).toEqual(before.parts.slice(0, 1));
+    expect(source.history!().counts.changedMessages).toBe(1);
+    expect(meter.bytes).toBeLessThanOrEqual(ceiling);
+    const { parts } = await complete(source, "ses_growmeta", first);
+    expect(parts).toEqual(before.parts);
   });
 });
 
