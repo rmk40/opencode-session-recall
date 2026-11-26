@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { capFamilySlots, familyDiversity, familyDrillSlots } from "../src/search.js";
-import type { SearchResult } from "../src/types.js";
+import { capAndSlice, capFamilySlots, familyDiversity, familyDrillSlots } from "../src/search.js";
+import type { EvidenceClass, SearchResult } from "../src/types.js";
 import { PROJECT_DIR } from "./helpers.js";
 
 /**
@@ -259,5 +259,69 @@ describe("capFamilySlots", () => {
       "f2",
       "f3",
     ]);
+  });
+});
+
+describe("capAndSlice with the family allowance", () => {
+  const family = new Set(["f1", "f2", "f3"]);
+  const hit = (sessionID: string, evidenceClass: EvidenceClass): SearchResult => ({
+    ...result(sessionID, sessionID),
+    why: { matchedFields: [], evidenceClass },
+  });
+
+  it("does not let a class cap move a third relative into the first five", () => {
+    // familyDiversity's order: two relatives in the first five and the third
+    // right after them, behind a second skill payload the cap holds back.
+    const ordered = [
+      hit("o1", "skill-definition"),
+      hit("f1", "human-text"),
+      hit("f2", "human-text"),
+      hit("o2", "skill-definition"),
+      hit("o3", "human-text"),
+      hit("f3", "human-text"),
+      hit("o4", "human-text"),
+      hit("o5", "human-text"),
+    ];
+    // Without the family, skipping o2 moves f3 up into the first five.
+    expect(partIDs(capAndSlice(ordered, 6, false)).slice(0, 5)).toEqual([
+      "o1",
+      "f1",
+      "f2",
+      "o3",
+      "f3",
+    ]);
+    expect(partIDs(capAndSlice(ordered, 6, false, family))).toEqual([
+      "o1",
+      "f1",
+      "f2",
+      "o3",
+      "o4",
+      "f3",
+    ]);
+  });
+
+  it("fills a held relative in only after every other held-back hit", () => {
+    const ordered = [
+      hit("f1", "human-text"),
+      hit("f2", "human-text"),
+      hit("f3", "human-text"),
+      hit("o1", "skill-definition"),
+      hit("o2", "skill-definition"),
+    ];
+    expect(partIDs(capAndSlice(ordered, 5, false, family))).toEqual(["f1", "f2", "o1", "o2", "f3"]);
+  });
+
+  it("promotes a relative's tool input into a relative's slot once the family holds its share", () => {
+    const ordered = [
+      hit("f1", "human-text"),
+      hit("o1", "human-text"),
+      hit("f2", "human-text"),
+      hit("o2", "human-text"),
+      hit("o3", "human-text"),
+      hit("f3", "tool-input"),
+    ];
+    // Without the family the promotion takes the last slot: a third relative.
+    expect(partIDs(capAndSlice(ordered, 5, true))).toEqual(["f1", "o1", "f2", "o2", "f3"]);
+    expect(partIDs(capAndSlice(ordered, 5, true, family))).toEqual(["f1", "o1", "f3", "o2", "o3"]);
   });
 });

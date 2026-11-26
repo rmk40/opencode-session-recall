@@ -1205,6 +1205,8 @@ const CLASS_CAPS: Partial<Record<EvidenceClass, number>> = {
 /** Queries that describe actions: exact code anchors or command verbs. */
 const COMMAND_VERB_RE = /\b(run|launch|type|press|test|reproduce|install|start)\b/i;
 
+const NO_FAMILY: ReadonlySet<string> = new Set();
+
 /**
  * Final part-mode pass: apply per-class caps within the slice, backfill from
  * held-back hits when the caps starve the fill, and for command-like queries
@@ -1212,39 +1214,75 @@ const COMMAND_VERB_RE = /\b(run|launch|type|press|test|reproduce|install|start)\
  * orderForDirectoryFallback — that re-sort is class-blind, so a cap applied
  * inside diversify() would be silently defeated whenever directory fallback
  * reorders the list.
+ *
+ * With `family` (the relatives {@link familyDiversity} orders by), it also
+ * keeps that pass's allowance: a cap skipping a hit moves later ones up, and
+ * a promotion replaces one, so either could otherwise put a third relative
+ * among the first {@link FAMILY_TOP_WINDOW} results. A relative the allowance
+ * holds back comes right after those results, and fills in among them only
+ * when no other hit is left. A promoted relative takes the slot of the last
+ * relative there instead of the last slot when the family already holds its
+ * share of them.
  */
 export function capAndSlice(
   ordered: SearchResult[],
   limit: number,
   commandLike: boolean,
+  family: ReadonlySet<string> = NO_FAMILY,
 ): SearchResult[] {
   const classCounts = new Map<string, number>();
   const final: SearchResult[] = [];
+  const taken = new Set<SearchResult>();
   const heldBack: SearchResult[] = [];
-
-  for (const hit of ordered) {
-    if (final.length >= limit) {
-      heldBack.push(hit);
-      continue;
-    }
+  /** Relatives the family allowance kept out of the first results. */
+  const deferred: SearchResult[] = [];
+  const isFamily = (hit: SearchResult): boolean => family.has(hit.sessionID);
+  const windowFull = (hit: SearchResult): boolean =>
+    isFamily(hit) &&
+    final.length < FAMILY_TOP_WINDOW &&
+    final.filter(isFamily).length >= FAMILY_TOP_MAX;
+  const classFull = (hit: SearchResult): boolean => {
     const cls = hit.why?.evidenceClass;
     const cap = cls != null ? CLASS_CAPS[cls] : undefined;
-    if (cls != null && cap != null) {
-      const used = classCounts.get(cls) ?? 0;
-      if (used >= cap) {
-        heldBack.push(hit);
-        continue;
-      }
-      classCounts.set(cls, used + 1);
+    return cls != null && cap != null && (classCounts.get(cls) ?? 0) >= cap;
+  };
+  const take = (hit: SearchResult): void => {
+    const cls = hit.why?.evidenceClass;
+    if (cls != null && CLASS_CAPS[cls] != null) {
+      classCounts.set(cls, (classCounts.get(cls) ?? 0) + 1);
     }
     final.push(hit);
+    taken.add(hit);
+  };
+  const offer = (hit: SearchResult): void => {
+    if (final.length >= limit || classFull(hit)) heldBack.push(hit);
+    else if (windowFull(hit)) deferred.push(hit);
+    else take(hit);
+  };
+
+  for (const hit of ordered) {
+    offer(hit);
+    // Once the first results are full, the relatives they held back are next.
+    if (final.length >= FAMILY_TOP_WINDOW && deferred.length > 0) {
+      for (const held of deferred.splice(0)) offer(held);
+    }
   }
 
   // Backfill in original order when the caps starved the fill (mirrors the
   // per-session diversity semantics: caps yield rather than return less).
-  for (const hit of heldBack) {
-    if (final.length >= limit) break;
-    final.push(hit);
+  // A relative the family allowance still refuses waits for a second pass,
+  // so it fills in only after every other held-back hit.
+  const position = new Map(ordered.map((hit, index) => [hit, index] as const));
+  const rest = [...heldBack, ...deferred].sort(
+    (a, b) => (position.get(a) ?? 0) - (position.get(b) ?? 0),
+  );
+  for (const keepAllowance of [true, false]) {
+    for (const hit of rest) {
+      if (final.length >= limit) break;
+      if (taken.has(hit) || (keepAllowance && windowFull(hit))) continue;
+      final.push(hit);
+      taken.add(hit);
+    }
   }
 
   if (
@@ -1252,10 +1290,15 @@ export function capAndSlice(
     final.length > 0 &&
     !final.some((hit) => hit.why?.evidenceClass === "tool-input")
   ) {
-    const promoted = heldBack.find(
-      (hit) => hit.why?.evidenceClass === "tool-input" && !final.includes(hit),
-    );
-    if (promoted) final[final.length - 1] = promoted;
+    const promoted = rest.find((hit) => hit.why?.evidenceClass === "tool-input" && !taken.has(hit));
+    if (promoted) {
+      let slot = final.length - 1;
+      if (isFamily(promoted) && slot < FAMILY_TOP_WINDOW && !isFamily(final[slot]!)) {
+        const window = final.slice(0, FAMILY_TOP_WINDOW).map(isFamily);
+        if (window.filter(Boolean).length >= FAMILY_TOP_MAX) slot = window.lastIndexOf(true);
+      }
+      final[slot] = promoted;
+    }
   }
 
   return final;
@@ -4370,7 +4413,7 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
             orderForDirectoryFallback(diversified, Boolean(bucketDirectory && fallback)),
             pools,
           );
-          const final = capAndSlice(ordered, resultsArg, commandLikeQuery);
+          const final = capAndSlice(ordered, resultsArg, commandLikeQuery, diversityFamily);
           return { final, total: partTotal, truncated: earlyExit || partTotal > final.length };
         };
 
