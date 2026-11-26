@@ -505,6 +505,16 @@ export function createV2Sync(db: ReadOnlyDb, opts: V2SyncOptions = {}): DistillS
     });
   }
 
+  async function seqOf(sessionID: string, messageID: string): Promise<number | null> {
+    await pause();
+    const row = db.get("SELECT seq FROM session_message WHERE id = ? AND session_id = ? LIMIT ?", [
+      messageID,
+      sessionID,
+      1,
+    ]);
+    return num(row?.seq);
+  }
+
   async function withParts(sessionIDs: string[]): Promise<Set<string>> {
     const found = new Set<string>();
     if (!partsOn) return found;
@@ -692,6 +702,7 @@ export function createV2Sync(db: ReadOnlyDb, opts: V2SyncOptions = {}): DistillS
     reconcileEveryMs,
     rangeDigest,
     withParts,
+    seqOf,
     inspect: inspectCheckpoint,
     annotate: annotateCheckpoint,
   };

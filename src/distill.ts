@@ -25,7 +25,6 @@ import { extractCodeTokens } from "./query.js";
 import {
   isDigestToken,
   isUnavailableText,
-  unavailableText,
   DIGEST_HEAD_CHARS,
   stripSubagentPrefix,
 } from "./digest.js";
@@ -106,14 +105,8 @@ const RANGE_ROWS = 500;
 /** A `seq` below every history row's (they are non-negative). */
 const BEFORE_FIRST_SEQ = -1;
 /** Cards the range check looks at, at most, per poll while it searches for
- *  one it may check. With the single range it checks, this is its budget. */
+ *  one it may check. With the one digest it reads, this is its budget. */
 const RECONCILE_SCAN_LIMIT = 64;
-/** The placeholder texts a tolerant read puts in place of a part row whose
- *  data does not decode; a strict read rejects such a row instead. */
-const MALFORMED_PART_TEXTS = new Set([
-  unavailableText("data is not valid JSON"),
-  unavailableText("data is not an object"),
-]);
 
 /** With `yieldBetween`, long store sweeps pause after this many writes. */
 const YIELD_EVERY_WRITES = 50;
@@ -449,6 +442,8 @@ export type DistillSync = {
   rangeDigest?(sessionID: string, afterSeq: number, limit: number): Promise<RangeRow[]>;
   /** Of `sessionIDs`, those with part rows. */
   withParts?(sessionIDs: string[]): Promise<Set<string>>;
+  /** A message's `seq`, or null when the session has no such message. */
+  seqOf?(sessionID: string, messageID: string): Promise<number | null>;
   /** What a stored checkpoint records, or null when it is not one. */
   inspect?(cursor: string | null | undefined): CheckpointInfo | null;
   /** `cursor` with what a write learned recorded in it: the lowest `seq` it
@@ -742,6 +737,10 @@ type SessionRead = {
   floor?: number;
 };
 
+/** A session's rows as a write digested them before its read, in groups of
+ *  one digest read each, and the range-check sweep current at the time. */
+type Digest = { groups: RangeRow[][]; sweepGen: number };
+
 /**
  * Why a read's projection is known to have lost content, or undefined: part
  * rows of a type the projector does not read (every assistant content type
@@ -769,6 +768,68 @@ function rangeHashOf(rows: RangeRow[]): string {
       )
       .join("\n"),
   );
+}
+
+/** What one range check found ({@link compareSpans}). */
+type SpanCheck = {
+  /** Stored spans the read holds in full and that still match. */
+  confirmed: RangeHash[];
+  /** The `seq` through which the card is now checked. */
+  verified: number;
+  /** Whether everything through the checkpoint is checked. */
+  done: boolean;
+  /** The first difference: where it starts and what it is. */
+  mismatch?: { seq: number; reason: string };
+};
+
+/**
+ * Compare one digest read with a card's stored range hashes. `rows` are the
+ * session's rows after `start` in `seq` order, at most {@link RANGE_ROWS}, a
+ * shorter read meaning the session ends there; `end` is the checkpoint's
+ * `seq`. The stored spans are walked by their recorded boundaries from
+ * `start` towards `end`, and each must hold exactly the rows it recorded:
+ * rows gone from a span (a whole span deleted included), a changed row, a row
+ * outside every span, or a span that starts at or below `start` (one that
+ * covers rows below the card's floor) is a mismatch. The walk stops at a
+ * span the read does not reach, to go on from `verified` next time.
+ */
+function compareSpans(rows: RangeRow[], spans: RangeHash[], start: number, end: number): SpanCheck {
+  const complete = rows.length < RANGE_ROWS;
+  const lastRead = rows.length > 0 ? rows[rows.length - 1]!.seq : start;
+  const confirmed: RangeHash[] = [];
+  let verified = start;
+  let k = 0;
+  const differ = (seq: number, reason: string): SpanCheck => ({
+    confirmed,
+    verified,
+    done: false,
+    mismatch: { seq, reason },
+  });
+  for (const span of spans) {
+    if (span.endSeq <= start) continue;
+    if (span.startSeq > end) break;
+    if (span.startSeq <= start) return differ(span.startSeq, "hash starts below the floor");
+    const next = rows[k];
+    if (next && next.seq < span.startSeq) return differ(next.seq, "no stored hash");
+    if (span.endSeq > lastRead && !complete) {
+      // A span holds at most one read's rows, so only rows added inside it
+      // can keep the first one out of reach.
+      if (confirmed.length === 0) return differ(span.startSeq, "hash differs");
+      return { confirmed, verified, done: false };
+    }
+    const inSpan: RangeRow[] = [];
+    while (k < rows.length && rows[k]!.seq <= span.endSeq) inSpan.push(rows[k++]!);
+    if (inSpan.length < span.rowCount) return differ(span.startSeq, "rows missing");
+    if (inSpan.length > span.rowCount || rangeHashOf(inSpan) !== span.hash) {
+      return differ(span.startSeq, "hash differs");
+    }
+    confirmed.push(span);
+    verified = span.endSeq;
+    if (verified >= end) return { confirmed, verified, done: true };
+  }
+  const unhashed = rows[k];
+  if (unhashed && unhashed.seq <= end) return differ(unhashed.seq, "no stored hash");
+  return { confirmed, verified, done: complete || lastRead >= end };
 }
 
 // ── Card derivation ──────────────────────────────────────────────────────────
@@ -1360,15 +1421,17 @@ export function createDistiller(options: DistillerOptions): Distiller {
    * always the cut placeholder, with the parts it read. It stops, leaving the
    * message partial, once the session's rows reach `maxRows` (counting
    * `rowsBefore` from the rest of the read), when the source cannot continue
-   * (`unsupported`, a vanished message), or when the lease is lost. A part
-   * whose data does not decode rejects as a malformed session, as the strict
-   * page read does.
+   * (`unsupported`, a vanished message), or when the lease is lost. The
+   * continuations are strict, as the page read is, so a part whose data does
+   * not decode rejects as a malformed session, and what they could not
+   * project is added to `counts` for the loss guard.
    */
   async function completeMessage(
     sessionID: string,
     msg: HistoryMessage,
     rowsBefore: number,
     maxRows: number,
+    counts: HistoryReadCounts,
   ): Promise<HistoryMessage> {
     let current = msg;
     while (current.partial) {
@@ -1381,16 +1444,10 @@ export function createDistiller(options: DistillerOptions): Distiller {
       const from = current.partial.nextOrdinal;
       const next = await gate.runBackground(() => {
         if (stopped || !leaseHeld) return Promise.resolve(null);
-        return source.getMessage(sessionID, msg.info.id, { partOrdinal: from });
+        return source.getMessage(sessionID, msg.info.id, { partOrdinal: from, strict: true });
       });
       if (!next?.ok) return current;
-      for (const part of next.value.parts) {
-        if (part.type === "text" && MALFORMED_PART_TEXTS.has(part.text)) {
-          throw new MalformedSessionError(
-            `message ${msg.info.id} has a part whose data does not decode`,
-          );
-        }
-      }
+      if (next.counts) addReadCounts(counts, next.counts);
       const parts = [...current.parts.slice(0, -1), ...next.value.parts];
       const partial = next.value.partial;
       current = partial ? { info: msg.info, parts, partial } : { info: msg.info, parts };
@@ -1433,7 +1490,7 @@ export function createDistiller(options: DistillerOptions): Distiller {
       try {
         for (const item of page.items) {
           const msg = item.partial
-            ? await completeMessage(sessionID, item, rowCount, maxRows)
+            ? await completeMessage(sessionID, item, rowCount, maxRows, counts)
             : item;
           if (msg.partial) cut++;
           all.push(msg);
@@ -1506,7 +1563,7 @@ export function createDistiller(options: DistillerOptions): Distiller {
             break;
           }
           const msg = item.partial
-            ? await completeMessage(sessionID, item, rowCount, caps.ftsRowsPerSession)
+            ? await completeMessage(sessionID, item, rowCount, caps.ftsRowsPerSession, counts)
             : item;
           if (msg.partial) cut++;
           collected.push(msg);
@@ -1622,22 +1679,20 @@ export function createDistiller(options: DistillerOptions): Distiller {
   }
 
   /**
-   * Hashes of a session's rows after `afterSeq`, in spans of up to
-   * {@link RANGE_ROWS} rows (one digest read each), for a write to record.
-   * A write takes them before it reads anything else, so a row that changes
-   * between this digest and the write's own read is recorded with its older
-   * state and fails the next range check. Undefined when range hashes are
-   * off, or when the lease was lost or the distiller stopped mid-digest
-   * (the write does not happen then).
+   * A session's rows after `afterSeq`, in groups of up to
+   * {@link RANGE_ROWS} rows (one digest read each), for a write to record as
+   * range hashes ({@link spansOf}). A write takes them before it reads
+   * anything else, so a row that changes between this digest and the
+   * write's own read is recorded with its older state and fails the next
+   * range check. Undefined when range hashes are off, or when the lease was
+   * lost or the distiller stopped mid-digest (the write does not happen
+   * then).
    */
-  async function digestSpans(
-    sessionID: string,
-    afterSeq: number,
-  ): Promise<RangeHash[] | undefined> {
+  async function digestSpans(sessionID: string, afterSeq: number): Promise<Digest | undefined> {
     const digest = sync?.rangeDigest;
     if (!rangesOn || !digest) return undefined;
     const sweepGen = currentSweepGen();
-    const spans: RangeHash[] = [];
+    const groups: RangeRow[][] = [];
     let after = afterSeq;
     for (;;) {
       const rows = await gate.runBackground(() => {
@@ -1646,19 +1701,49 @@ export function createDistiller(options: DistillerOptions): Distiller {
       });
       if (rows === null) return undefined;
       if (rows.length === 0) break;
-      const last = rows[rows.length - 1]!;
-      spans.push({
-        startSeq: rows[0]!.seq,
-        endSeq: last.seq,
-        rowCount: rows.length,
-        hash: rangeHashOf(rows),
-        sweepGen,
-      });
+      groups.push(rows);
       // A short read is the end of the session.
       if (rows.length < RANGE_ROWS) break;
-      after = last.seq;
+      after = rows[rows.length - 1]!.seq;
+    }
+    return { groups, sweepGen };
+  }
+
+  /**
+   * The range hashes of a digest, each group trimmed to the rows at or above
+   * `floor` (a group left empty is dropped), so the first one starts at the
+   * write's floor and no hash covers a row below it.
+   */
+  function spansOf(digest: Digest, floor: number | undefined): RangeHash[] {
+    const spans: RangeHash[] = [];
+    for (const group of digest.groups) {
+      const rows = floor === undefined ? group : group.filter((row) => row.seq >= floor);
+      if (rows.length === 0) continue;
+      spans.push({
+        startSeq: rows[0]!.seq,
+        endSeq: rows[rows.length - 1]!.seq,
+        rowCount: rows.length,
+        hash: rangeHashOf(rows),
+        sweepGen: digest.sweepGen,
+      });
     }
     return spans;
+  }
+
+  /**
+   * The digest a write takes before its read, or undefined to keep the
+   * stored hashes. Only a tail that is settled now is worth a digest: a
+   * write that reads a running tail stores an unsettled checkpoint, which the
+   * range check never checks, and the first write over a settled tail takes
+   * its own digest and replaces the hashes.
+   */
+  async function digestFor(
+    sessionID: string,
+    before: DistillCheckpoint | null,
+    afterSeq: number,
+  ): Promise<Digest | undefined> {
+    if (!before?.settled) return undefined;
+    return digestSpans(sessionID, afterSeq);
   }
 
   /**
@@ -1692,9 +1777,12 @@ export function createDistiller(options: DistillerOptions): Distiller {
   }
 
   /**
-   * Store a full derivation with its checkpoint, the generation and, with
-   * range hashes on, `spans`: those at or above the read's floor replace
-   * every hash stored for the session. Returns the store's verdict.
+   * Store a full derivation with its checkpoint, the generation and, with a
+   * `digest`, its range hashes trimmed to the read's floor, which replace
+   * every hash stored for the session in the same transaction (hashes of an
+   * earlier write can start at seqs this one's do not, rows removed since,
+   * and a range check must never find them). Without a digest the stored
+   * hashes are kept. Returns the store's verdict.
    *
    * The loss guard: when the read shows the projection lost content
    * ({@link lossOf}), an existing card is kept as it is, nothing is written
@@ -1709,27 +1797,23 @@ export function createDistiller(options: DistillerOptions): Distiller {
     read: SessionRead,
     checkpoint: DistillCheckpoint | null,
     moved: boolean,
-    spans: RangeHash[] | undefined,
+    digest: Digest | undefined,
   ): CardWrite & { kept?: string } {
     const loss = lossOf(read.counts);
     if (loss && store.getCard(session.id)) {
       markLoss(session.id, loss, true);
+      // The tail read is current even though the card is kept, so a session
+      // whose turn has ended stops being re-read on every poll.
+      noteSettled(session.id, checkpoint, moved);
       return { changed: false, kept: loss };
     }
     const card = stampCard(derived.card, checkpoint, { floor: read.floor, cut: read.cut });
-    let rangeHashes: RangeHash[] | undefined;
-    if (spans) {
-      const floor = read.floor;
-      rangeHashes = floor === undefined ? spans : spans.filter((span) => span.endSeq >= floor);
-      // Hashes of an earlier write can start at seqs this one's spans do
-      // not (rows removed since), and a range check must never find them.
-      store.clearRangeHashes(session.id);
-    }
+    const rangeHashes = digest ? spansOf(digest, read.floor) : undefined;
     const result = store.replaceSessionParts(
       session.id,
       derived.rows,
       card,
-      rangeHashes ? { rangeHashes } : undefined,
+      rangeHashes ? { rangeHashes, replaceRangeHashes: true } : undefined,
     );
     // An accepted replace clears the repair reason, so the mark follows it.
     if (loss && !result.refused) markLoss(session.id, loss, false);
@@ -1825,7 +1909,7 @@ export function createDistiller(options: DistillerOptions): Distiller {
 
   async function distillFull(session: DistillSessionMeta): Promise<CardWrite & { kept?: string }> {
     const before = await fetchCheckpoint(session.id);
-    const spans = await digestSpans(session.id, BEFORE_FIRST_SEQ);
+    const digest = await digestFor(session.id, before, BEFORE_FIRST_SEQ);
     const read = await fetchSessionMessages(session.id, caps.ftsRowsPerSession);
     const { checkpoint, moved } = await bracketCheckpoint(session.id, before);
     // Cheap flag check before parentChainOf touches the store: a detached
@@ -1844,16 +1928,107 @@ export function createDistiller(options: DistillerOptions): Distiller {
     // callback ever runs; the resumed fetch must not replace the new holder's
     // rows. One leaseStatus() read per write batch.
     if (stopped || !ownsLease()) return { changed: false };
-    return writeFull(session, derived, read, checkpoint, moved, spans);
+    return writeFull(session, derived, read, checkpoint, moved, digest);
   }
 
-  async function distillAppend(session: DistillSessionMeta, oldCard: Card): Promise<CardWrite> {
+  /**
+   * The floor of a card after an append adds `newRows` slim-index rows to
+   * the stored ones (oldest first, as the store inserts them). Under the
+   * per-session row cap the store evicts the oldest rows, so the floor moves
+   * up to the message that owns the oldest row left (its `seq` from the
+   * appended messages, or read from the history for a stored one).
+   * Otherwise the card keeps the floor it had. `null` when that message is
+   * gone from the history, so the stored rows no longer describe the
+   * session; `undefined` (with `aborted`) when the lease was lost.
+   */
+  async function floorAfterAppend(
+    sessionID: string,
+    stored: number | undefined,
+    newRows: PartTextRow[],
+    appended: HistoryMessage[],
+  ): Promise<{ floor: number | undefined } | null | "aborted"> {
+    const cap = caps.ftsRowsPerSession;
+    if (!sync?.annotate || cap <= 0) return { floor: stored };
+    const kept = store.sessionRowCount(sessionID);
+    const evicted = kept + newRows.length - cap;
+    if (evicted <= 0) return { floor: stored };
+    const owner =
+      evicted >= kept
+        ? newRows[evicted - kept]?.messageId
+        : store.sessionRowMessage(sessionID, evicted);
+    if (owner === undefined) return { floor: stored };
+    let seq = appended.find((msg) => msg.info.id === owner)?.info.seq;
+    const seqOf = sync.seqOf;
+    if (seq === undefined && seqOf) {
+      const found = await gate.runBackground(() => {
+        if (stopped || !leaseHeld) return Promise.resolve<number | null | "aborted">("aborted");
+        return seqOf(sessionID, owner);
+      });
+      if (found === "aborted") return "aborted";
+      if (found === null) return null;
+      seq = found;
+    }
+    if (seq === undefined) return { floor: stored };
+    return { floor: stored === undefined ? seq : Math.max(stored, seq) };
+  }
+
+  /**
+   * A session's stored range hashes once its floor moves up to `floor`:
+   * spans wholly below it are dropped, and the one span that holds rows on
+   * both sides of it is trimmed to the rows at or above it. That span is
+   * read again first and trimmed only when it still matches its stored hash,
+   * so a change the range check would have found is not hashed away;
+   * `changed` when it no longer matches, `aborted` when the lease was lost.
+   */
+  async function spansAboveFloor(
+    sessionID: string,
+    floor: number,
+  ): Promise<RangeHash[] | "changed" | "aborted"> {
+    const digest = sync?.rangeDigest;
+    const kept: RangeHash[] = [];
+    for (const span of store.getRangeHashes(sessionID)) {
+      if (span.endSeq < floor) continue;
+      if (span.startSeq >= floor) {
+        kept.push(span);
+        continue;
+      }
+      if (!digest) return "changed";
+      const rows = await gate.runBackground(() => {
+        if (stopped || !leaseHeld) return Promise.resolve<RangeRow[] | null>(null);
+        return digest(sessionID, span.startSeq - 1, span.rowCount);
+      });
+      if (rows === null) return "aborted";
+      const inSpan = rows.filter((row) => row.seq <= span.endSeq);
+      if (
+        inSpan.length !== span.rowCount ||
+        inSpan[0]?.seq !== span.startSeq ||
+        rangeHashOf(inSpan) !== span.hash
+      ) {
+        return "changed";
+      }
+      const above = inSpan.filter((row) => row.seq >= floor);
+      if (above.length === 0) continue;
+      kept.push({
+        startSeq: above[0]!.seq,
+        endSeq: above[above.length - 1]!.seq,
+        rowCount: above.length,
+        hash: rangeHashOf(above),
+        sweepGen: span.sweepGen,
+      });
+    }
+    return kept;
+  }
+
+  async function distillAppend(
+    session: DistillSessionMeta,
+    oldCard: Card,
+  ): Promise<CardWrite & { kept?: string }> {
     const checkpoint = oldCard.distilledThrough;
     if (!checkpoint) return distillFull(session);
     const before = await fetchCheckpoint(session.id);
     // The rows past the stored checkpoint are the ones this append reads.
     const stored = sync?.inspect?.(oldCard.distillCursor) ?? null;
-    const spans = stored ? await digestSpans(session.id, stored.seq) : undefined;
+    const digest = stored ? await digestFor(session.id, before, stored.seq) : undefined;
     const fetched = await fetchNewMessages(session.id, checkpoint);
     const { checkpoint: tail, moved } = await bracketCheckpoint(session.id, before);
     // Authoritative ownership check before the append write (see distillFull);
@@ -1863,14 +2038,20 @@ export function createDistiller(options: DistillerOptions): Distiller {
     // append tail (they'd re-insert already-stored parts and hit a UNIQUE
     // violation, wedging the session). Fall back to a full re-distill.
     if (!fetched.reached) return distillFull(session);
-    // The card keeps its rows, so it keeps the floor and cut messages of the
-    // write that read them.
-    const info = {
-      ...(stored?.floor !== undefined && { floor: stored.floor }),
-      cut: (stored?.cut ?? 0) + fetched.cut,
-    };
+    // The loss guard, before anything is written: an append can evict stored
+    // rows at the cap and replaces the card's aggregates, so a lossy one
+    // keeps the card, its rows and its checkpoint, as a full write does.
+    const loss = lossOf(fetched.counts);
+    if (loss) {
+      markLoss(session.id, loss, true);
+      noteSettled(session.id, tail, moved);
+      return { changed: false, kept: loss };
+    }
+    // The card keeps the cut messages of the write that read its rows.
+    const cut = (stored?.cut ?? 0) + fetched.cut;
     const newMessages = fetched.messages;
     if (newMessages.length === 0) {
+      const info = { ...(stored?.floor !== undefined && { floor: stored.floor }), cut };
       // Nothing appended. A sync host still refreshes the card's metadata and
       // checkpoint, or the cold pass would keep finding it stale.
       if (!sync) return { changed: false };
@@ -1889,13 +2070,31 @@ export function createDistiller(options: DistillerOptions): Distiller {
       );
       // Rows that are not messages (a switch, an idle marker) can still move
       // the checkpoint past the stored hashes.
-      if (spans && spans.length > 0) store.putRangeHashes(session.id, spans);
+      const spans = digest ? spansOf(digest, undefined) : [];
+      if (spans.length > 0) store.putRangeHashes(session.id, spans);
       noteSettled(session.id, tail, moved);
       return result;
     }
 
     const chrono = sortChronological(newMessages);
     const walk = walkMessages(chrono, checkpoint);
+    const placed = await floorAfterAppend(session.id, stored?.floor, walk.rows, chrono);
+    if (placed === "aborted") return { changed: false };
+    // The oldest row left belongs to a message the history no longer has.
+    if (placed === null) return distillFull(session);
+    if (stopped || !ownsLease()) return { changed: false };
+    const info = { ...(placed.floor !== undefined && { floor: placed.floor }), cut };
+    let rangeHashes = digest ? spansOf(digest, undefined) : undefined;
+    let replaceRangeHashes = false;
+    if (rangesOn && placed.floor !== undefined && placed.floor !== stored?.floor) {
+      // The append evicts rows: the stored hashes follow the floor up.
+      const kept = await spansAboveFloor(session.id, placed.floor);
+      if (kept === "aborted") return { changed: false };
+      if (kept === "changed") return distillFull(session);
+      if (stopped || !ownsLease()) return { changed: false };
+      rangeHashes = [...kept, ...(rangeHashes ?? [])];
+      replaceRangeHashes = true;
+    }
     const rootId = resolveRootId(session.id, parentChainOf(session));
     const boundary = { checkpointMessageId: checkpoint, firstNewMessageId: chrono[0]!.info.id };
 
@@ -1944,13 +2143,8 @@ export function createDistiller(options: DistillerOptions): Distiller {
           tail,
           info,
         ),
-      spans ? { rangeHashes: spans } : undefined,
+      rangeHashes ? { rangeHashes, replaceRangeHashes } : undefined,
     );
-    // An append adds to the stored rows and overwrites none, so a loss in
-    // what it read does not keep it from landing; the card is marked, and an
-    // append keeps the mark.
-    const loss = lossOf(fetched.counts);
-    if (loss && !result.refused) markLoss(session.id, loss, false);
     noteSettled(session.id, tail, moved);
     return { changed: result.changed };
   }
@@ -2091,12 +2285,12 @@ export function createDistiller(options: DistillerOptions): Distiller {
           }
 
           let read: SessionRead;
-          let spans: RangeHash[] | undefined;
+          let digest: Digest | undefined;
           let checkpoint: DistillCheckpoint | null;
           let moved: boolean;
           try {
             const before = await fetchCheckpoint(session.id);
-            spans = await digestSpans(session.id, BEFORE_FIRST_SEQ);
+            digest = await digestFor(session.id, before, BEFORE_FIRST_SEQ);
             read = await fetchSessionMessages(session.id, caps.ftsRowsPerSession);
             ({ checkpoint, moved } = await bracketCheckpoint(session.id, before));
           } catch (error) {
@@ -2172,7 +2366,7 @@ export function createDistiller(options: DistillerOptions): Distiller {
           // the cached flag — and skip it, counting the session as not
           // distilled.
           if (stopped || !ownsLease()) return;
-          if (writeFull(session, derived, read, checkpoint, moved, spans).kept === undefined) {
+          if (writeFull(session, derived, read, checkpoint, moved, digest).kept === undefined) {
             distilled++;
             distilledCount = distilled; // status counts only sessions actually distilled
           }
@@ -2426,6 +2620,9 @@ export function createDistiller(options: DistillerOptions): Distiller {
     let firstFailure: string | undefined;
     let consecutiveFailures = 0;
     let aborted = false;
+    /** Sessions this sweep did not rebuild: being re-distilled when it got
+     *  to them, or left stale by its own write (a lost lease, a refusal). */
+    const skipped: string[] = [];
     const progress = (running: boolean): Omit<RepairProgress, "at"> => ({
       pending: ordered.length - settled,
       repairPending: repairPending(),
@@ -2441,13 +2638,17 @@ export function createDistiller(options: DistillerOptions): Distiller {
         await pause();
         if (stopped || !leaseHeld || aborted) return;
       }
-      if (inFlight.has(sessionId)) return;
+      if (inFlight.has(sessionId)) {
+        skipped.push(sessionId);
+        return;
+      }
       sweeping.add(sessionId);
       try {
         const outcome = await repairOne(sessionId);
         consecutiveFailures = 0;
         if (outcome === "done") done++;
         if (outcome === "done" || outcome === "marked") settled++;
+        if (outcome === "skipped") skipped.push(sessionId);
       } catch (error) {
         failed++;
         firstFailure ??= `session ${sessionId}: ${errmsg(error)}`;
@@ -2478,8 +2679,17 @@ export function createDistiller(options: DistillerOptions): Distiller {
     );
     if (failed > 0) {
       lastError = failed > 1 ? `${firstFailure} (and ${failed - 1} more)` : firstFailure;
-      scheduleSweepRetry();
     }
+    // A skipped card the re-distill that held it did not rebuild stays stale,
+    // and nothing else would reach it before the next cold pass.
+    const stillStale = skipped.filter((id) => {
+      const card = store.getCard(id);
+      return card !== undefined && card.repairReason === undefined && belowGeneration(card);
+    });
+    if (stillStale.length > 0) {
+      logMsg(`repair sweep left ${stillStale.length} card(s) it skipped stale; retrying them`);
+    }
+    if (failed > 0 || stillStale.length > 0) scheduleSweepRetry();
   }
 
   // ── Range check (hosts with a projector generation and range digests) ──
@@ -2538,20 +2748,20 @@ export function createDistiller(options: DistillerOptions): Distiller {
   }
 
   /**
-   * Check one range for a change no poll window sees (a part row rewritten
-   * in a settled session moves neither the message nor the session
-   * watermark). Runs from the poll, at most one range per poll, only while
-   * this process holds the lease, no cold pass or repair sweep runs and no
-   * foreground query is in the fetch gate.
+   * Check stored ranges for a change no poll window sees (a part row
+   * rewritten in a settled session moves neither the message nor the
+   * session watermark). Runs from the poll, one digest read (at most
+   * {@link RANGE_ROWS} rows) per poll, only while this process holds the
+   * lease, no cold pass or repair sweep runs and no foreground query is in
+   * the fetch gate.
    *
    * It walks the cards in session id order, skipping any it may not check
    * ({@link checkable}), at most {@link RECONCILE_SCAN_LIMIT} per poll. For a
-   * card it starts at the range holding its floor (the lowest `seq` its last
-   * full write read, rows below it are not in the card) or at the session's
-   * start, and walks range by range to its checkpoint. Each check reads one
-   * digest after the previous range's end and compares it with the stored
-   * hash that starts at its first row. A match moves on and records the
-   * current sweep in the hash; a mismatch, or rows with no stored hash,
+   * card it starts at its floor (the lowest `seq` its last full write read;
+   * rows below it are not in the card) or at the session's start, and walks
+   * the stored spans by their recorded boundaries to its checkpoint
+   * ({@link compareSpans}), as many as the digest holds. Matching spans
+   * record the current sweep; a mismatch, or rows with no stored hash,
    * dispatches a removal, so the session is re-indexed in full and that
    * write records fresh hashes. The position, the sweep count and the
    * counters persist in {@link RECONCILE_PROGRESS_KEY}.
@@ -2618,16 +2828,15 @@ export function createDistiller(options: DistillerOptions): Distiller {
         continue;
       }
       const spans = store.getRangeHashes(id);
-      let from = after;
-      if (from === null) {
-        const floor = info.floor;
-        if (floor === undefined) from = BEFORE_FIRST_SEQ;
-        else {
-          const holder = spans.find((span) => span.startSeq <= floor && span.endSeq >= floor);
-          from = (holder ? holder.startSeq : floor) - 1;
-        }
-      }
-      if (from >= info.seq) {
+      // Rows below the floor are not in the card, so the walk starts at it.
+      const first = info.floor !== undefined ? info.floor - 1 : BEFORE_FIRST_SEQ;
+      // A position inside a stored span means the card's hashes were
+      // rewritten since the walk stopped there: walk the card again.
+      const resume =
+        after !== null && !spans.some((span) => span.startSeq <= after! && span.endSeq > after!)
+          ? after
+          : first;
+      if (resume >= info.seq) {
         advance();
         if (index >= ids.length) {
           save();
@@ -2635,38 +2844,36 @@ export function createDistiller(options: DistillerOptions): Distiller {
         }
         continue;
       }
-      const start = from;
       const rows = await gate.runBackground(() => {
         if (stopped || !leaseHeld) return Promise.resolve<RangeRow[] | null>(null);
-        return digest(id, start, RANGE_ROWS);
+        return digest(id, resume, RANGE_ROWS);
       });
       if (rows === null || stopped || !ownsLease()) return;
-      state = { ...state, session: id, after: from, checked: state.checked + 1, at: now() };
-      const first = rows[0];
-      if (!first || first.seq > info.seq) {
-        // Nothing left at or below the checkpoint: the card is checked.
+      const found = compareSpans(rows, spans, resume, info.seq);
+      state = {
+        ...state,
+        session: id,
+        after: resume,
+        checked: state.checked + found.confirmed.length + (found.mismatch ? 1 : 0),
+        at: now(),
+      };
+      const restamp = found.confirmed
+        .filter((span) => span.sweepGen !== state.sweep)
+        .map((span) => ({ ...span, sweepGen: state.sweep }));
+      if (restamp.length > 0) store.putRangeHashes(id, restamp);
+      if (found.mismatch) {
+        logMsg(
+          `session ${id} changed in rows ${found.mismatch.seq} and on (${found.mismatch.reason}); re-indexing it`,
+        );
+        state = { ...state, mismatched: state.mismatched + 1 };
         advance();
         save();
+        dispatch({ type: "removal", sessionID: id });
         return;
       }
-      const span = spans.find((stored) => stored.startSeq === first.seq);
-      const covered = span ? rows.filter((row) => row.seq <= span.endSeq) : [];
-      if (span && covered.length === span.rowCount && rangeHashOf(covered) === span.hash) {
-        if (span.sweepGen !== state.sweep) {
-          store.putRangeHashes(id, [{ ...span, sweepGen: state.sweep }]);
-        }
-        if (span.endSeq >= info.seq) advance();
-        else state = { ...state, after: span.endSeq };
-        save();
-        return;
-      }
-      logMsg(
-        `session ${id} changed in rows ${first.seq} and on (${span ? "hash differs" : "no stored hash"}); re-indexing it`,
-      );
-      state = { ...state, mismatched: state.mismatched + 1 };
-      advance();
+      if (found.done) advance();
+      else state = { ...state, after: found.verified };
       save();
-      dispatch({ type: "removal", sessionID: id });
       return;
     }
     save();
@@ -2820,7 +3027,10 @@ export function createDistiller(options: DistillerOptions): Distiller {
             existing.timeUpdated === session.timeUpdated &&
             existing.title === session.title &&
             existing.directory === session.directory &&
-            (existing.timeArchived ?? null) === (session.timeArchived ?? null)
+            (existing.timeArchived ?? null) === (session.timeArchived ?? null) &&
+            // A card below the projector generation is rebuilt whatever its
+            // tail says; the repair sweep skips sessions being re-distilled.
+            !belowGeneration(existing)
           ) {
             succeeded = true; // nothing changed since the card was written
             return;
@@ -2922,6 +3132,18 @@ export function createDistiller(options: DistillerOptions): Distiller {
         if (!stopped && ownsLease()) store.setMeta(key, value);
       },
     };
+    // Changes no poll window sees, one digest at a time. This runs before the
+    // poll's signals are dispatched: the poll's overlap re-signals a recently
+    // active session on every poll, and a session with a re-distill pending
+    // is not checked, so after dispatch such a session would never be. By
+    // now the previous poll's debounced re-distills have run.
+    try {
+      await checkOneRange();
+    } catch (error) {
+      lastError = errmsg(error);
+      logMsg(`range check failed: ${lastError}`);
+    }
+    if (stopped || !leaseHeld) return;
     try {
       const result = await gate.runBackground(() => {
         if (stopped || !leaseHeld) return Promise.resolve<PollResult | null>(null);
@@ -2953,8 +3175,6 @@ export function createDistiller(options: DistillerOptions): Distiller {
         lastReconcileAt = Date.now();
         await reconcileDeletions();
       }
-      // Changes no poll window sees, one range at a time.
-      await checkOneRange();
     } catch (error) {
       lastError = errmsg(error);
       logMsg(`poll failed: ${lastError}`);

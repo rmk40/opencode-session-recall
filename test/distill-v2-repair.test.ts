@@ -772,11 +772,12 @@ describe("v2 range check", () => {
     await waitFor(() => hits("xinew").length > 0);
     expect(hits("nuold")).toEqual([]);
 
-    // The first row is gone: the check finds no hash starting where the
-    // session now starts.
+    // The first row is gone: the span that recorded it holds a row fewer.
     v2db.db.run("DELETE FROM session_message WHERE id = ?", [opener]);
     await waitFor(() => hits("xinew").length === 0);
-    expect(h.logs.some((line) => line.includes("(no stored hash)"))).toBe(true);
+    expect(
+      h.logs.some((line) => line.includes("ses_a changed in rows 1 and on (rows missing)")),
+    ).toBe(true);
   });
 
   it("finds a rewrite that lands between a card's commit and its first check", async () => {
@@ -871,7 +872,8 @@ describe("v2 range check", () => {
       settled: true,
       floor: 511,
     });
-    expect(spansOf("ses_long")).toEqual([[501, 520]]);
+    // The first span starts at the floor, so no hash covers a row below it.
+    expect(spansOf("ses_long")).toEqual([[511, 520]]);
 
     rewriteUser(low, "tauneedle below the floor");
     const from = rangeSweeps(h.logs).length;
@@ -1088,6 +1090,437 @@ describe("repair machinery without a projector generation", () => {
       }
     } finally {
       db.close();
+    }
+  });
+});
+
+// ── Kept cards, span walks, floors and skipped repairs ───────────────────────
+
+/** An assistant row still streaming: written at `T0` but updated now, so it
+ *  is outside every poll window while the tail counts as running. */
+function addStreamingReply(sessionID: string, parts: unknown[]): string {
+  const seq = nextSeq(sessionID);
+  const id = `msg_${sessionID}_${seq}`;
+  insertMessage(v2db.db, {
+    id,
+    session_id: sessionID,
+    type: "assistant",
+    seq,
+    time_created: T0 + seq,
+    time_updated: Date.now(),
+    data: replyData({ completed: false }, T0 + seq),
+  });
+  parts.forEach((data, ordinal) => {
+    insertPart(v2db.db, { message_id: id, session_id: sessionID, ordinal, time_created: T0, data });
+  });
+  return id;
+}
+
+/** A session's stored slim-index rows, in insertion order. */
+const storedRows = (id: string): unknown[] =>
+  storeDb.all(
+    "SELECT part_id, message_id, prev_message_id, next_message_id, raw FROM part_text WHERE session_id = ? ORDER BY id",
+    [id],
+  );
+
+const lookupsOf = (h: Started, id: string): number => h.lookups.filter((x) => x === id).length;
+
+/** Stored range hashes without the sweep each was last confirmed in. */
+const hashesOf = (id: string): unknown[] =>
+  store.getRangeHashes(id).map(({ startSeq, endSeq, rowCount, hash }) => ({
+    startSeq,
+    endSeq,
+    rowCount,
+    hash,
+  }));
+
+const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
+describe("v2 kept cards", () => {
+  it("stops re-reading a kept session once its turn completes", async () => {
+    addSession("ses_a");
+    addUser("ses_a", "a prompt");
+    const reply = addStreamingReply("ses_a", [
+      text("streaming words"),
+      { type: "future-part", text: "unread" },
+    ]);
+    const h = startDistiller();
+    await coldPassDone(h);
+    const kept = (): number => h.logs.filter((line) => line.includes("ses_a kept its card")).length;
+    // Still running: every poll reads it again, and the loss keeps the card.
+    await waitFor(() => kept() >= 2);
+
+    v2db.db.run("UPDATE session_message SET data = ?, time_updated = ? WHERE id = ?", [
+      JSON.stringify(replyData({}, T0 + 2)),
+      Date.now(),
+      reply,
+    ]);
+    const before = kept();
+    await waitFor(() => kept() > before);
+    await sleep(30);
+    const reads = lookupsOf(h, "ses_a");
+    await sleep(150);
+    expect(lookupsOf(h, "ses_a")).toBe(reads);
+    expect(store.getCard("ses_a")?.repairReason).toMatch(/unknown types/);
+  });
+
+  it("keeps the card, its rows and its checkpoint when an append over the row cap lost content", async () => {
+    addSession("ses_a");
+    for (let i = 1; i <= 3; i++) addUser("ses_a", `lambdaword${i} words`);
+    const h = startDistiller({ appendThresholdParts: 0, limits: { ftsRowsPerSession: 3 } });
+    await cleanSweeps(h, 1);
+    const card = store.getCard("ses_a")!;
+    const rows = storedRows("ses_a");
+
+    addReply("ses_a", { parts: [text("munew answer"), { type: "future-part", text: "unread" }] });
+    h.distiller.onEvent({ type: "turn-ended", sessionID: "ses_a" });
+    await waitFor(() => store.getCard("ses_a")?.repairReason !== undefined);
+    expect(store.getCard("ses_a")).toEqual({
+      ...card,
+      repairReason: expect.stringMatching(/1 part rows of unknown types/) as unknown as string,
+    });
+    expect(storedRows("ses_a")).toEqual(rows);
+    expect(hits("lambdaword1")).toEqual(["ses_a"]);
+    expect(hits("munew")).toEqual([]);
+    expect(h.logs.some((line) => line.includes("ses_a kept its card"))).toBe(true);
+  });
+});
+
+describe("v2 continuation counts", () => {
+  /** A reply whose six ~405-byte parts do not fit a 1,500-byte page: the
+   *  page holds the first three and a continuation reads the rest. */
+  function longReply(sessionID: string, last: unknown): string {
+    const parts = Array.from({ length: 6 }, (_, i) =>
+      i === 5 ? last : text(String(i).repeat(380)),
+    );
+    return addReply(sessionID, { parts });
+  }
+
+  function countContinuations(continued: Array<number | undefined>) {
+    return (inner: HistorySource): HistorySource => ({
+      ...inner,
+      getMessage: async (sessionID, messageID, opts) => {
+        continued.push(opts?.partOrdinal);
+        return inner.getMessage(sessionID, messageID, opts);
+      },
+    });
+  }
+
+  it("keeps the card when an unknown part type turns up only in a continuation", async () => {
+    addSession("ses_cut");
+    addUser("ses_cut", "a question");
+    const reply = longReply("ses_cut", text("phiword answer"));
+    const continued: Array<number | undefined> = [];
+    const h = startDistiller({
+      source: { pageByteCeiling: 1_500 },
+      wrapSource: countContinuations(continued),
+    });
+    await coldPassDone(h);
+    expect(hits("phiword")).toEqual(["ses_cut"]);
+    const rev = cardsRev();
+
+    rewritePart(reply, 5, { type: "future-part", text: "phiword answer" });
+    h.distiller.onEvent({ type: "removal", sessionID: "ses_cut" });
+    await waitFor(() => store.getCard("ses_cut")?.repairReason !== undefined);
+    expect(store.getCard("ses_cut")?.repairReason).toMatch(/1 part rows of unknown types/);
+    expect(hits("phiword")).toEqual(["ses_cut"]);
+    expect(cardsRev()).toBe(rev);
+    // Both reads continued the message from its fourth part.
+    expect(continued).toEqual([3, 3]);
+  });
+
+  it("indexes a continued part whose own text reads like a placeholder", async () => {
+    addSession("ses_cut");
+    addUser("ses_cut", "a question");
+    const reply = longReply("ses_cut", text("[unavailable: data is not valid JSON]"));
+    const continued: Array<number | undefined> = [];
+    const h = startDistiller({
+      source: { pageByteCeiling: 1_500 },
+      wrapSource: countContinuations(continued),
+    });
+    await coldPassDone(h);
+    expect(continued).toEqual([3]);
+    expect(h.distiller.status().quarantinedCount).toBe(0);
+    expect(store.getCard("ses_cut")).toMatchObject({ distilledThrough: reply, partCount: 7 });
+    expect(store.getCard("ses_cut")?.repairReason).toBeUndefined();
+  });
+
+  it("quarantines a session whose continued part does not decode", async () => {
+    addSession("ses_cut");
+    addUser("ses_cut", "a question");
+    const reply = longReply("ses_cut", text("replaced below"));
+    v2db.db.run("UPDATE session_part SET data = ? WHERE message_id = ? AND ordinal = ?", [
+      "{not json",
+      reply,
+      5,
+    ]);
+    const h = startDistiller({ source: { pageByteCeiling: 1_500 } });
+    await coldPassDone(h);
+    expect(h.distiller.status().quarantinedCount).toBe(1);
+    expect(store.getCard("ses_cut")).toBeUndefined();
+  });
+});
+
+describe("v2 range check walks", () => {
+  it("finds a stored span whose every row was deleted", async () => {
+    addSession("ses_a");
+    addUser("ses_a", "first");
+    addUser("ses_a", "second");
+    const h = startDistiller({ appendThresholdParts: 0 });
+    await cleanSweeps(h, 1);
+    const middle = addUser("ses_a", "kappagone middle");
+    h.distiller.onEvent({ type: "turn-ended", sessionID: "ses_a" });
+    await waitFor(() => store.getRangeHashes("ses_a").length === 2);
+    addUser("ses_a", "fourth");
+    h.distiller.onEvent({ type: "turn-ended", sessionID: "ses_a" });
+    await waitFor(() => store.getRangeHashes("ses_a").length === 3);
+    expect(spansOf("ses_a")).toEqual([
+      [1, 2],
+      [3, 3],
+      [4, 4],
+    ]);
+    expect(hits("kappagone")).toEqual(["ses_a"]);
+
+    v2db.db.run("DELETE FROM session_message WHERE id = ?", [middle]);
+    await waitFor(() => hits("kappagone").length === 0);
+    expect(
+      h.logs.some((line) => line.includes("ses_a changed in rows 3 and on (rows missing)")),
+    ).toBe(true);
+  });
+
+  it("checks a session that keeps receiving rows, and finds an older part-only change", async () => {
+    addSession("ses_a");
+    const at = Date.now();
+    insertMessage(v2db.db, {
+      id: "msg_open",
+      session_id: "ses_a",
+      type: "user",
+      seq: nextSeq("ses_a"),
+      time_created: at,
+      data: { text: "a prompt", time: { created: at } },
+    });
+    const reply = "msg_reply";
+    insertMessage(v2db.db, {
+      id: reply,
+      session_id: "ses_a",
+      type: "assistant",
+      seq: nextSeq("ses_a"),
+      time_created: at,
+      data: replyData({}, at),
+    });
+    insertPart(v2db.db, {
+      message_id: reply,
+      session_id: "ses_a",
+      ordinal: 0,
+      time_created: at,
+      data: text("a first draft"),
+    });
+    // Appends never re-read the reply, and the checkpoint covers only its
+    // newest row, so only the range check can see the reply change.
+    const h = startDistiller({ appendThresholdParts: 0, sync: { fingerprintRows: 1 } });
+    await coldPassDone(h);
+
+    let appending = true;
+    const appender = (async () => {
+      while (appending) {
+        const seq = nextSeq("ses_a");
+        const now = Date.now();
+        insertMessage(v2db.db, {
+          id: `msg_more_${seq}`,
+          session_id: "ses_a",
+          type: "user",
+          seq,
+          time_created: now,
+          data: { text: `more ${seq}`, time: { created: now } },
+        });
+        await sleep(15);
+      }
+    })();
+    try {
+      await waitFor(
+        () => (inspectCheckpoint(store.getCard("ses_a")?.distillCursor)?.seq ?? 0) >= 4,
+      );
+      rewritePart(reply, 0, text("a sigmanew revision"));
+      await waitFor(() => hits("sigmanew").length > 0, 8_000);
+      expect(
+        h.logs.some((line) => /ses_a changed in rows \d+ and on \(hash differs\)/.test(line)),
+      ).toBe(true);
+    } finally {
+      appending = false;
+      await appender;
+    }
+  });
+});
+
+describe("v2 range hash writes", () => {
+  it("takes no digest on a full write over a running tail, and keeps the stored hashes", async () => {
+    addSession("ses_a");
+    addUser("ses_a", "a prompt");
+    addReply("ses_a", { parts: [text("an answer")] });
+    const h = startDistiller();
+    await cleanSweeps(h, 1);
+    const stored = hashesOf("ses_a");
+
+    addStreamingReply("ses_a", [text("omicronword partial")]);
+    h.distiller.onEvent({ type: "turn-ended", sessionID: "ses_a" });
+    await waitFor(() => hits("omicronword").length > 0);
+    const digests = h.digests.filter((id) => id === "ses_a").length;
+    const reads = lookupsOf(h, "ses_a");
+    // Every poll reads the running tail again, in full.
+    await waitFor(() => lookupsOf(h, "ses_a") >= reads + 3);
+    expect(h.digests.filter((id) => id === "ses_a").length).toBe(digests);
+    expect(hashesOf("ses_a")).toEqual(stored);
+  });
+
+  it("keeps the stored hashes when the card refuses the write", async () => {
+    addSession("ses_a");
+    addUser("ses_a", "a prompt");
+    await built();
+    // A newer build wrote this card.
+    storeDb.run("UPDATE card SET projector_gen = ? WHERE session_id = ?", [GEN + 1, "ses_a"]);
+    const stored = hashesOf("ses_a");
+    expect(stored).toHaveLength(1);
+
+    addUser("ses_a", "a later prompt");
+    const h = startDistiller({ limits: { coldPass: false } });
+    h.distiller.onEvent({ type: "removal", sessionID: "ses_a" });
+    await waitFor(() => h.digests.includes("ses_a"));
+    await sleep(50);
+    expect(store.getCard("ses_a")?.projectorGen).toBe(GEN + 1);
+    expect(hashesOf("ses_a")).toEqual(stored);
+  });
+});
+
+describe("v2 floors", () => {
+  it("never re-indexes a change below the floor in the block that holds it", async () => {
+    addSession("ses_long");
+    let below = "";
+    v2db.db.tx(() => {
+      for (let i = 1; i <= 520; i++) {
+        const id = addUser("ses_long", `row number ${i}`);
+        if (i === 505) below = id;
+      }
+    });
+    const h = startDistiller({ limits: { ftsRowsPerSession: 5 }, pageMessages: 10 });
+    await cleanSweeps(h, 1);
+    expect(inspectCheckpoint(store.getCard("ses_long")?.distillCursor)?.floor).toBe(511);
+
+    rewriteUser(below, "chineedle below the floor");
+    const from = rangeSweeps(h.logs).length;
+    await cleanSweeps(h, 1, 2, from);
+    expect(reindexed(h.logs)).toEqual([]);
+  });
+
+  it("moves the checkpoint's floor up when an append evicts rows at the row cap", async () => {
+    addSession("ses_a");
+    const opener = addUser("ses_a", "nuword1 words");
+    addUser("ses_a", "nuword2 words");
+    const h = startDistiller({ appendThresholdParts: 0, limits: { ftsRowsPerSession: 2 } });
+    await cleanSweeps(h, 1);
+    // The write read the whole session: no floor.
+    expect(inspectCheckpoint(store.getCard("ses_a")?.distillCursor)?.floor).toBeUndefined();
+
+    addUser("ses_a", "nuword3 words");
+    h.distiller.onEvent({ type: "turn-ended", sessionID: "ses_a" });
+    await waitFor(() => hits("nuword3").length > 0);
+    // The first row was evicted: the oldest row left is the second message's,
+    // and the span that held both is trimmed to the floor.
+    expect(inspectCheckpoint(store.getCard("ses_a")?.distillCursor)?.floor).toBe(2);
+    expect(spansOf("ses_a")).toEqual([
+      [2, 2],
+      [3, 3],
+    ]);
+    // The range check finds the trimmed spans current.
+    const between = rangeSweeps(h.logs).length;
+    await cleanSweeps(h, 2, 1, between);
+    expect(reindexed(h.logs)).toEqual([]);
+    addUser("ses_a", "nuword4 words");
+    h.distiller.onEvent({ type: "turn-ended", sessionID: "ses_a" });
+    await waitFor(() => hits("nuword4").length > 0);
+    expect(inspectCheckpoint(store.getCard("ses_a")?.distillCursor)?.floor).toBe(3);
+    expect(spansOf("ses_a")).toEqual([
+      [3, 3],
+      [4, 4],
+    ]);
+    expect(hits("nuword2")).toEqual([]);
+
+    // The first span now lies wholly below the floor, so a change there is
+    // never checked.
+    rewriteUser(opener, "xiword changed below the floor");
+    const from = rangeSweeps(h.logs).length;
+    await cleanSweeps(h, 2, 2, from);
+    expect(reindexed(h.logs)).toEqual([]);
+  });
+});
+
+describe("v2 repair sweep requeue", () => {
+  /** Hold the first session lookup (the re-distill's) until released, and
+   *  hold discovery until that lookup started, so the sweep meets the
+   *  session while its re-distill is in flight. */
+  function holdFirstLookup(fail: boolean) {
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => (release = resolve));
+    let started!: () => void;
+    const redistilling = new Promise<void>((resolve) => (started = resolve));
+    let first = true;
+    const wrap = (inner: HistorySource): HistorySource => ({
+      ...inner,
+      listSessions: async (o) => {
+        await redistilling;
+        return inner.listSessions(o);
+      },
+      getSession: async (id, o) => {
+        if (first) {
+          first = false;
+          started();
+          await held;
+          if (fail) throw new Error("lookup failed");
+        }
+        return inner.getSession(id, o);
+      },
+    });
+    return { wrap, release: () => release() };
+  }
+
+  it("rebuilds a stale card the sweep skipped once the re-distill that held it runs", async () => {
+    addSession("ses_a");
+    addUser("ses_a", "a prompt");
+    await built();
+    makeStale(["ses_a"]);
+    const hold = holdFirstLookup(false);
+    try {
+      const h = startDistiller({ wrapSource: hold.wrap });
+      h.distiller.onEvent({ type: "turn-ended", sessionID: "ses_a" });
+      await waitFor(() => h.logs.some((line) => line.includes("left 1 card(s) it skipped stale")));
+      expect(staleIds()).toEqual(["ses_a"]);
+
+      // The tail is unchanged, but the card is below the generation.
+      hold.release();
+      await waitFor(() => store.getCard("ses_a")?.projectorGen === GEN);
+      expect(staleIds()).toEqual([]);
+    } finally {
+      hold.release();
+    }
+  });
+
+  it("retries a card the sweep skipped when the re-distill that held it fails", async () => {
+    addSession("ses_a");
+    addUser("ses_a", "a prompt");
+    await built();
+    makeStale(["ses_a"]);
+    const hold = holdFirstLookup(true);
+    try {
+      const h = startDistiller({ wrapSource: hold.wrap, coldPassRetryMs: 20 });
+      h.distiller.onEvent({ type: "turn-ended", sessionID: "ses_a" });
+      await waitFor(() => h.logs.some((line) => line.includes("left 1 card(s) it skipped stale")));
+      expect(staleIds()).toEqual(["ses_a"]);
+
+      hold.release();
+      await waitFor(() => h.logs.some((line) => line.includes("ses_a re-distill failed")));
+      await waitFor(() => store.getCard("ses_a")?.projectorGen === GEN);
+      expect(staleIds()).toEqual([]);
+    } finally {
+      hold.release();
     }
   });
 });
