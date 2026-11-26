@@ -504,6 +504,12 @@ export type MessageParts = {
   cut?: MessagePartial & { note: string };
 };
 
+/** The id {@link projectMessage} gives a message's part: for an assistant
+ *  message's content, `suffix` is the part's position in the merged list. */
+export function partId(messageId: string, suffix: string | number): string {
+  return `${messageId}:${suffix}`;
+}
+
 /**
  * Project one decoded content row. Returns `undefined` for a row that is not
  * content (see {@link isContentRow}). `identity` attributes user-role rows and
@@ -530,7 +536,7 @@ export function projectMessage(
   if (!isContentRow(decoded)) return undefined;
   const { row, data } = decoded;
   const at = (suffix: string): PartBase => ({
-    id: `${row.id}:${suffix}`,
+    id: partId(row.id, suffix),
     sessionID: row.session_id,
     messageID: row.id,
   });

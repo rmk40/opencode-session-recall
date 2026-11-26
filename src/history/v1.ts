@@ -274,6 +274,8 @@ export function createV1HistorySource(clients: V1Clients): HistorySource {
       });
     },
 
+    // No `messagePageAscending`: the v1 endpoint pages newest first only, so
+    // callers report oldest-first paging as unsupported here.
     async messagePage(o): Promise<MessagePage> {
       return fetchMessagePage(scoped, o);
     },
