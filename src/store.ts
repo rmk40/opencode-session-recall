@@ -30,6 +30,12 @@ import { EMBED_REPRESENTATION } from "./embedding-text.js";
  * built under, `card.repair_reason` why a stale card could not be rebuilt, and
  * the `range_hash` table holds hashes of source row ranges for later checks.
  *
+ * A card distilled while its session's tail was still running also carries
+ * its settled base (`card.settled_base`, {@link SettledBase}): what the
+ * messages through the newest settled row contribute to it. The next write can
+ * then re-read only the tail and replace only the tail's slim-index rows
+ * ({@link Store.replaceSessionTail}).
+ *
  * Per-session writes are transactional delete-and-insert with an explicit FTS
  * mirror (the `part_fts` table is external-content, so deleting `part_text` rows
  * does not touch the index — the index is maintained by hand). Readers therefore
@@ -140,8 +146,8 @@ CREATE TABLE range_hash (
 // as exact quoted phrases, so prefix indexes would be write/disk cost with no
 // query to serve them. `distill_cursor` is the v2 host's per-session checkpoint
 // ({@link Card.distillCursor}); the v1 lane leaves it NULL, as it does
-// `projector_gen`. `settled_base` is reserved for a card's settled-prefix
-// aggregates: NULL means there is no base and the session is re-read in full.
+// `projector_gen` and `settled_base` ({@link Card.settledBase}), where NULL
+// means there is no base and the session is re-read in full.
 const DDL = `
 CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL) WITHOUT ROWID;
 
@@ -272,6 +278,42 @@ export type Card = {
    *  ({@link Store.markRepairPending}). Set by the store; ignored on writes.
    *  Cleared by any accepted {@link Store.replaceSessionParts}. */
   repairReason?: string;
+  /** What the session's messages through its settled boundary contribute to
+   *  the card, when the card was distilled against a running tail. Written
+   *  with the card's checkpoint, which it belongs to: absent (NULL) when the
+   *  checkpoint was settled, or on any card a host without checkpoints
+   *  wrote. */
+  settledBase?: SettledBase;
+};
+
+/**
+ * A card's settled base: the part of a card that the messages up to the
+ * newest settled history row below a running tail (the boundary) contribute.
+ * Those messages do not change while the tail runs, so a write can merge the
+ * base with a fresh read of the tail instead of reading the whole session
+ * ({@link Store.replaceSessionTail}). The store round-trips the aggregates as
+ * JSON and reads `rows` itself; the distiller owns their meaning.
+ */
+export type SettledBase = {
+  /** The boundary: `seq` of the newest settled row below the running tail. */
+  seq: number;
+  /** The newest message at or below the boundary that the card holds, or
+   *  null when there is none. Its slim-index rows point at the tail's first
+   *  message (`next_message_id`). */
+  messageId: string | null;
+  /** How many of the session's slim-index rows, oldest first, belong to the
+   *  base. The rest belong to the tail. */
+  rows: number;
+  /** The base messages' share of the card's aggregates, as
+   *  {@link Card} stores them. */
+  partCount: number;
+  summaryHead: string;
+  outcomeHead: string;
+  files: string[];
+  tools: string[];
+  errors: string[];
+  /** Base messages the card holds cut short. */
+  cut: number;
 };
 
 /** Result of a stamped write: `changed` is true when it altered what readers
@@ -279,11 +321,26 @@ export type Card = {
  *  there was nothing to write. */
 export type CardWrite = { changed: boolean };
 
-/** Result of {@link Store.replaceSessionParts} and {@link Store.appendSessionParts}.
- *  `refused` is set when the card's {@link Card.projectorGen} is below the
- *  stored one: nothing was written, so an older projection never overwrites a
- *  newer one. */
-export type SessionWrite = { changed: boolean; refused?: "older-generation" };
+/** Result of {@link Store.replaceSessionParts}, {@link Store.appendSessionParts}
+ *  and {@link Store.replaceSessionTail}. `refused` is set when nothing was
+ *  written: `older-generation` when the card's {@link Card.projectorGen} is
+ *  below the stored one, so an older projection never overwrites a newer
+ *  one; `base-changed` when a tail write finds the stored settled base is no
+ *  longer the one it merged with. */
+export type SessionWrite = { changed: boolean; refused?: "older-generation" | "base-changed" };
+
+/** The tail a {@link Store.replaceSessionTail} writes over a settled base. */
+export type SessionTail = {
+  /** The settled base the tail was merged with, as read from the card. */
+  base: SettledBase;
+  /** How many of the base's oldest slim-index rows the row cap evicts. */
+  evict: number;
+  /** The tail's slim-index rows, oldest first. */
+  rows: PartTextRow[];
+  /** The tail's first message, which the base's newest message's rows point
+   *  at (`next_message_id`), or null when the tail has no message. */
+  firstMessageId: string | null;
+};
 
 /** A hash over one session's source rows from `startSeq` through `endSeq`
  *  (both inclusive), as of when it was taken. `rowCount` is how many rows the
@@ -393,10 +450,10 @@ export type OpenStoreResult =
 export type Store = {
   /**
    * Write one card row as given, outside the revision accounting: no
-   * `cards_rev` is allocated, and `write_rev`, `repair_reason` and
-   * `settled_base` keep their stored values. On conflict the store-owned
-   * columns (the summary pair and the family rollup) keep theirs too. The
-   * distiller writes through the stamped methods instead.
+   * `cards_rev` is allocated, and `write_rev` and `repair_reason` keep their
+   * stored values. On conflict the store-owned columns (the summary pair and
+   * the family rollup) keep theirs too. The distiller writes through the
+   * stamped methods instead.
    */
   upsertCard(card: Card): void;
   getCard(sessionId: string): Card | undefined;
@@ -515,22 +572,24 @@ export type Store = {
    */
   deleteSession(sessionId: string): CardWrite;
   /**
-   * Patch a card's session metadata in place (title, directory, project) with
-   * a revision, without touching its content. Title and directory feed the
-   * embedded text, so a change to either drops the vector. `changed` is false,
-   * and nothing is written, when no card exists or no value differs. Used by a
-   * host's metadata signals (v2 renames and moves).
+   * Patch a card's session metadata in place (title, directory, project and
+   * the archive time, null for a session that is not archived) with a
+   * revision, without touching its content. Title and directory feed the
+   * embedded text, so a change to either drops the vector. `changed` is
+   * false, and nothing is written, when no card exists or no value differs.
+   * Used by a host's metadata signals (renames, moves, archiving).
    */
   patchCardMeta(
     sessionId: string,
-    patch: { title?: string; directory?: string; projectId?: string },
+    patch: { title?: string; directory?: string; projectId?: string; timeArchived?: number | null },
   ): CardWrite;
   /**
    * Refresh a card's session metadata after an append that found no new
    * messages. When the title, directory, project, `timeUpdated` or a given
    * `timeArchived` differs, it writes them with a revision and drops the
    * vector if the title or directory changed. Either way it stores
-   * `distillCursor` as the card's checkpoint. A no-op for an unknown session.
+   * `distillCursor` as the card's checkpoint and drops its settled base. A
+   * no-op for an unknown session.
    */
   refreshCardMeta(
     sessionId: string,
@@ -553,11 +612,12 @@ export type Store = {
    * it keeps the stored generation unless its recomputed card names one.
    *
    * When the stored card and rows already match the new ones, the write is
-   * suppressed: only the checkpoint ({@link Card.distillCursor}) and the
-   * projector generation are written, no revision is allocated and the stored
-   * vector is kept. The comparison covers every column a card write stores
-   * except the vector pair, the checkpoint and the generation, and every field
-   * of every row in order. Otherwise the rows and card are rewritten with a
+   * suppressed: only the checkpoint ({@link Card.distillCursor}), the
+   * projector generation and the settled base are written, no revision is
+   * allocated and the stored vector is kept. The comparison covers every
+   * column a card write stores except the vector pair, the checkpoint, the
+   * generation and the settled base, and every field of every row in order.
+   * Otherwise the rows and card are rewritten with a
    * revision. Any accepted replace, suppressed or not, clears the card's
    * {@link Card.repairReason}. `opts.rangeHashes` are stored in the same
    * transaction (see {@link putRangeHashes}), suppressed or not; with
@@ -591,9 +651,9 @@ export type Store = {
    * one, and is refused like a replace when it names a lower one (the whole
    * append rolls back). When no row was added, evicted or repointed and the
    * recomputed card matches the stored one (compared as in
-   * {@link replaceSessionParts}), only the checkpoint and generation are
-   * written, with no revision. A repair reason is kept: an append does not
-   * rebuild the card. `opts` stores range hashes as
+   * {@link replaceSessionParts}), only the checkpoint, generation and settled
+   * base are written, with no revision. A repair reason is kept: an append
+   * does not rebuild the card. `opts` stores range hashes as
    * {@link replaceSessionParts} does, and like it keeps the stored ones when
    * the append is refused or fails.
    */
@@ -602,6 +662,31 @@ export type Store = {
     rows: PartTextRow[],
     ftsRowsPerSession: number,
     boundary: { checkpointMessageId: string; firstNewMessageId: string },
+    recompute: (allRows: PartTextRow[]) => Card,
+    opts?: { rangeHashes?: RangeHash[]; replaceRangeHashes?: boolean },
+  ): SessionWrite;
+  /**
+   * Replace the tail of a card distilled against a running tail, keeping its
+   * settled base, in one transaction. The session's oldest `tail.base.rows`
+   * slim-index rows are the base's: the oldest `tail.evict` of them are
+   * evicted (the row cap), the rest are kept, and every row after them (the
+   * previous tail's) is replaced by `tail.rows`. The rows of the base's
+   * newest message ({@link SettledBase.messageId}) are repointed at
+   * `tail.firstMessageId`, as a full write of the same messages would store
+   * them. The card is then recomputed from every surviving row
+   * (`recompute`, oldest first).
+   *
+   * Refused with `base-changed`, writing nothing, unless the card still holds
+   * exactly `tail.base` and at least its rows: another write replaced the
+   * card since the caller read it. Refused with `older-generation` like
+   * {@link appendSessionParts}, whose generation, suppression (no row
+   * evicted, replaced or repointed and an unchanged card write only the
+   * checkpoint, generation and settled base, with no revision), repair
+   * reason and range hash rules it follows.
+   */
+  replaceSessionTail(
+    sessionId: string,
+    tail: SessionTail,
     recompute: (allRows: PartTextRow[]) => Card,
     opts?: { rangeHashes?: RangeHash[]; replaceRangeHashes?: boolean },
   ): SessionWrite;
@@ -678,6 +763,7 @@ const CARD_COLUMNS = [
   "distill_cursor",
   "projector_gen",
   "time_archived",
+  "settled_base",
 ] as const;
 
 type CardColumn = (typeof CARD_COLUMNS)[number];
@@ -691,13 +777,14 @@ const STORE_OWNED_COLUMNS = new Set<CardColumn>(["nl_summary", "summary_hash", "
 
 // Columns a content write stores but does not compare when deciding whether
 // anything changed: the vector pair (a suppressed write keeps the stored
-// vector), and the checkpoint and projector generation, which are written
-// either way.
+// vector), and the checkpoint, projector generation and settled base, which
+// are written either way and which readers do not see.
 const UNCOMPARED_COLUMNS = new Set<CardColumn>([
   "embedding",
   "embedding_gen",
   "distill_cursor",
   "projector_gen",
+  "settled_base",
 ]);
 
 /** Columns read into a {@link Card} beyond those a card write supplies; only
@@ -714,18 +801,17 @@ const CARD_UPSERT_SET = CARD_COLUMNS.filter(
   .map((c) => `${c}=excluded.${c}`)
   .join(", ");
 const CARD_UPSERT_SQL = `INSERT INTO card(${CARD_COLUMNS.join(", ")}) VALUES(${CARD_PLACEHOLDERS}) ON CONFLICT(session_id) DO UPDATE SET ${CARD_UPSERT_SET}`;
-// A stamped content write also records its revision and drops the settled
-// base, which no longer describes the rewritten card.
-const CARD_STAMPED_UPSERT_SQL = `INSERT INTO card(${CARD_COLUMNS.join(", ")}, write_rev) VALUES(${CARD_PLACEHOLDERS}, ?) ON CONFLICT(session_id) DO UPDATE SET ${CARD_UPSERT_SET}, write_rev=excluded.write_rev, settled_base=NULL`;
+// A stamped content write also records its revision.
+const CARD_STAMPED_UPSERT_SQL = `INSERT INTO card(${CARD_COLUMNS.join(", ")}, write_rev) VALUES(${CARD_PLACEHOLDERS}, ?) ON CONFLICT(session_id) DO UPDATE SET ${CARD_UPSERT_SET}, write_rev=excluded.write_rev`;
 
 const CARD_COMPARED_COLUMNS = CARD_COLUMNS.filter(
   (c) => c !== "session_id" && !STORE_OWNED_COLUMNS.has(c) && !UNCOMPARED_COLUMNS.has(c),
 );
 /** Position of each compared column in {@link cardValues}' output. */
 const CARD_COMPARED_INDEXES = CARD_COMPARED_COLUMNS.map((c) => CARD_COLUMNS.indexOf(c));
-/** What a content write reads first: the stored generation (for the guard)
- *  and every compared column. */
-const CARD_COMPARE_SQL = `SELECT projector_gen, ${CARD_COMPARED_COLUMNS.join(", ")} FROM card WHERE session_id=?`;
+/** What a content write reads first: the stored generation (for the guard),
+ *  the settled base (for a tail write's check) and every compared column. */
+const CARD_COMPARE_SQL = `SELECT projector_gen, settled_base, ${CARD_COMPARED_COLUMNS.join(", ")} FROM card WHERE session_id=?`;
 
 const PART_ROW_COLUMNS =
   "part_id, message_id, prev_message_id, next_message_id, class, time_created, raw, norm";
@@ -787,10 +873,78 @@ function parseRollup(value: SqlValue | undefined): FamilyRollup[] {
   }
 }
 
+function isCount(value: unknown): value is number {
+  return typeof value === "number" && Number.isInteger(value) && value >= 0;
+}
+
+function isStringArray(value: unknown): value is string[] {
+  return Array.isArray(value) && value.every((item) => typeof item === "string");
+}
+
+/** A stored `settled_base` value, or undefined for NULL or anything that is
+ *  not a whole {@link SettledBase} (the card is then re-read in full). */
+function parseSettledBase(value: SqlValue | undefined): SettledBase | undefined {
+  if (typeof value !== "string") return undefined;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(value);
+  } catch {
+    return undefined;
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return undefined;
+  const b = parsed as Record<string, unknown>;
+  if (
+    typeof b.seq !== "number" ||
+    !Number.isFinite(b.seq) ||
+    !(b.messageId === null || typeof b.messageId === "string") ||
+    !isCount(b.rows) ||
+    !isCount(b.partCount) ||
+    typeof b.summaryHead !== "string" ||
+    typeof b.outcomeHead !== "string" ||
+    !isStringArray(b.files) ||
+    !isStringArray(b.tools) ||
+    !isStringArray(b.errors) ||
+    !isCount(b.cut)
+  ) {
+    return undefined;
+  }
+  return {
+    seq: b.seq,
+    messageId: b.messageId,
+    rows: b.rows,
+    partCount: b.partCount,
+    summaryHead: b.summaryHead,
+    outcomeHead: b.outcomeHead,
+    files: b.files,
+    tools: b.tools,
+    errors: b.errors,
+    cut: b.cut,
+  };
+}
+
+/** The stored form of a settled base: its fields in one fixed order, so the
+ *  same base always serializes to the same string (a tail write compares the
+ *  stored string with the base it merged with). */
+function serializeSettledBase(base: SettledBase): string {
+  return JSON.stringify({
+    seq: base.seq,
+    messageId: base.messageId,
+    rows: base.rows,
+    partCount: base.partCount,
+    summaryHead: base.summaryHead,
+    outcomeHead: base.outcomeHead,
+    files: base.files,
+    tools: base.tools,
+    errors: base.errors,
+    cut: base.cut,
+  });
+}
+
 function rowToCard(row: Row): Card {
   const projectorGen = asNullableNumber(row.projector_gen);
   const timeArchived = asNullableNumber(row.time_archived);
   const writeRev = asNullableNumber(row.write_rev);
+  const settledBase = parseSettledBase(row.settled_base);
   return {
     sessionId: asString(row.session_id),
     parentId: asNullableString(row.parent_id),
@@ -824,6 +978,7 @@ function rowToCard(row: Row): Card {
     ...(timeArchived !== null && { timeArchived }),
     ...(writeRev !== null && { writeRev }),
     ...(typeof row.repair_reason === "string" && { repairReason: row.repair_reason }),
+    ...(settledBase !== undefined && { settledBase }),
   };
 }
 
@@ -858,6 +1013,7 @@ function cardValues(card: Card): SqlValue[] {
     card.distillCursor ?? null,
     card.projectorGen ?? null,
     card.timeArchived ?? null,
+    card.settledBase ? serializeSettledBase(card.settledBase) : null,
   ];
 }
 
@@ -895,6 +1051,20 @@ function sameRows(stored: Row[], rows: PartTextRow[]): boolean {
       sameSqlValue(old.norm, row.norm)
     );
   });
+}
+
+/** A stored slim-index row (read with {@link PART_ROW_COLUMNS}). */
+function rowToPart(row: Row): PartTextRow {
+  return {
+    partId: asString(row.part_id),
+    messageId: asString(row.message_id),
+    prevMessageId: asNullableString(row.prev_message_id),
+    nextMessageId: asNullableString(row.next_message_id),
+    class: asString(row.class),
+    timeCreated: asNumber(row.time_created),
+    raw: asString(row.raw),
+    norm: asString(row.norm),
+  };
 }
 
 /** Whether a write at projector generation `next` must be refused because the
@@ -1419,14 +1589,18 @@ class SqliteStore implements Store {
     this.db.run(CARD_STAMPED_UPSERT_SQL, [...cardValues(card), this.nextRev()]);
   }
 
-  /** Store only the checkpoint and projector generation of an unchanged card.
-   *  Caller supplies the transaction. */
+  /** Store only the checkpoint, projector generation and settled base of an
+   *  unchanged card. Caller supplies the transaction. */
   private writeCheckpoint(sessionId: string, card: Card): void {
-    this.db.run("UPDATE card SET distill_cursor=?, projector_gen=? WHERE session_id=?", [
-      card.distillCursor ?? null,
-      card.projectorGen ?? null,
-      sessionId,
-    ]);
+    this.db.run(
+      "UPDATE card SET distill_cursor=?, projector_gen=?, settled_base=? WHERE session_id=?",
+      [
+        card.distillCursor ?? null,
+        card.projectorGen ?? null,
+        card.settledBase ? serializeSettledBase(card.settledBase) : null,
+        sessionId,
+      ],
+    );
   }
 
   writeCardEmbeddings(
@@ -1534,7 +1708,7 @@ class SqliteStore implements Store {
 
   patchCardMeta(
     sessionId: string,
-    patch: { title?: string; directory?: string; projectId?: string },
+    patch: { title?: string; directory?: string; projectId?: string; timeArchived?: number | null },
   ): CardWrite {
     return this.db.tx(() =>
       this.writeCardMeta(sessionId, (stored) => ({
@@ -1542,6 +1716,7 @@ class SqliteStore implements Store {
         title: patch.title ?? stored.title,
         directory: patch.directory ?? stored.directory,
         projectId: patch.projectId ?? stored.projectId,
+        timeArchived: patch.timeArchived === undefined ? stored.timeArchived : patch.timeArchived,
       })),
     );
   }
@@ -1571,8 +1746,9 @@ class SqliteStore implements Store {
    * writes them all with a revision; title and directory feed the embedded
    * text (embeddingTextOf), so a change to either also drops the vector and
    * its generation, which the semantic layer recomputes on the next load.
-   * `distillCursor`, when given, is stored either way. Caller supplies the
-   * transaction.
+   * `distillCursor`, when given, is stored either way, and the settled base
+   * dropped with it: a base belongs to the checkpoint it was written with.
+   * Caller supplies the transaction.
    */
   private writeCardMeta(
     sessionId: string,
@@ -1598,11 +1774,11 @@ class SqliteStore implements Store {
       meta.projectId !== stored.projectId ||
       meta.timeUpdated !== stored.timeUpdated ||
       meta.timeArchived !== stored.timeArchived;
-    const cursorSet = distillCursor === undefined ? "" : ", distill_cursor=?";
+    const cursorSet = distillCursor === undefined ? "" : ", distill_cursor=?, settled_base=NULL";
     const cursorParam: SqlValue[] = distillCursor === undefined ? [] : [distillCursor];
     if (!changed) {
       if (distillCursor !== undefined) {
-        this.db.run("UPDATE card SET distill_cursor=? WHERE session_id=?", [
+        this.db.run("UPDATE card SET distill_cursor=?, settled_base=NULL WHERE session_id=?", [
           distillCursor,
           sessionId,
         ]);
@@ -1741,6 +1917,87 @@ class SqliteStore implements Store {
     }
   }
 
+  replaceSessionTail(
+    sessionId: string,
+    tail: SessionTail,
+    recompute: (allRows: PartTextRow[]) => Card,
+    opts?: { rangeHashes?: RangeHash[]; replaceRangeHashes?: boolean },
+  ): SessionWrite {
+    const { base, evict } = tail;
+    try {
+      return this.db.tx((): SessionWrite => {
+        const stored = this.db.get(CARD_COMPARE_SQL, [sessionId]);
+        if (!stored || stored.settled_base !== serializeSettledBase(base)) {
+          return { changed: false, refused: "base-changed" };
+        }
+        const old = this.db.all(
+          `SELECT id, ${PART_ROW_COLUMNS} FROM part_text WHERE session_id=? ORDER BY id`,
+          [sessionId],
+        );
+        if (old.length < base.rows || !Number.isInteger(evict) || evict < 0 || evict > base.rows) {
+          return { changed: false, refused: "base-changed" };
+        }
+        const evicted = old.slice(0, evict);
+        const oldTail = old.slice(base.rows);
+        // The base's newest message points at the tail's first one, as in a
+        // full write; only its rows can need repointing.
+        const kept = old.slice(evict, base.rows).map((row) => {
+          const part = rowToPart(row);
+          return base.messageId !== null && part.messageId === base.messageId
+            ? { ...part, nextMessageId: tail.firstMessageId }
+            : part;
+        });
+        const repoint =
+          base.messageId !== null &&
+          old
+            .slice(evict, base.rows)
+            .some(
+              (row) =>
+                row.message_id === base.messageId &&
+                !sameSqlValue(row.next_message_id, tail.firstMessageId),
+            );
+        const rowsChanged = evict > 0 || repoint || !sameRows(oldTail, tail.rows);
+        const recomputed = recompute([...kept, ...tail.rows]);
+        // Like an append, a tail write extends the card at its stored
+        // generation unless the recomputed card names one.
+        const card: Card =
+          recomputed.projectorGen === undefined
+            ? { ...recomputed, projectorGen: asNullableNumber(stored.projector_gen) }
+            : recomputed;
+        if (belowStoredGen(card.projectorGen, stored.projector_gen)) {
+          throw new OlderGenerationRefused();
+        }
+        if (rowsChanged) {
+          const dropped = [...evicted, ...oldTail];
+          this.evictFts(dropped);
+          for (const row of dropped) {
+            this.db.run("DELETE FROM part_text WHERE id=?", [asNumber(row.id)]);
+          }
+          if (repoint) {
+            this.db.run(
+              "UPDATE part_text SET next_message_id=? WHERE session_id=? AND message_id=?",
+              [tail.firstMessageId, sessionId, base.messageId],
+            );
+          }
+          for (const row of tail.rows) this.insertRow(sessionId, row);
+        }
+        const changed = rowsChanged || !sameCard(stored, card);
+        if (changed) this.writeStampedCard(card);
+        else this.writeCheckpoint(sessionId, card);
+        if (opts?.replaceRangeHashes) {
+          this.db.run("DELETE FROM range_hash WHERE session_id=?", [sessionId]);
+        }
+        this.writeRangeHashes(sessionId, opts?.rangeHashes);
+        return { changed };
+      });
+    } catch (error) {
+      if (error instanceof OlderGenerationRefused) {
+        return { changed: false, refused: "older-generation" };
+      }
+      throw error;
+    }
+  }
+
   /** Insert one slim-index row into `part_text` and mirror it into the
    *  external-content FTS index under its freshly assigned rowid. Caller
    *  supplies the transaction. */
@@ -1774,16 +2031,7 @@ class SqliteStore implements Store {
       `SELECT ${PART_ROW_COLUMNS} FROM part_text WHERE session_id=? ORDER BY id`,
       [sessionId],
     );
-    return rows.map((row) => ({
-      partId: asString(row.part_id),
-      messageId: asString(row.message_id),
-      prevMessageId: asNullableString(row.prev_message_id),
-      nextMessageId: asNullableString(row.next_message_id),
-      class: asString(row.class),
-      timeCreated: asNumber(row.time_created),
-      raw: asString(row.raw),
-      norm: asString(row.norm),
-    }));
+    return rows.map(rowToPart);
   }
 
   /** Delete slim-index rows (read with their `id`, `raw` and `norm`) from the

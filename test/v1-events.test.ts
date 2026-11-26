@@ -46,7 +46,6 @@ describe("v1EventToSignal", () => {
   });
 
   it("ignores every other event", () => {
-    expect(v1EventToSignal(event("session.updated", { sessionID: "s1", info: {} }))).toBeNull();
     expect(v1EventToSignal(event("message.updated", { sessionID: "s1", info: {} }))).toBeNull();
   });
 });

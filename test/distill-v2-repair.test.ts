@@ -1353,7 +1353,7 @@ describe("v2 range check walks", () => {
 });
 
 describe("v2 range hash writes", () => {
-  it("takes no digest on a full write over a running tail, and keeps the stored hashes", async () => {
+  it("takes no digest while a running tail stays running, and keeps the stored hashes", async () => {
     addSession("ses_a");
     addUser("ses_a", "a prompt");
     addReply("ses_a", { parts: [text("an answer")] });
@@ -1366,7 +1366,7 @@ describe("v2 range hash writes", () => {
     await waitFor(() => hits("omicronword").length > 0);
     const digests = h.digests.filter((id) => id === "ses_a").length;
     const reads = lookupsOf(h, "ses_a");
-    // Every poll reads the running tail again, in full.
+    // Every poll reads the running tail again.
     await waitFor(() => lookupsOf(h, "ses_a") >= reads + 3);
     expect(h.digests.filter((id) => id === "ses_a").length).toBe(digests);
     expect(hashesOf("ses_a")).toEqual(stored);
