@@ -38,6 +38,7 @@ import { createFetchGate } from "../src/fetch-gate.js";
 import { openStore } from "../src/store.js";
 import { openSqlite, type ReadOnlyDb, type SqliteDb } from "../src/sqlite.js";
 import { createV2HistorySource, openOpencodeDb } from "../src/history/v2.js";
+import { V2_PROJECTOR_GEN } from "../src/history/v2-project.js";
 import {
   createV2Sync,
   POLL_CURSOR_KEY,
@@ -407,4 +408,139 @@ describe.skipIf(!ENABLED)("perf: v2 event-loop stalls", () => {
       rmSync(storeDir, { recursive: true, force: true });
     }
   }, 900_000);
+
+  it(`a tail write over a 5,000-row card never blocks the loop over ${BUDGET_MS} ms`, async () => {
+    const TAIL_BUDGET_TOTAL_MS = 1_000;
+    const v2 = await makeV2Db();
+    const storeDir = mkdtempSync(join(tmpdir(), "recall-perf-v2-tail-"));
+    try {
+      const at = Date.now();
+      const w = v2.db;
+      const sid = "ses_streaming";
+      let seq = 0;
+      const add = (type: string, data: unknown, t: number, updated = t) => {
+        const id = `msg_${++seq}`;
+        w.run(
+          `INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data)
+           VALUES (?, ?, ?, ?, ?, ?, ?)`,
+          [id, sid, type, seq, t, updated, JSON.stringify(data)],
+        );
+        return id;
+      };
+      const running = (text: string, t: number) => ({
+        agent: "build",
+        model: { id: "m", providerID: "p" },
+        content: [{ type: "text", text }],
+        time: { created: t },
+      });
+      // 5,000 settled rows of about 1,800 characters each, then a reply that
+      // is still running (updated now, so it is not abandoned).
+      const t0 = at - 10_000_000;
+      w.tx(() => {
+        insertProject(w, { id: "prj", worktree: "/workspace/perf" });
+        insertSession(w, {
+          id: sid,
+          project_id: "prj",
+          directory: "/workspace/perf",
+          time_created: t0,
+          time_updated: t0,
+        });
+        for (let r = 0; r < 5_000; r++) {
+          add("user", { text: sentence(r, 200), time: { created: t0 + r } }, t0 + r);
+        }
+      });
+      const reply = add("assistant", running("streaming words", t0 + 5_000), t0 + 5_000, at);
+
+      const slow = slowLog();
+      const opened = await openOpencodeDb(v2.path);
+      if (!opened.ok) throw new Error(opened.reason);
+      const reader = timedReader(opened.db, slow);
+      const rawStoreDb = await openSqlite(join(storeDir, "store.db"));
+      if (!rawStoreDb) throw new Error("no sqlite");
+      const openedStore = openStore(timedStoreDb(rawStoreDb, slow), {
+        host: "opencode-v2",
+        source: v2.path,
+      });
+      if (!openedStore.ok) throw new Error(openedStore.reason);
+      const store = openedStore.store;
+      let tailWrites = 0;
+      const replaceTail = store.replaceSessionTail.bind(store);
+      store.replaceSessionTail = (...args) => {
+        tailWrites++;
+        return replaceTail(...args);
+      };
+      const source = createV2HistorySource(reader);
+      const distiller = createDistiller({
+        source,
+        store,
+        gate: createFetchGate({ concurrency: DEFAULTS.concurrency }),
+        limits: { ...DEFAULTS, coldPass: false, distillDelayMs: 0 },
+        instanceId: "perf-v2-tail",
+        sync: createV2Sync(reader, { pollIntervalMs: 3_600_000 }),
+        projectorGen: V2_PROJECTOR_GEN,
+        idleDebounceMs: 1,
+        yieldBetween: () => new Promise((resolve) => setTimeout(resolve, 0)),
+        log: () => {},
+      });
+      const probe = stallProbe();
+      const results: Record<string, number> = {};
+      try {
+        distiller.start();
+        // The first write reads in full and records the settled base.
+        distiller.onEvent({ type: "turn-ended", sessionID: sid });
+        const firstStart = performance.now();
+        while (store.getCard(sid)?.settledBase === undefined) {
+          if (performance.now() - firstStart > 120_000) throw new Error("no first write");
+          await new Promise((resolve) => setTimeout(resolve, 5));
+        }
+        results.fullWriteMs = performance.now() - firstStart;
+
+        // The reply grows: a tail write.
+        w.run("UPDATE session_message SET data = ?, time_updated = ? WHERE id = ?", [
+          JSON.stringify(running("streaming words and more of them", t0 + 5_000)),
+          at + 1,
+          reply,
+        ]);
+        probe.reset();
+        const tailStart = performance.now();
+        distiller.onEvent({ type: "turn-ended", sessionID: sid });
+        while (tailWrites === 0) {
+          if (performance.now() - tailStart > 60_000) throw new Error("no tail write");
+          await new Promise((resolve) => setTimeout(resolve, 1));
+        }
+        results.tailWriteTotalMs = performance.now() - tailStart;
+        results.tailWriteMaxSliceMs = probe.max();
+
+        // Nothing changed: no write at all.
+        probe.reset();
+        const quietStart = performance.now();
+        distiller.onEvent({ type: "turn-ended", sessionID: sid });
+        await new Promise((resolve) => setTimeout(resolve, 200));
+        results.unchangedMaxSliceMs = probe.max();
+        results.unchangedWindowMs = performance.now() - quietStart;
+        results.tailWrites = tailWrites;
+        results.storedRows = store.sessionRowCount(sid);
+        await distiller.stop();
+      } finally {
+        probe.stop();
+        reader.close();
+        rawStoreDb.close();
+      }
+      const round = (n: number) => Math.round(n * 10) / 10;
+      console.log(
+        "v2 tail write perf:",
+        JSON.stringify(Object.fromEntries(Object.entries(results).map(([k, v]) => [k, round(v)]))),
+      );
+      console.log("slowest synchronous calls:", JSON.stringify(slow.top(8)));
+
+      expect(results.storedRows).toBe(DEFAULTS.ftsRowsPerSession);
+      expect(results.tailWrites).toBe(1);
+      expect(results.tailWriteMaxSliceMs).toBeLessThan(BUDGET_MS);
+      expect(results.tailWriteTotalMs).toBeLessThan(TAIL_BUDGET_TOTAL_MS);
+      expect(results.unchangedMaxSliceMs).toBeLessThan(BUDGET_MS);
+    } finally {
+      v2.cleanup();
+      rmSync(storeDir, { recursive: true, force: true });
+    }
+  }, 300_000);
 });
