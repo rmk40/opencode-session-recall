@@ -84,6 +84,17 @@ export type SessionContext = {
   model: ModelRef | null;
 };
 
+/**
+ * The generation of this projection, stamped on every card the v2 host
+ * writes in full (`Card.projectorGen`). A change to what the projector
+ * produces from the same rows (another part merge, a new content type) bumps
+ * it, so cards built under the old projection read as stale and are rebuilt,
+ * and it rides a `SCHEMA_VERSION` bump in `store.ts`, which keeps a build of
+ * the older projection out of the store. Generation 1 is the first to read
+ * `session_part`.
+ */
+export const V2_PROJECTOR_GEN = 1;
+
 /** Message types that carry content. Everything else (`system`, `idle`,
  *  `agent-switched`, `model-switched`, `location-switched`, and unknown future
  *  types) is not content; `compaction` counts only once completed. */
