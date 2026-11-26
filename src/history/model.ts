@@ -26,7 +26,8 @@ export type MessagePartial = {
   /** Content items left out: part rows from `nextOrdinal` on, plus the
    *  message's inline content items. */
   omittedParts: number;
-  /** Encoded bytes of the part rows left out, as measured before the read. */
+  /** Encoded bytes of the part rows left out, as measured when the read was
+   *  cut. Inline content left out counts in `omittedParts` only. */
   omittedBytes: number;
 };
 

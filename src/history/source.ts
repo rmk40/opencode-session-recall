@@ -83,11 +83,18 @@ export type HistoryReadCounts = {
   /** Part rows attached to a message that is not an assistant message, which
    *  opencode never reads and neither does the projector. */
   strayParts: number;
-  /** Part rows over the byte ceiling on their own, projected as placeholders. */
+  /** Part rows over the byte ceiling on their own, projected as placeholders.
+   *  A part row within the ceiling is never a placeholder: one that does not
+   *  fit beside the rest of a read is left for a continuation instead. */
   oversizedParts: number;
   /** Part rows whose data does not decode, projected as placeholders (only
    *  reads that are not `strict`; a strict read rejects instead). */
   malformedParts: number;
+  /** Assistant messages whose stored row kept changing while their part rows
+   *  were read (opencode moving inline content into part rows), after the
+   *  read's retries. Such a message is returned `partial` with its inline
+   *  content left for the continuation, so nothing is read twice. */
+  changedMessages: number;
 };
 
 /** Where the host database differs from what this build reads. */
@@ -136,6 +143,7 @@ export function emptyReadCounts(): HistoryReadCounts {
     strayParts: 0,
     oversizedParts: 0,
     malformedParts: 0,
+    changedMessages: 0,
   };
 }
 
@@ -147,6 +155,7 @@ export function addReadCounts(into: HistoryReadCounts, from: HistoryReadCounts):
   into.strayParts += from.strayParts;
   into.oversizedParts += from.oversizedParts;
   into.malformedParts += from.malformedParts;
+  into.changedMessages += from.changedMessages;
 }
 
 /** Whether any count is non-zero. */
@@ -157,7 +166,8 @@ export function hasReadCounts(counts: HistoryReadCounts): boolean {
     counts.partialMessages > 0 ||
     counts.strayParts > 0 ||
     counts.oversizedParts > 0 ||
-    counts.malformedParts > 0
+    counts.malformedParts > 0 ||
+    counts.changedMessages > 0
   );
 }
 
@@ -252,8 +262,10 @@ export interface HistorySource {
    * `partial.nextOrdinal`): the result holds the part rows from that ordinal
    * on, then the message's inline content, with the same part ids a whole
    * read gives them, and is itself `partial` when the rest still does not
-   * fit. v1 has no part ordinals and answers any `partOrdinal` with
-   * `unsupported`.
+   * fit. Following `partial.nextOrdinal` until a read is not `partial`
+   * returns every part. Only an assistant message has part ordinals: v1, a
+   * v2 database without part rows and a v2 message of any other type answer
+   * a `partOrdinal` with `unsupported`.
    */
   getMessage(
     sessionID: string,

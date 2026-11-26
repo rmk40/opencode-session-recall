@@ -58,14 +58,23 @@ import {
  *   text is what gets indexed. The body statements re-read every size, since
  *   rows can grow between statements, and cut where a running total would
  *   pass what is left of the ceiling, so the bytes a page loads never exceed
- *   it. A first message whose parts alone pass it loads its parts in ordinal
- *   order up to the cut and is marked `partial` (see {@link MessageParts});
- *   `getMessage` continues it from a part ordinal. An oversized row's
- *   placeholder takes the session's agent and model; no statement reads
- *   anything from its body (beyond measuring it, which on SQLite before 3.43
- *   loads it inside SQLite). (The one exception is the compaction status
- *   filter, which parses a compaction row's JSON inside SQLite; nothing
- *   reaches JS.)
+ *   it. A first message whose parts do not fit loads them in ordinal order up
+ *   to the cut (possibly none) and is marked `partial` (see
+ *   {@link MessageParts}); `getMessage` continues it from a part ordinal,
+ *   charging the envelope's metadata rather than its inline content, and a
+ *   continuation may pass the ceiling by at most that metadata
+ *   ({@link CONTINUATION_METADATA_MAX}) so that it always moves forward. An
+ *   oversized row's placeholder takes the session's agent and model; no
+ *   statement reads anything from its body (beyond measuring it, which on
+ *   SQLite before 3.43 loads it inside SQLite). (The exceptions are the
+ *   compaction status filter, which parses a compaction row's JSON inside
+ *   SQLite, and a continuation's envelope read, which has SQLite split a row
+ *   within the ceiling into its metadata and its inline content.)
+ * - Consistent: opencode moves an assistant's inline content into part rows
+ *   on a later write. A read that took the envelope before such a move and
+ *   the part rows after it would hold that content twice, so a read whose
+ *   envelope held inline content re-checks the row's `time_updated` and size
+ *   after its part read and reads the message again when they changed.
  * - Parts by their own statements: part sizes and part bodies are read by
  *   `session_part` statements scoped by session id and the page's message
  *   ids. No `session_message` statement reads `session_part`. A database
@@ -419,6 +428,14 @@ const PART_ID_CHUNK = 500;
 const PAGE_MESSAGES_MAX = 5_000;
 /** Part rows decoded between yields to the event loop. */
 const PARTS_PER_YIELD = 200;
+/** The largest envelope metadata (the row's data without its inline content)
+ *  a part continuation loads; a larger one is left out and the message takes
+ *  the session's agent and model. A continuation can pass the byte ceiling by
+ *  at most this much (see `getMessage`). */
+export const CONTINUATION_METADATA_MAX = 16 * 1024;
+/** Reads of one message tried while its stored row keeps changing under the
+ *  part read, before the read settles for leaving its inline content out. */
+const ENVELOPE_ATTEMPTS = 3;
 /** The lowest part ordinal: a whole message reads from here. */
 const FIRST_ORDINAL = Number.MIN_SAFE_INTEGER;
 /** Sessions whose immutable fork fields are remembered per source. */
@@ -501,8 +518,9 @@ export function malformedNote(reason: string): string {
 /** The text that ends a message whose parts a read cut short: what was left
  *  out and where the rest starts. Worded without domain words. */
 export function cutNote(omittedParts: number, omittedBytes: number, nextOrdinal: number): string {
+  const size = omittedBytes > 0 ? ` (${omittedBytes} bytes)` : "";
   return unavailableText(
-    `${omittedParts} more items (${omittedBytes} bytes) over the read cap, continued from ordinal ${nextOrdinal}`,
+    `${omittedParts} more items${size} over the read cap, continued from ordinal ${nextOrdinal}`,
   );
 }
 
@@ -639,16 +657,37 @@ type PartSize = { rows: number; bytes: number; total: number; skipped: number };
  *  and the first ordinal it did not load. */
 type PartCut = { pos: number; ordinal: number };
 
-/** A part body row from a read, with the budget that read had left (the cap a
- *  placeholder names when the row did not fit it). */
-type LoadedPart = { row: Row; budget: number };
-
-/** One assistant message's part rows as read, before its envelope decodes. */
+/** One assistant message's part rows as read, before the projector merges
+ *  them. `inlineCount` is the number of inline content items when the
+ *  envelope was read without them (a continuation); otherwise they are in
+ *  the decoded envelope. */
 type PartLoad = {
-  rows: LoadedPart[];
+  rows: Row[];
   start: number;
+  inlineCount?: number;
   cut?: { nextOrdinal: number; omittedRows: number; omittedBytes: number };
 };
+
+/** A message row's identity for change detection: a row that is rewritten
+ *  (opencode moving its inline content into part rows) gets a new
+ *  `time_updated` and, with its content gone, a new size. */
+type Fingerprint = { timeUpdated: number; bytes: number };
+
+/** A decoded (or placeholder) message row, ready to project. */
+type Decoded = Extract<DecodedRow, { ok: true }>;
+
+function fingerprintOf(row: Row): Fingerprint {
+  return { timeUpdated: asNumber(row.time_updated) ?? 0, bytes: asNumber(row.bytes) ?? 0 };
+}
+
+function sameFingerprint(a: Fingerprint, b: Fingerprint): boolean {
+  return a.timeUpdated === b.timeUpdated && a.bytes === b.bytes;
+}
+
+/** Inline content items in a decoded envelope. */
+function inlineCountOf(data: Record<string, unknown>): number {
+  return Array.isArray(data.content) ? data.content.length : 0;
+}
 
 /** Escape LIKE wildcards so a title search matches literally. */
 function likeContains(search: string): string {
@@ -695,13 +734,28 @@ function sharedState(
 export function createV2HistorySource(db: ReadOnlyDb, opts: V2SourceOptions = {}): HistorySource {
   const projectID = opts.projectID;
   const byteCeiling = opts.pageByteCeiling ?? DEFAULT_PAGE_BYTE_CEILING;
-  const partRowCap = opts.pagePartRows ?? DEFAULT_PAGE_PART_ROWS;
+  // At least one row: a cap of 0 would cut every read at the same ordinal.
+  const partRowCap =
+    typeof opts.pagePartRows === "number" && Number.isFinite(opts.pagePartRows)
+      ? Math.max(1, Math.floor(opts.pagePartRows))
+      : DEFAULT_PAGE_PART_ROWS;
   const pause = opts.yieldBetween ?? macrotask;
   const { schema, drift } = sharedState(db, opts);
   /** Whether part rows are read at all (`session_part` with every column). */
   const partsOn = schema.parts;
   const BYTES = byteLengthSql(db, "data");
   const PART_BYTES = byteLengthSql(db, "p.data");
+  /** A row's data without its inline content, and that content, as SQLite
+   *  re-encodes them (only ever evaluated on a row within the ceiling whose
+   *  data is a JSON object). */
+  const META_BYTES = byteLengthSql(db, "json_remove(data, '$.content')");
+  const INLINE_BYTES = byteLengthSql(db, "json_extract(data, '$.content')");
+  /** `expr` for a row within the ceiling whose data is a JSON object, else
+   *  NULL. Binds the ceiling. Nested CASEs, so `json_type` never sees
+   *  malformed JSON and nothing parses a row over the ceiling. */
+  const ifObject = (expr: string): string =>
+    `CASE WHEN ${BYTES} <= ? THEN CASE WHEN json_valid(data) THEN
+       CASE WHEN json_type(data) = 'object' THEN ${expr} END END END`;
   /** A row's columns, with `data` NULL when it is larger than the ceiling
    *  now (re-checked here, not trusted from an earlier size read), plus its
    *  size. Binds the ceiling first. The size expression appears twice; with
@@ -776,22 +830,24 @@ export function createV2HistorySource(db: ReadOnlyDb, opts: V2SourceOptions = {}
    * Each statement re-reads the sizes, returns a row over the byte ceiling
    * without its data (a placeholder) and stops where a running total would
    * pass what is left of the budget or the cap; the first row it leaves out
-   * comes back as `cut`. The first row of the message at position 0 always
-   * comes back, without its data when it does not fit, so a read of a message
-   * always moves past at least one part row.
+   * comes back as `cut`. With `force`, the first row of the message at
+   * position 0 always comes back with its data when it is within the ceiling
+   * on its own, even past `budget`: a continuation uses it so that every
+   * read moves past at least one part row.
    */
   async function readParts(
     sessionID: string,
     page: Array<{ id: string; pos: number }>,
     from: number,
     budget: number,
-  ): Promise<{ loaded: LoadedPart[]; cut?: PartCut }> {
-    const loaded: LoadedPart[] = [];
+    force: boolean,
+  ): Promise<{ loaded: Row[]; cut?: PartCut }> {
+    const loaded: Row[] = [];
     let left = Math.max(0, budget);
     let rowsLeft = partRowCap;
     for (let i = 0; i < page.length; i += PART_ID_CHUNK) {
       const chunk = page.slice(i, i + PART_ID_CHUNK);
-      const forcedPos = i === 0 ? 0 : -1;
+      const forcedPos = force && i === 0 ? 0 : -1;
       await pause();
       const rows = read("part rows", () =>
         db.all(
@@ -819,7 +875,7 @@ export function createV2HistorySource(db: ReadOnlyDb, opts: V2SourceOptions = {}
            )
            SELECT p.message_id, p.session_id, p.ordinal, p.type, p.call_id, p.time_created,
              p.time_updated, e.pos AS pos, e.bytes AS bytes, e.inc AS inc,
-             CASE WHEN e.inc = 1 AND e.bytes <= ? AND e.running <= ? THEN p.data END AS data
+             CASE WHEN e.inc = 1 AND e.bytes <= ? THEN p.data END AS data
            FROM edge e JOIN session_part p ON p.message_id = e.message_id AND p.ordinal = e.ordinal
            WHERE e.inc = 1 OR e.prev = 1
            ORDER BY e.pos, e.ordinal LIMIT ?`,
@@ -833,7 +889,6 @@ export function createV2HistorySource(db: ReadOnlyDb, opts: V2SourceOptions = {}
             left,
             forcedPos,
             byteCeiling,
-            left,
             rowsLeft + 1,
           ],
         ),
@@ -847,22 +902,68 @@ export function createV2HistorySource(db: ReadOnlyDb, opts: V2SourceOptions = {}
             cut: { pos: asNumber(row.pos) ?? 0, ordinal: asNumber(row.ordinal) ?? 0 },
           };
         }
-        loaded.push({ row, budget: left });
+        loaded.push(row);
       }
       for (const row of rows) if (row.data != null) left -= asNumber(row.bytes) ?? 0;
+      left = Math.max(0, left);
       rowsLeft -= rows.length;
     }
     return { loaded };
   }
 
+  /** Bytes of the part rows a read loaded with their data. */
+  function loadedBytes(rows: Row[]): number {
+    let sum = 0;
+    for (const row of rows) if (row.data != null) sum += asNumber(row.bytes) ?? 0;
+    return sum;
+  }
+
+  /** The cut that leaves a message's inline content out after the part rows
+   *  a read loaded (the next ordinal is past the last of them). */
+  function inlineCut(rows: Row[], from: number): NonNullable<PartLoad["cut"]> {
+    const last = rows.length > 0 ? asNumber(rows[rows.length - 1]!.ordinal) : null;
+    return { nextOrdinal: last === null ? from : last + 1, omittedRows: 0, omittedBytes: 0 };
+  }
+
+  /**
+   * The ids, among `rows` (message rows with the `time_updated` and `bytes`
+   * they were read with), whose stored row changed since: one
+   * `session_message` statement per {@link PART_ID_CHUNK} ids, each after a
+   * yield. A row that is gone counts as changed.
+   */
+  async function changedRows(
+    sessionID: string,
+    rows: Array<{ id: string; was: Fingerprint }>,
+  ): Promise<Set<string>> {
+    const changed = new Set<string>();
+    for (let i = 0; i < rows.length; i += PART_ID_CHUNK) {
+      const chunk = rows.slice(i, i + PART_ID_CHUNK);
+      await pause();
+      const now = read("message fingerprints", () =>
+        db.all(
+          `SELECT id, time_updated, ${BYTES} AS bytes FROM session_message
+           WHERE session_id = ? AND id IN (${bindList(chunk.length)}) LIMIT ?`,
+          [sessionID, ...chunk.map((r) => r.id), chunk.length],
+        ),
+      );
+      const byId = new Map(now.map((row) => [asString(row.id) ?? "", row]));
+      for (const { id, was } of chunk) {
+        const row = byId.get(id);
+        if (!row || !sameFingerprint(was, fingerprintOf(row))) changed.add(id);
+      }
+    }
+    return changed;
+  }
+
   /**
    * Part rows of one message as content items for the projector, in ordinal
-   * order: a row that was not loaded becomes a text placeholder naming its
-   * size, and one whose data does not decode a text placeholder naming why
-   * (or a {@link MalformedSessionError} under `strict`). Counts what it saw.
+   * order: a row over the byte ceiling (the only kind a read returns without
+   * its data) becomes a text placeholder naming its size, and one whose data
+   * does not decode a text placeholder naming why (or a
+   * {@link MalformedSessionError} under `strict`). Counts what it saw.
    */
   async function partItems(
-    rows: LoadedPart[],
+    rows: Row[],
     strict: boolean,
     counts: HistoryReadCounts,
     unknownTypes: Set<string>,
@@ -870,7 +971,7 @@ export function createV2HistorySource(db: ReadOnlyDb, opts: V2SourceOptions = {}
     const items: unknown[] = [];
     for (let i = 0; i < rows.length; i++) {
       if (i > 0 && i % PARTS_PER_YIELD === 0) await pause();
-      const { row, budget } = rows[i]!;
+      const row = rows[i]!;
       const part = toPartRow(row);
       if (!PART_TYPES.includes(part.type)) {
         counts.unknownPartTypes++;
@@ -878,9 +979,7 @@ export function createV2HistorySource(db: ReadOnlyDb, opts: V2SourceOptions = {}
       }
       if (row.data == null) {
         counts.oversizedParts++;
-        const bytes = asNumber(row.bytes) ?? 0;
-        const cap = bytes > byteCeiling ? byteCeiling : budget;
-        items.push({ type: "text", text: oversizedNote(bytes, cap) });
+        items.push({ type: "text", text: oversizedNote(asNumber(row.bytes) ?? 0, byteCeiling) });
         continue;
       }
       const decoded = decodePartRow(part);
@@ -1152,22 +1251,13 @@ export function createV2HistorySource(db: ReadOnlyDb, opts: V2SourceOptions = {}
   }
 
   /**
-   * Decode and project body rows (newest first), each assistant row with its
-   * part rows from `parts` (keyed by message id). An undecodable row or part
-   * row rejects the page under `strict` (the distiller's quarantine);
-   * otherwise it becomes a placeholder, so a page with rows is never empty and
-   * a walk never stops early on bad data. Yields every {@link ROWS_PER_YIELD}
-   * rows. Adds what it could not project faithfully to `counts`.
+   * Decode body rows (newest first). An undecodable row rejects under
+   * `strict` (the distiller's quarantine); otherwise it becomes a placeholder,
+   * so a page with rows is never empty and a walk never stops early on bad
+   * data. Yields every {@link ROWS_PER_YIELD} rows.
    */
-  async function project(
-    rows: Row[],
-    session: SessionContext,
-    strict: boolean,
-    parts: Map<string, PartLoad>,
-    counts: HistoryReadCounts,
-    unknownTypes: Set<string>,
-  ): Promise<HistoryMessage[]> {
-    const decoded: Array<Extract<DecodedRow, { ok: true }>> = [];
+  async function decodeRows(rows: Row[], strict: boolean): Promise<Decoded[]> {
+    const decoded: Decoded[] = [];
     for (let i = 0; i < rows.length; i++) {
       if (i > 0 && i % ROWS_PER_YIELD === 0) await pause();
       // An oversized row's placeholder carries no agent or model: reading them
@@ -1179,9 +1269,32 @@ export function createV2HistorySource(db: ReadOnlyDb, opts: V2SourceOptions = {}
         continue;
       }
       if (strict) throw new MalformedSessionError(d.reason);
-      const { type, data } = placeholderData(d.row.type, malformedNote(d.reason));
-      decoded.push({ ok: true, row: { ...d.row, type, data: "" }, data });
+      decoded.push(malformedPlaceholder(d.row, d.reason));
     }
+    return decoded;
+  }
+
+  /** The placeholder for a row whose data does not decode. */
+  function malformedPlaceholder(row: V2MessageRow, reason: string): Decoded {
+    const { type, data } = placeholderData(row.type, malformedNote(reason));
+    return { ok: true, row: { ...row, type, data: "" }, data };
+  }
+
+  /**
+   * Project decoded rows (newest first), each assistant row with its part rows
+   * from `parts` (keyed by message id). A part row that does not decode
+   * rejects under `strict` and becomes a placeholder otherwise. Yields every
+   * {@link ROWS_PER_YIELD} rows. Adds what it could not project faithfully to
+   * `counts`.
+   */
+  async function project(
+    decoded: Decoded[],
+    session: SessionContext,
+    strict: boolean,
+    parts: Map<string, PartLoad>,
+    counts: HistoryReadCounts,
+    unknownTypes: Set<string>,
+  ): Promise<HistoryMessage[]> {
     const who = await identities(decoded, session.id, session);
     const fallback = resolveIdentity([], session);
     const items: HistoryMessage[] = [];
@@ -1194,7 +1307,7 @@ export function createV2HistorySource(db: ReadOnlyDb, opts: V2SourceOptions = {}
         const partList = await partItems(load.rows, strict, counts, unknownTypes);
         messageParts = { items: partList, start: load.start };
         if (load.cut) {
-          const inline = Array.isArray(d.data.content) ? d.data.content.length : 0;
+          const inline = load.inlineCount ?? inlineCountOf(d.data);
           const omittedParts = load.cut.omittedRows + inline;
           messageParts.cut = {
             nextOrdinal: load.cut.nextOrdinal,
@@ -1223,6 +1336,189 @@ export function createV2HistorySource(db: ReadOnlyDb, opts: V2SourceOptions = {}
   ): HistoryReadCounts | undefined {
     drift.record(counts, unknownTypes);
     return hasReadCounts(counts) ? counts : undefined;
+  }
+
+  /**
+   * Of the first `keep` rows, the assistant rows (id to position) whose
+   * stored row changed while their part rows were read, among those such a
+   * change could make hold content twice: the envelope held inline content,
+   * part rows were loaded for it and the read was not cut (a cut leaves the
+   * inline content out). opencode moves inline content into part rows after
+   * the existing ordinals and empties the envelope, so a read that took the
+   * envelope before the move and the part rows after it would hold that
+   * content twice, under different ids.
+   */
+  async function movedDuringRead(
+    sessionID: string,
+    rows: Row[],
+    decoded: Decoded[],
+    loads: Map<string, PartLoad>,
+    keep: number,
+  ): Promise<Map<string, number>> {
+    const candidates: Array<{ id: string; pos: number; was: Fingerprint }> = [];
+    for (let pos = 0; pos < keep; pos++) {
+      const d = decoded[pos]!;
+      const load = loads.get(d.row.id);
+      if (!load || load.cut || load.rows.length === 0 || inlineCountOf(d.data) === 0) continue;
+      candidates.push({ id: d.row.id, pos, was: fingerprintOf(rows[pos]!) });
+    }
+    if (candidates.length === 0) return new Map();
+    const changed = await changedRows(sessionID, candidates);
+    return new Map(candidates.filter((c) => changed.has(c.id)).map((c) => [c.id, c.pos]));
+  }
+
+  /**
+   * Continue an assistant message from part ordinal `from` (see
+   * `HistorySource.getMessage`). The envelope is read without its inline
+   * content: its metadata (the data minus `content`, left out when over
+   * {@link CONTINUATION_METADATA_MAX}), the count and size of its inline
+   * items and its fingerprint. The part rows from `from` on are read under
+   * what the metadata and the inline content leave of the ceiling, the first
+   * one forced in; then, when every part row fit, the inline content is read
+   * if it still fits, in a statement that also re-reads the fingerprint.
+   *
+   * The bound: a continuation loads at most the ceiling, except that its
+   * forced first part row, which is within the ceiling on its own, loads
+   * even when the metadata leaves it too little room. That read loads the
+   * metadata and part rows only, never the inline content, so it stays under
+   * `byteCeiling + CONTINUATION_METADATA_MAX`. Each continuation moves past
+   * at least one part row, so every part row within the ceiling is returned
+   * with its data by some continuation.
+   */
+  async function continueMessage(
+    sessionID: string,
+    messageID: string,
+    from: number,
+    fork: SqlValue[],
+  ): Promise<Lookup<HistoryMessage>> {
+    for (let attempt = 0; ; attempt++) {
+      // One primary-key read: no yield before the first.
+      if (attempt > 0) await pause();
+      const head = read("message head", () =>
+        db.get(
+          `SELECT ${MESSAGE_META_COLUMNS}, ${BYTES} AS bytes,
+             CASE WHEN ${BYTES} > ? THEN 'oversized'
+                  WHEN NOT json_valid(data) THEN 'invalid'
+                  WHEN json_type(data) <> 'object' THEN 'other'
+                  ELSE 'object' END AS shape,
+             ${ifObject("json_array_length(data, '$.content')")} AS inline_count,
+             ${ifObject(INLINE_BYTES)} AS inline_bytes,
+             ${ifObject(META_BYTES)} AS meta_bytes,
+             ${ifObject(`CASE WHEN ${META_BYTES} <= ? THEN json_remove(data, '$.content') END`)} AS meta
+           FROM session_message
+           WHERE id = ? AND session_id = ? AND ${CONTENT_FILTER} AND ${FORK_FILTER} LIMIT ?`,
+          [
+            byteCeiling,
+            byteCeiling,
+            byteCeiling,
+            byteCeiling,
+            byteCeiling,
+            CONTINUATION_METADATA_MAX,
+            messageID,
+            sessionID,
+            ...fork,
+            1,
+          ],
+        ),
+      );
+      if (!head)
+        return { ok: false, reason: "not-found", error: `Message not found: ${messageID}` };
+      if (head.type !== "assistant") {
+        return {
+          ok: false,
+          reason: "unsupported",
+          error: `message ${messageID} is not an assistant message, so it has no part rows to continue`,
+        };
+      }
+      const session = contextOf(sessionID);
+      if (!session) return sessionNotFound(sessionID);
+
+      // A placeholder envelope carries its note as its inline content. A
+      // real one carries its metadata only, its inline content read last.
+      const message = toMessageRow(head);
+      const shape = asString(head.shape);
+      let decoded: Decoded;
+      let charge = 0;
+      let inlineCount = 0;
+      let inlineBytes = 0;
+      if (shape === "oversized") {
+        const placeholder = decodeBody(head);
+        decoded = placeholder.ok
+          ? placeholder
+          : malformedPlaceholder(placeholder.row, placeholder.reason);
+      } else if (shape === "invalid" || shape === "other") {
+        const what = shape === "invalid" ? "is not valid JSON" : "is not an object";
+        decoded = malformedPlaceholder(message, `message ${messageID} data ${what}`);
+      } else {
+        inlineCount = asNumber(head.inline_count) ?? 0;
+        inlineBytes = inlineCount > 0 ? (asNumber(head.inline_bytes) ?? 0) : 0;
+        let data: Record<string, unknown> = {};
+        const meta = asString(head.meta);
+        if (meta !== null) {
+          const parsed = decodeRow({ ...message, data: meta });
+          if (parsed.ok) {
+            data = parsed.data;
+            charge = asNumber(head.meta_bytes) ?? 0;
+          }
+        }
+        decoded = { ok: true, row: { ...message, data: "" }, data: { ...data, content: [] } };
+      }
+      const inlinePending = inlineCount > 0;
+
+      const start = (await partSizes(sessionID, [messageID], from)).get(messageID)?.skipped ?? 0;
+      const got = await readParts(
+        sessionID,
+        [{ id: messageID, pos: 0 }],
+        from,
+        byteCeiling - charge - inlineBytes,
+        true,
+      );
+      const counts = emptyReadCounts();
+      const unknownTypes = new Set<string>();
+      const load: PartLoad = { rows: got.loaded, start };
+      if (inlinePending) load.inlineCount = inlineCount;
+      if (got.cut) {
+        load.cut = await cutAt(sessionID, messageID, got.cut.ordinal);
+      } else if (inlinePending) {
+        // With no part row loaded, the metadata and the inline content are
+        // the envelope's own size, within the ceiling.
+        const room =
+          got.loaded.length > 0 ? byteCeiling - charge - loadedBytes(got.loaded) : byteCeiling;
+        await pause();
+        const tail = read("message inline content", () =>
+          db.get(
+            `SELECT time_updated, ${BYTES} AS bytes,
+               ${ifObject(`CASE WHEN ${INLINE_BYTES} <= ? THEN json_extract(data, '$.content') END`)} AS content
+             FROM session_message WHERE id = ? AND session_id = ? LIMIT ?`,
+            [byteCeiling, room, messageID, sessionID, 1],
+          ),
+        );
+        if (!tail || !sameFingerprint(fingerprintOf(head), fingerprintOf(tail))) {
+          // The row changed under the part read: read it again, then settle
+          // for the part rows read, with the inline content left for the
+          // continuation (which reads part rows moved there too).
+          if (attempt < ENVELOPE_ATTEMPTS - 1) continue;
+          load.cut = inlineCut(got.loaded, from);
+          counts.changedMessages++;
+        } else {
+          const items = parseInline(asString(tail.content));
+          if (items === undefined) load.cut = inlineCut(got.loaded, from);
+          else decoded.data.content = items;
+        }
+      }
+      const [projected] = await project(
+        [decoded],
+        session,
+        false,
+        new Map([[messageID, load]]),
+        counts,
+        unknownTypes,
+      );
+      recordRead(counts, unknownTypes);
+      return projected
+        ? { ok: true, value: projected }
+        : { ok: false, reason: "not-found", error: `Message not found: ${messageID}` };
+    }
   }
 
   return {
@@ -1385,10 +1681,14 @@ export function createV2HistorySource(db: ReadOnlyDb, opts: V2SourceOptions = {}
           continue;
         }
 
+        const decoded = await decodeRows(rows, strict);
+
         // Parts of the page's assistant rows, under what the envelopes left
         // of the ceiling. A cut in the first message makes it partial and
-        // ends the page with it; a cut in a later message ends the page
-        // before that message, which leads the next page instead.
+        // ends the page with it (holding no part row at all when its first
+        // one does not fit beside the envelope; a continuation reads it); a
+        // cut in a later message ends the page before that message, which
+        // leads the next page instead.
         const counts = emptyReadCounts();
         const unknownTypes = new Set<string>();
         const loads = new Map<string, PartLoad>();
@@ -1404,12 +1704,13 @@ export function createV2HistorySource(db: ReadOnlyDb, opts: V2SourceOptions = {}
             assistants,
             FIRST_ORDINAL,
             byteCeiling - envelopes,
+            false,
           );
           if (got.cut) keep = Math.max(1, got.cut.pos);
           for (const { id, pos } of assistants) {
             if (pos >= keep) break;
             loads.set(id, {
-              rows: got.loaded.filter((part) => asNumber(part.row.pos) === pos),
+              rows: got.loaded.filter((part) => asNumber(part.pos) === pos),
               start: 0,
             });
           }
@@ -1418,6 +1719,23 @@ export function createV2HistorySource(db: ReadOnlyDb, opts: V2SourceOptions = {}
             const firstID = asString(rows[0]!.id) ?? "";
             const load = loads.get(firstID);
             if (load) load.cut = await cutAt(o.sessionID, firstID, got.cut.ordinal);
+          }
+          const moved = await movedDuringRead(o.sessionID, rows, decoded, loads, keep);
+          if (moved.size > 0) {
+            // Read the page again; on the last attempt, the first message
+            // leaves its inline content for the continuation and a later one
+            // leads the next page.
+            if (attempt < PAGE_ATTEMPTS - 1) continue;
+            for (const [id, pos] of moved) {
+              if (pos > 0) {
+                keep = Math.min(keep, pos);
+                continue;
+              }
+              const load = loads.get(id)!;
+              load.cut = inlineCut(load.rows, FIRST_ORDINAL);
+              counts.changedMessages++;
+              keep = 1;
+            }
           }
         }
         const kept = rows.slice(0, keep);
@@ -1434,7 +1752,14 @@ export function createV2HistorySource(db: ReadOnlyDb, opts: V2SourceOptions = {}
         const more = plannedMore || returnedOldest > oldest || keep < rows.length;
         const session = contextOf(o.sessionID);
         if (!session) throw notFound;
-        const items = await project(kept, session, strict, loads, counts, unknownTypes);
+        const items = await project(
+          decoded.slice(0, keep),
+          session,
+          strict,
+          loads,
+          counts,
+          unknownTypes,
+        );
         const pageCounts = recordRead(counts, unknownTypes);
         return {
           items,
@@ -1464,50 +1789,81 @@ export function createV2HistorySource(db: ReadOnlyDb, opts: V2SourceOptions = {}
           error: `part ordinal must be an integer, got ${String(partOrdinal)}`,
         };
       }
+      if (partOrdinal !== undefined && !partsOn) {
+        return {
+          ok: false,
+          reason: "unsupported",
+          error: "this opencode database has no part rows, so it cannot continue a message",
+        };
+      }
       const fork = forkBinds(sessionID);
       if (!fork) {
         return { ok: false, reason: "not-found", error: `Session not found: ${sessionID}` };
       }
-      // One primary-key read: no yield before it.
-      const row = read("message", () =>
-        db.get(
-          `SELECT ${BODY_COLUMNS} FROM session_message
-           WHERE id = ? AND session_id = ? AND ${CONTENT_FILTER} AND ${FORK_FILTER} LIMIT ?`,
-          [byteCeiling, messageID, sessionID, ...fork, 1],
-        ),
-      );
-      if (!row) return notFound;
-      const session = contextOf(sessionID);
-      if (!session)
-        return { ok: false, reason: "not-found", error: `Session not found: ${sessionID}` };
-
-      // An assistant's part rows from the continuation ordinal on (all of
-      // them without one), under what its envelope left of the ceiling.
-      // Their ids count the rows before that ordinal, so a continuation
-      // names each part as a whole read does.
-      const counts = emptyReadCounts();
-      const unknownTypes = new Set<string>();
-      const loads = new Map<string, PartLoad>();
-      if (partsOn && row.type === "assistant") {
-        const from = partOrdinal ?? FIRST_ORDINAL;
-        const envelope = row.data != null ? (asNumber(row.bytes) ?? 0) : 0;
-        const got = await readParts(
-          sessionID,
-          [{ id: messageID, pos: 0 }],
-          from,
-          byteCeiling - envelope,
-        );
-        const start =
-          partOrdinal === undefined
-            ? 0
-            : ((await partSizes(sessionID, [messageID], partOrdinal)).get(messageID)?.skipped ?? 0);
-        const load: PartLoad = { rows: got.loaded, start };
-        if (got.cut) load.cut = await cutAt(sessionID, messageID, got.cut.ordinal);
-        loads.set(messageID, load);
+      if (partOrdinal !== undefined) {
+        return continueMessage(sessionID, messageID, partOrdinal, fork);
       }
-      const [message] = await project([row], session, false, loads, counts, unknownTypes);
-      recordRead(counts, unknownTypes);
-      return message ? { ok: true, value: message } : notFound;
+
+      for (let attempt = 0; ; attempt++) {
+        // One primary-key read: no yield before the first.
+        if (attempt > 0) await pause();
+        const row = read("message", () =>
+          db.get(
+            `SELECT ${BODY_COLUMNS} FROM session_message
+             WHERE id = ? AND session_id = ? AND ${CONTENT_FILTER} AND ${FORK_FILTER} LIMIT ?`,
+            [byteCeiling, messageID, sessionID, ...fork, 1],
+          ),
+        );
+        if (!row) return notFound;
+        const session = contextOf(sessionID);
+        if (!session) return sessionNotFound(sessionID);
+        const decoded = await decodeRows([row], false);
+
+        // An assistant's part rows, under what its envelope left of the
+        // ceiling; a first part row that does not fit beside the envelope
+        // cuts the message before it, for a continuation to read.
+        const counts = emptyReadCounts();
+        const unknownTypes = new Set<string>();
+        const loads = new Map<string, PartLoad>();
+        if (partsOn && row.type === "assistant") {
+          const envelope = row.data != null ? (asNumber(row.bytes) ?? 0) : 0;
+          const got = await readParts(
+            sessionID,
+            [{ id: messageID, pos: 0 }],
+            FIRST_ORDINAL,
+            byteCeiling - envelope,
+            false,
+          );
+          const load: PartLoad = { rows: got.loaded, start: 0 };
+          if (got.cut) load.cut = await cutAt(sessionID, messageID, got.cut.ordinal);
+          loads.set(messageID, load);
+          const moved = await movedDuringRead(sessionID, [row], decoded, loads, 1);
+          if (moved.size > 0) {
+            if (attempt < ENVELOPE_ATTEMPTS - 1) continue;
+            load.cut = inlineCut(load.rows, FIRST_ORDINAL);
+            counts.changedMessages++;
+          }
+        }
+        const [message] = await project(decoded, session, false, loads, counts, unknownTypes);
+        recordRead(counts, unknownTypes);
+        return message ? { ok: true, value: message } : notFound;
+      }
     },
   };
+}
+
+function sessionNotFound(sessionID: string): { ok: false; reason: "not-found"; error: string } {
+  return { ok: false, reason: "not-found", error: `Session not found: ${sessionID}` };
+}
+
+/** Inline content items from `json_extract(data, '$.content')`, or undefined
+ *  when the read left them out or they are not an array. */
+function parseInline(text: string | null): unknown[] | undefined {
+  if (text === null) return undefined;
+  try {
+    const items: unknown = JSON.parse(text);
+    return Array.isArray(items) ? items : undefined;
+  } catch {
+    return undefined;
+  }
 }

@@ -12,6 +12,7 @@ import {
 } from "../src/history/source.js";
 import {
   checkV2Schema,
+  CONTINUATION_METADATA_MAX,
   createV2HistorySource,
   cutNote,
   openOpencodeDb,
@@ -737,28 +738,93 @@ describe("v2 source: a first message over the page", () => {
     expect(tail.partial).toBeUndefined();
   });
 
-  it("moves past a first part the envelope leaves no room for, as a placeholder", async () => {
+  it("cuts before a first part the envelope leaves no room for, and continues it with its text", async () => {
     const f = await partsFixture();
     f.session("ses_room");
     const first = txt("f".repeat(800));
+    const small = txt("small");
     const long = f.assistant("ses_room", {
-      parts: [first, txt("small")],
+      parts: [first, small],
       // A ~1,000-byte envelope leaves ~500 bytes of the ceiling for parts.
       extra: { padding: "e".repeat(900) },
     });
-    const envelope = f.sizes.get(long)!.envelope;
     const { source } = await open(f.t, { pageByteCeiling: 1_500 });
+    const whole = await open(f.t);
+    const both = bytesOf(first) + bytesOf(small);
+
+    // Pages and point reads alike cut before the part and load none.
     const [page] = await pages(source, "ses_room", 10);
     const m = page!.items[0]!;
-    expect(m.partial).toEqual({
-      nextOrdinal: 1,
-      omittedParts: 1,
-      omittedBytes: bytesOf(txt("small")),
+    expect(m.partial).toEqual({ nextOrdinal: 0, omittedParts: 2, omittedBytes: both });
+    expect(m.parts.map(partText)).toEqual([cutNote(2, both, 0)]);
+    expect(page!.counts).toEqual(counts({ partialMessages: 1 }));
+    expect(await point(source, "ses_room", long)).toEqual(m);
+
+    // A continuation charges only the envelope's metadata, so the part loads
+    // with its text, and the next one returns the rest.
+    const { parts, reads } = await complete(source, "ses_room", m);
+    expect(reads.map((r) => r.partial?.nextOrdinal)).toEqual([0, 1, undefined]);
+    expect(parts.map(partText)).toEqual(["f".repeat(800), "small"]);
+    expect(parts).toEqual((await point(whole.source, "ses_room", long)).parts);
+    expect(source.history!().counts.oversizedParts).toBe(0);
+  });
+
+  it("marks a message whose only part was cut partial, in pages and point reads", async () => {
+    const f = await partsFixture();
+    f.session("ses_only");
+    const only = txt("o".repeat(800));
+    const long = f.assistant("ses_only", { parts: [only], extra: { padding: "e".repeat(900) } });
+    const { source } = await open(f.t, { pageByteCeiling: 1_500 });
+    const expected = { nextOrdinal: 0, omittedParts: 1, omittedBytes: bytesOf(only) };
+    const [page] = await pages(source, "ses_only", 10);
+    expect(page!.items[0]!.partial).toEqual(expected);
+    const lookup = await point(source, "ses_only", long);
+    expect(lookup.partial).toEqual(expected);
+    const rest = await point(source, "ses_only", long, 0);
+    expect(rest.partial).toBeUndefined();
+    expect(rest.parts.map((p) => [p.id, partText(p)])).toEqual([[`${long}:0`, "o".repeat(800)]]);
+  });
+
+  it("leaves a mixed row's inline content for the read after the part that fills a continuation", async () => {
+    const f = await partsFixture();
+    f.session("ses_mixed");
+    const part = txt("p".repeat(900));
+    const inline = txt("i".repeat(700));
+    const long = f.assistant("ses_mixed", { parts: [part], inline: [inline] });
+    const { source } = await open(f.t, { pageByteCeiling: 1_500 });
+    const whole = await open(f.t);
+
+    const first = await point(source, "ses_mixed", long);
+    // The part row and the inline item are both left out.
+    expect(first.partial).toEqual({ nextOrdinal: 0, omittedParts: 2, omittedBytes: bytesOf(part) });
+    // The metadata leaves the part room only without the inline content: it
+    // loads past the budget, and the inline content waits for the next read.
+    const second = await point(source, "ses_mixed", long, 0);
+    expect(second.partial).toEqual({ nextOrdinal: 1, omittedParts: 1, omittedBytes: 0 });
+    expect(second.parts.map(partText)).toEqual(["p".repeat(900), cutNote(1, 0, 1)]);
+    const third = await point(source, "ses_mixed", long, 1);
+    expect(third.partial).toBeUndefined();
+    expect(third.parts.map((p) => [p.id, partText(p)])).toEqual([[`${long}:1`, "i".repeat(700)]]);
+    const { parts } = await complete(source, "ses_mixed", first);
+    expect(parts).toEqual((await point(whole.source, "ses_mixed", long)).parts);
+  });
+
+  it("continues without metadata over the cap, taking the session's agent and model", async () => {
+    const f = await partsFixture();
+    f.session("ses_meta", { agent: "sess-agent" });
+    const part = txt("q".repeat(50_000));
+    const long = f.assistant("ses_meta", {
+      parts: [part],
+      extra: { padding: "m".repeat(CONTINUATION_METADATA_MAX + 4_000) },
     });
-    expect(partText(m.parts[0])).toBe(oversizedNote(bytesOf(first), 1_500 - envelope));
-    expect(page!.counts).toEqual(counts({ oversizedParts: 1, partialMessages: 1 }));
-    const { parts } = await complete(source, "ses_room", m);
-    expect(parts.map(partText)).toEqual([oversizedNote(bytesOf(first), 1_500 - envelope), "small"]);
+    const { source } = await open(f.t, { pageByteCeiling: 64 * 1024 });
+    const first = await point(source, "ses_meta", long);
+    expect(first.partial?.nextOrdinal).toBe(0);
+    expect(first.info).toMatchObject({ agent: "build" });
+    const rest = await point(source, "ses_meta", long, 0);
+    expect(rest.partial).toBeUndefined();
+    expect(rest.parts.map(partText)).toEqual(["q".repeat(50_000)]);
+    expect(rest.info).toMatchObject({ agent: "sess-agent" });
   });
 
   it("rejects a part ordinal that is not an integer", async () => {
@@ -772,6 +838,209 @@ describe("v2 source: a first message over the page", () => {
         reason: "error",
       });
     }
+  });
+
+  it("answers a part ordinal on a message without part ordinals as unsupported", async () => {
+    const f = await partsFixture();
+    f.session("ses_kind");
+    const prompt = f.user("ses_kind", "a prompt");
+    const { source } = await open(f.t);
+    expect(await source.getMessage("ses_kind", prompt, { partOrdinal: 0 })).toEqual({
+      ok: false,
+      reason: "unsupported",
+      error: expect.stringContaining("not an assistant message"),
+    });
+    // Without a part ordinal it reads as usual.
+    expect((await point(source, "ses_kind", prompt)).parts.map(partText)).toEqual(["a prompt"]);
+
+    // A database without session_part has no part ordinals at all.
+    const t = await makeV2Db();
+    cleanups.push(t.cleanup);
+    const old = fixture(t);
+    old.session("ses_old");
+    const reply = old.assistant("ses_old", { inline: [txt("inline only")] });
+    const { source: oldSource, spy } = await open(t);
+    const before = spy.statements.length;
+    expect(await oldSource.getMessage("ses_old", reply, { partOrdinal: 0 })).toEqual({
+      ok: false,
+      reason: "unsupported",
+      error: expect.stringContaining("no part rows"),
+    });
+    expect(spy.statements.length).toBe(before);
+    expect((await point(oldSource, "ses_old", reply)).parts.map(partText)).toEqual(["inline only"]);
+  });
+
+  it("reads at least one part row per read under a part-row cap below one", async () => {
+    const f = await partsFixture();
+    f.session("ses_zero");
+    const items = [txt("one"), txt("two"), txt("three")];
+    const long = f.assistant("ses_zero", { parts: items });
+    const whole = await open(f.t);
+    for (const pagePartRows of [0, -3, 0.5, Number.NaN]) {
+      const { source } = await open(f.t, { pagePartRows });
+      const [page] = await pages(source, "ses_zero", 10);
+      const m = page!.items[0]!;
+      const { parts, reads } = await complete(source, "ses_zero", m);
+      // NaN falls back to the default cap; every other value reads one row at a time.
+      expect(reads, String(pagePartRows)).toHaveLength(Number.isNaN(pagePartRows) ? 1 : 3);
+      expect(parts, String(pagePartRows)).toEqual(
+        (await point(whole.source, "ses_zero", long)).parts,
+      );
+    }
+  });
+});
+
+// ── A row rewritten while it is read ─────────────────────────────────────────
+
+describe("v2 source: a row opencode rewrites between the envelope and the part read", () => {
+  /** A source whose every statement runs `after(sql)` once it returns. */
+  async function hooked(t: V2TestDb, after: (sql: string) => void, opts: V2SourceOptions = {}) {
+    const opened = await openOpencodeDb(t.path);
+    if (!opened.ok) throw new Error(opened.reason);
+    cleanups.push(() => opened.db.close());
+    const spy = limitSpy(opened.db);
+    const db: typeof spy = {
+      ...spy,
+      get: (sql, params) => {
+        const row = spy.get(sql, params);
+        after(sql);
+        return row;
+      },
+      all: (sql, params) => {
+        const rows = spy.all(sql, params);
+        after(sql);
+        return rows;
+      },
+    };
+    return createV2HistorySource(db, { yieldBetween: noYield, ...opts });
+  }
+
+  /** opencode's lazy move: the row's inline items become part rows after its
+   *  highest ordinal, and the row is rewritten with no inline content. */
+  function moveInline(f: Fixture, sessionID: string, id: string): void {
+    const row = f.t.db.get("SELECT data, time_updated FROM session_message WHERE id = ?", [id]);
+    const data = JSON.parse(String(row?.data)) as Item;
+    const top = f.t.db.get("SELECT max(ordinal) AS n FROM session_part WHERE message_id = ?", [id]);
+    const next = top?.n == null ? 0 : Number(top.n) + 1;
+    (data.content as unknown[]).forEach((item, i) => {
+      insertPart(f.t.db, {
+        message_id: id,
+        session_id: sessionID,
+        ordinal: next + i,
+        time_created: 1,
+        data: item,
+      });
+    });
+    f.t.db.run("UPDATE session_message SET data = ?, time_updated = ? WHERE id = ?", [
+      JSON.stringify({ ...data, content: [] }),
+      Number(row?.time_updated) + 1,
+      id,
+    ]);
+  }
+
+  /** Rewrite the row with the same content, as any envelope update does. */
+  function touch(f: Fixture, id: string): void {
+    f.t.db.run("UPDATE session_message SET time_updated = time_updated + 1 WHERE id = ?", [id]);
+  }
+
+  async function mixed(sessionID: string) {
+    const f = await partsFixture();
+    f.session(sessionID);
+    const id = f.assistant(sessionID, {
+      parts: [txt("row zero"), txt("row one")],
+      inline: [txt("inline two"), { type: "reasoning", text: "inline three" }],
+    });
+    const before = await point((await open(f.t)).source, sessionID, id);
+    expect(suffixes(before)).toEqual(["0", "1", "2", "3"]);
+    return { f, id, before };
+  }
+
+  const envelopeRead = (sql: string) =>
+    /\bsession_message\b/.test(sql) && /WHERE id = \?/.test(sql);
+  /** Any message statement but the re-read that checks for a change. */
+  const rowRead = (sql: string) => /\bsession_message\b/.test(sql) && !/\bid IN \(/.test(sql);
+  const unique = (m: HistoryMessage) => new Set(m.parts.map((p) => p.id)).size === m.parts.length;
+
+  it("reads a point read again when the content moved under it, without duplicates", async () => {
+    const { f, id, before } = await mixed("ses_mv1");
+    let moved = false;
+    const source = await hooked(f.t, (sql) => {
+      if (moved || !envelopeRead(sql)) return;
+      moved = true;
+      moveInline(f, "ses_mv1", id);
+    });
+    const got = await point(source, "ses_mv1", id);
+    expect(moved).toBe(true);
+    expect(got).toEqual(before);
+    expect(unique(got)).toBe(true);
+    expect(source.history!().counts.changedMessages).toBe(0);
+  });
+
+  it("reads a page again when the content moved under it, without duplicates", async () => {
+    const { f, id, before } = await mixed("ses_mv2");
+    let moved = false;
+    const source = await hooked(f.t, (sql) => {
+      if (moved || !/WITH sized AS/.test(sql) || !/\bsession_message\b/.test(sql)) return;
+      moved = true;
+      moveInline(f, "ses_mv2", id);
+    });
+    const [page] = await pages(source, "ses_mv2", 10);
+    expect(moved).toBe(true);
+    expect(page!.items).toEqual([before]);
+    expect(page).not.toHaveProperty("counts");
+  });
+
+  it("continues a message again when the content moved under the continuation", async () => {
+    const { f, id, before } = await mixed("ses_mv3");
+    let moved = false;
+    const source = await hooked(f.t, (sql) => {
+      if (moved || !/json_remove/.test(sql)) return;
+      moved = true;
+      moveInline(f, "ses_mv3", id);
+    });
+    const rest = await point(source, "ses_mv3", id, 1);
+    expect(moved).toBe(true);
+    expect(rest.partial).toBeUndefined();
+    expect(rest.parts).toEqual(before.parts.slice(1));
+    expect(source.history!().counts.changedMessages).toBe(0);
+  });
+
+  it("leaves the inline content for the continuation when the row keeps changing", async () => {
+    const { f, id, before } = await mixed("ses_mv4");
+    let touching = true;
+    const source = await hooked(f.t, (sql) => {
+      if (touching && rowRead(sql)) touch(f, id);
+    });
+    const first = await point(source, "ses_mv4", id);
+    // Both part rows, then the inline items left out.
+    expect(first.partial).toEqual({ nextOrdinal: 2, omittedParts: 2, omittedBytes: 0 });
+    expect(suffixes(first).slice(0, -1)).toEqual(["0", "1"]);
+    expect(source.history!().counts.changedMessages).toBe(1);
+    touching = false;
+    const { parts } = await complete(source, "ses_mv4", first);
+    expect(parts).toEqual(before.parts);
+
+    // A page leaves it the same way, and counts it.
+    touching = true;
+    const [page] = await pages(source, "ses_mv4", 10);
+    expect(page!.items[0]!.partial).toEqual(first.partial);
+    expect(page!.counts).toEqual(counts({ partialMessages: 1, changedMessages: 1 }));
+  });
+
+  it("finds the moved rows through the continuation of a read that settled before the move", async () => {
+    const { f, id, before } = await mixed("ses_mv5");
+    let touching = true;
+    const source = await hooked(f.t, (sql) => {
+      if (touching && rowRead(sql)) touch(f, id);
+    });
+    const first = await point(source, "ses_mv5", id);
+    expect(first.partial?.nextOrdinal).toBe(2);
+    touching = false;
+    // The move lands after the read: the inline items are now part rows from
+    // ordinal 2 on, which the continuation reads instead of inline content.
+    moveInline(f, "ses_mv5", id);
+    const { parts } = await complete(source, "ses_mv5", first);
+    expect(parts).toEqual(before.parts);
   });
 });
 
