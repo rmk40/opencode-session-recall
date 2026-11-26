@@ -17,12 +17,15 @@
  * The other gates measure, each on its own database: a tail write over a
  * 5,000-row card; a repair sweep over 400 stale cards (half of them with part
  * rows an older build never read, the rest rebuilt by suppressed writes) in a
- * 12,000-card store; paged discovery of 10,501 sessions and of a root's 2,400
- * children; and one range check over a 500-row session. Each records its total
- * time and its longest slice. Those gates assert the longest slice with V8's
- * garbage-collection pauses taken out, and log the raw stall and the longest
- * GC pause beside it: on a loaded machine a major collection alone can pause
- * the loop past the budget, which says nothing about the code under test.
+ * 12,000-card store; a child session's write and then its deletion in a
+ * 12,000-card store whose root has 2,400 other children, each of which
+ * recomputes the root's rollup; paged discovery of 10,501 sessions and of a
+ * root's 2,400 children; and one range check over a 500-row session. Each
+ * records its total time and its longest slice. Those gates assert the
+ * longest slice with V8's garbage-collection pauses taken out, and log the
+ * raw stall and the longest GC pause beside it: on a loaded machine a major
+ * collection alone can pause the loop past the budget, which says nothing
+ * about the code under test.
  *
  * When the budget fails the report names the slowest synchronous calls it
  * could attribute (opencode.db statements and store reads and transactions)
@@ -94,6 +97,10 @@ const APPEND_ROWS = 200;
 const SWEEP_SESSIONS = 400;
 const SWEEP_STORE_CARDS = 12_000;
 const SWEEP_TOTAL_BUDGET_MS = 30_000;
+/** Children of the root whose child is written and then deleted, in a store
+ *  of SWEEP_STORE_CARDS cards: each change recomputes the root's rollup. */
+const FAMILY_CHILDREN = 2_400;
+const CHILD_TOTAL_BUDGET_MS = 1_000;
 /** Sessions discovery lists, one root's children among them. */
 const DISCOVERY_SESSIONS = 10_501;
 const ROOT_CHILDREN = 2_400;
@@ -887,6 +894,153 @@ describe.skipIf(!ENABLED)("perf: v2 event-loop stalls", () => {
       rmSync(storeDir, { recursive: true, force: true });
     }
   }, 900_000);
+
+  it(`a child write and a child deletion in a ${SWEEP_STORE_CARDS}-card store never block the loop over ${BUDGET_MS} ms`, async () => {
+    const v2 = await makeV2PartsDb();
+    v2.db.exec("PRAGMA synchronous = OFF");
+    const storeDir = mkdtempSync(join(tmpdir(), "recall-perf-v2-child-"));
+    const slow = slowLog();
+    try {
+      const at = Date.now();
+      const t0 = at - 2 * 86_400_000;
+      const w = v2.db;
+      const root = "ses_family_root";
+      const child = "ses_family_child";
+      let seq = 0;
+      const say = (sid: string, text: string, t: number): string => {
+        const id = `msg_${sid}_${++seq}`;
+        insertMessage(w, {
+          id,
+          session_id: sid,
+          type: "user",
+          seq,
+          time_created: t,
+          data: userData(text, t),
+        });
+        return id;
+      };
+      w.tx(() => {
+        insertProject(w, { id: "prj", worktree: "/workspace/perf" });
+        for (const [sid, parent] of [
+          [root, null],
+          [child, root],
+        ] as const) {
+          insertSession(w, {
+            id: sid,
+            project_id: "prj",
+            directory: "/workspace/perf",
+            parent_id: parent,
+            title: `Family ${sid}`,
+            time_created: t0,
+            time_updated: t0 + 10,
+          });
+          for (let m = 0; m < 4; m++) say(sid, sentence(m, 30), t0 + m);
+        }
+      });
+
+      const fx = await openFixture(v2, storeDir, slow);
+      const source = createV2HistorySource(fx.reader);
+      const inner = createV2Sync(fx.reader, { pollIntervalMs: 3_600_000 });
+      // The filler cards stand for sessions this opencode.db does not hold.
+      const sync: DistillSync = { ...inner, missing: async () => [] };
+      const logs: string[] = [];
+      const distiller = createDistiller({
+        source,
+        store: fx.store,
+        gate: createFetchGate({ concurrency: DEFAULTS.concurrency }),
+        limits: { ...DEFAULTS, distillDelayMs: 0 },
+        instanceId: "perf-v2-child",
+        discover: () => pagedDiscover(source),
+        sync,
+        projectorGen: V2_PROJECTOR_GEN,
+        idleDebounceMs: 1,
+        yieldBetween: macrotask,
+        log: (line) => logs.push(line),
+      });
+      const rollup = () => fx.store.getCard(root)?.familyRollup ?? [];
+      const results: Record<string, number> = {};
+      const windows: Record<string, { from: number; to: number }> = {};
+      const probe = stallProbe();
+      let load = "";
+      try {
+        distiller.start();
+        await until(
+          () =>
+            distiller.status().coldPass === "done" && distiller.repair()?.sweep?.running !== true,
+          "the first build",
+        );
+        expect(rollup().map((entry) => entry.sessionId)).toEqual([child]);
+
+        // The rest of a long-used store, the root's other children among it,
+        // all older than the child's next message.
+        const corpus = perfCorpus({ now: t0 });
+        for (let i = 0; i < SWEEP_STORE_CARDS - 2; i++) {
+          const card = { ...corpus.card(i), projectorGen: V2_PROJECTOR_GEN };
+          const member = i < FAMILY_CHILDREN ? { rootId: root, parentId: root } : {};
+          fx.store.replaceSessionParts(corpus.id(i), [], { ...card, ...member });
+        }
+        load = loadAverage();
+
+        // The child gets a message: its write recomputes the root's rollup.
+        const message = say(child, sentence(9, 30), at);
+        w.run("UPDATE session_v2 SET time_updated = ? WHERE id = ?", [at, child]);
+        probe.reset();
+        let start = performance.now();
+        distiller.onEvent({ type: "turn-ended", sessionID: child });
+        await until(
+          () => rollup()[0]?.sessionId === child && rollup()[0]?.messageId === message,
+          "the child write",
+        );
+        windows.write = { from: start, to: performance.now() };
+        results.writeTotalMs = windows.write.to - start;
+        Object.assign(results, stallFields("write", await probe.stalls(windows.write)));
+        results.writeRollup = rollup().length;
+
+        // The child is deleted: the root's rollup is recomputed without it.
+        probe.reset();
+        start = performance.now();
+        distiller.onEvent({ type: "deleted", sessionID: child });
+        await until(
+          () => rollup().length > 0 && rollup().every((entry) => entry.sessionId !== child),
+          "the child deletion",
+        );
+        windows.delete = { from: start, to: performance.now() };
+        results.deleteTotalMs = windows.delete.to - start;
+        Object.assign(results, stallFields("delete", await probe.stalls(windows.delete)));
+        results.deleteRollup = rollup().length;
+        results.cards = fx.store.cardCount();
+      } catch (error) {
+        console.log("distiller log:", JSON.stringify(logs.slice(-30)));
+        throw error;
+      } finally {
+        await distiller.stop();
+        probe.stop();
+        fx.close();
+      }
+
+      console.log(
+        `v2 child write and deletion perf (load ${load}):`,
+        JSON.stringify(rounded(results)),
+      );
+      for (const [name, window] of Object.entries(windows)) {
+        console.log(
+          `slowest synchronous calls in the ${name}:`,
+          JSON.stringify(slow.topIn(window, 6)),
+        );
+      }
+
+      expect(results.cards).toBe(SWEEP_STORE_CARDS - 1);
+      expect(results.writeRollup).toBe(12);
+      expect(results.deleteRollup).toBe(12);
+      expect(results.writeMaxSliceMs).toBeLessThan(BUDGET_MS);
+      expect(results.deleteMaxSliceMs).toBeLessThan(BUDGET_MS);
+      expect(results.writeTotalMs).toBeLessThan(CHILD_TOTAL_BUDGET_MS);
+      expect(results.deleteTotalMs).toBeLessThan(CHILD_TOTAL_BUDGET_MS);
+    } finally {
+      v2.cleanup();
+      rmSync(storeDir, { recursive: true, force: true });
+    }
+  }, 600_000);
 
   it(`paged discovery of ${DISCOVERY_SESSIONS} sessions and a ${ROOT_CHILDREN}-child root never blocks the loop over ${BUDGET_MS} ms`, async () => {
     const v2 = await makeV2PartsDb();
