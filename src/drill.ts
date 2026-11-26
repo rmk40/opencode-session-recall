@@ -480,15 +480,21 @@ export function createDrill(deps: DrillDeps): Drill {
   /**
    * A point lookup, from the cache or fetched and cached; null when the source
    * has no such message. Only a not-found is cached as null: any other failure
-   * may be transient, so the next query asks again. Point lookups differ from
-   * query to query, so their cached chars are capped at the per-session budget;
-   * reaching the cap empties the point cache before the next one is added, and
-   * drops the cached build, which may hold the emptied lookups.
+   * may be transient, so the next query asks again.
+   *
+   * Point lookups differ from query to query, so their cached chars are capped
+   * at the per-session budget. A lookup that would pass the cap first drops
+   * every cached lookup outside `own`, the ids the current query has asked for,
+   * and drops the cached build, which may hold them. The query's own lookups
+   * stay, so repeating it refetches nothing, and they may pass the cap by about
+   * one message: the lookup loop checks the per-session budget before each
+   * fetch, so a query's lookups stop within one message of it.
    */
   async function pointAt(
     entry: SessionEntry,
     target: DrillTarget,
     messageID: string,
+    own: ReadonlySet<string>,
   ): Promise<DrilledMessage | null> {
     const hit = entry.points.get(messageID);
     if (hit !== undefined) return hit;
@@ -501,9 +507,13 @@ export function createDrill(deps: DrillDeps): Drill {
     }
     const msg = prepare(lookup.value, target);
     if (entry.pointChars + msg.chars > limits.drillCharsPerSession) {
-      charge(entry, -entry.pointChars);
-      entry.points.clear();
-      entry.pointChars = 0;
+      for (const [id, cached] of entry.points) {
+        if (own.has(id)) continue;
+        entry.points.delete(id);
+        if (!cached) continue;
+        entry.pointChars -= cached.chars;
+        charge(entry, -cached.chars);
+      }
       entry.build = undefined;
     }
     entry.points.set(messageID, msg);
@@ -558,10 +568,12 @@ export function createDrill(deps: DrillDeps): Drill {
         if (hit.prevMessageId) wanted.add(hit.prevMessageId);
         if (hit.nextMessageId) wanted.add(hit.nextMessageId);
       }
+      const asked = new Set<string>();
       for (const messageID of wanted) {
         if (retained >= limits.drillCharsPerSession) break;
         if (byId.has(messageID)) continue;
-        const msg = await pointAt(entry, target, messageID);
+        asked.add(messageID);
+        const msg = await pointAt(entry, target, messageID, asked);
         if (!msg) continue;
         byId.set(msg.message.info.id, msg);
         retained += msg.retained;
