@@ -45,6 +45,35 @@ describe("v1EventToSignal", () => {
     });
   });
 
+  it("maps session.updated to a patch of the archive time alone", () => {
+    const updated = (info: unknown) =>
+      v1EventToSignal(event("session.updated", { sessionID: "s1", info }));
+    expect(
+      updated({ title: "Renamed", time: { created: 1, updated: 2, archived: 5_000 } }),
+    ).toEqual({
+      type: "meta",
+      sessionID: "s1",
+      patch: { timeArchived: 5_000 },
+    });
+    // Anything but a finite number is a session that is not archived.
+    for (const info of [
+      { time: { created: 1, updated: 2 } },
+      { time: { archived: "5000" } },
+      { time: { archived: Number.NaN } },
+      { time: { archived: Number.POSITIVE_INFINITY } },
+      { time: null },
+      {},
+      null,
+      undefined,
+    ]) {
+      expect(updated(info), JSON.stringify(info)).toEqual({
+        type: "meta",
+        sessionID: "s1",
+        patch: { timeArchived: null },
+      });
+    }
+  });
+
   it("ignores every other event", () => {
     expect(v1EventToSignal(event("message.updated", { sessionID: "s1", info: {} }))).toBeNull();
   });

@@ -9,6 +9,8 @@ import {
   type Card,
   type PartTextRow,
   type RangeHash,
+  type SessionTail,
+  type SettledBase,
   type Store,
   type StoreIdentity,
   type StoreOptions,
@@ -1978,6 +1980,453 @@ describe("metadata and owned-column writes", () => {
       result: { changed: false },
       rev: 0,
     });
+    db.close();
+  });
+});
+
+describe("archive time patches", () => {
+  it("patchCardMeta writes the archive time with a revision only when it changes, and null clears it", async () => {
+    const { db, store } = await fresh();
+    store.replaceSessionParts("s1", [], makeCard("s1", { title: "T" }));
+    embed(store, "s1");
+    const steps: Array<{
+      name: string;
+      patch: { title?: string; timeArchived?: number | null };
+      changed: boolean;
+      archived: number | undefined;
+    }> = [
+      { name: "archive", patch: { timeArchived: 5000 }, changed: true, archived: 5000 },
+      { name: "same archive time", patch: { timeArchived: 5000 }, changed: false, archived: 5000 },
+      { name: "archive time left out", patch: { title: "T" }, changed: false, archived: 5000 },
+      { name: "archived again", patch: { timeArchived: 6000 }, changed: true, archived: 6000 },
+      { name: "unarchive", patch: { timeArchived: null }, changed: true, archived: undefined },
+      {
+        name: "unarchive again",
+        patch: { timeArchived: null },
+        changed: false,
+        archived: undefined,
+      },
+    ];
+    for (const step of steps) {
+      const moved = counterMoves(store, () => store.patchCardMeta("s1", step.patch));
+      expect(moved.result.changed, step.name).toBe(step.changed);
+      expect(moved.rev, step.name).toBe(step.changed ? 1 : 0);
+      const card = store.getCard("s1");
+      expect(card?.timeArchived, step.name).toBe(step.archived);
+      if (step.changed) expect(card?.writeRev, step.name).toBe(store.cardStats().cardsRev);
+      // The archive time is not part of the embedded text.
+      expect(card?.embedding, step.name).toEqual(VECTOR);
+    }
+    db.close();
+  });
+});
+
+describe("tail writes", () => {
+  /** The settled base of a card distilled against a running tail: messages
+   *  m-1 and m-2, one slim-index row each. */
+  const base: SettledBase = {
+    seq: 2,
+    messageId: "m-2",
+    rows: 2,
+    partCount: 2,
+    summaryHead: "alpha",
+    outcomeHead: "beta",
+    files: ["src/a.ts"],
+    tools: ["bash"],
+    errors: [],
+    cut: 0,
+  };
+  const baseRows = [
+    makePart("p1", "alpha", { messageId: "m-1", nextMessageId: "m-2" }),
+    makePart("p2", "beta", { messageId: "m-2", prevMessageId: "m-1", nextMessageId: "m-3" }),
+  ];
+  /** A row of the tail, whose message follows the base's newest one. */
+  const tailRow = (partId: string, raw: string, messageId = "m-3"): PartTextRow =>
+    makePart(partId, raw, { messageId, prevMessageId: "m-2" });
+  const tail = (over: Partial<SessionTail> = {}): SessionTail => ({
+    base,
+    evict: 0,
+    rows: [tailRow("p3", "gammaold")],
+    firstMessageId: "m-3",
+    ...over,
+  });
+  const found = (store: Store, word: string): string[] =>
+    sessions(store.ftsSearch({ strong: [word], weak: [] }));
+
+  /** s1 as a full write over its running tail stores it, with one range hash. */
+  async function seeded() {
+    const ctx = await fresh();
+    const card = makeCard("s1", {
+      distillState: "full",
+      distilledThrough: "m-3",
+      partCount: 3,
+      distillCursor: "c-1",
+      projectorGen: 2,
+      settledBase: base,
+    });
+    ctx.store.replaceSessionParts("s1", [...baseRows, tailRow("p3", "gammaold")], card, {
+      rangeHashes: [rangeHash(0)],
+    });
+    const rows = () =>
+      ctx.db.all(
+        "SELECT part_id, message_id, prev_message_id, next_message_id, raw FROM part_text WHERE session_id = ? ORDER BY id",
+        ["s1"],
+      );
+    return { ...ctx, card, rows };
+  }
+
+  it("replaces the rows past the base, keeps the base's, and recomputes the card from both with one revision", async () => {
+    const { db, store, card, rows } = await seeded();
+    const next = [tailRow("p3", "gammanew"), tailRow("p4", "delta")];
+    let recomputedFrom: PartTextRow[] = [];
+    const moved = counterMoves(store, () =>
+      store.replaceSessionTail("s1", tail({ rows: next }), (all) => {
+        recomputedFrom = all;
+        return { ...card, partCount: all.length, distillCursor: "c-2" };
+      }),
+    );
+    expect(moved).toMatchObject({ result: { changed: true }, rev: 1, stamped: 1 });
+    expect(recomputedFrom).toEqual([...baseRows, ...next]);
+    expect(store.getCard("s1")).toMatchObject({
+      partCount: 4,
+      distillCursor: "c-2",
+      settledBase: base,
+      writeRev: store.cardStats().cardsRev,
+    });
+    expect(rows().map((row) => row.part_id)).toEqual(["p1", "p2", "p3", "p4"]);
+    expect(found(store, "alpha")).toEqual(["s1"]);
+    expect(found(store, "gammanew")).toEqual(["s1"]);
+    expect(found(store, "gammaold")).toEqual([]);
+    db.close();
+  });
+
+  it.each<{ name: string; first: string | null; next: PartTextRow[] }>([
+    { name: "a new first message", first: "m-5", next: [tailRow("p5", "epsilon", "m-5")] },
+    { name: "none when the tail has no message", first: null, next: [] },
+  ])("points the base's newest message at $name, leaving older ones", async ({ first, next }) => {
+    const { db, store, card, rows } = await seeded();
+    expect(
+      store.replaceSessionTail("s1", tail({ rows: next, firstMessageId: first }), (all) => ({
+        ...card,
+        partCount: all.length,
+      })),
+    ).toEqual({ changed: true });
+    expect(rows().map((row) => [row.message_id, row.next_message_id])).toEqual([
+      ["m-1", "m-2"],
+      ["m-2", first],
+      ...next.map((row) => [row.messageId, null]),
+    ]);
+    db.close();
+  });
+
+  it("evicts the base's oldest rows, from the index too", async () => {
+    const { db, store, card, rows } = await seeded();
+    const next = [tailRow("p3", "gammaold"), tailRow("p4", "delta")];
+    expect(
+      store.replaceSessionTail("s1", tail({ evict: 1, rows: next }), (all) => ({
+        ...card,
+        partCount: all.length,
+      })),
+    ).toEqual({ changed: true });
+    expect(rows().map((row) => row.part_id)).toEqual(["p2", "p3", "p4"]);
+    expect(found(store, "alpha")).toEqual([]);
+    expect(found(store, "beta")).toEqual(["s1"]);
+    db.close();
+  });
+
+  it("writes only the checkpoint, generation and settled base when no row and nothing a reader sees changed", async () => {
+    const { db, store, card } = await seeded();
+    embed(store, "s1");
+    const before = store.getCard("s1");
+    const later: SettledBase = { ...base, seq: 3 };
+    const moved = counterMoves(store, () =>
+      store.replaceSessionTail(
+        "s1",
+        tail(),
+        () => ({ ...card, distillCursor: "c-2", projectorGen: 3, settledBase: later }),
+        { rangeHashes: [rangeHash(500)] },
+      ),
+    );
+    expect(moved).toMatchObject({ result: { changed: false }, rev: 0, stamped: 0 });
+    expect(store.getCard("s1")).toEqual({
+      ...before,
+      distillCursor: "c-2",
+      projectorGen: 3,
+      settledBase: later,
+    });
+    expect(store.getRangeHashes("s1")).toEqual([rangeHash(0), rangeHash(500)]);
+    db.close();
+  });
+
+  it.each<{ name: string; tail: Partial<SessionTail>; card?: Partial<Card> }>([
+    { name: "replaces a tail row", tail: { rows: [tailRow("p3", "gammanew")] } },
+    { name: "evicts a base row", tail: { evict: 1 } },
+    { name: "repoints the base's newest message", tail: { firstMessageId: "m-9" } },
+    { name: "changes the card", tail: {}, card: { title: "Renamed" } },
+  ])("rewrites with a revision when the write $name", async ({ tail: over, card: change }) => {
+    const { db, store, card } = await seeded();
+    const moved = counterMoves(store, () =>
+      store.replaceSessionTail("s1", tail(over), () => ({ ...card, ...change })),
+    );
+    expect(moved).toMatchObject({ result: { changed: true }, rev: 1, stamped: 1 });
+    expect(store.getCard("s1")?.writeRev).toBe(store.cardStats().cardsRev);
+    db.close();
+  });
+
+  it("matches the stored base whatever order the caller's fields come in", async () => {
+    const { db, store, card } = await seeded();
+    const reordered = Object.fromEntries(Object.entries(base).reverse()) as SettledBase;
+    expect(store.replaceSessionTail("s1", tail({ base: reordered, rows: [] }), () => card)).toEqual(
+      { changed: true },
+    );
+    db.close();
+  });
+
+  /** The seeded card with its settled base replaced (or dropped), as another
+   *  write over the same rows would store it. */
+  function rewriteBase(store: Store, card: Card, next: SettledBase | undefined): void {
+    const rewritten: Card = { ...card };
+    if (next) rewritten.settledBase = next;
+    else delete rewritten.settledBase;
+    store.replaceSessionParts("s1", [...baseRows, tailRow("p3", "gammaold")], rewritten);
+  }
+
+  it.each<{
+    name: string;
+    setup?: (store: Store, card: Card) => void;
+    tail?: Partial<SessionTail>;
+  }>([
+    {
+      name: "the card holds another base",
+      setup: (store, card) => rewriteBase(store, card, { ...base, seq: 3 }),
+    },
+    {
+      name: "the card holds no base",
+      setup: (store, card) => rewriteBase(store, card, undefined),
+    },
+    { name: "the session has no card", setup: (store) => void store.deleteSession("s1") },
+    {
+      name: "the card holds fewer rows than its base",
+      setup: (store, card) => rewriteBase(store, card, { ...base, rows: 4 }),
+      tail: { base: { ...base, rows: 4 } },
+    },
+    { name: "the eviction is negative", tail: { evict: -1 } },
+    { name: "the eviction passes the base", tail: { evict: 3 } },
+    { name: "the eviction is not a whole row count", tail: { evict: 0.5 } },
+  ])("refuses as base-changed and writes nothing when $name", async ({ setup, tail: over }) => {
+    const { db, store, card, rows } = await seeded();
+    setup?.(store, card);
+    const before = store.getCard("s1");
+    const storedRows = rows();
+    const hashes = store.getRangeHashes("s1");
+    const moved = counterMoves(store, () =>
+      store.replaceSessionTail(
+        "s1",
+        tail({ rows: [tailRow("p4", "refusedword")], ...over }),
+        (all) => ({ ...card, partCount: all.length }),
+        { rangeHashes: [rangeHash(500)], replaceRangeHashes: true },
+      ),
+    );
+    expect(moved).toMatchObject({
+      result: { changed: false, refused: "base-changed" },
+      rev: 0,
+      stamped: 0,
+    });
+    expect(store.getCard("s1")).toEqual(before);
+    expect(rows()).toEqual(storedRows);
+    expect(store.getRangeHashes("s1")).toEqual(hashes);
+    expect(found(store, "refusedword")).toEqual([]);
+    db.close();
+  });
+
+  it("refuses a tail whose card is below the stored generation, writing nothing", async () => {
+    const { db, store, card, rows } = await seeded();
+    const before = store.getCard("s1");
+    const storedRows = rows();
+    const moved = counterMoves(store, () =>
+      store.replaceSessionTail(
+        "s1",
+        tail({ evict: 1, rows: [tailRow("p4", "rolledback", "m-4")], firstMessageId: "m-4" }),
+        (all) => ({ ...card, partCount: all.length, projectorGen: 1 }),
+        { rangeHashes: [rangeHash(500)], replaceRangeHashes: true },
+      ),
+    );
+    expect(moved).toMatchObject({
+      result: { changed: false, refused: "older-generation" },
+      rev: 0,
+      stamped: 0,
+    });
+    expect(store.getCard("s1")).toEqual(before);
+    expect(rows()).toEqual(storedRows);
+    expect(found(store, "alpha")).toEqual(["s1"]);
+    expect(found(store, "rolledback")).toEqual([]);
+    expect(store.getRangeHashes("s1")).toEqual([rangeHash(0)]);
+    db.close();
+  });
+
+  it("keeps the stored generation unless the recomputed card names one", async () => {
+    const { db, store, card } = await seeded();
+    const unstamped: Card = { ...card };
+    delete unstamped.projectorGen;
+    store.replaceSessionTail("s1", tail({ rows: [tailRow("p3", "gammanew")] }), () => unstamped);
+    expect(store.getCard("s1")?.projectorGen).toBe(2);
+    store.replaceSessionTail("s1", tail({ rows: [tailRow("p3", "gammanewer")] }), () => ({
+      ...card,
+      projectorGen: 3,
+    }));
+    expect(store.getCard("s1")?.projectorGen).toBe(3);
+    db.close();
+  });
+
+  it("stores range hashes with the write, replacing the session's only when asked", async () => {
+    const { db, store, card } = await seeded();
+    store.replaceSessionTail("s1", tail({ rows: [tailRow("p3", "gammanew")] }), () => card, {
+      rangeHashes: [rangeHash(500)],
+    });
+    expect(store.getRangeHashes("s1")).toEqual([rangeHash(0), rangeHash(500)]);
+    store.replaceSessionTail("s1", tail({ rows: [tailRow("p3", "gammanewer")] }), () => card, {
+      rangeHashes: [rangeHash(500, "trimmed")],
+      replaceRangeHashes: true,
+    });
+    expect(store.getRangeHashes("s1")).toEqual([rangeHash(500, "trimmed")]);
+    db.close();
+  });
+
+  it("keeps the repair reason, as an append does", async () => {
+    const { db, store, card } = await seeded();
+    store.markRepairPending("s1", "malformed");
+    expect(
+      store.replaceSessionTail("s1", tail({ rows: [tailRow("p3", "gammanew")] }), () => card),
+    ).toEqual({ changed: true });
+    expect(store.getCard("s1")?.repairReason).toBe("malformed");
+    db.close();
+  });
+});
+
+describe("settled base", () => {
+  const base: SettledBase = {
+    seq: 4,
+    messageId: "m-p2",
+    rows: 2,
+    partCount: 2,
+    summaryHead: "alpha",
+    outcomeHead: "",
+    files: [],
+    tools: [],
+    errors: ["boom"],
+    cut: 1,
+  };
+
+  it("is written with every replace, suppressed or not, and never makes one change", async () => {
+    const { db, store } = await fresh();
+    const rows = [makePart("p1", "alpha"), makePart("p2", "beta")];
+    const card = makeCard("s1", { distillState: "full", distillCursor: "c-1", settledBase: base });
+    store.replaceSessionParts("s1", rows, card);
+    expect(store.getCard("s1")?.settledBase).toEqual(base);
+
+    const later: SettledBase = { ...base, seq: 5, rows: 1 };
+    let moved = counterMoves(store, () =>
+      store.replaceSessionParts("s1", rows, { ...card, distillCursor: "c-2", settledBase: later }),
+    );
+    expect(moved).toMatchObject({ result: { changed: false }, rev: 0 });
+    expect(store.getCard("s1")).toMatchObject({ distillCursor: "c-2", settledBase: later });
+
+    // A card written against a settled tail carries no base: the stored one goes.
+    const settled: Card = { ...card, distillCursor: "c-3" };
+    delete settled.settledBase;
+    moved = counterMoves(store, () => store.replaceSessionParts("s1", rows, settled));
+    expect(moved).toMatchObject({ result: { changed: false }, rev: 0 });
+    expect(store.getCard("s1")?.settledBase).toBeUndefined();
+
+    moved = counterMoves(store, () =>
+      store.replaceSessionParts("s1", rows, { ...card, title: "Renamed" }),
+    );
+    expect(moved).toMatchObject({ result: { changed: true }, rev: 1 });
+    expect(store.getCard("s1")?.settledBase).toEqual(base);
+    db.close();
+  });
+
+  it("is written by an append, suppressed or not", async () => {
+    const { db, store } = await fresh();
+    const card = makeCard("s1", {
+      distillState: "full",
+      distilledThrough: "m-p2",
+      distillCursor: "c-1",
+    });
+    store.replaceSessionParts(
+      "s1",
+      [makePart("p1", "alpha"), makePart("p2", "beta", { nextMessageId: "m-p3" })],
+      card,
+    );
+    const boundary = { checkpointMessageId: "m-p2", firstNewMessageId: "m-p3" };
+    let moved = counterMoves(store, () =>
+      store.appendSessionParts("s1", [], 0, boundary, () => ({ ...card, settledBase: base })),
+    );
+    expect(moved).toMatchObject({ result: { changed: false }, rev: 0 });
+    expect(store.getCard("s1")?.settledBase).toEqual(base);
+
+    const later: SettledBase = { ...base, seq: 5 };
+    moved = counterMoves(store, () =>
+      store.appendSessionParts("s1", [makePart("p3", "gamma")], 0, boundary, (all) => ({
+        ...card,
+        partCount: all.length,
+        settledBase: later,
+      })),
+    );
+    expect(moved).toMatchObject({ result: { changed: true }, rev: 1 });
+    expect(store.getCard("s1")?.settledBase).toEqual(later);
+    db.close();
+  });
+
+  it("is dropped by refreshCardMeta with the checkpoint it belongs to, and kept by patchCardMeta", async () => {
+    const { db, store } = await fresh();
+    const meta = { title: "T", directory: "/d", projectId: "prj", timeUpdated: 1000 };
+    const card = makeCard("s1", { ...meta, distillCursor: "c-1", settledBase: base });
+    store.replaceSessionParts("s1", [], card);
+    expect(store.patchCardMeta("s1", { title: "T2" })).toEqual({ changed: true });
+    expect(store.getCard("s1")?.settledBase).toEqual(base);
+
+    // Nothing differs: only the checkpoint is written, and the base goes.
+    expect(store.refreshCardMeta("s1", { ...meta, title: "T2" }, "c-2")).toEqual({
+      changed: false,
+    });
+    expect(store.getCard("s1")?.distillCursor).toBe("c-2");
+    expect(store.getCard("s1")?.settledBase).toBeUndefined();
+
+    // Something differs: the same.
+    store.replaceSessionParts("s1", [], card);
+    expect(store.getCard("s1")?.settledBase).toEqual(base);
+    expect(store.refreshCardMeta("s1", { ...meta, timeUpdated: 2000 }, "c-3")).toEqual({
+      changed: true,
+    });
+    expect(store.getCard("s1")?.settledBase).toBeUndefined();
+    db.close();
+  });
+
+  it("reads a stored value that is not a whole base as none", async () => {
+    const { db, store } = await fresh();
+    store.replaceSessionParts("s1", [], makeCard("s1", { settledBase: base }));
+    const withoutCut: Record<string, unknown> = { ...base };
+    delete withoutCut.cut;
+    for (const stored of [
+      "not json",
+      "[]",
+      "null",
+      JSON.stringify(withoutCut),
+      JSON.stringify({ ...base, seq: null }),
+      JSON.stringify({ ...base, messageId: 3 }),
+      JSON.stringify({ ...base, rows: -1 }),
+      JSON.stringify({ ...base, cut: 1.5 }),
+      JSON.stringify({ ...base, files: [1] }),
+      JSON.stringify({ ...base, summaryHead: null }),
+    ]) {
+      db.run("UPDATE card SET settled_base = ? WHERE session_id = ?", [stored, "s1"]);
+      expect(store.getCard("s1")?.settledBase, stored).toBeUndefined();
+    }
+    // A base with no message of its own is whole.
+    const empty: SettledBase = { ...base, messageId: null, rows: 0 };
+    db.run("UPDATE card SET settled_base = ? WHERE session_id = ?", [JSON.stringify(empty), "s1"]);
+    expect(store.getCard("s1")?.settledBase).toEqual(empty);
     db.close();
   });
 });

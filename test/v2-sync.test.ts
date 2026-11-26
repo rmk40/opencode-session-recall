@@ -13,6 +13,8 @@ import { createFetchGate } from "../src/fetch-gate.js";
 import { openStore, type Store } from "../src/store.js";
 import { openSqlite, type ReadOnlyDb, type SqliteDb } from "../src/sqlite.js";
 import { createV2HistorySource, openOpencodeDb } from "../src/history/v2.js";
+import { createV2EventMapper } from "../src/history/v2-events.js";
+import { sessions as sessionsTool } from "../src/sessions.js";
 import {
   createV2Sync,
   POLL_CURSOR_KEY,
@@ -30,7 +32,7 @@ import {
   type SessionInsert,
   type V2TestDb,
 } from "./v2-db.js";
-import { TEST_LIMITS } from "./helpers.js";
+import { runTool, TEST_LIMITS } from "./helpers.js";
 
 /**
  * The v2 distiller's freshness without events:
@@ -407,6 +409,22 @@ describe("v2 poll queries", () => {
     expect(metaIds.sort()).toEqual(["ses_idle", "ses_null"]);
   });
 
+  it("patches each scanned session's archive time, null for one that is not archived", async () => {
+    const at = Date.now();
+    addSession("ses_arch", at - 1_000, { time_archived: at - 1_500 });
+    addSession("ses_live", at - 1_000);
+    const sync = createV2Sync(reader, { sessionScanEveryMs: 0, yieldBetween: async () => {} });
+    const meta = memoryMeta();
+    meta.set(SESSION_WATERMARK_KEY, String(at - 10_000));
+    const patches = (await pollOnce(sync, meta)).flatMap((s) =>
+      s.type === "meta" ? [[s.sessionID, s.patch?.timeArchived]] : [],
+    );
+    expect(patches.sort()).toEqual([
+      ["ses_arch", at - 1_500],
+      ["ses_live", null],
+    ]);
+  });
+
   it("pages a window by (time, session) and moves the watermark once it drains", async () => {
     const at = Date.now();
     addSession("ses_a", at - 10_000);
@@ -595,6 +613,77 @@ describe("v2 poll queries", () => {
     });
     const signals = await pollOnce(sync, memoryMeta());
     expect(signals.map((s) => s.sessionID)).toEqual(["ses_new"]);
+  });
+});
+
+describe("archive state in recall_sessions", () => {
+  type Listing = { ok: boolean; sessions: Array<{ id: string; archived: boolean }> };
+
+  /** What recall_sessions, listing from the cards, reports for a session's
+   *  archive state. */
+  async function listedArchived(id: string): Promise<boolean | undefined> {
+    const tool = sessionsTool(
+      createV2HistorySource(reader, { yieldBetween: async () => {} }),
+      true,
+      TEST_LIMITS,
+      { cards: () => store.allCards() },
+    );
+    const out = await runTool<Listing>(tool, { scope: "global", since: "1d" });
+    expect(out.ok).toBe(true);
+    return out.sessions.find((s) => s.id === id)?.archived;
+  }
+
+  it("follows an archive and an unarchive with no new messages through the session scan", async () => {
+    const at = Date.now();
+    addSession("ses_1", at - 10_000);
+    addRow("ses_1", "user", user("archneedle", at - 9_000), at - 9_000);
+    const d = startDistiller();
+    await waitFor(() => d.status().coldPass === "done");
+    expect(await listedArchived("ses_1")).toBe(false);
+
+    // opencode moves the session's time_updated with its archive time.
+    const archivedAt = Date.now();
+    v2db.db.run("UPDATE session_v2 SET time_archived = ?, time_updated = ? WHERE id = ?", [
+      archivedAt,
+      archivedAt,
+      "ses_1",
+    ]);
+    await waitFor(() => store.getCard("ses_1")?.timeArchived === archivedAt);
+    expect(await listedArchived("ses_1")).toBe(true);
+
+    v2db.db.run("UPDATE session_v2 SET time_archived = NULL, time_updated = ? WHERE id = ?", [
+      archivedAt + 1,
+      "ses_1",
+    ]);
+    await waitFor(() => store.getCard("ses_1")?.timeArchived === undefined);
+    expect(await listedArchived("ses_1")).toBe(false);
+    expect(hits("archneedle")).toEqual(["ses_1"]);
+  });
+
+  it("follows an archive and an unarchive from their events alone", async () => {
+    const at = Date.now();
+    addSession("ses_1", at - 10_000);
+    addRow("ses_1", "user", user("archneedle", at - 9_000), at - 9_000);
+    const d = startDistiller({ sessionScanEveryMs: 1e12 });
+    await waitFor(() => d.status().coldPass === "done");
+    const mapper = createV2EventMapper({ emit: (signal) => d.onEvent(signal) });
+    try {
+      // Only the session row changes, and no poll window sees it.
+      v2db.db.run("UPDATE session_v2 SET time_archived = ? WHERE id = ?", [at, "ses_1"]);
+      await new Promise((resolve) => setTimeout(resolve, 60));
+      expect(store.getCard("ses_1")?.timeArchived).toBeUndefined();
+
+      mapper.map({ type: "session.archived", data: { sessionID: "ses_1" } });
+      await waitFor(() => store.getCard("ses_1")?.timeArchived === at);
+      expect(await listedArchived("ses_1")).toBe(true);
+
+      v2db.db.run("UPDATE session_v2 SET time_archived = NULL WHERE id = ?", ["ses_1"]);
+      mapper.map({ type: "session.unarchived", data: { sessionID: "ses_1" } });
+      await waitFor(() => store.getCard("ses_1")?.timeArchived === undefined);
+      expect(await listedArchived("ses_1")).toBe(false);
+    } finally {
+      mapper.dispose();
+    }
   });
 });
 
