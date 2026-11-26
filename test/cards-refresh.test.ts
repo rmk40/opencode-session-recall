@@ -150,6 +150,30 @@ function gate(): {
   };
 }
 
+/** A `yieldBetween` that passes straight through until `hold()`, then keeps
+ *  every chunked build waiting until `release()`. */
+function holdable(): {
+  yieldBetween: () => Promise<void>;
+  hold: () => void;
+  release: () => void;
+  held: () => number;
+} {
+  let holding = false;
+  const waiting: Array<() => void> = [];
+  return {
+    yieldBetween: () =>
+      holding ? new Promise<void>((resolve) => waiting.push(resolve)) : Promise.resolve(),
+    hold: () => {
+      holding = true;
+    },
+    release: () => {
+      holding = false;
+      for (const resolve of waiting.splice(0)) resolve();
+    },
+    held: () => waiting.length,
+  };
+}
+
 /** Lets every pending callback run. */
 const settle = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0));
 
@@ -619,6 +643,165 @@ describe("ready() without the index", () => {
     await Promise.all([building, reading]);
     await runtime.ready({ index: true });
     expect(ids(runtime.rank(parseQuery("arrival"), {}))).toEqual(["late"]);
+  });
+});
+
+describe("a full reload during the first index build", () => {
+  /** Rankings a runtime built from scratch over `source` gives. */
+  const freshRanks = (source: CardSource): string[][] => {
+    const fresh = createCardsRuntime({ source });
+    return ["alpha", "omega"].map((q) => ids(fresh.rank(parseQuery(q), {})));
+  };
+
+  it("leaves no changed, added or deleted card behind on cards-lite", async () => {
+    let liteCards = ["a", "b", "c"].map((id) => makeCard(id, { title: `${id} alpha` }));
+    const source: CardSource = {
+      getCards: () => liteCards,
+      revision: () => undefined,
+      degraded: true,
+    };
+    const slices = gate();
+    slowSlices();
+    const runtime = createCardsRuntime({
+      source,
+      now: () => 1_000,
+      yieldBetween: slices.yieldBetween,
+    });
+    // The first build takes its snapshot and stops after one slice.
+    const building = runtime.ready({ index: true });
+    await settle();
+    expect(slices.yields()).toBe(1);
+
+    // "a" changes, "b" goes and "d" arrives; the reload lands beside the build.
+    liteCards = [
+      makeCard("a", { title: "a omega" }),
+      liteCards[2]!,
+      makeCard("d", { title: "d alpha" }),
+    ];
+    runtime.invalidate();
+    await runtime.ready();
+    slices.open();
+    await building;
+
+    const ranks = ["alpha", "omega"].map((q) => ids(runtime.rank(parseQuery(q), {})));
+    expect(ranks).toEqual(freshRanks(source));
+    expect(ranks).toEqual([["c", "d"], ["a"]]);
+  });
+
+  it("leaves no changed, added or deleted card behind on a store", async () => {
+    const store = await freshStore();
+    for (const id of ["s1", "s2", "s3"]) put(store, id, { inventory: "alpha" });
+    const slices = gate();
+    slowSlices();
+    const runtime = createCardsRuntime({
+      source: storeCardSource(store),
+      refreshIntervalMs: 0,
+      yieldBetween: slices.yieldBetween,
+    });
+    const building = runtime.ready({ index: true });
+    await settle();
+    expect(slices.yields()).toBe(1);
+
+    // An older build rewrites s1 without stamping it, which only a full
+    // reload applies; s2 goes and s4 arrives.
+    store.upsertCard(makeCard("s1", { inventory: "omega" }));
+    store.setMeta(CARDS_REV_KEY, String(Number(store.getMeta(CARDS_REV_KEY)) + 1));
+    store.deleteSession("s2");
+    put(store, "s4", { inventory: "alpha" });
+    await runtime.ready();
+    slices.open();
+    await building;
+
+    const ranks = ["alpha", "omega"].map((q) => ids(runtime.rank(parseQuery(q), {})));
+    expect(ranks).toEqual(freshRanks(storeCardSource(store)));
+    expect(ranks).toEqual([["s3", "s4"], ["s1"]]);
+  });
+});
+
+describe("vectors behind a card's content", () => {
+  it("never scores new content with the old vector while a reload under another stamp waits", async () => {
+    const store = await freshStore();
+    for (let i = 0; i < 5; i++) put(store, cardId(i), { inventory: `other${i} ${SUBST}` });
+    put(store, "s-x", { inventory: `alpha ${SUBST}` });
+    const embed = vi.fn((text: string) =>
+      Float32Array.from(
+        text.includes("alpha") ? [1, 0] : text.includes("omega") ? [0, 1] : [0.6, 0.8],
+      ),
+    );
+    const slices = holdable();
+    const runtime = createCardsRuntime({
+      source: storeCardSource(store),
+      embedder: { ready: true, embed },
+      semanticWeight: 0.5,
+      semanticModel: MODEL,
+      refreshIntervalMs: 0,
+      yieldBetween: slices.yieldBetween,
+    });
+    await runtime.ready({ index: true });
+    expect(ids(runtime.rank(parseQuery("alpha"), {}))).toContain("s-x");
+
+    // Another process on another model restamps the store, and s-x changes.
+    store.writeCardEmbeddings(cardVectorStamp("model-other"), EMBED_REPRESENTATION, []);
+    put(store, "s-x", { inventory: `omega ${SUBST}` });
+    slices.hold();
+    slowSlices();
+
+    // rank() takes s-x into the index in place and starts the vector reload,
+    // which waits after its first slice: s-x's old vector must not score.
+    const meanwhile = runtime.rank(parseQuery("alpha"), {});
+    expect(slices.held()).toBe(1);
+    expect(ids(meanwhile)).not.toContain("s-x");
+
+    slices.release();
+    await runtime.ready({ index: true });
+    const after = runtime.rank(parseQuery("alpha"), {}).find((hit) => hit.sessionId === "s-x");
+    // Its new vector ([0, 1]) against the query's ([1, 0]).
+    expect(after?.semanticScore).toBeCloseTo(0.5);
+  });
+
+  it("installs reloaded vectors while another process writes between its pages, re-embedding none", async () => {
+    const store = await freshStore();
+    for (let i = 0; i < 300; i++) put(store, cardId(i), { inventory: `card${i} ${SUBST}` });
+    const embed = vi.fn(() => Float32Array.from([1, 0]));
+    // Another runtime stores every card's vector first.
+    await createCardsRuntime({
+      source: storeCardSource(store),
+      embedder: { ready: true, embed },
+      semanticWeight: 0.5,
+      semanticModel: MODEL,
+    }).ready({ index: true });
+    expect(embed).toHaveBeenCalledTimes(300);
+    embed.mockClear();
+
+    // Whenever this runtime yields, another process rewrites a stored vector
+    // (unchanged), so a vector write lands between every two pages it reads.
+    const kept = store.cardVectorsPage(undefined, 1)[0]!;
+    let embedderReady = false;
+    const runtime = createCardsRuntime({
+      source: storeCardSource(store),
+      embedder: {
+        get ready() {
+          return embedderReady;
+        },
+        embed,
+      },
+      semanticWeight: 0.5,
+      semanticModel: MODEL,
+      now: () => 1_000,
+      yieldBetween: () => {
+        store.writeCardEmbeddings(cardVectorStamp(MODEL), EMBED_REPRESENTATION, [
+          { sessionId: kept.sessionId, embedding: kept.embedding!, expectedSummaryHash: "" },
+        ]);
+        return Promise.resolve();
+      },
+    });
+    await runtime.ready({ index: true });
+    expect(runtime.semanticStatus()?.cardsWithVectors).toBe(0);
+
+    embedderReady = true;
+    await runtime.ready({ index: true });
+    expect(runtime.semanticStatus()?.cardsWithVectors).toBe(300);
+    expect(embed).not.toHaveBeenCalled();
   });
 });
 
