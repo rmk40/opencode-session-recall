@@ -625,9 +625,10 @@ export type SessionsOutput = TrimmedFields & {
   /** Children branch only: echoes the resolved parent session ID. Its presence
    *  is NOT the discrimination rule — check `scope === "children"`. */
   parentID?: string;
-  /** Children branch only: the post-filter child count across every page
-   *  (withheld foreign rows excluded). `childCount > returned` means the
-   *  listing has more pages (or the output was trimmed). */
+  /** Children branch only: the total number of children the listing holds
+   *  across all its pages, after the filters (withheld foreign rows
+   *  excluded). Every page carries the same count, the last one included,
+   *  so `nextCursor` is what says another page follows. */
   childCount?: number;
   /** More sessions match than this page holds. `nextCursor` reads them,
    *  except where the listing could not reach them, which `note` explains:
