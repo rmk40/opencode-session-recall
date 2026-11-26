@@ -524,6 +524,14 @@ export function cutNote(omittedParts: number, omittedBytes: number, nextOrdinal:
   );
 }
 
+/** The text that ends a message whose inline content a read left out because
+ *  the stored row kept changing while it was read. */
+export function changedNote(omittedParts: number, nextOrdinal: number): string {
+  return unavailableText(
+    `${omittedParts} more items left out while the row changed, continued from ordinal ${nextOrdinal}`,
+  );
+}
+
 /** `n` comma-separated SQL parameters. */
 function bindList(n: number): string {
   return Array.from({ length: n }, () => "?").join(", ");
@@ -665,7 +673,9 @@ type PartLoad = {
   rows: Row[];
   start: number;
   inlineCount?: number;
-  cut?: { nextOrdinal: number; omittedRows: number; omittedBytes: number };
+  /** `changed`: the inline content was left out because the row kept
+   *  changing, not for lack of room. */
+  cut?: { nextOrdinal: number; omittedRows: number; omittedBytes: number; changed?: boolean };
 };
 
 /** A message row's identity for change detection: a row that is rewritten
@@ -682,6 +692,13 @@ function fingerprintOf(row: Row): Fingerprint {
 
 function sameFingerprint(a: Fingerprint, b: Fingerprint): boolean {
   return a.timeUpdated === b.timeUpdated && a.bytes === b.bytes;
+}
+
+const utf8 = new TextEncoder();
+
+/** Encoded UTF-8 bytes of a value a statement returned. */
+function utf8Length(text: string): number {
+  return utf8.encode(text).length;
 }
 
 /** Inline content items in a decoded envelope. */
@@ -745,17 +762,15 @@ export function createV2HistorySource(db: ReadOnlyDb, opts: V2SourceOptions = {}
   const partsOn = schema.parts;
   const BYTES = byteLengthSql(db, "data");
   const PART_BYTES = byteLengthSql(db, "p.data");
-  /** A row's data without its inline content, and that content, as SQLite
-   *  re-encodes them (only ever evaluated on a row within the ceiling whose
-   *  data is a JSON object). */
-  const META_BYTES = byteLengthSql(db, "json_remove(data, '$.content')");
+  /** A row's inline content as SQLite re-encodes it (only ever evaluated on a
+   *  row within the ceiling whose data is valid JSON; NULL when the data has
+   *  no `content`). */
   const INLINE_BYTES = byteLengthSql(db, "json_extract(data, '$.content')");
-  /** `expr` for a row within the ceiling whose data is a JSON object, else
-   *  NULL. Binds the ceiling. Nested CASEs, so `json_type` never sees
-   *  malformed JSON and nothing parses a row over the ceiling. */
-  const ifObject = (expr: string): string =>
-    `CASE WHEN ${BYTES} <= ? THEN CASE WHEN json_valid(data) THEN
-       CASE WHEN json_type(data) = 'object' THEN ${expr} END END END`;
+  /** `expr` for a row within the ceiling whose data is valid JSON, else NULL.
+   *  Binds the ceiling. Nested CASEs, so no JSON function sees malformed JSON
+   *  and nothing parses a row over the ceiling. */
+  const ifValid = (expr: string): string =>
+    `CASE WHEN ${BYTES} <= ? THEN CASE WHEN json_valid(data) THEN ${expr} END END`;
   /** A row's columns, with `data` NULL when it is larger than the ceiling
    *  now (re-checked here, not trusted from an earlier size read), plus its
    *  size. Binds the ceiling first. The size expression appears twice; with
@@ -923,6 +938,14 @@ export function createV2HistorySource(db: ReadOnlyDb, opts: V2SourceOptions = {}
   function inlineCut(rows: Row[], from: number): NonNullable<PartLoad["cut"]> {
     const last = rows.length > 0 ? asNumber(rows[rows.length - 1]!.ordinal) : null;
     return { nextOrdinal: last === null ? from : last + 1, omittedRows: 0, omittedBytes: 0 };
+  }
+
+  /** Settle a read whose row kept changing under it: keep the part rows it
+   *  loaded and leave the inline content for the continuation, which also
+   *  finds any rows moved there meanwhile. */
+  function leaveInline(load: PartLoad, from: number, counts: HistoryReadCounts): void {
+    load.cut = { ...inlineCut(load.rows, from), changed: true };
+    counts.changedMessages++;
   }
 
   /**
@@ -1313,7 +1336,9 @@ export function createV2HistorySource(db: ReadOnlyDb, opts: V2SourceOptions = {}
             nextOrdinal: load.cut.nextOrdinal,
             omittedParts,
             omittedBytes: load.cut.omittedBytes,
-            note: cutNote(omittedParts, load.cut.omittedBytes, load.cut.nextOrdinal),
+            note: load.cut.changed
+              ? changedNote(omittedParts, load.cut.nextOrdinal)
+              : cutNote(omittedParts, load.cut.omittedBytes, load.cut.nextOrdinal),
           };
         }
       }
@@ -1336,6 +1361,23 @@ export function createV2HistorySource(db: ReadOnlyDb, opts: V2SourceOptions = {}
   ): HistoryReadCounts | undefined {
     drift.record(counts, unknownTypes);
     return hasReadCounts(counts) ? counts : undefined;
+  }
+
+  /** Project one point read and record it. */
+  async function finishPoint(
+    decoded: Decoded,
+    session: SessionContext,
+    load: PartLoad | undefined,
+    counts: HistoryReadCounts,
+    unknownTypes: Set<string>,
+  ): Promise<Lookup<HistoryMessage>> {
+    const id = decoded.row.id;
+    const loads = new Map<string, PartLoad>(load ? [[id, load]] : []);
+    const [message] = await project([decoded], session, false, loads, counts, unknownTypes);
+    recordRead(counts, unknownTypes);
+    return message
+      ? { ok: true, value: message }
+      : { ok: false, reason: "not-found", error: `Message not found: ${id}` };
   }
 
   /**
@@ -1371,18 +1413,20 @@ export function createV2HistorySource(db: ReadOnlyDb, opts: V2SourceOptions = {}
    * Continue an assistant message from part ordinal `from` (see
    * `HistorySource.getMessage`). The envelope is read without its inline
    * content: its metadata (the data minus `content`, left out when over
-   * {@link CONTINUATION_METADATA_MAX}), the count and size of its inline
-   * items and its fingerprint. The part rows from `from` on are read under
-   * what the metadata and the inline content leave of the ceiling, the first
-   * one forced in; then, when every part row fit, the inline content is read
-   * if it still fits, in a statement that also re-reads the fingerprint.
+   * {@link CONTINUATION_METADATA_MAX}), the count of its inline items and
+   * its fingerprint. The part rows from `from` on are read under what the
+   * metadata and the inline content leave of the ceiling, the first one
+   * forced in; then, when every part row fit, the inline content is read if
+   * it still fits, in a statement that also re-reads the fingerprint.
    *
    * The bound: a continuation loads at most the ceiling, except that its
    * forced first part row, which is within the ceiling on its own, loads
    * even when the metadata leaves it too little room. That read loads the
    * metadata and part rows only, never the inline content, so it stays under
-   * `byteCeiling + CONTINUATION_METADATA_MAX`. Each continuation moves past
-   * at least one part row, so every part row within the ceiling is returned
+   * `byteCeiling + CONTINUATION_METADATA_MAX`. A retry, after a read the row
+   * changed under, gets only what is left of the ceiling and forces nothing,
+   * so the whole call stays under the same bound. Each call moves past at
+   * least one part row, so every part row within the ceiling is returned
    * with its data by some continuation.
    */
   async function continueMessage(
@@ -1391,9 +1435,20 @@ export function createV2HistorySource(db: ReadOnlyDb, opts: V2SourceOptions = {}
     from: number,
     fork: SqlValue[],
   ): Promise<Lookup<HistoryMessage>> {
+    // Body bytes this call has loaded, discarded attempts included, and the
+    // read to fall back on when a discarded attempt is not read again.
+    let spent = 0;
+    let settle: (() => Promise<Lookup<HistoryMessage>>) | undefined;
     for (let attempt = 0; ; attempt++) {
       // One primary-key read: no yield before the first.
       if (attempt > 0) await pause();
+      const retry = settle !== undefined;
+      const budget = byteCeiling - spent;
+      const metaCap = retry
+        ? Math.max(0, Math.min(CONTINUATION_METADATA_MAX, budget))
+        : CONTINUATION_METADATA_MAX;
+      // The metadata is measured as the row less its inline content, a few
+      // bytes over what `json_remove` returns, so the row is split once.
       const head = read("message head", () =>
         db.get(
           `SELECT ${MESSAGE_META_COLUMNS}, ${BYTES} AS bytes,
@@ -1401,24 +1456,14 @@ export function createV2HistorySource(db: ReadOnlyDb, opts: V2SourceOptions = {}
                   WHEN NOT json_valid(data) THEN 'invalid'
                   WHEN json_type(data) <> 'object' THEN 'other'
                   ELSE 'object' END AS shape,
-             ${ifObject("json_array_length(data, '$.content')")} AS inline_count,
-             ${ifObject(INLINE_BYTES)} AS inline_bytes,
-             ${ifObject(META_BYTES)} AS meta_bytes,
-             ${ifObject(`CASE WHEN ${META_BYTES} <= ? THEN json_remove(data, '$.content') END`)} AS meta
+             ${ifValid("json_array_length(data, '$.content')")} AS inline_count,
+             ${ifValid(
+               `CASE WHEN ${BYTES} - coalesce(${INLINE_BYTES}, 0) <= ?
+                  THEN json_remove(data, '$.content') END`,
+             )} AS meta
            FROM session_message
            WHERE id = ? AND session_id = ? AND ${CONTENT_FILTER} AND ${FORK_FILTER} LIMIT ?`,
-          [
-            byteCeiling,
-            byteCeiling,
-            byteCeiling,
-            byteCeiling,
-            byteCeiling,
-            CONTINUATION_METADATA_MAX,
-            messageID,
-            sessionID,
-            ...fork,
-            1,
-          ],
+          [byteCeiling, byteCeiling, byteCeiling, metaCap, messageID, sessionID, ...fork, 1],
         ),
       );
       if (!head)
@@ -1436,6 +1481,7 @@ export function createV2HistorySource(db: ReadOnlyDb, opts: V2SourceOptions = {}
       // A placeholder envelope carries its note as its inline content. A
       // real one carries its metadata only, its inline content read last.
       const message = toMessageRow(head);
+      const bytes = asNumber(head.bytes) ?? 0;
       const shape = asString(head.shape);
       let decoded: Decoded;
       let charge = 0;
@@ -1451,73 +1497,85 @@ export function createV2HistorySource(db: ReadOnlyDb, opts: V2SourceOptions = {}
         decoded = malformedPlaceholder(message, `message ${messageID} data ${what}`);
       } else {
         inlineCount = asNumber(head.inline_count) ?? 0;
-        inlineBytes = inlineCount > 0 ? (asNumber(head.inline_bytes) ?? 0) : 0;
         let data: Record<string, unknown> = {};
         const meta = asString(head.meta);
+        // A retry whose metadata no longer fits keeps the earlier read.
+        if (retry && meta === null) return settle!();
         if (meta !== null) {
+          charge = utf8Length(meta);
           const parsed = decodeRow({ ...message, data: meta });
-          if (parsed.ok) {
-            data = parsed.data;
-            charge = asNumber(head.meta_bytes) ?? 0;
-          }
+          if (parsed.ok) data = parsed.data;
         }
+        // The inline content is at most the row less the metadata (all of
+        // the row when the metadata was left out); its own read re-checks it.
+        if (inlineCount > 0) inlineBytes = Math.max(0, bytes - charge);
         decoded = { ok: true, row: { ...message, data: "" }, data: { ...data, content: [] } };
       }
+      spent += charge;
       const inlinePending = inlineCount > 0;
 
       const start = (await partSizes(sessionID, [messageID], from)).get(messageID)?.skipped ?? 0;
+      // A first read forces its first part row in; a retry only takes what
+      // is left of the ceiling.
       const got = await readParts(
         sessionID,
         [{ id: messageID, pos: 0 }],
         from,
-        byteCeiling - charge - inlineBytes,
-        true,
+        budget - charge - inlineBytes,
+        !retry,
       );
+      const partBytes = loadedBytes(got.loaded);
+      spent += partBytes;
       const counts = emptyReadCounts();
       const unknownTypes = new Set<string>();
       const load: PartLoad = { rows: got.loaded, start };
       if (inlinePending) load.inlineCount = inlineCount;
+      const finish = () => finishPoint(decoded, session, load, counts, unknownTypes);
       if (got.cut) {
         load.cut = await cutAt(sessionID, messageID, got.cut.ordinal);
+        if (retry && got.loaded.length === 0) return settle!();
       } else if (inlinePending) {
-        // With no part row loaded, the metadata and the inline content are
-        // the envelope's own size, within the ceiling.
-        const room =
-          got.loaded.length > 0 ? byteCeiling - charge - loadedBytes(got.loaded) : byteCeiling;
+        // With no part row loaded on a first read, the metadata and the
+        // inline content are the envelope's own size, within the ceiling.
+        const room = got.loaded.length > 0 || retry ? budget - charge - partBytes : byteCeiling;
         await pause();
         const tail = read("message inline content", () =>
           db.get(
             `SELECT time_updated, ${BYTES} AS bytes,
-               ${ifObject(`CASE WHEN ${INLINE_BYTES} <= ? THEN json_extract(data, '$.content') END`)} AS content
+               ${ifValid(`CASE WHEN ${INLINE_BYTES} <= ? THEN json_extract(data, '$.content') END`)} AS content
              FROM session_message WHERE id = ? AND session_id = ? LIMIT ?`,
-            [byteCeiling, room, messageID, sessionID, 1],
+            [byteCeiling, Math.max(0, room), messageID, sessionID, 1],
           ),
         );
+        const content = tail ? asString(tail.content) : null;
+        if (content !== null) spent += utf8Length(content);
         if (!tail || !sameFingerprint(fingerprintOf(head), fingerprintOf(tail))) {
-          // The row changed under the part read: read it again, then settle
-          // for the part rows read, with the inline content left for the
-          // continuation (which reads part rows moved there too).
-          if (attempt < ENVELOPE_ATTEMPTS - 1) continue;
+          // The row changed under the part read. Read it again while what is
+          // left of the ceiling holds another read of the same size; then
+          // settle for the part rows read, with the inline content left for
+          // the continuation (which reads part rows moved there too).
+          const settled = (): Promise<Lookup<HistoryMessage>> => {
+            leaveInline(load, from, counts);
+            return finish();
+          };
+          if (
+            attempt < ENVELOPE_ATTEMPTS - 1 &&
+            byteCeiling - spent >= charge + partBytes + inlineBytes
+          ) {
+            settle = settled;
+            continue;
+          }
+          return settled();
+        }
+        const items = parseInline(content);
+        if (items === undefined) {
+          if (retry) return settle!();
           load.cut = inlineCut(got.loaded, from);
-          counts.changedMessages++;
         } else {
-          const items = parseInline(asString(tail.content));
-          if (items === undefined) load.cut = inlineCut(got.loaded, from);
-          else decoded.data.content = items;
+          decoded.data.content = items;
         }
       }
-      const [projected] = await project(
-        [decoded],
-        session,
-        false,
-        new Map([[messageID, load]]),
-        counts,
-        unknownTypes,
-      );
-      recordRead(counts, unknownTypes);
-      return projected
-        ? { ok: true, value: projected }
-        : { ok: false, reason: "not-found", error: `Message not found: ${messageID}` };
+      return finish();
     }
   }
 
@@ -1585,11 +1643,22 @@ export function createV2HistorySource(db: ReadOnlyDb, opts: V2SourceOptions = {}
       const strict = o.strict === true;
       const limit = Math.min(o.limit, PAGE_MESSAGES_MAX);
 
+      // Body bytes this call has loaded, discarded attempts included, and the
+      // page to fall back on when a discarded attempt is not read again.
+      let spent = 0;
+      let settle: (() => Promise<MessagePage>) | undefined;
+
       // Each attempt plans a page from sizes, then reads its bodies. Rows can
       // change eligibility between the two statements (a compaction completing,
       // a row growing), so the cursor comes from the rows actually returned.
-      // Only a planned range that emptied entirely retries, bounded.
+      // A planned range that emptied entirely retries, bounded, as does a page
+      // whose message was rewritten under its part read (see
+      // `movedDuringRead`). A retry after bodies were loaded gets only what
+      // is left of the ceiling and keeps its first message only when that
+      // fits, so one call never loads more than the ceiling.
       for (let attempt = 0; attempt < PAGE_ATTEMPTS; attempt++) {
+        const retry = settle !== undefined;
+        const budget = byteCeiling - spent;
         // Sizes first: pick the page without loading a row body.
         await pause();
         const sizes = read("page sizes", () =>
@@ -1600,15 +1669,16 @@ export function createV2HistorySource(db: ReadOnlyDb, opts: V2SourceOptions = {}
             [o.sessionID, below, ...fork, limit + 1],
           ),
         );
-        if (sizes.length === 0) return { items: [], nextCursor: null };
+        if (sizes.length === 0) return settle ? settle() : { items: [], nextCursor: null };
         const planned = await partSizes(
           o.sessionID,
           sizes.map((size) => asString(size.id) ?? ""),
           FIRST_ORDINAL,
         );
         // Each message costs its envelope plus, for an assistant, its part
-        // rows' bytes and count. The first message is always taken; its parts
-        // are cut to fit if they do not.
+        // rows' bytes and count. The first message is always taken (on a
+        // retry, when its envelope fits); its parts are cut to fit if they do
+        // not.
         let take = 0;
         let bytes = 0;
         let partRows = 0;
@@ -1622,12 +1692,14 @@ export function createV2HistorySource(db: ReadOnlyDb, opts: V2SourceOptions = {}
           const own = size.type === "assistant" ? planned.get(id) : undefined;
           const cost = envelope + (own?.bytes ?? 0);
           const rowsCost = own?.rows ?? 0;
-          if (take > 0 && (bytes + cost > byteCeiling || partRows + rowsCost > partRowCap)) break;
+          if (take === 0 && retry && envelope > budget) break;
+          if (take > 0 && (bytes + cost > budget || partRows + rowsCost > partRowCap)) break;
           bytes += cost;
           partRows += rowsCost;
           take++;
           if (own && own.bytes > 0) extra.push(id, own.bytes);
         }
+        if (take === 0) return settle!();
         const newest = asNumber(sizes[0]!.seq) ?? 0;
         const oldest = asNumber(sizes[take - 1]!.seq) ?? 0;
         const plannedMore = sizes.length > take;
@@ -1636,9 +1708,11 @@ export function createV2HistorySource(db: ReadOnlyDb, opts: V2SourceOptions = {}
         // the same statement (rows may have grown since the size read), each row's
         // planned part bytes are added to it, a running total cuts the page
         // where it would pass the ceiling, and only rows inside the cut load
-        // `data`. The first row is always kept; its parts are cut by the part
-        // read when they no longer fit. The CTEs hold only ids, seqs and
-        // sizes; bodies are read by the final join.
+        // `data`. The first row is always kept (on a retry, when its envelope
+        // fits); its parts are cut by the part read when they no longer fit.
+        // The CTEs hold only ids, seqs and sizes; bodies are read by the
+        // final join.
+        const firstCap = retry ? budget : byteCeiling;
         await pause();
         const rows = read("page rows", () =>
           db.all(
@@ -1657,7 +1731,8 @@ export function createV2HistorySource(db: ReadOnlyDb, opts: V2SourceOptions = {}
              )
              SELECT ${PAGE_BODY_COLUMNS}
              FROM budget b JOIN session_message m ON m.session_id = ? AND m.seq = b.seq
-             WHERE b.running <= ? OR b.rn = 1
+             WHERE b.running <= ?
+               OR (b.rn = 1 AND CASE WHEN b.bytes <= ? THEN b.bytes ELSE 0 END <= ?)
              ORDER BY m.seq DESC LIMIT ?`,
             [
               o.sessionID,
@@ -1669,17 +1744,23 @@ export function createV2HistorySource(db: ReadOnlyDb, opts: V2SourceOptions = {}
               byteCeiling,
               byteCeiling,
               o.sessionID,
+              budget,
               byteCeiling,
+              firstCap,
               take,
             ],
           ),
         );
         if (rows.length === 0) {
+          if (settle) return settle();
           // The whole planned range became ineligible: continue below it.
           if (!plannedMore) return { items: [], nextCursor: null };
           below = oldest;
           continue;
         }
+        let envelopes = 0;
+        for (const row of rows) if (row.data != null) envelopes += asNumber(row.bytes) ?? 0;
+        spent += envelopes;
 
         const decoded = await decodeRows(rows, strict);
 
@@ -1696,16 +1777,45 @@ export function createV2HistorySource(db: ReadOnlyDb, opts: V2SourceOptions = {}
         const assistants = rows.flatMap((row, pos) =>
           row.type === "assistant" ? [{ id: asString(row.id) ?? "", pos }] : [],
         );
+        const finish = async (): Promise<MessagePage> => {
+          const kept = rows.slice(0, keep);
+          for (const row of kept) {
+            if (row.type === "assistant") continue;
+            const stray = planned.get(asString(row.id) ?? "");
+            if (stray) counts.strayParts += stray.rows + stray.skipped;
+          }
+          // If a row became eligible mid-range, LIMIT cut the page above the
+          // planned oldest row; resuming from the oldest returned row keeps
+          // every row below it for the next page.
+          const returnedOldest = asNumber(kept[kept.length - 1]!.seq) ?? oldest;
+          const more = plannedMore || returnedOldest > oldest || keep < rows.length;
+          const session = contextOf(o.sessionID);
+          if (!session) throw notFound;
+          const items = await project(
+            decoded.slice(0, keep),
+            session,
+            strict,
+            loads,
+            counts,
+            unknownTypes,
+          );
+          const pageCounts = recordRead(counts, unknownTypes);
+          return {
+            items,
+            nextCursor: more ? encodeV2Cursor(returnedOldest) : null,
+            ...(pageCounts && { counts: pageCounts }),
+          };
+        };
         if (partsOn && assistants.length > 0) {
-          let envelopes = 0;
-          for (const row of rows) if (row.data != null) envelopes += asNumber(row.bytes) ?? 0;
           const got = await readParts(
             o.sessionID,
             assistants,
             FIRST_ORDINAL,
-            byteCeiling - envelopes,
+            budget - envelopes,
             false,
           );
+          const partBytes = loadedBytes(got.loaded);
+          spent += partBytes;
           if (got.cut) keep = Math.max(1, got.cut.pos);
           for (const { id, pos } of assistants) {
             if (pos >= keep) break;
@@ -1722,51 +1832,32 @@ export function createV2HistorySource(db: ReadOnlyDb, opts: V2SourceOptions = {}
           }
           const moved = await movedDuringRead(o.sessionID, rows, decoded, loads, keep);
           if (moved.size > 0) {
-            // Read the page again; on the last attempt, the first message
-            // leaves its inline content for the continuation and a later one
-            // leads the next page.
-            if (attempt < PAGE_ATTEMPTS - 1) continue;
-            for (const [id, pos] of moved) {
-              if (pos > 0) {
-                keep = Math.min(keep, pos);
-                continue;
+            // This page, settled: the first message leaves its inline
+            // content for the continuation and a later one leads the next
+            // page.
+            const settled = (): Promise<MessagePage> => {
+              for (const [id, pos] of moved) {
+                if (pos > 0) {
+                  keep = Math.min(keep, pos);
+                  continue;
+                }
+                leaveInline(loads.get(id)!, FIRST_ORDINAL, counts);
+                keep = 1;
               }
-              const load = loads.get(id)!;
-              load.cut = inlineCut(load.rows, FIRST_ORDINAL);
-              counts.changedMessages++;
-              keep = 1;
+              return finish();
+            };
+            // Read the page again only while what is left of the ceiling
+            // holds another read of the same size.
+            if (attempt < PAGE_ATTEMPTS - 1 && byteCeiling - spent >= envelopes + partBytes) {
+              settle = settled;
+              continue;
             }
+            return settled();
           }
         }
-        const kept = rows.slice(0, keep);
-        for (const row of kept) {
-          if (row.type === "assistant") continue;
-          const stray = planned.get(asString(row.id) ?? "");
-          if (stray) counts.strayParts += stray.rows + stray.skipped;
-        }
-
-        // If a row became eligible mid-range, LIMIT cut the page above the
-        // planned oldest row; resuming from the oldest returned row keeps
-        // every row below it for the next page.
-        const returnedOldest = asNumber(kept[kept.length - 1]!.seq) ?? oldest;
-        const more = plannedMore || returnedOldest > oldest || keep < rows.length;
-        const session = contextOf(o.sessionID);
-        if (!session) throw notFound;
-        const items = await project(
-          decoded.slice(0, keep),
-          session,
-          strict,
-          loads,
-          counts,
-          unknownTypes,
-        );
-        const pageCounts = recordRead(counts, unknownTypes);
-        return {
-          items,
-          nextCursor: more ? encodeV2Cursor(returnedOldest) : null,
-          ...(pageCounts && { counts: pageCounts }),
-        };
+        return finish();
       }
+      if (settle) return settle();
       // Every attempt's planned range emptied between the size read and the
       // body read. This empty page with a cursor is the one case that can end
       // a drill early (a reader may stop on an empty page); it takes
@@ -1804,20 +1895,33 @@ export function createV2HistorySource(db: ReadOnlyDb, opts: V2SourceOptions = {}
         return continueMessage(sessionID, messageID, partOrdinal, fork);
       }
 
+      // Body bytes this call has loaded, discarded attempts included, and the
+      // read to fall back on when a discarded attempt is not read again. A
+      // retry gets only what is left of the ceiling, so one call never loads
+      // more than the ceiling.
+      let spent = 0;
+      let settle: (() => Promise<Lookup<HistoryMessage>>) | undefined;
       for (let attempt = 0; ; attempt++) {
         // One primary-key read: no yield before the first.
         if (attempt > 0) await pause();
+        const budget = byteCeiling - spent;
+        // On a retry the envelope loads only when it fits what is left.
+        const cap = settle ? Math.max(0, Math.min(byteCeiling, budget)) : byteCeiling;
         const row = read("message", () =>
           db.get(
             `SELECT ${BODY_COLUMNS} FROM session_message
              WHERE id = ? AND session_id = ? AND ${CONTENT_FILTER} AND ${FORK_FILTER} LIMIT ?`,
-            [byteCeiling, messageID, sessionID, ...fork, 1],
+            [cap, messageID, sessionID, ...fork, 1],
           ),
         );
         if (!row) return notFound;
+        const bytes = asNumber(row.bytes) ?? 0;
+        if (settle && row.data == null && bytes <= byteCeiling) return settle();
         const session = contextOf(sessionID);
         if (!session) return sessionNotFound(sessionID);
         const decoded = await decodeRows([row], false);
+        const envelope = row.data != null ? bytes : 0;
+        spent += envelope;
 
         // An assistant's part rows, under what its envelope left of the
         // ceiling; a first part row that does not fit beside the envelope
@@ -1826,27 +1930,34 @@ export function createV2HistorySource(db: ReadOnlyDb, opts: V2SourceOptions = {}
         const unknownTypes = new Set<string>();
         const loads = new Map<string, PartLoad>();
         if (partsOn && row.type === "assistant") {
-          const envelope = row.data != null ? (asNumber(row.bytes) ?? 0) : 0;
           const got = await readParts(
             sessionID,
             [{ id: messageID, pos: 0 }],
             FIRST_ORDINAL,
-            byteCeiling - envelope,
+            budget - envelope,
             false,
           );
+          const partBytes = loadedBytes(got.loaded);
+          spent += partBytes;
           const load: PartLoad = { rows: got.loaded, start: 0 };
           if (got.cut) load.cut = await cutAt(sessionID, messageID, got.cut.ordinal);
           loads.set(messageID, load);
           const moved = await movedDuringRead(sessionID, [row], decoded, loads, 1);
           if (moved.size > 0) {
-            if (attempt < ENVELOPE_ATTEMPTS - 1) continue;
-            load.cut = inlineCut(load.rows, FIRST_ORDINAL);
-            counts.changedMessages++;
+            const settled = (): Promise<Lookup<HistoryMessage>> => {
+              leaveInline(load, FIRST_ORDINAL, counts);
+              return finishPoint(decoded[0]!, session, load, counts, unknownTypes);
+            };
+            // Read again only while what is left of the ceiling holds
+            // another read of the same size.
+            if (attempt < ENVELOPE_ATTEMPTS - 1 && byteCeiling - spent >= envelope + partBytes) {
+              settle = settled;
+              continue;
+            }
+            return settled();
           }
         }
-        const [message] = await project(decoded, session, false, loads, counts, unknownTypes);
-        recordRead(counts, unknownTypes);
-        return message ? { ok: true, value: message } : notFound;
+        return finishPoint(decoded[0]!, session, loads.get(messageID), counts, unknownTypes);
       }
     },
   };

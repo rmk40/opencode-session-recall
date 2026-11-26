@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it } from "vitest";
 import type { Part } from "@opencode-ai/sdk/v2";
 import type { HistoryMessage } from "../src/history/model.js";
+import type { Row } from "../src/sqlite.js";
 import {
   createHistoryDriftState,
   createUnavailableSource,
@@ -11,6 +12,7 @@ import {
   type MessagePage,
 } from "../src/history/source.js";
 import {
+  changedNote,
   checkV2Schema,
   CONTINUATION_METADATA_MAX,
   createV2HistorySource,
@@ -809,6 +811,54 @@ describe("v2 source: a first message over the page", () => {
     expect(parts).toEqual((await point(whole.source, "ses_mixed", long)).parts);
   });
 
+  it("passes the ceiling by no more than the metadata to load a forced first part", async () => {
+    const f = await partsFixture();
+    f.session("ses_over");
+    const ceiling = 8_000;
+    // ~3,100 bytes of metadata leave ~4,900 for parts; the part is ~6,000.
+    const part = txt("v".repeat(6_000));
+    const long = f.assistant("ses_over", { parts: [part], extra: { padding: "m".repeat(3_000) } });
+    const envelope = f.sizes.get(long)!.envelope;
+    expect(bytesOf(part)).toBeGreaterThan(ceiling - envelope);
+    expect(bytesOf(part)).toBeLessThanOrEqual(ceiling);
+
+    const opened = await openOpencodeDb(f.t.path);
+    if (!opened.ok) throw new Error(opened.reason);
+    cleanups.push(() => opened.db.close());
+    const spy = limitSpy(opened.db);
+    let loaded = 0;
+    const tally = (row: Record<string, unknown> | undefined) => {
+      for (const column of ["data", "meta", "content"]) {
+        const value = row?.[column];
+        if (typeof value === "string") loaded += bytesOf(value);
+      }
+    };
+    const db: typeof spy = {
+      ...spy,
+      get: (sql, params) => {
+        const row = spy.get(sql, params);
+        tally(row);
+        return row;
+      },
+      all: (sql, params) => {
+        const rows = spy.all(sql, params);
+        rows.forEach(tally);
+        return rows;
+      },
+    };
+    const source = createV2HistorySource(db, { pageByteCeiling: ceiling, yieldBetween: noYield });
+
+    const first = await point(source, "ses_over", long);
+    expect(first.partial?.nextOrdinal).toBe(0);
+    loaded = 0;
+    const rest = await point(source, "ses_over", long, 0);
+    expect(rest.partial).toBeUndefined();
+    expect(rest.parts.map(partText)).toEqual(["v".repeat(6_000)]);
+    expect(rest.info).toMatchObject({ agent: "build" });
+    expect(loaded).toBeGreaterThan(ceiling);
+    expect(loaded).toBeLessThanOrEqual(ceiling + CONTINUATION_METADATA_MAX);
+  });
+
   it("continues without metadata over the cap, taking the session's agent and model", async () => {
     const f = await partsFixture();
     f.session("ses_meta", { agent: "sess-agent" });
@@ -895,24 +945,41 @@ describe("v2 source: a first message over the page", () => {
 describe("v2 source: a row opencode rewrites between the envelope and the part read", () => {
   /** A source whose every statement runs `after(sql)` once it returns. */
   async function hooked(t: V2TestDb, after: (sql: string) => void, opts: V2SourceOptions = {}) {
+    return (await metered(t, after, opts)).source;
+  }
+
+  /** Like {@link hooked}, also totalling the body bytes every statement
+   *  returned: message and part `data`, continuation metadata and inline
+   *  content, from kept and discarded reads alike. */
+  async function metered(t: V2TestDb, after: (sql: string) => void, opts: V2SourceOptions = {}) {
     const opened = await openOpencodeDb(t.path);
     if (!opened.ok) throw new Error(opened.reason);
     cleanups.push(() => opened.db.close());
     const spy = limitSpy(opened.db);
+    const meter = { bytes: 0 };
+    const count = (row: Row | undefined): void => {
+      for (const column of ["data", "meta", "content"]) {
+        const value = row?.[column];
+        if (typeof value === "string") meter.bytes += bytesOf(value);
+      }
+    };
     const db: typeof spy = {
       ...spy,
       get: (sql, params) => {
         const row = spy.get(sql, params);
+        count(row);
         after(sql);
         return row;
       },
       all: (sql, params) => {
         const rows = spy.all(sql, params);
+        for (const row of rows) count(row);
         after(sql);
         return rows;
       },
     };
-    return createV2HistorySource(db, { yieldBetween: noYield, ...opts });
+    const source = createV2HistorySource(db, { yieldBetween: noYield, ...opts });
+    return { source, meter };
   }
 
   /** opencode's lazy move: the row's inline items become part rows after its
@@ -1012,9 +1079,11 @@ describe("v2 source: a row opencode rewrites between the envelope and the part r
       if (touching && rowRead(sql)) touch(f, id);
     });
     const first = await point(source, "ses_mv4", id);
-    // Both part rows, then the inline items left out.
+    // Both part rows, then the inline items left out, named as left out for
+    // the change rather than for room.
     expect(first.partial).toEqual({ nextOrdinal: 2, omittedParts: 2, omittedBytes: 0 });
     expect(suffixes(first).slice(0, -1)).toEqual(["0", "1"]);
+    expect(partText(first.parts.at(-1))).toBe(changedNote(2, 2));
     expect(source.history!().counts.changedMessages).toBe(1);
     touching = false;
     const { parts } = await complete(source, "ses_mv4", first);
@@ -1041,6 +1110,75 @@ describe("v2 source: a row opencode rewrites between the envelope and the part r
     moveInline(f, "ses_mv5", id);
     const { parts } = await complete(source, "ses_mv5", first);
     expect(parts).toEqual(before.parts);
+  });
+
+  /** A mixed message whose envelope, part rows and inline item together come
+   *  to about `share` of a 3,000-byte ceiling. */
+  async function sized(sessionID: string, share: number) {
+    const f = await partsFixture();
+    f.session(sessionID);
+    const each = Math.floor((3_000 * share) / 3) - 40;
+    const id = f.assistant(sessionID, {
+      parts: [txt("a".repeat(each)), txt("b".repeat(each))],
+      inline: [txt("c".repeat(each))],
+    });
+    const own = f.sizes.get(id)!;
+    const total = own.envelope + [...own.parts.values()].reduce((sum, n) => sum + n, 0);
+    return { f, id, total };
+  }
+
+  it("never loads more than the ceiling in one call while a row near it keeps changing", async () => {
+    const ceiling = 3_000;
+    for (const kind of ["point", "page", "continuation"] as const) {
+      const sid = `ses_cap_${kind}`;
+      const { f, id, total } = await sized(sid, 0.9);
+      expect(total).toBeGreaterThan(ceiling / 2);
+      expect(total).toBeLessThanOrEqual(ceiling);
+      let touches = 0;
+      const { source, meter } = await metered(
+        f.t,
+        (sql) => {
+          if (!/\bsession_message\b/.test(sql) || /\bid IN \(/.test(sql)) return;
+          touches++;
+          touch(f, id);
+        },
+        { pageByteCeiling: ceiling },
+      );
+      if (kind === "point") await point(source, sid, id);
+      else if (kind === "page") await source.messagePage({ sessionID: sid, limit: 10 });
+      else await point(source, sid, id, 0);
+      // One attempt, then the fallback: another would pass the ceiling.
+      expect(meter.bytes, kind).toBeLessThanOrEqual(ceiling);
+      expect(meter.bytes, kind).toBeGreaterThan(ceiling / 2);
+      expect(source.history!().counts.changedMessages, kind).toBe(1);
+      expect(touches, kind).toBeGreaterThan(0);
+    }
+  });
+
+  it("retries a small changing row within the ceiling, counting discarded attempts", async () => {
+    const ceiling = 3_000;
+    for (const kind of ["point", "page", "continuation"] as const) {
+      const sid = `ses_small_${kind}`;
+      const { f, id, total } = await sized(sid, 0.25);
+      let reads = 0;
+      const { source, meter } = await metered(
+        f.t,
+        (sql) => {
+          if (!/\bsession_message\b/.test(sql) || /\bid IN \(/.test(sql)) return;
+          if (/WITH sized AS|WHERE id = \?/.test(sql)) reads++;
+          touch(f, id);
+        },
+        { pageByteCeiling: ceiling },
+      );
+      if (kind === "point") await point(source, sid, id);
+      else if (kind === "page") await source.messagePage({ sessionID: sid, limit: 10 });
+      else await point(source, sid, id, 0);
+      // Every attempt ran and every one of them counts against the ceiling.
+      expect(reads, kind).toBeGreaterThanOrEqual(3);
+      expect(meter.bytes, kind).toBeGreaterThan(2 * total);
+      expect(meter.bytes, kind).toBeLessThanOrEqual(ceiling);
+      expect(source.history!().counts.changedMessages, kind).toBe(1);
+    }
   });
 });
 

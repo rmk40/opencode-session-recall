@@ -15,10 +15,15 @@ import type { HistoryMessage, HistorySession } from "./model.js";
  */
 
 /**
- * A session listing: host rows, or the host's error string. `truncated` says
- * more sessions matched than the listing returned (decided by reading one row
- * past `limit`). `nextCursor` is set only on a truncated listing in id order,
- * and resumes it as `after`.
+ * A session listing: host rows, or the host's error string. `truncated` is
+ * decided by reading one row past `limit`. Where the host filters (v2, and
+ * v1 except as below) it means more matching sessions exist. Where the
+ * source drops rows after the host returned them (v1 with
+ * `archived: "exclude"` on an endpoint that cannot filter archived
+ * sessions) it means more may exist: the host had more rows, and whether
+ * any of them match is unknown. `false` always means the listing is
+ * complete. `nextCursor` is set only on a truncated listing in id order, and
+ * resumes it as `after`.
  */
 export type Listing<T> =
   | { ok: true; items: T[]; truncated: boolean; nextCursor?: string }
