@@ -670,6 +670,23 @@ type SessionRead = {
   floor?: number;
 };
 
+/**
+ * Why a read's projection is known to have lost content, or undefined: part
+ * rows of a type the projector does not read (every assistant content type
+ * carries content), or completed assistant messages that projected nothing
+ * although part rows were read for them.
+ */
+function lossOf(counts: HistoryReadCounts): string | undefined {
+  const found: string[] = [];
+  if (counts.unknownPartTypes > 0) {
+    found.push(`${counts.unknownPartTypes} part rows of unknown types`);
+  }
+  if (counts.emptyWithParts > 0) {
+    found.push(`${counts.emptyWithParts} completed assistant messages empty despite part rows`);
+  }
+  return found.length > 0 ? `projection lost content: ${found.join(", ")}` : undefined;
+}
+
 /** The hash a range of rows is recorded and checked under. */
 function rangeHashOf(rows: RangeRow[]): string {
   return cyrb53(
@@ -1549,10 +1566,23 @@ export function createDistiller(options: DistillerOptions): Distiller {
     return spans;
   }
 
+  /** Record a read's projection loss as the card's repair reason. */
+  function markLoss(sessionId: string, loss: string, kept: boolean): void {
+    store.markRepairPending(sessionId, loss);
+    logMsg(`session ${sessionId} ${kept ? "kept its card" : "is repair-pending"}: ${loss}`);
+  }
+
   /**
    * Store a full derivation with its checkpoint, the generation and, with
    * range hashes on, `spans`: those at or above the read's floor replace
    * every hash stored for the session. Returns the store's verdict.
+   *
+   * The loss guard: when the read shows the projection lost content
+   * ({@link lossOf}), an existing card is kept as it is, nothing is written
+   * and the card gets the loss as its repair reason (`kept`), which takes it
+   * out of the stale set until a projector generation bump clears it. With no
+   * card to keep, the card is written and then marked the same way. The
+   * read's counts are in the source's drift state already.
    */
   function writeFull(
     session: DistillSessionMeta,
@@ -1561,7 +1591,12 @@ export function createDistiller(options: DistillerOptions): Distiller {
     checkpoint: DistillCheckpoint | null,
     moved: boolean,
     spans: RangeHash[] | undefined,
-  ): CardWrite {
+  ): CardWrite & { kept?: string } {
+    const loss = lossOf(read.counts);
+    if (loss && store.getCard(session.id)) {
+      markLoss(session.id, loss, true);
+      return { changed: false, kept: loss };
+    }
     const card = stampCard(derived.card, checkpoint, { floor: read.floor, cut: read.cut });
     let rangeHashes: RangeHash[] | undefined;
     if (spans) {
@@ -1577,6 +1612,8 @@ export function createDistiller(options: DistillerOptions): Distiller {
       card,
       rangeHashes ? { rangeHashes } : undefined,
     );
+    // An accepted replace clears the repair reason, so the mark follows it.
+    if (loss && !result.refused) markLoss(session.id, loss, false);
     noteSettled(session.id, checkpoint, moved);
     return { changed: result.changed };
   }
@@ -1790,6 +1827,11 @@ export function createDistiller(options: DistillerOptions): Distiller {
         ),
       spans ? { rangeHashes: spans } : undefined,
     );
+    // An append adds to the stored rows and overwrites none, so a loss in
+    // what it read does not keep it from landing; the card is marked, and an
+    // append keeps the mark.
+    const loss = lossOf(fetched.counts);
+    if (loss && !result.refused) markLoss(session.id, loss, false);
     noteSettled(session.id, tail, moved);
     return { changed: result.changed };
   }
@@ -2004,9 +2046,10 @@ export function createDistiller(options: DistillerOptions): Distiller {
           // the cached flag — and skip it, counting the session as not
           // distilled.
           if (stopped || !ownsLease()) return;
-          writeFull(session, derived, read, checkpoint, moved, spans);
-          distilled++;
-          distilledCount = distilled; // status counts only sessions actually distilled
+          if (writeFull(session, derived, read, checkpoint, moved, spans).kept === undefined) {
+            distilled++;
+            distilledCount = distilled; // status counts only sessions actually distilled
+          }
         } else {
           // Indexed and current (perhaps by another holder): not failing.
           clearStrikesOnSuccess(session.id);
