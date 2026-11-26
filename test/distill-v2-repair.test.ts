@@ -1524,3 +1524,162 @@ describe("v2 repair sweep requeue", () => {
     }
   });
 });
+
+describe("v2 bounded re-reads and raised floors", () => {
+  it("re-reads a card kept after an append loss within the row cap, and replaces it once the loss is past it", async () => {
+    addSession("ses_a");
+    addUser("ses_a", "one");
+    addUser("ses_a", "two");
+    /** The message ids each page read of ses_a returned, in order. */
+    const pages: string[][] = [];
+    const h = startDistiller({
+      appendThresholdParts: 0,
+      pageMessages: 1,
+      limits: { ftsRowsPerSession: 2 },
+      wrapSource: (inner) => ({
+        ...inner,
+        messagePage: async (o) => {
+          const page = await inner.messagePage(o);
+          if (o.sessionID === "ses_a") pages.push(page.items.map((msg) => msg.info.id));
+          return page;
+        },
+      }),
+    });
+    await cleanSweeps(h, 1);
+    const kept = (): number => h.logs.filter((line) => line.includes("ses_a kept its card")).length;
+
+    // A turn with a part type this build does not read: the append keeps the
+    // card and marks it.
+    const lossy = addReply("ses_a", {
+      parts: [text("alphaturn reply"), { type: "future-part", text: "unread" }],
+    });
+    h.distiller.onEvent({ type: "turn-ended", sessionID: "ses_a" });
+    await waitFor(() => kept() === 1);
+    expect(store.getCard("ses_a")?.repairReason).toMatch(/unknown types/);
+
+    // The first turn after it: the capped read still reaches the lossy reply.
+    const first = addUser("ses_a", "betaturn prompt");
+    h.distiller.onEvent({ type: "turn-ended", sessionID: "ses_a" });
+    await waitFor(() => kept() === 2);
+
+    // The second: the capped read stops at the first one, so the card is
+    // replaced and loses its mark.
+    const from = pages.length;
+    addUser("ses_a", "gammaturn prompt");
+    h.distiller.onEvent({ type: "turn-ended", sessionID: "ses_a" });
+    await waitFor(() => hits("gammaturn").length > 0);
+    const read = pages.slice(from).flat();
+    expect(read).toContain(first);
+    expect(read).not.toContain(lossy);
+    expect(read).not.toContain("msg_ses_a_2");
+    expect(store.getCard("ses_a")?.repairReason).toBeUndefined();
+    expect(hits("betaturn")).toEqual(["ses_a"]);
+    expect(hits("alphaturn")).toEqual([]);
+  });
+
+  it("trims an append's own hashes to the floor it raised", async () => {
+    addSession("ses_a");
+    addUser("ses_a", "one");
+    addUser("ses_a", "two");
+    const h = startDistiller({ appendThresholdParts: 0, limits: { ftsRowsPerSession: 2 } });
+    await cleanSweeps(h, 1);
+    expect(spansOf("ses_a")).toEqual([[1, 2]]);
+
+    // Three rows into a card of two: the floor moves past every stored row,
+    // into the rows the append read.
+    addUser("ses_a", "three");
+    addUser("ses_a", "four");
+    addUser("ses_a", "omegafive prompt");
+    h.distiller.onEvent({ type: "turn-ended", sessionID: "ses_a" });
+    await waitFor(() => hits("omegafive").length > 0);
+    expect(inspectCheckpoint(store.getCard("ses_a")?.distillCursor)?.floor).toBe(4);
+    expect(spansOf("ses_a")).toEqual([[4, 5]]);
+    const from = rangeSweeps(h.logs).length;
+    await cleanSweeps(h, 1, 2, from);
+    expect(reindexed(h.logs)).toEqual([]);
+  });
+
+  it("resumes a range walk at a floor an evicting append raised since", async () => {
+    addSession("ses_a");
+    v2db.db.tx(() => {
+      for (let i = 1; i <= 1_000; i++) addUser("ses_a", `row number ${i}`);
+    });
+    let release!: () => void;
+    const released = new Promise<void>((resolve) => (release = resolve));
+    let held = false;
+    const h = startDistiller({
+      appendThresholdParts: 0,
+      limits: { ftsRowsPerSession: 1_000 },
+      wrapSync: (inner) => ({
+        ...inner,
+        // The poll after the walk stopped inside the card waits until the
+        // append below has landed, so the next walk resumes over it.
+        poll: async (meta) => {
+          const at = JSON.parse(store.getMeta(RECONCILE_PROGRESS_KEY) ?? "{}") as {
+            session?: string;
+            after?: number;
+          };
+          if (!held && at.session === "ses_a" && at.after === 500) {
+            held = true;
+            await released;
+          }
+          return inner.poll(meta);
+        },
+      }),
+    });
+    try {
+      await waitFor(() => held, 20_000);
+      expect(spansOf("ses_a")).toEqual([
+        [1, 500],
+        [501, 1_000],
+      ]);
+      v2db.db.tx(() => {
+        for (let i = 1_001; i <= 1_601; i++) addUser("ses_a", `row number ${i}`);
+      });
+      h.distiller.onEvent({ type: "turn-ended", sessionID: "ses_a" });
+      await waitFor(
+        () => inspectCheckpoint(store.getCard("ses_a")?.distillCursor)?.floor === 602,
+        20_000,
+      );
+      expect(spansOf("ses_a")).toEqual([
+        [602, 1_000],
+        [1_001, 1_500],
+        [1_501, 1_601],
+      ]);
+    } finally {
+      release();
+    }
+    // The walk resumes at the floor, not at 500, and finds every span current.
+    await waitFor(() => rangeSweeps(h.logs).length >= 1, 20_000);
+    expect(reindexed(h.logs)).toEqual([]);
+    expect(rangeSweeps(h.logs)[0]).toEqual({ ranges: 4, changed: 0 });
+  }, 60_000);
+
+  it("records no append floor and reads no history for it without a projector generation", async () => {
+    addSession("ses_a");
+    addUser("ses_a", "one");
+    addUser("ses_a", "two");
+    let seqReads = 0;
+    const h = startDistiller({
+      projectorGen: null,
+      appendThresholdParts: 0,
+      limits: { ftsRowsPerSession: 2 },
+      wrapSync: (inner) => ({
+        ...inner,
+        seqOf: async (sessionID, messageID) => {
+          seqReads++;
+          return inner.seqOf!(sessionID, messageID);
+        },
+      }),
+    });
+    await coldPassDone(h);
+    addUser("ses_a", "rhothree prompt");
+    h.distiller.onEvent({ type: "turn-ended", sessionID: "ses_a" });
+    await waitFor(() => hits("rhothree").length > 0);
+    // The append evicted the first row, but the floor serves only range
+    // checks, which are off.
+    expect(hits("one")).toEqual([]);
+    expect(inspectCheckpoint(store.getCard("ses_a")?.distillCursor)?.floor).toBeUndefined();
+    expect(seqReads).toBe(0);
+  });
+});

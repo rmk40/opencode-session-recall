@@ -1735,7 +1735,12 @@ export function createDistiller(options: DistillerOptions): Distiller {
    * stored hashes. Only a tail that is settled now is worth a digest: a
    * write that reads a running tail stores an unsettled checkpoint, which the
    * range check never checks, and the first write over a settled tail takes
-   * its own digest and replaces the hashes.
+   * its own digest and replaces the hashes. Nor is a repair-pending card's:
+   * its re-reads are usually kept by the loss guard, which writes no hashes,
+   * so a whole-session digest on each of them would be wasted work that
+   * grows with the session. A re-read that does replace the card leaves the
+   * stored hashes, the range check finds them out of date and the re-index it
+   * dispatches takes the digest.
    */
   async function digestFor(
     sessionID: string,
@@ -1743,6 +1748,7 @@ export function createDistiller(options: DistillerOptions): Distiller {
     afterSeq: number,
   ): Promise<Digest | undefined> {
     if (!before?.settled) return undefined;
+    if (store.getCard(sessionID)?.repairReason !== undefined) return undefined;
     return digestSpans(sessionID, afterSeq);
   }
 
@@ -1939,7 +1945,9 @@ export function createDistiller(options: DistillerOptions): Distiller {
    * appended messages, or read from the history for a stored one).
    * Otherwise the card keeps the floor it had. `null` when that message is
    * gone from the history, so the stored rows no longer describe the
-   * session; `undefined` (with `aborted`) when the lease was lost.
+   * session; `aborted` when the lease was lost. Only the range check reads
+   * the floor, so without range hashes the card keeps its floor and this
+   * reads nothing.
    */
   async function floorAfterAppend(
     sessionID: string,
@@ -1948,7 +1956,7 @@ export function createDistiller(options: DistillerOptions): Distiller {
     appended: HistoryMessage[],
   ): Promise<{ floor: number | undefined } | null | "aborted"> {
     const cap = caps.ftsRowsPerSession;
-    if (!sync?.annotate || cap <= 0) return { floor: stored };
+    if (!rangesOn || cap <= 0) return { floor: stored };
     const kept = store.sessionRowCount(sessionID);
     const evicted = kept + newRows.length - cap;
     if (evicted <= 0) return { floor: stored };
@@ -2070,7 +2078,7 @@ export function createDistiller(options: DistillerOptions): Distiller {
       );
       // Rows that are not messages (a switch, an idle marker) can still move
       // the checkpoint past the stored hashes.
-      const spans = digest ? spansOf(digest, undefined) : [];
+      const spans = digest ? spansOf(digest, stored?.floor) : [];
       if (spans.length > 0) store.putRangeHashes(session.id, spans);
       noteSettled(session.id, tail, moved);
       return result;
@@ -2084,7 +2092,9 @@ export function createDistiller(options: DistillerOptions): Distiller {
     if (placed === null) return distillFull(session);
     if (stopped || !ownsLease()) return { changed: false };
     const info = { ...(placed.floor !== undefined && { floor: placed.floor }), cut };
-    let rangeHashes = digest ? spansOf(digest, undefined) : undefined;
+    // An append that evicts more rows than the card held raises the floor
+    // into the rows it read, so its own hashes are trimmed to the floor too.
+    let rangeHashes = digest ? spansOf(digest, placed.floor) : undefined;
     let replaceRangeHashes = false;
     if (rangesOn && placed.floor !== undefined && placed.floor !== stored?.floor) {
       // The append evicts rows: the stored hashes follow the floor up.
@@ -2831,10 +2841,12 @@ export function createDistiller(options: DistillerOptions): Distiller {
       // Rows below the floor are not in the card, so the walk starts at it.
       const first = info.floor !== undefined ? info.floor - 1 : BEFORE_FIRST_SEQ;
       // A position inside a stored span means the card's hashes were
-      // rewritten since the walk stopped there: walk the card again.
+      // rewritten since the walk stopped there: walk the card again. A
+      // position below the floor (an append that evicted rows raised it
+      // since) resumes at the floor.
       const resume =
         after !== null && !spans.some((span) => span.startSeq <= after! && span.endSeq > after!)
-          ? after
+          ? Math.max(after, first)
           : first;
       if (resume >= info.seq) {
         advance();
@@ -3038,12 +3050,18 @@ export function createDistiller(options: DistillerOptions): Distiller {
           rewritten = change === "rewritten";
         }
         // An append extends the stored card, so it must be at this
-        // distiller's projector generation (none and NULL are the same).
+        // distiller's projector generation (none and NULL are the same). A
+        // repair-pending card is re-read in full instead: the loss guard keeps
+        // its checkpoint where the last write left it, so an append would page
+        // back to it on every turn with no row cap, while the capped full read
+        // costs the same each turn and replaces the card once the lossy
+        // message is past the cap.
         const canAppend =
           existing != null &&
           existing.distilledThrough != null &&
           existing.partCount > appendThresholdParts &&
           (existing.projectorGen ?? null) === (projectorGen ?? null) &&
+          existing.repairReason === undefined &&
           !hadRemoval &&
           !rewritten;
         const result =
