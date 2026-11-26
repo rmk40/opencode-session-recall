@@ -2731,6 +2731,50 @@ describe("recall drill cache", () => {
   });
 });
 
+describe("recall card index use", () => {
+  /** A recall tool whose card runtime has a semantic embedder: any build of
+   *  the card index embeds the cards below, and any ranking embeds the query. */
+  async function semanticRecall(h: FakeHarness) {
+    const embed = vi.fn(() => Float32Array.from([1, 0]));
+    const { deps, store, cleanup } = await makeRecallDeps(h, TEST_LIMITS, {
+      semantic: { embedder: { ready: true, embed }, weight: 0.5 },
+    });
+    cleanups.push(cleanup);
+    // Enough distinct content words for the card to earn a vector.
+    store.upsertCard({
+      ...store.getCard("s-project-2")!,
+      inventory:
+        "reticulate splines calibrate manifold turbine gasket flange bearing sprocket lattice quiver zephyr",
+    });
+    return { recall: search(h.source, true, TEST_LIMITS, deps), embed, cards: deps.cards };
+  }
+
+  it.each([
+    { scope: "sessionID", args: { query: "walkthrough", sessionID: "s-other" } },
+    { scope: "the current session", args: { query: "rate-limit", scope: "session" } },
+    { scope: "a sessions list", args: { query: "walkthrough", sessions: ["s-other"] } },
+    {
+      scope: "a deep sessions list",
+      args: { query: "walkthrough", deep: true, sessions: ["s-other"] },
+    },
+  ])("never builds the card index for a search scoped to $scope", async ({ args }) => {
+    const { recall, embed, cards } = await semanticRecall(makeFakeHarness());
+    const out = await runTool<SearchOutput>(recall, args);
+    expect(out.ok).toBe(true);
+    expect(out.results.length).toBeGreaterThan(0);
+    expect(embed).not.toHaveBeenCalled();
+    expect(cards.semanticStatus()?.cardsWithVectors).toBe(0);
+  });
+
+  it("builds the card index for a ranked search", async () => {
+    const { recall, embed, cards } = await semanticRecall(makeFakeHarness());
+    const out = await runTool<SearchOutput>(recall, { query: "walkthrough" });
+    expect(out.ok).toBe(true);
+    expect(embed).toHaveBeenCalled();
+    expect(cards.semanticStatus()?.cardsWithVectors).toBeGreaterThan(0);
+  });
+});
+
 // ── History drift, card repair and cut messages ──────────────────────────────
 
 describe("recall history coverage", () => {
