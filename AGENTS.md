@@ -119,8 +119,11 @@ Bugs that only manifest through the real opencode host (like the
 defaults-not-applied bug) are invisible to vitest. Drive a real session:
 
 1. Make a throwaway workspace: `mktemp -d`, optionally `git init`.
-2. Launch: `npx -y tuistory launch "opencode" -s <name> --cols 160 --rows 50 --cwd <tmp> --background`.
-   (Run via `npx -y tuistory` — reliable regardless of PATH.)
+2. Launch: `npx -y tuistory launch "opencode --standalone" -s <name> --cols 160 --rows 50 --cwd <tmp> --background`.
+   (Run via `npx -y tuistory` — reliable regardless of PATH.) On v2,
+   `--standalone` makes the TUI run its own server instead of attaching to
+   the shared background service. The 1.18 CLI has no `--standalone`, so a
+   v1 run launches the v1 binary without it.
 3. `wait` for the prompt: `npx -y tuistory -s <name> wait "/Ask anything|Build ·/i" --timeout 35000`.
 4. `type` a prompt that **explicitly tells the agent which recall tool + args to
    call** (you're testing the tool, not invocation heuristics), then `press enter`.
@@ -131,6 +134,12 @@ defaults-not-applied bug) are invisible to vitest. Drive a real session:
 6. Always `close` the session and remove the tmp dir when done. Never
    `daemon-stop` (kills others' sessions).
 
+tuistory shares one daemon between every caller. When `launch` finds it
+unresponsive, it replaces it ("Relay port ... is occupied but not answering;
+replacing wedged daemon"), which ends every session the old daemon held,
+yours and other agents' alike. Check that a session still exists before you
+read from it.
+
 Cross-project trick: to prove recall finds _this_ project's history from a fresh
 session in a tmp dir, search `scope:"global"` for distinctive strings you know
 are in the DB. That exercises the cross-project path, which is exactly where the
@@ -140,11 +149,22 @@ scoped-vs-unscoped and defaults bugs hide.
 
 On this machine the v1 binary is
 `/opt/homebrew/lib/node_modules/opencode-ai/bin/opencode.exe` (1.18.33) and `opencode`
-on `PATH` is v2 (2.0.18). Isolate every live run with temporary
-`XDG_CONFIG_HOME`/`XDG_DATA_HOME`/`XDG_CACHE_HOME`/`XDG_STATE_HOME` directories. For
-v1 cold-pass tests, copy a v1-only database (here
-`~/.local/share/opencode/opencode.db.v1-final`) into the temp data directory as
-`opencode/opencode.db`; a v2 database has no v1 tables.
+on `PATH` is v2. The v2 reader was last checked live against opencode 2.4.1. Isolate
+every live run with temporary
+`XDG_CONFIG_HOME`/`XDG_DATA_HOME`/`XDG_CACHE_HOME`/`XDG_STATE_HOME` directories.
+
+On v2, `opencode serve` rejects `--standalone` ("Unrecognized flag"). Run the TUI as
+`opencode --standalone` through tuistory instead. Make API calls such as
+`session.fork` with `opencode api --standalone`. The 1.18 CLI has no `--standalone`.
+Run it as `serve --pure` on a private port.
+
+v1 cold-pass tests need a database with v1 tables. No ready-made one exists on this
+machine, so build it in the temp data directory. Start the 1.18.33 binary once so it
+creates a fresh `opencode/opencode.db`, stop it, then copy a few sessions into it from
+the v1 `session`, `message` and `part` tables of a database that still has them,
+attached read-only and filtered by session id. Copying a whole live database does not
+work, because 1.18.33 re-runs its migrations on the copied schema and fails ("table
+`project_directory` already exists").
 
 ### v2 hazards: a copied opencode.db can run real turns
 
