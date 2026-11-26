@@ -253,6 +253,9 @@ export type EvalCase = {
   expect?: {
     /** Session IDs that must NOT appear anywhere in the results. */
     notInResults?: string[];
+    /** Each `session` must appear in the results, ranked below `below`
+     *  (by its first result), which must appear too. */
+    rankedBelow?: Array<{ session: string; below: string }>;
     /** At least one of these evidence classes must appear in the top 3. */
     classInTop3?: EvidenceClass[];
     /** Per-class maximum count within the top 5 results. */

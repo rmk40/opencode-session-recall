@@ -74,6 +74,14 @@ describe("recall relevance eval through the v2 history source", () => {
       for (const banned of c.expect.notInResults ?? []) {
         expect(result.returnedSessionIDs, `${c.name}: ${banned}`).not.toContain(banned);
       }
+      for (const { session, below } of c.expect.rankedBelow ?? []) {
+        const upper = result.returnedSessionIDs.indexOf(below);
+        expect(upper, `${c.name}: ${below}`).toBeGreaterThanOrEqual(0);
+        expect(
+          result.returnedSessionIDs.indexOf(session),
+          `${c.name}: ${session} below ${below}`,
+        ).toBeGreaterThan(upper);
+      }
       if (c.expect.classInTop3) {
         const top3 = result.topClasses.slice(0, 3);
         expect(

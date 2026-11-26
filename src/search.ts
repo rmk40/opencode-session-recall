@@ -215,9 +215,10 @@ const MAX_FAMILY_DEPTH = 16;
 /**
  * The current session's delegation tree within the discovered set: walk
  * parentID up to the highest discovered ancestor (bounded, cycle-guarded),
- * then collect that root's transitive descendants. Searching for prior
- * history from a parent must not answer with its own subagents' restated
- * findings — and vice versa from inside a subagent. Exported for tests.
+ * then collect that root's transitive descendants. The search itself reads
+ * the same set from the cards (`exclusionFamilyFromCards`); this discovery
+ * form is the reference the equivalence test compares it with. Exported for
+ * tests.
  */
 export function exclusionFamily(
   discovered: SessionMetaInternal[],
@@ -1275,6 +1276,129 @@ function diversify(results: SearchResult[], limit: number, perSession: number): 
   return [...firstPass, ...heldBack];
 }
 
+// ── Family diversity ─────────────────────────────────────────────────
+// recall leaves the current session's relatives (its parent, siblings and
+// subagents) in by default, so an orchestrator can find what its subagents
+// found. A relative can still echo the query without holding an answer: a
+// subagent's prompt is the orchestrator's own wording of it. These passes keep
+// such echoes from crowding out prior work.
+
+/** Family sessions may hold at most this many of the first
+ *  {@link FAMILY_TOP_WINDOW} results while other results remain. */
+const FAMILY_TOP_MAX = 2;
+const FAMILY_TOP_WINDOW = 5;
+/** Family sessions may take at most this share of the drill shortlist
+ *  (never fewer than {@link FAMILY_TOP_MAX} slots). */
+const FAMILY_DRILL_SHARE = 1 / 3;
+
+/** The drill slots family sessions may take in a shortlist of `cap`. */
+export function familyDrillSlots(cap: number): number {
+  return Math.max(FAMILY_TOP_MAX, Math.floor(cap * FAMILY_DRILL_SHARE));
+}
+
+/**
+ * Family diversity over ordered results. `family` holds the current session's
+ * relatives, never the current session itself. A family session whose best
+ * evidence (its first result that is not a title hit) is a delegated prompt
+ * (`delegated` says which) moves below the best result from outside the
+ * family, keeping its order. Then the family holds at most
+ * {@link FAMILY_TOP_MAX} of the first {@link FAMILY_TOP_WINDOW} results; the
+ * results it would have held there move down behind them, and fill in only
+ * when no other result is left. Without a result from outside the family
+ * nothing moves. Exported for direct unit tests.
+ */
+export function familyDiversity(
+  results: SearchResult[],
+  family: ReadonlySet<string>,
+  delegated: (result: SearchResult) => boolean,
+): SearchResult[] {
+  if (family.size === 0) return results;
+  const isFamily = (result: SearchResult): boolean => family.has(result.sessionID);
+  const bestOther = results.findIndex((result) => !isFamily(result));
+  if (bestOther === -1) return results;
+
+  let ordered = results;
+  if (bestOther > 0) {
+    const leads = new Map<string, SearchResult>();
+    for (const result of results.slice(0, bestOther)) {
+      if (result.source !== "title" && !leads.has(result.sessionID)) {
+        leads.set(result.sessionID, result);
+      }
+    }
+    const demoted = new Set(
+      [...leads.values()].filter((lead) => delegated(lead)).map((lead) => lead.sessionID),
+    );
+    if (demoted.size > 0) {
+      const above = results.slice(0, bestOther);
+      ordered = [
+        ...above.filter((result) => !demoted.has(result.sessionID)),
+        results[bestOther]!,
+        ...above.filter((result) => demoted.has(result.sessionID)),
+        ...results.slice(bestOther + 1),
+      ];
+    }
+  }
+
+  const top: SearchResult[] = [];
+  const held: SearchResult[] = [];
+  let familyInTop = 0;
+  let next = 0;
+  for (; next < ordered.length && top.length < FAMILY_TOP_WINDOW; next++) {
+    const result = ordered[next]!;
+    if (isFamily(result)) {
+      if (familyInTop >= FAMILY_TOP_MAX) {
+        held.push(result);
+        continue;
+      }
+      familyInTop++;
+    }
+    top.push(result);
+  }
+  if (held.length === 0) return ordered;
+  return [...top, ...held, ...ordered.slice(next)];
+}
+
+/**
+ * Caps the family sessions in a drill shortlist at `max`, keeping the first
+ * ones in order. The freed slots go to the next ids of `ranked` (the ranked
+ * card ids, then the slim-index sessions) from outside the family; when none
+ * is left, the capped family ids take them back, so the shortlist never
+ * shrinks. Exported for direct unit tests.
+ */
+export function capFamilySlots(
+  shortlist: string[],
+  ranked: readonly string[],
+  family: ReadonlySet<string>,
+  max: number,
+): string[] {
+  const kept: string[] = [];
+  const dropped: string[] = [];
+  let familyKept = 0;
+  for (const id of shortlist) {
+    if (family.has(id)) {
+      if (familyKept >= max) {
+        dropped.push(id);
+        continue;
+      }
+      familyKept++;
+    }
+    kept.push(id);
+  }
+  if (dropped.length === 0) return shortlist;
+  const seen = new Set(shortlist);
+  for (const id of ranked) {
+    if (kept.length >= shortlist.length) break;
+    if (seen.has(id) || family.has(id)) continue;
+    seen.add(id);
+    kept.push(id);
+  }
+  for (const id of dropped) {
+    if (kept.length >= shortlist.length) break;
+    kept.push(id);
+  }
+  return kept;
+}
+
 /** Safety cap on messages fetched while locating one hit's context window. */
 const MAX_EXPAND_CONTEXT_FETCH = 200;
 
@@ -1462,6 +1586,69 @@ function capWarnings(warnings: string[]): string[] | undefined {
   return unique.length > 0 ? unique.slice(0, MAX_WARNINGS) : undefined;
 }
 
+/** Below this many results (or the `results` asked for, when fewer), a search
+ *  that excluded matching sessions says which argument includes them. */
+const FEW_RESULTS = 3;
+
+/** What a search's exclusion arguments removed that matched the query, as the
+ *  card ranking and the slim-index lookup measured it: whether the current
+ *  session matched, and how many of its relatives (its parent, siblings and
+ *  subagents, removed only by `excludeFamily`) did. */
+export type ExcludedMatches = { current: boolean; relatives: number };
+
+type ExcludedHintInput = {
+  results: SearchResult[];
+  currentSessionExcluded: boolean;
+  excludeFamily?: boolean;
+  excludedMatches?: ExcludedMatches;
+  requested?: number;
+};
+
+/** The suggestion naming the argument that includes the excluded sessions
+ *  matching the query, on zero or few results. Without a measurement (a
+ *  search over listed or named sessions), only an empty result after the
+ *  current session was excluded gets one. */
+function excludedHint(input: ExcludedHintInput): SearchSuggestion | undefined {
+  const matched = input.excludedMatches;
+  if (!matched) {
+    if (input.results.length > 0 || !input.currentSessionExcluded) return undefined;
+    return input.excludeFamily
+      ? {
+          reason: "This search excluded the current session and its family.",
+          action: "Drop excludeFamily to search its parent, siblings and subagents.",
+          example: { excludeFamily: false },
+        }
+      : {
+          reason: "This search excluded the current session.",
+          action: "Pass excludeCurrentSession:false if you meant to search this conversation.",
+          example: { excludeCurrentSession: false },
+        };
+  }
+  const few = input.results.length < Math.min(FEW_RESULTS, input.requested ?? FEW_RESULTS);
+  if (!few) return undefined;
+  if (matched.relatives > 0) {
+    const n = matched.relatives;
+    return {
+      reason: `${plural(n, "session")} in the current session's family (its parent, siblings or subagents) ${n === 1 ? "matches" : "match"} the query, but excludeFamily:true left ${n === 1 ? "it" : "them"} out.`,
+      action: "Drop excludeFamily to search them.",
+      example: { excludeFamily: false },
+    };
+  }
+  if (!matched.current) return undefined;
+  return input.excludeFamily
+    ? {
+        reason: "The current session matches the query, but excludeFamily:true left it out.",
+        action:
+          "Drop excludeFamily and pass excludeCurrentSession:false if you meant to search this conversation.",
+        example: { excludeFamily: false, excludeCurrentSession: false },
+      }
+    : {
+        reason: "The current session matches the query, but recall excludes it by default.",
+        action: "Pass excludeCurrentSession:false if you meant to search this conversation.",
+        example: { excludeCurrentSession: false },
+      };
+}
+
 // Exported for direct unit tests (the absent-`coverage.cards` guard cannot be
 // reached through the tool, which always attaches a cards block).
 export function buildSuggestions(input: {
@@ -1477,6 +1664,12 @@ export function buildSuggestions(input: {
   currentSessionExcluded: boolean;
   /** Caller explicitly passed excludeCurrentSession:false. */
   excludeExplicitOff: boolean;
+  /** Caller passed excludeFamily:true. */
+  excludeFamily?: boolean;
+  /** Excluded sessions that matched the query, when the search ranked cards. */
+  excludedMatches?: ExcludedMatches;
+  /** The `results` count the caller asked for. */
+  requested?: number;
   codeTokens: string[];
   /** Session IDs the metadata shortlist selected (smart/fuzzy only). */
   shortlistIDs: string[];
@@ -1570,15 +1763,10 @@ export function buildSuggestions(input: {
   }
 
   // Ahead of the generic zero-result hints so the cap cannot drop it: when
-  // the exclusion removed the caller's session, that is the likeliest
+  // the exclusion removed sessions that match, that is the likeliest
   // explanation for an empty result.
-  if (input.results.length === 0 && input.currentSessionExcluded) {
-    add(0, {
-      reason: "This search excluded the current session.",
-      action: "Pass excludeCurrentSession:false if you meant to search this conversation.",
-      example: { excludeCurrentSession: false },
-    });
-  }
+  const excluded = excludedHint(input);
+  if (excluded) add(input.results.length === 0 ? 0 : 1, excluded);
 
   // Suppressed under a stale window: broadening the match cannot recover
   // sessions the index has not seen.
@@ -1720,6 +1908,9 @@ function attachCommonOutput<T extends SearchOutput>(
     currentSessionID?: string;
     currentSessionExcluded: boolean;
     excludeExplicitOff: boolean;
+    excludeFamily: boolean;
+    excludedMatches?: ExcludedMatches;
+    requested: number;
     codeTokens: string[];
     shortlistIDs: string[];
     after?: number;
@@ -1741,6 +1932,9 @@ function attachCommonOutput<T extends SearchOutput>(
     currentSessionID: input.currentSessionID,
     currentSessionExcluded: input.currentSessionExcluded,
     excludeExplicitOff: input.excludeExplicitOff,
+    excludeFamily: input.excludeFamily,
+    ...(input.excludedMatches && { excludedMatches: input.excludedMatches }),
+    requested: input.requested,
     codeTokens: input.codeTokens,
     shortlistIDs: input.shortlistIDs,
     ...(input.after != null && { after: input.after }),
@@ -2058,7 +2252,7 @@ Skip trivial commands, simple local code/file lookup, simple edits with full con
 
 For "how did we do X before": match:"smart", group:"session" (current session is already excluded by default); if results are weak, search the project directory literally for the tool/command name and inspect tool-input hits with expand:"context" or recall_context.
 
-First call: for broad discovery use match:"smart", group:"session", ${mode ? 'scope:"project" (default in this mode; cross-project needs an explicit scope:"global")' : 'scope:"global" (default)'}, 5-10 results, and short terms from error text/feature/config/file/decision. The current session and its subagent sessions are excluded by default; pass excludeCurrentSession:false to search them (or use scope:"session"). Use role:"user" for requirements/decisions, and authorship:"human" when you specifically want what a person typed — role:"user" also carries subagent prompts written by an orchestrating agent and host-injected text. Use expand:"context" or "message" when top-hit evidence will avoid a follow-up.
+First call: for broad discovery use match:"smart", group:"session", ${mode ? 'scope:"project" (default in this mode; cross-project needs an explicit scope:"global")' : 'scope:"global" (default)'}, 5-10 results, and short terms from error text/feature/config/file/decision. Only the current session is excluded by default, so its subagents' findings stay searchable; pass excludeCurrentSession:false to include it (or use scope:"session"), or excludeFamily:true to also drop its parent, siblings and subagents. Use role:"user" for requirements/decisions, and authorship:"human" when you specifically want what a person typed — role:"user" also carries subagent prompts written by an orchestrating agent and host-injected text. Use expand:"context" or "message" when top-hit evidence will avoid a follow-up.
 
 If memory exists, store only durable findings: preferences, project decisions, reusable root causes, environment facts, behavior corrections, or repeatable success/failure. Do not store ephemeral details, one-off commands, transient errors, or implementation minutiae.
 
@@ -2098,6 +2292,10 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
         .boolean()
         .optional()
         .describe("Default true for project/global scopes; false includes this session"),
+      excludeFamily: tool.schema
+        .boolean()
+        .optional()
+        .describe("true also excludes this session's parent, siblings and subagents"),
       excludeSessionID: tool.schema.string().optional().describe("Exclude one session by ID"),
       type: tool.schema
         .enum(["text", "tool", "reasoning", "all"])
@@ -2413,6 +2611,10 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
         typeof args.excludeCurrentSession === "boolean" ? args.excludeCurrentSession : undefined;
       const currentSessionID = optionalString(ctx.sessionID);
       const excludeCurrent = excludeExplicit ?? (scope !== "session" && !sessionID);
+      // Family exclusion is opt-in: the default leaves the current session's
+      // parent, siblings and subagents searchable. Anything but `true` reads
+      // as unset.
+      const excludeFamily = args.excludeFamily === true;
       const requestedSessions =
         args.sessionLimit == null
           ? undefined
@@ -2488,6 +2690,7 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
           toolName: toolName ?? null,
           excludeSessionID: excludeSessionID ?? null,
           excludeCurrentSession: excludeExplicit ?? null,
+          excludeFamily,
           sessionLimit: requestedSessions ?? null,
           deep: deepRequested,
           sessions: explicitSessions,
@@ -2563,6 +2766,20 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
       if (excludeExplicit === true && sessionID && currentSessionID === sessionID) {
         return fail(
           "sessionID targets the current session but excludeCurrentSession is true; drop one of them",
+        );
+      }
+      // The family includes the current session, so excludeFamily carries
+      // every contradiction excludeCurrentSession:true does, plus one with an
+      // explicit excludeCurrentSession:false. A sessionID in the family is
+      // checked once the cards are read, below.
+      if (excludeFamily && scope === "session") {
+        return fail(
+          'excludeFamily cannot be combined with scope:"session"; the search would exclude its only target',
+        );
+      }
+      if (excludeFamily && excludeExplicit === false) {
+        return fail(
+          "excludeFamily:true also excludes the current session, which excludeCurrentSession:false includes; drop one of them",
         );
       }
 
@@ -2673,6 +2890,40 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
         // never builds or updates it.
         await cards.ready();
 
+        /** The current session's family (itself, its parent, siblings and
+         *  subagents) from the card map, read once and only when needed. */
+        let familyMemo: Set<string> | undefined;
+        const currentFamily = (): Set<string> =>
+          (familyMemo ??= currentSessionID
+            ? cards.exclusionFamily(currentSessionID)
+            : new Set<string>());
+        if (excludeFamily && sessionID && currentFamily().has(sessionID)) {
+          return fail(
+            "sessionID targets a session excludeFamily:true excludes (the current session or its parent, a sibling or a subagent); drop one of them",
+          );
+        }
+        /** The card filter for what the exclusion arguments remove: the whole
+         *  family with excludeFamily, else the current session alone. */
+        const exclusionFilter = (): Pick<CardFilters, "excludeFamilyOf" | "excludeSessionId"> => {
+          if (!currentSessionID) return {};
+          if (excludeFamily) return { excludeFamilyOf: currentSessionID };
+          return excludeCurrent ? { excludeSessionId: currentSessionID } : {};
+        };
+        /** The session ids {@link exclusionFilter} removes. */
+        const excludedIds = (): Set<string> => {
+          if (!currentSessionID) return new Set<string>();
+          if (excludeFamily) return currentFamily();
+          return excludeCurrent ? new Set([currentSessionID]) : new Set<string>();
+        };
+        /** The relatives family diversity reorders: the family less the
+         *  current session, empty when excludeFamily removed them anyway. */
+        const relatives = (): Set<string> => {
+          if (excludeFamily || !currentSessionID) return new Set<string>();
+          const ids = new Set(currentFamily());
+          ids.delete(currentSessionID);
+          return ids;
+        };
+
         const skippedByReason: Record<string, number> = {};
 
         const cardMeta = (card: Card): SessionMetaInternal => ({
@@ -2704,6 +2955,14 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
         /** Cards tier-1 ranking left out because the index had yet to take
          *  their latest content (reported as `coverage.cards.pending`). */
         let cardsPending = 0;
+        /** The relatives family diversity applies to (see `familyDiversity`):
+         *  set only by tier-1 ranking, so a search of one session or of a
+         *  named list keeps its order, and only without a time bound, since a
+         *  time-bounded search asks for what happened in that window wherever
+         *  it happened, the current session's subagents included. */
+        let diversityFamily = new Set<string>();
+        /** Excluded sessions that matched, measured by tier-1 ranking. */
+        let excludedMatches: ExcludedMatches | undefined;
         /** Sessions the authorship root-only restriction removed from selection,
          *  across BOTH selection paths (card ranking and the FTS admission
          *  chain). Kept as ids so the two paths cannot double-count the same
@@ -2790,9 +3049,11 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
               // philosophy above — and silently dropping an uncarded own id
               // would reproduce the original sessionsEligible:0 signature for
               // exactly the young-session population this path exists for.
-              // (The carded shortlist half applies no exclusion at all — an
-              // older inconsistency, out of scope.)
+              // An explicit excludeFamily:true skips the ids it excludes the
+              // same way. (The carded shortlist half applies no exclusion at
+              // all — an older inconsistency, out of scope.)
               !(excludeExplicit === true && currentSessionID === id) &&
+              !(excludeFamily && currentFamily().has(id)) &&
               cards.get(id) == null &&
               !workerCard(id),
           );
@@ -3061,8 +3322,7 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
             if (singleTarget !== excludeSessionID) drillTargets = [targetFor(singleTarget)];
           } else {
             // since + project/directory constraint (validated by the scope gate).
-            if (excludeCurrent && currentSessionID) timeFilters.excludeFamilyOf = currentSessionID;
-            const scoped = cards.list(timeFilters).filter((card) => {
+            const scoped = cards.list({ ...timeFilters, ...exclusionFilter() }).filter((card) => {
               const rel = relevanceOf(card);
               return directoryFilter ? rel === "exact" : rel === "exact" || rel === "project";
             });
@@ -3132,10 +3392,9 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
           if (scope !== "global") pushUnique(normalized.limitedBy, "scope");
         } else {
           // ── Tier 1: rank cards ──
-          const cardFilters: CardRankFilters = {};
+          const cardFilters: CardRankFilters = { ...exclusionFilter() };
           if (after != null) cardFilters.since = after;
           if (before != null) cardFilters.until = before;
-          if (excludeCurrent && currentSessionID) cardFilters.excludeFamilyOf = currentSessionID;
           // Selection-tier win for the dominant contaminant: under
           // authorship:{human} a child session can contribute no result at all,
           // so drop it from ranking and let a root session take the slot. The
@@ -3233,6 +3492,14 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
           const skippedContenders = rankStats.rootOnlySkipped.filter(
             (s) => passesTitle(s.card) && keptRelevances.has(relevanceOf(s.card)),
           );
+          // Excluded sessions that matched the query, kept to the same
+          // selection guards; the slim-index lookup below adds the ones only
+          // its rows match.
+          const excludedMatched = new Set(
+            (rankStats.excludedMatched ?? [])
+              .filter((card) => passesTitle(card) && keptRelevances.has(relevanceOf(card)))
+              .map((card) => card.sessionId),
+          );
 
           for (const e of eligible) {
             relevanceBySession.set(e.hit.sessionId, e.relevance);
@@ -3292,13 +3559,10 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
               if (list) list.push(row);
               else ftsBySession.set(row.sessionId, [row]);
             }
-            const excludedFamily =
-              excludeCurrent && currentSessionID
-                ? cards.exclusionFamily(currentSessionID)
-                : new Set<string>();
+            const ftsExcluded = excludedIds();
             for (const id of ftsBySession.keys()) {
               if (eligibleIdSet.has(id)) continue;
-              if (id === excludeSessionID || excludedFamily.has(id)) continue;
+              if (id === excludeSessionID) continue;
               const card = store.getCard(id);
               if (!card) continue;
               // A direct store read bypasses the card runtime's filter, so a stray
@@ -3312,6 +3576,13 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
                 if (relevance === "project" && !(projectScope || (directoryFilter && fallback))) {
                   continue;
                 }
+              }
+              // After the guards above, so only a session they would have
+              // admitted counts as an excluded match (one the roots-only
+              // restriction below would drop anyway does not).
+              if (ftsExcluded.has(id)) {
+                if (!(humanOnly && parentageOf(card.parentId) === "child")) excludedMatched.add(id);
+                continue;
               }
               // This path never goes through `cards.rank`/`CardFilters`, so the
               // roots-only restriction needs its own check here. Not marginal:
@@ -3346,7 +3617,18 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
               ? Math.min(requestedSessions, Math.max(1, limits.drillSessions))
               : Math.max(1, limits.drillSessions);
           const semanticSlots = semanticIds.length > 0 ? limits.semanticSlots : 0;
-          const mergedIds = mergeShortlist(eligibleIds, ftsOnly, semanticIds, cap, semanticSlots);
+          if (after == null && before == null) diversityFamily = relatives();
+          // The current session's relatives take at most a share of the drill
+          // slots, so subagents that echo the query cannot crowd out other
+          // history.
+          const familyRanked = [...eligibleIds, ...ftsOnly];
+          const capFamily = (ids: string[]): string[] =>
+            diversityFamily.size > 0
+              ? capFamilySlots(ids, familyRanked, diversityFamily, familyDrillSlots(cap))
+              : ids;
+          const mergedIds = capFamily(
+            mergeShortlist(eligibleIds, ftsOnly, semanticIds, cap, semanticSlots),
+          );
 
           // How many child sessions the roots-only restriction cost the
           // shortlist: re-run the real `mergeShortlist` with the dropped
@@ -3412,7 +3694,9 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
           // a lexically-strong card that also scores well semantically is NOT
           // counted, since it would be here regardless.
           if (semanticSlots > 0) {
-            const lexicalOnly = new Set(mergeShortlist(eligibleIds, ftsOnly, [], cap, 0));
+            const lexicalOnly = new Set(
+              capFamily(mergeShortlist(eligibleIds, ftsOnly, [], cap, 0)),
+            );
             semanticReserved = mergedIds.filter((id) => !lexicalOnly.has(id));
           }
           drillTargets = mergedIds
@@ -3449,12 +3733,13 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
           if (shortlistSkipped > 0) {
             skippedByReason.sessionsLimit = (skippedByReason.sessionsLimit ?? 0) + shortlistSkipped;
           }
-          if (excludeCurrent && currentSessionID) {
-            // Count the current session's whole delegation tree (the cards the
-            // family filter removed from ranking) so coverage reports the skip.
-            const family = cards.exclusionFamily(currentSessionID);
+          const excluded = excludedIds();
+          if (currentSessionID && excluded.size > 0) {
+            // Count the sessions the exclusion removed from ranking (the
+            // current session, or its whole family with excludeFamily) so
+            // coverage reports the skip.
             let excludedKnown = 0;
-            for (const id of family) {
+            for (const id of excluded) {
               if (!store || store.getCard(id)) excludedKnown++;
             }
             if (excludedKnown > 0) {
@@ -3462,6 +3747,11 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
               skippedByReason.excludedSession =
                 (skippedByReason.excludedSession ?? 0) + excludedKnown;
             }
+            // excludeSessionID removes its session whatever the exclusion
+            // arguments say, so it is not one they would let back in.
+            if (excludeSessionID) excludedMatched.delete(excludeSessionID);
+            const current = excludedMatched.has(currentSessionID);
+            excludedMatches = { current, relatives: excludedMatched.size - (current ? 1 : 0) };
           }
           if (scope !== "global") pushUnique(normalized.limitedBy, "scope");
         }
@@ -3859,6 +4149,9 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
               currentSessionID,
               currentSessionExcluded,
               excludeExplicitOff: excludeExplicit === false,
+              excludeFamily,
+              ...(excludedMatches && { excludedMatches }),
+              requested: resultsArg,
               codeTokens: queryMeta.codeTokens,
               shortlistIDs,
               ...(after != null && { after }),
@@ -3873,15 +4166,42 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
           resultsArg * DIVERSITY_SCAN_MULTIPLIER,
         );
 
+        /** Family diversity over ordered results, judged on the candidates
+         *  of the drilled `pools` the results came from. Runs after the
+         *  directory-fallback re-sort, which is family-blind and would undo
+         *  it. */
+        const orderForFamily = (ordered: SearchResult[], pools: DrilledPool[]): SearchResult[] => {
+          if (diversityFamily.size === 0) return ordered;
+          let byPart: Map<string, Candidate> | undefined;
+          const delegated = (result: SearchResult): boolean => {
+            if (!byPart) {
+              byPart = new Map();
+              for (const pool of pools) {
+                if (!diversityFamily.has(pool.target.sessionId)) continue;
+                for (const candidate of pool.candidates) {
+                  byPart.set(`${candidate.sessionID}\u0000${candidate.partID}`, candidate);
+                }
+              }
+            }
+            const candidate = byPart.get(`${result.sessionID}\u0000${result.partID}`);
+            return candidate !== undefined && authorshipOf(candidate) === "delegated";
+          };
+          return familyDiversity(ordered, diversityFamily, delegated);
+        };
+
         const applyGroupAndSlice = (
           results: SearchResult[],
           partTotal: number,
           earlyExit: boolean,
+          pools: DrilledPool[],
         ): { final: SearchResult[]; total: number; truncated: boolean } => {
           if (isGrouped) {
-            const grouped = orderForDirectoryFallback(
-              groupBySession(results),
-              Boolean(bucketDirectory && fallback),
+            const grouped = orderForFamily(
+              orderForDirectoryFallback(
+                groupBySession(results),
+                Boolean(bucketDirectory && fallback),
+              ),
+              pools,
             );
             const final = grouped.slice(0, resultsArg);
             return {
@@ -3891,9 +4211,9 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
             };
           }
           const diversified = diversify(results, resultsArg, MAX_HITS_PER_SESSION_INITIAL);
-          const ordered = orderForDirectoryFallback(
-            diversified,
-            Boolean(bucketDirectory && fallback),
+          const ordered = orderForFamily(
+            orderForDirectoryFallback(diversified, Boolean(bucketDirectory && fallback)),
+            pools,
           );
           const final = capAndSlice(ordered, resultsArg, commandLikeQuery);
           return { final, total: partTotal, truncated: earlyExit || partTotal > final.length };
@@ -3997,7 +4317,12 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
             const matcher = matchMode === "regex" && regex ? regexMatcher(regex) : literalMatcher;
             const limit = isGrouped ? Number.MAX_SAFE_INTEGER : partScanLimit;
             const scanned = scanPools(deepResult.pools, limit, matcher);
-            const sliced = applyGroupAndSlice(scanned.collected, scanned.total, scanned.early);
+            const sliced = applyGroupAndSlice(
+              scanned.collected,
+              scanned.total,
+              scanned.early,
+              deepResult.pools,
+            );
             ({ final, total: outTotal, truncated } = sliced);
           } else {
             effMode = smartMode;
@@ -4012,7 +4337,12 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
               relevanceBySession,
               emitAuthorship,
             );
-            const sliced = applyGroupAndSlice(allResults, allResults.length, false);
+            const sliced = applyGroupAndSlice(
+              allResults,
+              allResults.length,
+              false,
+              deepResult.pools,
+            );
             ({ final, total: outTotal, truncated } = sliced);
           }
 
@@ -4053,7 +4383,11 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
           );
           const limit = isGrouped ? Number.MAX_SAFE_INTEGER : partScanLimit;
           const { collected, total, early } = scanPools(drilled.pools, limit, literalMatcher);
-          const { final, total: outTotal, truncated } = applyGroupAndSlice(collected, total, early);
+          const {
+            final,
+            total: outTotal,
+            truncated,
+          } = applyGroupAndSlice(collected, total, early, drilled.pools);
 
           const unit = isGrouped ? "session" : "result";
           ctx.metadata({
@@ -4083,7 +4417,11 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
           );
           const limit = isGrouped ? Number.MAX_SAFE_INTEGER : partScanLimit;
           const { collected, total, early } = scanPools(drilled.pools, limit, regexMatcher(regex));
-          const { final, total: outTotal, truncated } = applyGroupAndSlice(collected, total, early);
+          const {
+            final,
+            total: outTotal,
+            truncated,
+          } = applyGroupAndSlice(collected, total, early, drilled.pools);
 
           const unit = isGrouped ? "session" : "result";
           ctx.metadata({
@@ -4181,7 +4519,11 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
         if (allResults.length === 0 && !ctx.abort.aborted) {
           const limit = isGrouped ? Number.MAX_SAFE_INTEGER : partScanLimit;
           const { collected, total, early } = scanPools(drilled.pools, limit, literalMatcher);
-          const { final, total: outTotal, truncated } = applyGroupAndSlice(collected, total, early);
+          const {
+            final,
+            total: outTotal,
+            truncated,
+          } = applyGroupAndSlice(collected, total, early, drilled.pools);
           if (final.length > 0) {
             const unit = isGrouped ? "session" : "result";
             ctx.metadata({
@@ -4205,7 +4547,7 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
           final,
           total: outTotal,
           truncated,
-        } = applyGroupAndSlice(allResults, allResults.length, false);
+        } = applyGroupAndSlice(allResults, allResults.length, false, drilled.pools);
         const unit = isGrouped ? "session" : "result";
         ctx.metadata({
           title: `Found ${final.length} ${unit}${final.length !== 1 ? "s" : ""} for "${args.query}" (${smartMode}, ${drilled.drilledSessions.length} session${drilled.drilledSessions.length !== 1 ? "s" : ""}${loadErrorSuffixOf(outCtx.loadErrorCount)})`,
