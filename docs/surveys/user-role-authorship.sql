@@ -1,5 +1,3 @@
--- Survey backing docs/plans/genuine-prompt-filtering.md
---
 -- Question: of everything carrying `role: "user"` in the opencode transcript,
 -- how much was actually typed by a human?
 --

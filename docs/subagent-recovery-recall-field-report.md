@@ -61,8 +61,7 @@ One more wrinkle: these sessions were cancelled rather than completed. If the in
 
 ## Addendum (post-fix)
 
-Two of the recommendations above shipped in the plugin
-(see [docs/plans/subagent-recovery-parent-filter.md](plans/subagent-recovery-parent-filter.md)):
+Two of the recommendations above shipped in the plugin:
 
 - **Recommendation 2 shipped in full.** `recall_sessions` now takes a
   `parentID` filter (`"current"` = the calling session) that lists a parent's

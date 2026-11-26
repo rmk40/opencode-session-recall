@@ -12,7 +12,7 @@ import type { Card } from "./store.js";
  * SOLE rebuild signal (the lite source's `revision()` remains a pure
  * `() => undefined` getter).
  *
- * Contract (see docs/plans/ephemeral-mode.md, step 3):
+ * Contract:
  * - `maybeRefresh()` is called fire-and-forget at query entry; the triggering
  *   query proceeds on the current snapshot. New sessions become visible on the
  *   first query after the discover resolves (bound = discover latency —

@@ -7,7 +7,7 @@
  *
  *     RECALL_PERF=1 npx vitest run test/perf.test.ts
  *
- * Budgets (from docs/plans/recall-distill-then-search.md "## Verification"):
+ * Budgets:
  *   - Tier-1 card rank p95 < 50ms over 20 varied queries on ~4,700 cards.
  *   - Single-session distill+replace p50 < 150ms (20 sessions of ~64 parts).
  *   - ftsSearch over ~50k slim-index rows < 100ms.
