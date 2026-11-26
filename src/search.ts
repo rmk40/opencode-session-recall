@@ -1799,6 +1799,14 @@ export function buildSuggestions(input: {
     }
   }
 
+  // On an empty result the exclusion hint comes right after the stale-window
+  // hint and ahead of every other priority-0 entry, so the cap keeps both it
+  // and the tool-name hint inserted next: what the exclusion removed is the
+  // likeliest explanation, ahead of routing, directory and literal-mode
+  // advice. On a few results it ranks with the priority-1 hints.
+  const excluded = excludedHint(input);
+  if (excluded) add(input.results.length === 0 ? 0 : 1, excluded);
+
   // A toolName that matched no tool part the other filters keep. When the
   // authorship filter removed the parts it did match, that filter emptied the
   // result; otherwise the name did, so name what is there. A deep sweep that
@@ -1862,12 +1870,6 @@ export function buildSuggestions(input: {
       example: { directory: input.directory, fallback: true },
     });
   }
-
-  // Ahead of the generic zero-result hints so the cap cannot drop it: when
-  // the exclusion removed sessions that match, that is the likeliest
-  // explanation for an empty result.
-  const excluded = excludedHint(input);
-  if (excluded) add(input.results.length === 0 ? 0 : 1, excluded);
 
   // Suppressed under a stale window: broadening the match cannot recover
   // sessions the index has not seen.

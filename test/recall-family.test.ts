@@ -607,6 +607,44 @@ describe("the suggestion naming excluded sessions that match", () => {
       ]);
     });
 
+    it.each([
+      { name: "measured to match", excludedMatches: { current: true, relatives: 0 } },
+      { name: "not measured", excludedMatches: undefined },
+    ])(
+      "keeps the exclusion hint and the tool-name hint when every other hint fires too ($name)",
+      ({ excludedMatches }) => {
+        // An empty literal search shaped like a pattern, under a directory
+        // filter without fallback and a toolName that matched nothing: the
+        // routing, directory and literal hints all want the three slots.
+        const out = reasons({
+          results: [],
+          matchMode: "literal",
+          query: "foo|bar",
+          directory: "/workspace/project",
+          coverage: {
+            ...coverage,
+            toolNames: {
+              filter: "bassh",
+              accepted: ["bassh"],
+              matched: 0,
+              parts: 4,
+              distinct: 1,
+              top: [{ name: "bash", count: 4 }],
+              closest: "bash",
+            },
+          },
+          ...(excludedMatches && { excludedMatches }),
+        });
+        expect(out).toHaveLength(3);
+        expect(out[0]).toBe(
+          excludedMatches ? CURRENT_DEFAULT : "This search excluded the current session.",
+        );
+        expect(out[1]).toContain('toolName:"bassh" matched none');
+        // The routing hint takes the last slot; the directory hint is cut.
+        expect(out[2]).toContain("It may be intended as a pattern.");
+      },
+    );
+
     it("names the relatives ahead of the current session, by count", () => {
       const one = suggest({
         excludeFamily: true,
