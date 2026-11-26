@@ -215,6 +215,10 @@ export type DrillDeps = {
   /** Soft wall-clock budget for a deep sweep in ms (default 20s). Injectable so
    *  tests can force a time stop without a real 20s wait. */
   deepWallClockMs?: number;
+  /** Messages the drill cache may hold across all sessions (default
+   *  {@link MAX_CACHED_MESSAGES}). Injectable so tests can reach the bound
+   *  without fetching tens of thousands of messages. */
+  maxCachedMessages?: number;
 };
 
 /** Messages per page during a deep sweep (the spec's exhaustive page size). */
@@ -226,6 +230,12 @@ const DEFAULT_DEEP_WALL_CLOCK_MS = 20_000;
  *  an uncarded or unverified target may carry 0 there, so a short bound caps
  *  how stale those pages can get. */
 export const UNREVISED_ENTRY_TTL_MS = 30_000;
+/** Default bound on the messages the drill cache holds, counting each page
+ *  message, point lookup and not-found lookup as one. `cacheMaxChars` bounds
+ *  candidate chars only, and a message with no searchable text or a not-found
+ *  lookup charges none, though each keeps its info object or id. So the cache
+ *  evicts while either bound is passed. */
+export const MAX_CACHED_MESSAGES = 50_000;
 
 // ── Deep continuation cursor (opaque base64url JSON) ─────────────────────────
 // btoa/atob are DOM globals (available under Bun and Node), so no Node Buffer is
@@ -288,6 +298,13 @@ type DrilledMessage = {
 /** One cached newest-first page and the cursor it returned. */
 type CachedPage = { items: DrilledMessage[]; nextCursor: string | null };
 
+/** The messages one query's slice of a session holds (see `sliceFor`). */
+type Slice = {
+  messages: DrilledMessage[];
+  signature: string;
+  points: Array<[string, DrilledMessage]>;
+};
+
 /**
  * The candidates one query's slice of a session builds to. `signature` names
  * the slice (pages walked, point lookups added), so a later query that lands
@@ -309,10 +326,12 @@ type SliceBuild = {
  * produced each page ("" for the first page: a source never hands back an
  * empty cursor, since the paging loop reads one as the end of the session).
  * `points` holds point lookups by requested message id, with null for a
- * not-found. `chars` is the entry's charge against `cacheMaxChars`; the
- * `build`'s candidates are shallow copies sharing the cached strings, so they
- * add no charge. `live` turns false once the entry leaves the cache, after
- * which a query still holding it stops charging the cache total.
+ * not-found. `chars` and `messages` are the entry's charge against
+ * `cacheMaxChars` and the cached-message bound. The `build`'s candidates are
+ * shallow copies of candidates the entry holds, sharing their strings, so
+ * they add no charge; a build is cached only while every message under it is
+ * still held. `live` turns false once the entry leaves the cache, after which
+ * a query still holding it stops charging the cache totals.
  */
 type SessionEntry = {
   sessionId: string;
@@ -322,6 +341,7 @@ type SessionEntry = {
   points: Map<string, DrilledMessage | null>;
   pointChars: number;
   chars: number;
+  messages: number;
   build: SliceBuild | undefined;
   live: boolean;
 };
@@ -361,13 +381,18 @@ function estimateRetained(msg: HistoryMessage): number {
 export function createDrill(deps: DrillDeps): Drill {
   const { source, gate, limits } = deps;
   const clock = deps.now ?? Date.now;
+  const maxCachedMessages = deps.maxCachedMessages ?? MAX_CACHED_MESSAGES;
   // Per-session LRU of fetched pages and point lookups; Map order is LRU order.
   const cache = new Map<string, SessionEntry>();
   let cachedTotal = 0;
+  let cachedMessages = 0;
 
-  function charge(entry: SessionEntry, chars: number): void {
+  function charge(entry: SessionEntry, chars: number, messages: number): void {
     entry.chars += chars;
-    if (entry.live) cachedTotal += chars;
+    entry.messages += messages;
+    if (!entry.live) return;
+    cachedTotal += chars;
+    cachedMessages += messages;
   }
 
   function drop(entry: SessionEntry): void {
@@ -375,11 +400,12 @@ export function createDrill(deps: DrillDeps): Drill {
     entry.live = false;
     cache.delete(entry.sessionId);
     cachedTotal -= entry.chars;
+    cachedMessages -= entry.messages;
   }
 
   function evict(): void {
     for (const entry of cache.values()) {
-      if (cachedTotal <= limits.cacheMaxChars) break;
+      if (cachedTotal <= limits.cacheMaxChars && cachedMessages <= maxCachedMessages) break;
       drop(entry);
     }
   }
@@ -387,19 +413,24 @@ export function createDrill(deps: DrillDeps): Drill {
   /**
    * The cache entry for the target's session version, moved to MRU, or a new
    * empty one when the cached entry was filled under another (time.updated,
-   * writeRev) pair or has outlived its time bound.
+   * writeRev) pair or has outlived its time bound. The cache holds one entry
+   * per session id, so targets that stamp one session differently replace
+   * each other's entry rather than sharing the cache: a session-scoped query
+   * whose target has no `writeRev`, alternating with a carded target for the
+   * same session, refetches on every switch.
    *
    * The key deliberately omits `target.parentID`. Two targets for the same
-   * session CAN disagree about parentage under the same stamp — a card whose
-   * `timeUpdated` is 0, or an id with no card at all, stamps the same as the
-   * metadata-less fallback — so the stamp alone cannot be trusted to imply
-   * matching parentage. Extending the key would instead refetch the same
-   * session, which is exactly what this cache exists to avoid. So parentage is
-   * treated as TARGET metadata rather than message-derived data: a build whose
-   * stamp disagrees with the current target is restamped onto a copy
-   * ({@link restamped}). Getting this wrong fails OPEN — cached root parentage
-   * served to an unknown-parentage target would let its candidates satisfy
-   * `authorship: "human"`.
+   * session CAN disagree about parentage under the same stamp — a card without
+   * a `writeRev` whose `timeUpdated` is 0, or an id with no card at all, stamps
+   * the same as the metadata-less fallback — so the stamp alone cannot be
+   * trusted to imply matching parentage. Extending the key would instead
+   * refetch the same session, which is exactly what this cache exists to
+   * avoid. So parentage is treated as TARGET metadata rather than
+   * message-derived data: a build whose stamp disagrees with the current
+   * target is restamped onto a copy ({@link restamped}). Getting this wrong
+   * fails OPEN — cached root parentage served to an unknown-parentage target
+   * would let its candidates satisfy `authorship: "human"`. Title and
+   * directory are not restamped (see {@link prepare}).
    */
   function entryFor(target: DrillTarget): SessionEntry {
     const stamp = `${target.timeUpdated}:${target.writeRev ?? ""}`;
@@ -422,6 +453,7 @@ export function createDrill(deps: DrillDeps): Drill {
       points: new Map(),
       pointChars: 0,
       chars: 0,
+      messages: 0,
       build: undefined,
       live: true,
     };
@@ -429,7 +461,12 @@ export function createDrill(deps: DrillDeps): Drill {
     return entry;
   }
 
-  /** Build one fetched message's candidates once, for every slice that holds it. */
+  /** Build one fetched message's candidates once, for every slice that holds it.
+   *  Their `sessionTitle` and `directory` come from the target that filled the
+   *  entry and, unlike parentage, are not restamped: two targets with the same
+   *  stamp but different titles both see the first one's. A title change
+   *  rewrites the card and moves its `writeRev`, so this reaches only targets
+   *  without one. */
   function prepare(msg: HistoryMessage, target: DrillTarget): DrilledMessage {
     const { candidates, charsUsed } = buildCandidates([msg], {
       id: target.sessionId,
@@ -473,7 +510,7 @@ export function createDrill(deps: DrillDeps): Drill {
     entry.pages.set(key, cached);
     let chars = 0;
     for (const msg of cached.items) chars += msg.chars;
-    charge(entry, chars);
+    charge(entry, chars, cached.items.length);
     return cached;
   }
 
@@ -502,7 +539,10 @@ export function createDrill(deps: DrillDeps): Drill {
     const raced = entry.points.get(messageID);
     if (raced !== undefined) return raced;
     if (!lookup.ok) {
-      if (lookup.reason === "not-found") entry.points.set(messageID, null);
+      if (lookup.reason === "not-found") {
+        entry.points.set(messageID, null);
+        charge(entry, 0, 1);
+      }
       return null;
     }
     const msg = prepare(lookup.value, target);
@@ -510,15 +550,15 @@ export function createDrill(deps: DrillDeps): Drill {
       for (const [id, cached] of entry.points) {
         if (own.has(id)) continue;
         entry.points.delete(id);
-        if (!cached) continue;
-        entry.pointChars -= cached.chars;
-        charge(entry, -cached.chars);
+        const chars = cached?.chars ?? 0;
+        entry.pointChars -= chars;
+        charge(entry, -chars, -1);
       }
       entry.build = undefined;
     }
     entry.points.set(messageID, msg);
     entry.pointChars += msg.chars;
-    charge(entry, msg.chars);
+    charge(entry, msg.chars, 1);
     return msg;
   }
 
@@ -527,14 +567,16 @@ export function createDrill(deps: DrillDeps): Drill {
    * loop and the point lookups run over the cache with the query's own stop
    * rules, fetching only what the cache lacks. `signature` names the slice by
    * the pages walked and the point lookups added; with the entry's pages fixed
-   * for its lifetime, equal signatures mean equal slices.
+   * for its lifetime, equal signatures mean equal slices. `points` lists the
+   * lookups added, by requested id, so the caller can tell whether the entry
+   * still holds them all.
    */
   async function sliceFor(
     entry: SessionEntry,
     target: DrillTarget,
     needles: string[],
     ftsHits: FtsHit[] | undefined,
-  ): Promise<{ messages: DrilledMessage[]; signature: string }> {
+  ): Promise<Slice> {
     const byId = new Map<string, DrilledMessage>();
     let retained = 0;
 
@@ -560,7 +602,7 @@ export function createDrill(deps: DrillDeps): Drill {
     // charging their retained chars against the SAME per-session budget as the
     // untargeted paging — once the session's budget is exhausted, stop fetching
     // further point targets (matching the documented per-session bound).
-    const pointsAdded: string[] = [];
+    const points: Array<[string, DrilledMessage]> = [];
     if (ftsHits && ftsHits.length > 0) {
       const wanted = new Set<string>();
       for (const hit of ftsHits) {
@@ -577,13 +619,14 @@ export function createDrill(deps: DrillDeps): Drill {
         if (!msg) continue;
         byId.set(msg.message.info.id, msg);
         retained += msg.retained;
-        pointsAdded.push(messageID);
+        points.push([messageID, msg]);
       }
     }
 
     return {
       messages: [...byId.values()],
-      signature: [String(pagesWalked), ...pointsAdded].join("\n"),
+      signature: [String(pagesWalked), ...points.map(([id]) => id)].join("\n"),
+      points,
     };
   }
 
@@ -607,10 +650,7 @@ export function createDrill(deps: DrillDeps): Drill {
    *  them over the chronological slice, stamped with the slice's digest and the
    *  target's parentage. The cached per-message candidates are copied, never
    *  stamped, since other slices share them. */
-  function assemble(
-    target: DrillTarget,
-    slice: { messages: DrilledMessage[]; signature: string },
-  ): SliceBuild {
+  function assemble(target: DrillTarget, slice: Slice): SliceBuild {
     const chrono = [...slice.messages].sort((a, b) => compareMessages(a.message, b.message));
     const built: Candidate[] = [];
     let chars = 0;
@@ -645,7 +685,11 @@ export function createDrill(deps: DrillDeps): Drill {
         return restamped(entry.build, target.parentID);
       }
       const build = assemble(target, slice);
-      entry.build = build;
+      // A concurrent query may have evicted some of this slice's lookups
+      // while it waited on a later one. Caching the build then would keep
+      // their candidates reachable with their chars no longer charged.
+      // Page messages need no check: a live entry never drops a page.
+      if (slice.points.every(([id, msg]) => entry.points.get(id) === msg)) entry.build = build;
       return build;
     } finally {
       evict();

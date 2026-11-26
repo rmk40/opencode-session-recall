@@ -1121,6 +1121,77 @@ describe("drill cache bounds", () => {
     await drill.pools(input);
     expect(ctl.lookups).toHaveLength(3);
   });
+
+  it("does not cache a build over lookups another query evicted while it waited", async () => {
+    // A asks for o1, o2 and o3 and is held on o3. Meanwhile B's lookup of o4
+    // passes the 250-char cap and evicts o1 and o2, uncharging them. A build
+    // cached by A would keep their candidates reachable uncharged; instead
+    // B's build, whose lookups are all still cached, stays the cached one.
+    const graph = pointGraph();
+    graph.messagesBySession["s-p"]!.unshift(note("s-p", "o4", 500, sized("marker four", 100)));
+    const { source, ctl } = makeControlledSource(graph);
+    const drill = newDrill(source, POINT_LIMITS);
+    const queryA = poolsInput([revised("s-p")], "marker", {
+      "s-p": [ftsHit("s-p", "o1"), ftsHit("s-p", "o2"), ftsHit("s-p", "o3")],
+    });
+    const queryB = poolsInput([revised("s-p")], "marker", { "s-p": [ftsHit("s-p", "o4")] });
+
+    ctl.holdLookup = (req) => req.messageID === "o3";
+    const pendingA = drill.pools(queryA);
+    await waitFor(() => ctl.held.length === 1);
+    ctl.holdLookup = undefined;
+    const firstB = await drill.pools(queryB);
+    ctl.held[0]!();
+    const firstA = await pendingA;
+
+    expect(poolTexts(firstA, "s-p")).toHaveLength(5);
+    expect(drill.cachedChars()).toBe(216); // both pages, o4 and o3
+
+    const againB = await drill.pools(queryB);
+    expect(ctl.lookups.map((l) => l.messageID)).toEqual(["o1", "o2", "o3", "o4"]);
+    expect(againB.pools[0]!.candidates).toBe(firstB.pools[0]!.candidates);
+  });
+
+  it("bounds cached messages by count, whatever chars they charge", async () => {
+    // Messages without searchable text and not-found lookups charge no chars,
+    // so only the message bound (8 here) evicts them.
+    const empty = (sid: string): MessageBundle[] =>
+      Array.from({ length: 6 }, (_, i) => note(sid, `${sid}-${i}`, 1000 + i, ""));
+    const graph: Graph = {
+      messagesBySession: {
+        "s-e": empty("s-e"),
+        "s-f": empty("s-f"),
+        "s-n": [note("s-n", "n1", 1000, "needle")],
+      },
+    };
+    const { source, ctl } = makeControlledSource(graph);
+    const drill = createDrill({
+      source,
+      gate: createFetchGate({ concurrency: 4 }),
+      limits: { ...TEST_LIMITS, drillPageMessages: 10 },
+      maxCachedMessages: 8,
+    });
+    const run = (sid: string, fts?: Record<string, FtsHit[]>) =>
+      drill.pools(poolsInput([revised(sid)], "needle", fts));
+
+    await run("s-e");
+    await run("s-f"); // 12 messages: s-e, the least recently used, goes
+    await run("s-f");
+    await run("s-e");
+    expect(ctl.pages.map((p) => p.sessionID)).toEqual(["s-e", "s-f", "s-e"]);
+    expect(drill.cachedChars()).toBe(0);
+
+    // One page message and eight not-found lookups pass the bound alone, so
+    // the entry is dropped once its query has used it, and a repeat reads all
+    // of it again with the same result.
+    const gone = { "s-n": Array.from({ length: 8 }, (_, i) => ftsHit("s-n", `gone-${i}`)) };
+    const first = await run("s-n", gone);
+    const again = await run("s-n", gone);
+    expect(ctl.lookups).toHaveLength(16);
+    expect(ctl.pages.filter((p) => p.sessionID === "s-n")).toHaveLength(2);
+    expect(poolTexts(again, "s-n")).toEqual(poolTexts(first, "s-n"));
+    expect(poolTexts(first, "s-n")).toEqual(["needle"]);
+  });
 });
 
 describe("drill cache entries dropped mid-query", () => {
