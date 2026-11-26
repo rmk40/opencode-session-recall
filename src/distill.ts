@@ -282,6 +282,49 @@ export type DistillSync = {
   /** How often the lease holder's poll also drops cards of sessions the host
    *  no longer has ({@link DistillSync.missing}); the cold pass does it too. */
   readonly reconcileEveryMs: number;
+  /**
+   * A session's rows after `afterSeq`, ascending by `seq`, at most `limit`
+   * (capped by the host), each with the state of its part rows. The range
+   * hashes and the range check are built from these. Absent: the host keeps
+   * no range hashes.
+   */
+  rangeDigest?(sessionID: string, afterSeq: number, limit: number): Promise<RangeRow[]>;
+  /** Of `sessionIDs`, those with part rows. */
+  withParts?(sessionIDs: string[]): Promise<Set<string>>;
+  /** What a stored checkpoint records, or null when it is not one. */
+  inspect?(cursor: string | null | undefined): CheckpointInfo | null;
+  /** `cursor` with what a write learned recorded in it: the lowest `seq` it
+   *  read when it stopped at the row cap, and the messages it left cut. */
+  annotate?(cursor: string, info: { floor?: number; cut?: number }): string;
+};
+
+/** One history row as {@link DistillSync.rangeDigest} reads it. */
+export type RangeRow = {
+  seq: number;
+  id: string;
+  timeUpdated: number;
+  /** Part rows of the message, their newest `time_updated` (0 when none)
+   *  and their distinct types, sorted. */
+  parts: number;
+  partsUpdated: number;
+  partTypes: string[];
+};
+
+/** What a stored checkpoint records ({@link DistillSync.inspect}). */
+export type CheckpointInfo = {
+  /** Format version. Version 1 is an older build's and makes the card
+   *  stale. */
+  version: number;
+  /** `seq` of the newest row the checkpoint describes. */
+  seq: number;
+  /** Whether the tail was settled when the checkpoint was taken. */
+  settled: boolean;
+  /** The lowest `seq` the card's last full write read, when it stopped at
+   *  the per-session row cap; rows below it are not in the card. */
+  floor?: number;
+  /** Messages the card holds cut short: each ends in a placeholder that says
+   *  what was left out, and nothing past it is indexed. */
+  cut?: number;
 };
 
 export type Distiller = {
