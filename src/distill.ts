@@ -1287,11 +1287,13 @@ export function createDistiller(options: DistillerOptions): Distiller {
         else childrenByRoot.set(card.rootId, [card]);
       }
     }
-    let written = 0;
+    // Counts every setFamilyRollup call, including those that skip an
+    // unchanged rollup: each still runs a transaction.
+    let rollupCalls = 0;
     for (const [rootId, root] of rootCards) {
       const rollup = buildRollup(childrenByRoot.get(rootId) ?? []);
       if (rollup.length > 0 || root.familyRollup.length > 0) {
-        if (pause && ++written % YIELD_EVERY_WRITES === 0) {
+        if (pause && ++rollupCalls % YIELD_EVERY_WRITES === 0) {
           await pause();
           if (stopped || !ownsLease()) return;
         }

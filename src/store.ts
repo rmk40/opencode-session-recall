@@ -539,8 +539,10 @@ export type Store = {
    * Replace a session's slim-index rows and card in one transaction.
    *
    * Refused (`refused: "older-generation"`, nothing written) when the card's
-   * {@link Card.projectorGen} is below the stored one; with no generation on
-   * the card the check is skipped.
+   * {@link Card.projectorGen} is below the stored one. A card that names no
+   * projector generation skips this check, and the write stores NULL over the
+   * stored generation, suppressed or not. {@link appendSessionParts} differs:
+   * it keeps the stored generation unless its recomputed card names one.
    *
    * When the stored card and rows already match the new ones, the write is
    * suppressed: only the checkpoint ({@link Card.distillCursor}) and the
