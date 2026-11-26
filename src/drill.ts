@@ -33,8 +33,15 @@ import type { FtsHit } from "./store.js";
  * per-candidate cap immediately; it stops at the per-session retained budget or
  * once pages stop matching any query anchor. Targeted drill (a session with FTS
  * hits) point-fetches the hit message plus its stored prev/next neighbors. A
- * per-query retained budget caps the whole drill; a small LRU keyed
- * (session, time.updated) keeps repeat/refined queries warm.
+ * per-query retained budget caps the whole drill.
+ *
+ * A small per-session LRU keeps repeat and refined queries warm. It holds the
+ * pages and point lookups earlier queries fetched, not their slices: each query
+ * replays the paging loop over the cached pages with its own stop rules,
+ * fetches only what the cache lacks and builds from exactly the slice an
+ * uncached fetch would return for it, so results never depend on query order.
+ * An entry is valid for one (time.updated, card write revision) pair, so a
+ * re-index that keeps the session's timestamp still invalidates it.
  */
 
 export type DrillTarget = {
@@ -49,6 +56,12 @@ export type DrillTarget = {
    *  a construction site that forgets the key fails CLOSED (withholds from
    *  `authorship: "human"`) rather than claiming agent text is human-typed. */
   parentID?: string | null;
+  /** The session card's `writeRev`, the store revision of its last stamped
+   *  write. With `timeUpdated` it keys the drill cache, so a re-index that
+   *  leaves `timeUpdated` unchanged still drops the cached pages. Absent when
+   *  the session has no card or no stamped write has touched it; the cache then
+   *  serves the session's pages only for {@link UNREVISED_ENTRY_TTL_MS}. */
+  writeRev?: number;
 };
 
 export type DrillInput = {
@@ -64,7 +77,7 @@ export type DrillInput = {
   /** Per-query candidate eligibility (type/role/time/toolName). Applied to each
    *  drilled session's candidates before scoring/scanning, mirroring the old
    *  `assembleSession` filter. Absent = keep every candidate. Never cached: the
-   *  drill LRU holds the unfiltered pool, so the filter runs per query. */
+   *  drill cache holds unfiltered candidates, so the filter runs per query. */
   filter?: (candidate: Candidate) => boolean;
   /** Append each session's bound title candidate to its pool (mirrors the old
    *  `assembleSession` title binding) — the newest eligible candidate carries
@@ -188,7 +201,7 @@ export type Drill = {
    * would thrash it).
    */
   deep(input: DeepInput): Promise<DeepOutput>;
-  /** Retained-chars currently held by the drilled-session LRU (diagnostics/tests). */
+  /** Candidate chars currently held by the drill cache (diagnostics/tests). */
   cachedChars(): number;
 };
 
@@ -196,17 +209,34 @@ export type DrillDeps = {
   source: HistorySource;
   gate: FetchGate;
   limits: Limits;
-  /** Injectable clock for the deep sweep's wall-clock budget (tests). */
+  /** Injectable clock for the deep sweep's wall-clock budget and the drill
+   *  cache's time bound (tests). */
   now?: () => number;
   /** Soft wall-clock budget for a deep sweep in ms (default 20s). Injectable so
    *  tests can force a time stop without a real 20s wait. */
   deepWallClockMs?: number;
+  /** Objects the drill cache may hold across all sessions (default
+   *  {@link MAX_CACHED_OBJECTS}). Injectable so tests can reach the bound
+   *  without fetching tens of thousands of messages. */
+  maxCachedObjects?: number;
 };
 
 /** Messages per page during a deep sweep (the spec's exhaustive page size). */
 const DEEP_PAGE_MESSAGES = 50;
 /** Default soft wall-clock budget for a deep sweep. */
 const DEFAULT_DEEP_WALL_CLOCK_MS = 20_000;
+/** How long the drill cache serves a session whose target carries no card
+ *  `writeRev`. Without a revision only `timeUpdated` can reveal a change, and
+ *  an uncarded or unverified target may carry 0 there, so a short bound caps
+ *  how stale those pages can get. */
+export const UNREVISED_ENTRY_TTL_MS = 30_000;
+/** Default bound on the objects the drill cache holds, counting each session
+ *  entry, cached page, page message, point lookup and not-found lookup as one.
+ *  `cacheMaxChars` bounds candidate chars only, and an entry or page with no
+ *  messages, a message with no searchable text or a not-found lookup charges
+ *  none, though each stays in memory. So the cache evicts while either bound
+ *  is passed. */
+export const MAX_CACHED_OBJECTS = 50_000;
 
 // ── Deep continuation cursor (opaque base64url JSON) ─────────────────────────
 // btoa/atob are DOM globals (available under Bun and Node), so no Node Buffer is
@@ -252,10 +282,71 @@ export function decodeDeepCursor(raw: string): DeepCursorPayload | null {
   }
 }
 
-/** One cached session build. `parentID` records the session parentage the
- *  cached candidates are currently STAMPED with, so a hit served to a target
- *  that disagrees can be restamped instead of silently inheriting it. */
-type CacheEntry = { candidates: Candidate[]; chars: number; parentID: string | null | undefined };
+/**
+ * A fetched message as the drill cache keeps it: its candidates built and
+ * normalized once, without the slice-dependent digest. The parts are dropped;
+ * `message` keeps only `info`, for ordering through `compareMessages`.
+ * `retained` is the message's charge against the per-session budget and
+ * `chars` the candidate chars it holds.
+ */
+type DrilledMessage = {
+  message: HistoryMessage;
+  candidates: Candidate[];
+  retained: number;
+  chars: number;
+};
+
+/** One cached newest-first page and the cursor it returned. */
+type CachedPage = { items: DrilledMessage[]; nextCursor: string | null };
+
+/** The messages one query's slice of a session holds (see `sliceFor`). */
+type Slice = {
+  messages: DrilledMessage[];
+  signature: string;
+  points: Array<[string, DrilledMessage]>;
+};
+
+/**
+ * The candidates one query's slice of a session builds to. `signature` names
+ * the slice (pages walked, point lookups added), so a later query that lands
+ * on the same slice reuses the build. `parentID` records the parentage the
+ * candidates are currently STAMPED with, so a hit served to a target that
+ * disagrees can be restamped instead of silently inheriting it.
+ */
+type SliceBuild = {
+  signature: string;
+  candidates: Candidate[];
+  chars: number;
+  parentID: string | null | undefined;
+};
+
+/**
+ * Everything the drill fetched for one session version. `stamp` is the
+ * (time.updated, writeRev) pair it was filled under; `expiresAt` bounds an
+ * entry filled without a revision. `pages` is keyed by the cursor that
+ * produced each page ("" for the first page: a source never hands back an
+ * empty cursor, since the paging loop reads one as the end of the session).
+ * `points` holds point lookups by requested message id, with null for a
+ * not-found. `chars` and `objects` are the entry's charge against
+ * `cacheMaxChars` and the cached-object bound; `objects` counts the entry
+ * itself from the moment it is cached. The `build`'s candidates are
+ * shallow copies of candidates the entry holds, sharing their strings, so
+ * they add no charge; a build is cached only while every message under it is
+ * still held. `live` turns false once the entry leaves the cache, after which
+ * a query still holding it stops charging the cache totals.
+ */
+type SessionEntry = {
+  sessionId: string;
+  stamp: string;
+  expiresAt: number | undefined;
+  pages: Map<string, CachedPage>;
+  points: Map<string, DrilledMessage | null>;
+  pointChars: number;
+  chars: number;
+  objects: number;
+  build: SliceBuild | undefined;
+  live: boolean;
+};
 
 const MAX_LOAD_ERROR_SAMPLES = 5;
 
@@ -263,12 +354,15 @@ function anchorNeedles(query: ParsedQuery): string[] {
   return [...query.tokens, ...query.phrases, ...query.codeTokens.map((t) => t.toLowerCase())];
 }
 
-function partsMatchAnchor(page: HistoryMessage[], needles: string[]): boolean {
+/** Whether any searchable text on the page contains a needle. A message's
+ *  candidates carry every searchable field of its parts (a part without one
+ *  builds no candidate), so this reads the same texts the raw parts hold. */
+function partsMatchAnchor(page: DrilledMessage[], needles: string[]): boolean {
   if (needles.length === 0) return true;
   for (const msg of page) {
-    for (const part of msg.parts) {
-      for (const text of searchable(part)) {
-        const lower = text.toLowerCase();
+    for (const candidate of msg.candidates) {
+      for (const field of candidate.fieldTexts) {
+        const lower = field.text.toLowerCase();
         if (needles.some((n) => lower.includes(n))) return true;
       }
     }
@@ -288,56 +382,234 @@ function estimateRetained(msg: HistoryMessage): number {
 
 export function createDrill(deps: DrillDeps): Drill {
   const { source, gate, limits } = deps;
-  // Drilled-session LRU keyed by (session, time.updated); Map order is LRU order.
-  const cache = new Map<string, CacheEntry>();
+  const clock = deps.now ?? Date.now;
+  const maxCachedObjects = deps.maxCachedObjects ?? MAX_CACHED_OBJECTS;
+  // Per-session LRU of fetched pages and point lookups; Map order is LRU order.
+  const cache = new Map<string, SessionEntry>();
   let cachedTotal = 0;
+  let cachedObjects = 0;
+
+  function charge(entry: SessionEntry, chars: number, objects: number): void {
+    entry.chars += chars;
+    entry.objects += objects;
+    if (!entry.live) return;
+    cachedTotal += chars;
+    cachedObjects += objects;
+  }
+
+  function drop(entry: SessionEntry): void {
+    if (!entry.live) return;
+    entry.live = false;
+    cache.delete(entry.sessionId);
+    cachedTotal -= entry.chars;
+    cachedObjects -= entry.objects;
+  }
 
   function evict(): void {
-    for (const key of cache.keys()) {
-      if (cachedTotal <= limits.cacheMaxChars) break;
-      const entry = cache.get(key)!;
-      cache.delete(key);
-      cachedTotal -= entry.chars;
+    for (const entry of cache.values()) {
+      if (cachedTotal <= limits.cacheMaxChars && cachedObjects <= maxCachedObjects) break;
+      drop(entry);
     }
   }
 
-  async function fetchDrilledMessages(
+  /**
+   * The cache entry for the target's session version, moved to MRU, or a new
+   * empty one when the cached entry was filled under another (time.updated,
+   * writeRev) pair or has outlived its time bound. The cache holds one entry
+   * per session id, so targets that stamp one session differently replace
+   * each other's entry rather than sharing the cache: a session-scoped query
+   * whose target has no `writeRev`, alternating with a carded target for the
+   * same session, refetches on every switch.
+   *
+   * The key deliberately omits `target.parentID`. Two targets for the same
+   * session CAN disagree about parentage under the same stamp — a card without
+   * a `writeRev` whose `timeUpdated` is 0, or an id with no card at all, stamps
+   * the same as the metadata-less fallback — so the stamp alone cannot be
+   * trusted to imply matching parentage. Extending the key would instead
+   * refetch the same session, which is exactly what this cache exists to
+   * avoid. So parentage is treated as TARGET metadata rather than
+   * message-derived data: a build whose stamp disagrees with the current
+   * target is restamped onto a copy ({@link restamped}). Getting this wrong
+   * fails OPEN — cached root parentage served to an unknown-parentage target
+   * would let its candidates satisfy `authorship: "human"`. Title and
+   * directory are not restamped (see {@link prepare}).
+   */
+  function entryFor(target: DrillTarget): SessionEntry {
+    const stamp = `${target.timeUpdated}:${target.writeRev ?? ""}`;
+    const now = clock();
+    const cached = cache.get(target.sessionId);
+    if (cached) {
+      const expired = cached.expiresAt !== undefined && now >= cached.expiresAt;
+      if (cached.stamp === stamp && !expired) {
+        cache.delete(target.sessionId); // move to MRU
+        cache.set(target.sessionId, cached);
+        return cached;
+      }
+      drop(cached);
+    }
+    const entry: SessionEntry = {
+      sessionId: target.sessionId,
+      stamp,
+      expiresAt: target.writeRev === undefined ? now + UNREVISED_ENTRY_TTL_MS : undefined,
+      pages: new Map(),
+      points: new Map(),
+      pointChars: 0,
+      chars: 0,
+      objects: 0,
+      build: undefined,
+      live: true,
+    };
+    cache.set(target.sessionId, entry);
+    // The entry counts as one object for as long as it is cached, so entries
+    // that never cache a message (an empty history, a failed first read) still
+    // fill the bound and are evicted.
+    charge(entry, 0, 1);
+    return entry;
+  }
+
+  /** Build one fetched message's candidates once, for every slice that holds it.
+   *  Their `sessionTitle` and `directory` come from the target that filled the
+   *  entry and, unlike parentage, are not restamped: two targets with the same
+   *  stamp but different titles both see the first one's. A title change
+   *  rewrites the card and moves its `writeRev`, so this reaches only targets
+   *  without one. */
+  function prepare(msg: HistoryMessage, target: DrillTarget): DrilledMessage {
+    const { candidates, charsUsed } = buildCandidates([msg], {
+      id: target.sessionId,
+      title: target.title,
+      directory: target.directory,
+      parentID: target.parentID,
+    });
+    for (const candidate of candidates) populateNormalized(candidate);
+    return {
+      message: { info: msg.info, parts: [] },
+      candidates,
+      retained: estimateRetained(msg),
+      chars: charsUsed,
+    };
+  }
+
+  /** The page `before` names, from the cache or fetched and cached. A page a
+   *  concurrent query cached while this fetch was in flight wins, so every
+   *  query walks one consistent chain. */
+  async function pageAt(
+    entry: SessionEntry,
+    target: DrillTarget,
+    before: string | undefined,
+  ): Promise<CachedPage> {
+    const key = before ?? "";
+    const hit = entry.pages.get(key);
+    if (hit) return hit;
+    const page = await gate.runQuery(() =>
+      source.messagePage({
+        sessionID: target.sessionId,
+        limit: limits.drillPageMessages,
+        before,
+      }),
+    );
+    const raced = entry.pages.get(key);
+    if (raced) return raced;
+    const cached: CachedPage = {
+      items: page.items.map((msg) => prepare(msg, target)),
+      nextCursor: page.nextCursor,
+    };
+    entry.pages.set(key, cached);
+    let chars = 0;
+    for (const msg of cached.items) chars += msg.chars;
+    // The page itself counts as one object, so an empty page is not free.
+    charge(entry, chars, cached.items.length + 1);
+    return cached;
+  }
+
+  /**
+   * A point lookup, from the cache or fetched and cached; null when the source
+   * has no such message. Only a not-found is cached as null: any other failure
+   * may be transient, so the next query asks again.
+   *
+   * Point lookups differ from query to query, so their cached chars are capped
+   * at the per-session budget. A lookup that would pass the cap first drops
+   * every cached lookup outside `own`, the ids the current query has asked for,
+   * and drops the cached build, which may hold them. The query's own lookups
+   * stay, so repeating it refetches nothing, and they may pass the cap by about
+   * one message: the lookup loop checks the per-session budget before each
+   * fetch, so a query's lookups stop within one message of it.
+   */
+  async function pointAt(
+    entry: SessionEntry,
+    target: DrillTarget,
+    messageID: string,
+    own: ReadonlySet<string>,
+  ): Promise<DrilledMessage | null> {
+    const hit = entry.points.get(messageID);
+    if (hit !== undefined) return hit;
+    const lookup = await gate.runQuery(() => source.getMessage(target.sessionId, messageID));
+    const raced = entry.points.get(messageID);
+    if (raced !== undefined) return raced;
+    if (!lookup.ok) {
+      if (lookup.reason === "not-found") {
+        entry.points.set(messageID, null);
+        charge(entry, 0, 1);
+      }
+      return null;
+    }
+    const msg = prepare(lookup.value, target);
+    if (entry.pointChars + msg.chars > limits.drillCharsPerSession) {
+      for (const [id, cached] of entry.points) {
+        if (own.has(id)) continue;
+        entry.points.delete(id);
+        const chars = cached?.chars ?? 0;
+        entry.pointChars -= chars;
+        charge(entry, -chars, -1);
+      }
+      entry.build = undefined;
+    }
+    entry.points.set(messageID, msg);
+    entry.pointChars += msg.chars;
+    charge(entry, msg.chars, 1);
+    return msg;
+  }
+
+  /**
+   * The messages an uncached fetch would return for this query: the paging
+   * loop and the point lookups run over the cache with the query's own stop
+   * rules, fetching only what the cache lacks. `signature` names the slice by
+   * the pages walked and the point lookups added; with the entry's pages fixed
+   * for its lifetime, equal signatures mean equal slices. `points` lists the
+   * lookups added, by requested id, so the caller can tell whether the entry
+   * still holds them all.
+   */
+  async function sliceFor(
+    entry: SessionEntry,
     target: DrillTarget,
     needles: string[],
     ftsHits: FtsHit[] | undefined,
-  ): Promise<HistoryMessage[]> {
-    const byId = new Map<string, HistoryMessage>();
+  ): Promise<Slice> {
+    const byId = new Map<string, DrilledMessage>();
     let retained = 0;
 
     // Untargeted: bounded newest-first paging.
     let cursor: string | undefined;
-    let firstPage = true;
+    let pagesWalked = 0;
     do {
-      const before = cursor;
-      const page = await gate.runQuery(() =>
-        source.messagePage({
-          sessionID: target.sessionId,
-          limit: limits.drillPageMessages,
-          before,
-        }),
-      );
-      const matched = partsMatchAnchor(page.items, needles);
+      const page = await pageAt(entry, target, cursor);
+      pagesWalked++;
       for (const msg of page.items) {
-        if (!byId.has(msg.info.id)) {
-          byId.set(msg.info.id, msg);
-          retained += estimateRetained(msg);
+        const id = msg.message.info.id;
+        if (!byId.has(id)) {
+          byId.set(id, msg);
+          retained += msg.retained;
         }
       }
       cursor = page.nextCursor ?? undefined;
       // Stop once a non-first page stops matching any anchor (nothing more to gain).
-      if (!firstPage && !matched) break;
-      firstPage = false;
+      if (pagesWalked > 1 && !partsMatchAnchor(page.items, needles)) break;
     } while (cursor && retained < limits.drillCharsPerSession);
 
     // Targeted: point-fetch each FTS hit's message plus its stored neighbors,
     // charging their retained chars against the SAME per-session budget as the
     // untargeted paging — once the session's budget is exhausted, stop fetching
     // further point targets (matching the documented per-session bound).
+    const points: Array<[string, DrilledMessage]> = [];
     if (ftsHits && ftsHits.length > 0) {
       const wanted = new Set<string>();
       for (const hit of ftsHits) {
@@ -345,82 +617,90 @@ export function createDrill(deps: DrillDeps): Drill {
         if (hit.prevMessageId) wanted.add(hit.prevMessageId);
         if (hit.nextMessageId) wanted.add(hit.nextMessageId);
       }
+      const asked = new Set<string>();
       for (const messageID of wanted) {
         if (retained >= limits.drillCharsPerSession) break;
         if (byId.has(messageID)) continue;
-        const lookup = await gate.runQuery(() => source.getMessage(target.sessionId, messageID));
-        if (!lookup.ok) continue;
-        const bundle = lookup.value;
-        byId.set(bundle.info.id, bundle);
-        retained += estimateRetained(bundle);
+        asked.add(messageID);
+        const msg = await pointAt(entry, target, messageID, asked);
+        if (!msg) continue;
+        byId.set(msg.message.info.id, msg);
+        retained += msg.retained;
+        points.push([messageID, msg]);
       }
     }
 
-    // Chronological (oldest-first) for buildCandidates, which walks newest-first.
-    return [...byId.values()].sort(compareMessages);
+    return {
+      messages: [...byId.values()],
+      signature: [String(pagesWalked), ...points.map(([id]) => id)].join("\n"),
+      points,
+    };
   }
 
-  /** Return the entry's candidates carrying `parentID` as their session
+  /** Return the build's candidates carrying `parentID` as their session
    *  parentage. The common case (the stamp already matches) returns the cached
    *  array untouched. On a mismatch the candidates are SHALLOW-COPIED before
    *  restamping: the cached array may be held by a concurrent reader, and
    *  mutating it in place would retroactively change that reader's
-   *  classification. The cache entry itself is never rewritten, so it stays the
-   *  canonical build for whichever target filled it. */
-  function restamped(entry: CacheEntry, parentID: string | null | undefined): CacheEntry {
-    if (entry.parentID === parentID) return entry;
-    const candidates = entry.candidates.map((candidate) => ({
+   *  classification. The cached build itself is never rewritten, so it stays
+   *  the canonical build for whichever target made it. */
+  function restamped(build: SliceBuild, parentID: string | null | undefined): SliceBuild {
+    if (build.parentID === parentID) return build;
+    const candidates = build.candidates.map((candidate) => ({
       ...candidate,
       sessionParentID: parentID,
     }));
-    return { candidates, chars: entry.chars, parentID };
+    return { signature: build.signature, candidates, chars: build.chars, parentID };
+  }
+
+  /** The slice's candidates newest message first, as `buildCandidates` emits
+   *  them over the chronological slice, stamped with the slice's digest and the
+   *  target's parentage. The cached per-message candidates are copied, never
+   *  stamped, since other slices share them. */
+  function assemble(target: DrillTarget, slice: Slice): SliceBuild {
+    const chrono = [...slice.messages].sort((a, b) => compareMessages(a.message, b.message));
+    const built: Candidate[] = [];
+    let chars = 0;
+    for (let i = chrono.length - 1; i >= 0; i--) {
+      const msg = chrono[i]!;
+      for (const candidate of msg.candidates) built.push(candidate);
+      chars += msg.chars;
+    }
+
+    // Content-derived session digest, stamped as a normalized field so
+    // content-identity participates in ranking exactly as the corpus scan did
+    // (the digest-bridge case depends on this).
+    const digestText = buildSessionDigest(built);
+    const normalizedDigest = digestText ? normalize(digestText) : "";
+    const candidates = built.map((candidate) => ({
+      ...candidate,
+      sessionParentID: target.parentID,
+      digestText: normalizedDigest,
+    }));
+    return { signature: slice.signature, candidates, chars, parentID: target.parentID };
   }
 
   async function candidatesFor(
     target: DrillTarget,
     needles: string[],
     ftsHits: FtsHit[] | undefined,
-  ): Promise<CacheEntry> {
-    // The key deliberately omits `target.parentID`. Two targets for the same
-    // session CAN disagree about parentage at the same `timeUpdated` — a card
-    // whose `timeUpdated` is 0, or an id with no card at all, produces the same
-    // `${sessionId}:0` key as the metadata-less fallback — so the key alone
-    // cannot be trusted to imply matching parentage. Extending the key would
-    // instead refetch the same session, which is exactly what this cache
-    // exists to avoid. So parentage is treated as TARGET metadata rather than
-    // message-derived data: a hit whose stamp disagrees with the current target
-    // is restamped onto a copy (below). Getting this wrong fails OPEN — cached
-    // root parentage served to an unknown-parentage target would let its
-    // candidates satisfy `authorship: "human"`.
-    const key = `${target.sessionId}:${target.timeUpdated}`;
-    const cached = cache.get(key);
-    if (cached) {
-      cache.delete(key); // move to MRU
-      cache.set(key, cached);
-      return restamped(cached, target.parentID);
+  ): Promise<SliceBuild> {
+    const entry = entryFor(target);
+    try {
+      const slice = await sliceFor(entry, target, needles, ftsHits);
+      if (entry.build?.signature === slice.signature) {
+        return restamped(entry.build, target.parentID);
+      }
+      const build = assemble(target, slice);
+      // A concurrent query may have evicted some of this slice's lookups
+      // while it waited on a later one. Caching the build then would keep
+      // their candidates reachable with their chars no longer charged.
+      // Page messages need no check: a live entry never drops a page.
+      if (slice.points.every(([id, msg]) => entry.points.get(id) === msg)) entry.build = build;
+      return build;
+    } finally {
+      evict();
     }
-
-    const messages = await fetchDrilledMessages(target, needles, ftsHits);
-    const { candidates, charsUsed } = buildCandidates(messages, {
-      id: target.sessionId,
-      title: target.title,
-      directory: target.directory,
-      parentID: target.parentID,
-    });
-    for (const candidate of candidates) populateNormalized(candidate);
-
-    // Content-derived session digest, stamped as a normalized field so
-    // content-identity participates in ranking exactly as the corpus scan did
-    // (the digest-bridge case depends on this).
-    const digestText = buildSessionDigest(candidates);
-    const normalizedDigest = digestText ? normalize(digestText) : "";
-    for (const candidate of candidates) candidate.digestText = normalizedDigest;
-
-    const entry: CacheEntry = { candidates, chars: charsUsed, parentID: target.parentID };
-    cache.set(key, entry);
-    cachedTotal += charsUsed;
-    evict();
-    return entry;
   }
 
   /** Shared bounded fetch loop for both the BM25 and scan paths: drills each
@@ -445,18 +725,18 @@ export function createDrill(deps: DrillDeps): Drill {
         budgetExhausted = true;
         break;
       }
-      let entry: CacheEntry;
+      let build: SliceBuild;
       try {
-        entry = await candidatesFor(target, needles, input.ftsBySession?.get(target.sessionId));
+        build = await candidatesFor(target, needles, input.ftsBySession?.get(target.sessionId));
       } catch (error) {
         if (loadErrors.length < MAX_LOAD_ERROR_SAMPLES) {
           loadErrors.push(`${target.sessionId}: ${errmsg(error)}`);
         }
         continue;
       }
-      queryRetained += entry.chars;
+      queryRetained += build.chars;
       drilledSessions.push(target.sessionId);
-      pools.push({ target, ...poolFor(target, entry.candidates, input) });
+      pools.push({ target, ...poolFor(target, build.candidates, input) });
     }
     return { pools, drilledSessions, loadErrors, budgetExhausted };
   }
