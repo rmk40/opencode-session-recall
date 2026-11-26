@@ -116,6 +116,27 @@ export const EVAL_CASES: EvalCase[] = [
     },
   },
   {
+    // A relative whose reply (not its prompt) parrots the query: family
+    // diversity does not demote a reply, so only excludeFamily keeps it out
+    // and lets the real session (e-harbor) surface, as default family
+    // exclusion once did for every search.
+    name: "excludeFamily: a subagent's reply echoing the query stays out",
+    args: {
+      query: "harborlight retry backoff jitter",
+      match: "smart",
+      group: "session",
+      scope: "global",
+      excludeFamily: true,
+    },
+    ctxSessionID: "e-hub",
+    relevantSessionIDs: ["e-harbor"],
+    expect: {
+      notInResults: ["e-hub", "e-hub-echo"],
+      classInTop3: ["human-text", "tool-input"],
+      maxClassInTop5: { "skill-definition": 0 },
+    },
+  },
+  {
     // The only session holding the answer is a subagent of the session
     // searching for it (e-orch); a more recent outsider (e-weak) shares one
     // query term. The subagent's best match is its own reply, not its

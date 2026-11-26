@@ -13,7 +13,8 @@
  *  - cross-session / cross-project recall
  *  - old-but-strong vs. recent-but-weak
  *  - the current session's subagents: one holding the answer outranks a weak
- *    outsider, one whose prompt echoes the query ranks below the real answer
+ *    outsider, one whose prompt echoes the query ranks below the real answer,
+ *    and one whose reply echoes it stays out under excludeFamily
  *
  * The corpus is intentionally separate from `makeFixture` in helpers.ts so
  * eval cases stay stable even if the unit-test fixture changes.
@@ -116,6 +117,23 @@ export function makeEvalCorpus(now = Date.now()): EvalCorpus {
   );
   // e-weak: an unrelated, more recent session sharing one query term.
   const sWeak = session("e-weak", "Dashboard polish", PROJECT_DIR, now - 4_000);
+
+  // ── A model-written echo in a relative's reply ──
+  // e-hub: the current session in that case; it parrots its own query.
+  const sHub = session("e-hub", "Uploader hardening", PROJECT_DIR, now - 45_000);
+  // e-hub-echo: its subagent, whose reply (not its prompt) restates the
+  // query with no evidence. Family diversity does not demote a reply, so it
+  // outranks the real session unless excludeFamily removes it.
+  const sHubEcho = session(
+    "e-hub-echo",
+    "Summarize earlier uploader work",
+    PROJECT_DIR,
+    now - 44_000,
+    undefined,
+    "e-hub",
+  );
+  // e-harbor: the earlier session that did the work.
+  const sHarbor = session("e-harbor", "Upload client changes", PROJECT_DIR, now - 70_000);
 
   // ── Distill-then-search tier probes (round-4) ────────────────────────
   const HOUR = 60 * 60 * 1000;
@@ -497,6 +515,48 @@ export function makeEvalCorpus(now = Date.now()): EvalCorpus {
       ]),
     ],
 
+    // ── e-hub / e-hub-echo / e-harbor: an echo only excludeFamily removes ──
+    [sHub.id]: [
+      bundle(userMessage("ehb-1", sHub.id, now - 46_000), [
+        textPart(
+          "ehb-1p",
+          sHub.id,
+          "ehb-1",
+          "How did we add harborlight retry backoff with jitter before? Check recall.",
+        ),
+      ]),
+    ],
+    [sHubEcho.id]: [
+      bundle(assistantMessage("ehe-1", sHubEcho.id, now - 44_500), [
+        textPart(
+          "ehe-1p",
+          sHubEcho.id,
+          "ehe-1",
+          "Findings: harborlight retry backoff jitter came up in an earlier session. " +
+            "Query terms repeated: harborlight retry backoff jitter.",
+        ),
+      ]),
+    ],
+    [sHarbor.id]: [
+      bundle(userMessage("ehr-1", sHarbor.id, now - 72_000), [
+        textPart(
+          "ehr-1p",
+          sHarbor.id,
+          "ehr-1",
+          "Give the harborlight uploader retries with exponential backoff and jitter.",
+        ),
+      ]),
+      bundle(assistantMessage("ehr-2", sHarbor.id, now - 71_000), [
+        textPart(
+          "ehr-2p",
+          sHarbor.id,
+          "ehr-2",
+          "Wrapped the harborlight upload call in exponential backoff with full jitter; " +
+            "it gives up after five tries.",
+        ),
+      ]),
+    ],
+
     // ── e-inv: card-inventory needle (distinctive token in a tool INPUT) ──
     [sInv.id]: [
       bundle(userMessage("ei-1", sInv.id, now - 7_000), [
@@ -582,6 +642,9 @@ export function makeEvalCorpus(now = Date.now()): EvalCorpus {
     sOrch,
     sOrchSub,
     sWeak,
+    sHub,
+    sHubEcho,
+    sHarbor,
     sInv,
     sFts,
     sOut,
@@ -602,6 +665,9 @@ export function makeEvalCorpus(now = Date.now()): EvalCorpus {
     sOrch,
     sOrchSub,
     sWeak,
+    sHub,
+    sHubEcho,
+    sHarbor,
     sInv,
     sFts,
     sOut,

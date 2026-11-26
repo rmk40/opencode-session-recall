@@ -1358,7 +1358,10 @@ export function familyDrillSlots(cap: number): number {
  * relatives, never the current session itself. A family session whose best
  * evidence (its first result that is not a title hit) is a delegated prompt
  * (`delegated` says which) moves below the best result from outside the
- * family, keeping its order. Then the family holds at most
+ * family, keeping its order. A relative whose best evidence is its own
+ * reply is not moved, even when the reply only restates the query: the pass
+ * cannot tell a model-written echo from an answer, so only `excludeFamily`
+ * removes one. Then the family holds at most
  * {@link FAMILY_TOP_MAX} of the first {@link FAMILY_TOP_WINDOW} results; the
  * results it would have held there move down behind them, and fill in only
  * when no other result is left. Without a result from outside the family
