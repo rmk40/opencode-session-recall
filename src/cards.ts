@@ -1339,6 +1339,7 @@ export function createCardsRuntime(deps: CardsRuntimeDeps): CardsRuntime {
 
     async ready(opts): Promise<void> {
       const withIndex = opts?.index === true;
+      let reloaded = false;
       for (let round = 0; round < MAX_READY_ROUNDS && !disposed; round++) {
         // The map first. A caller that reads only the map never waits on the
         // index or the vectors.
@@ -1355,6 +1356,13 @@ export function createCardsRuntime(deps: CardsRuntimeDeps): CardsRuntime {
         if (indexJob) {
           await indexJob;
           continue;
+        }
+        if (!indexNeedsBuild() && dirty.size === 0 && vectorsNeedReload()) {
+          // A reload this call already ran installed its vectors and is stale
+          // only because another process wrote during it. The next refresh
+          // picks that write up, as it does any other foreign write.
+          if (reloaded) return;
+          reloaded = true;
         }
         const index = indexSteps();
         if (!index) return;
