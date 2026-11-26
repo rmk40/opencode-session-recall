@@ -11,7 +11,11 @@ import {
   type SearchOutput,
   type ErrorOutput,
 } from "../src/types.js";
-import { emptyReadCounts, type HistoryDrift } from "../src/history/source.js";
+import {
+  createHistoryDriftState,
+  emptyReadCounts,
+  type HistoryDrift,
+} from "../src/history/source.js";
 import type { RepairProgress, RepairStatus, ReconcileProgress } from "../src/distill.js";
 import {
   PROJECT_DIR,
@@ -2603,9 +2607,35 @@ describe("recall drill accounting", () => {
       messagesEligible: 2,
     });
     expect(byId(users.coverage?.sessionStops)).toEqual({
-      "s-current": { fetched: 6, candidate: 5, eligible: 1, stop: "cached" },
-      "s-project-2": { fetched: 3, candidate: 3, eligible: 1, stop: "cached" },
+      "s-current": { fetched: 6, candidate: 5, eligible: 1, stop: "end", cached: true },
+      "s-project-2": { fetched: 3, candidate: 3, eligible: 1, stop: "end", cached: true },
     });
+  });
+
+  it("reports the same stop for a repeated query, the second time flagged cached", async () => {
+    // One message per page, newest first: the second page misses every query
+    // anchor, so the walk stops there, before the session's oldest message.
+    const h = makeFakeHarness();
+    const now = Date.now();
+    const s = session("s-anchor", "Anchor walk", PROJECT_DIR, now - 3_000);
+    h.sessions.push(s);
+    h.globalSessions.push(globalSessionFrom(s));
+    const notes = ["quillwort oldest", "filler one", "filler two", "quillwort newest"];
+    h.messagesBySession[s.id] = notes.map((text, i) =>
+      bundle(userMessage(`m-anchor-${i}`, s.id, now - 10_000 + i * 100), [
+        textPart(`p-anchor-${i}`, s.id, `m-anchor-${i}`, text),
+      ]),
+    );
+    const limits: Limits = { ...TEST_LIMITS, drillPageMessages: 1 };
+    const recall = await recallTool(h, true, limits);
+    const query = { query: "quillwort", scope: "project", sessionID: "s-anchor" };
+
+    const first = (await runTool<SearchOutput>(recall, query)).coverage?.sessionStops;
+    const second = (await runTool<SearchOutput>(recall, query)).coverage?.sessionStops;
+    expect(first?.sessions).toHaveLength(1);
+    expect(first?.sessions[0]?.stop).toBe("anchor");
+    expect(first?.sessions[0]).not.toHaveProperty("cached");
+    expect(second?.sessions).toEqual([{ ...first!.sessions[0]!, cached: true }]);
   });
 
   it("lists the first ten targets in drill order and counts every one", async () => {
@@ -2775,17 +2805,21 @@ describe("recall history coverage", () => {
     });
   });
 
+  it.each<[string, HistoryDrift["migration"]]>([
+    ["an untested migration", { newest: "20270101000000_future", tested: false }],
+    ["no migration recorded", { newest: null, tested: false }],
+  ])(
+    "reports %s in coverage but gives no drift warning while reads are clean",
+    async (_name, migration) => {
+      const drift = { ...clean(), migration };
+      const { recall } = await recallWith({ history: () => drift });
+      const out = await runTool<SearchOutput>(recall, RATE);
+      expect(out.coverage?.history?.migration).toEqual(migration);
+      expect((out.warnings ?? []).some((w) => DRIFT.test(w))).toBe(false);
+    },
+  );
+
   it.each<[string, Partial<HistoryDrift>, string]>([
-    [
-      "an untested migration",
-      { migration: { newest: "20270101000000_future", tested: false } },
-      "untested migration 20270101000000_future",
-    ],
-    [
-      "no migration recorded",
-      { migration: { newest: null, tested: false } },
-      "untested migration (none recorded)",
-    ],
     [
       "unknown tables",
       { unknownTables: ["session_future", "session_x"] },
@@ -2832,8 +2866,38 @@ describe("recall history coverage", () => {
       counts: { ...emptyReadCounts(), malformedParts: 2 },
     };
     const warnings = (await warningsOf({ history: () => drift })).filter((w) => DRIFT.test(w));
+    // The untested migration is reported in coverage, not in the warning.
     expect(warnings).toEqual([
-      "opencode's history database differs from what this plugin version reads (untested migration 20270101000000_future; unknown tables session_future; 2 parts that do not decode); some content may be missing from results. Updating opencode-session-recall may fix it.",
+      "opencode's history database differs from what this plugin version reads (unknown tables session_future; 2 parts that do not decode); some content may be missing from results. Updating opencode-session-recall may fix it.",
+    ]);
+  });
+
+  it("reports what the query's own drill could not project, not the drift state before it", async () => {
+    // The drift state is clean until this query's drill reads a page holding
+    // a part of an unknown type.
+    const h = makeFakeHarness();
+    const state = createHistoryDriftState({
+      capabilities: { parts: true },
+      migration: { newest: "20261120004954_machine-key", tested: true },
+      unknownTables: [],
+      missingColumns: [],
+    });
+    let armed = false;
+    const page = h.source.messagePage.bind(h.source);
+    h.source.messagePage = async (o) => {
+      const read = await page(o);
+      if (armed) state.record({ ...emptyReadCounts(), unknownPartTypes: 1 }, ["hologram"]);
+      return read;
+    };
+    const { recall } = await recallWith({ history: () => state.snapshot() }, h);
+    armed = true;
+    const out = await runTool<SearchOutput>(recall, RATE);
+
+    expect(out.coverage?.sessionStops?.sessions.some((s) => s.fetched > 0)).toBe(true);
+    expect(out.coverage?.history?.unknownPartTypeNames).toEqual(["hologram"]);
+    expect(out.coverage?.history?.counts.unknownPartTypes).toBeGreaterThan(0);
+    expect(out.warnings?.filter((w) => DRIFT.test(w))).toEqual([
+      expect.stringContaining("of unknown types (hologram)"),
     ]);
   });
 

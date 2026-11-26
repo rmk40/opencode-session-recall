@@ -118,8 +118,6 @@ export type SearchSuggestion = {
  *   budget ran out before every point lookup the slim index asked for (a hit
  *   message and its neighbors) was read.
  * - `end`: the whole session was read.
- * - `cached`: every page and point lookup came from the drill cache, so
- *   nothing was fetched (whatever stopped the walk).
  * - `queryBudget`: the per-query budget ran out before this session was read.
  * - `loadError`: reading the session failed.
  * - `aborted`: the query was cancelled before (or, in a deep sweep, while)
@@ -133,7 +131,6 @@ export type DrillStop =
   | "anchor"
   | "sessionBudget"
   | "end"
-  | "cached"
   | "queryBudget"
   | "loadError"
   | "aborted"
@@ -147,13 +144,16 @@ export type DrillStop =
  * none), `candidate` those that built at least one candidate before the
  * query's filters, and `eligible` those with a candidate left after the
  * filters and the authorship stage (the session's title candidate is not a
- * message and counts in neither).
+ * message and counts in neither). `cached` is set when every page and point
+ * lookup came from the drill cache, so nothing was fetched; `stop` is still
+ * what stopped the walk.
  */
 export type DrillSessionStats = {
   fetched: number;
   candidate: number;
   eligible: number;
   stop: DrillStop;
+  cached?: true;
 };
 
 /** One drilled (or not drilled) target in `coverage.sessionStops`. */

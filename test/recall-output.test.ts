@@ -644,6 +644,21 @@ describe("recall continuations that no longer fit their search", { timeout: 30_0
     });
   });
 
+  it("reads a non-string cursor the host passes unchecked as no cursor", async () => {
+    const h = makeFakeHarness();
+    addBulk(h);
+    const { tool } = await recallOver(h);
+    // Warm the drill cache, so every compared output flags the same reads
+    // `cached` in coverage.sessionStops.
+    await call(tool, ARGS);
+    const first = await call(tool, ARGS);
+    expect(first.trimmed).toBe(true);
+    for (const cursor of [123, 0, false, ["rc.x"]]) {
+      // The first output again, continuation and all, not a refusal.
+      expect(await call(tool, { ...ARGS, cursor }), JSON.stringify(cursor)).toEqual(first);
+    }
+  });
+
   it("requires a query even when the host passes the arguments unchecked", async () => {
     const { tool } = await recallOver(makeFakeHarness());
     for (const args of [{}, { query: "" }, { query: 7 }, { query: null, cursor: "rc.x" }]) {

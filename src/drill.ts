@@ -750,19 +750,20 @@ export function createDrill(deps: DrillDeps): Drill {
     return { signature: slice.signature, candidates, chars, parentID: target.parentID };
   }
 
-  /** One target's slice built to candidates, with the messages it holds and
-   *  why its walk stopped (`cached` when it fetched nothing). */
+  /** One target's slice built to candidates, with the messages it holds,
+   *  why its walk stopped, and whether the cache held all of it. */
   async function candidatesFor(
     target: DrillTarget,
     needles: string[],
     ftsHits: FtsHit[] | undefined,
-  ): Promise<{ build: SliceBuild; fetched: number; stop: DrillStop }> {
+  ): Promise<{ build: SliceBuild; fetched: number; stop: SliceStop; cached: boolean }> {
     const entry = entryFor(target);
     try {
       const slice = await sliceFor(entry, target, needles, ftsHits);
       const read = {
         fetched: slice.messages.length,
-        stop: slice.fetches === 0 ? ("cached" as const) : slice.stop,
+        stop: slice.stop,
+        cached: slice.fetches === 0,
       };
       if (entry.build?.signature === slice.signature) {
         return { build: restamped(entry.build, target.parentID), ...read };
@@ -820,6 +821,7 @@ export function createDrill(deps: DrillDeps): Drill {
         candidate: countMessages(read.build.candidates),
         eligible: countMessages(pool.candidates),
         stop: read.stop,
+        ...(read.cached && { cached: true as const }),
       };
       pools.push({ target, ...pool, stats });
       targets.push({ sessionId: target.sessionId, ...stats });

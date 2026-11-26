@@ -6,7 +6,6 @@ import {
   type ExpandedResult,
   type MessageItem,
   type PartOutput,
-  type PartTextField,
   type SearchResult,
   type SearchOutput,
   type ErrorOutput,
@@ -72,9 +71,8 @@ import { inspectCheckpoint } from "./history/v2-sync.js";
 import type { RepairStatus } from "./distill.js";
 import { cyrb53 } from "./hash.js";
 import {
-  PART_TEXT_FIELDS,
-  decodeContinuation,
-  encodeContinuation,
+  decodeRecallCursor,
+  encodeRecallCursor,
   fitMessage,
   fitMessageList,
   messageItem,
@@ -84,12 +82,11 @@ import {
   utf8Length,
   writeError,
   writeOutput,
-  type Decoded,
   type Fitted,
   type MessagePosition,
   type OutputSection,
   type OutputStop,
-  type PartPosition,
+  type RecallCursor,
 } from "./output.js";
 
 /** The embedder as the search path consumes it: the cache-facing surface plus
@@ -1853,6 +1850,7 @@ function drillAccounting(
           candidate: target.candidate,
           eligible: target.eligible,
           stop: target.stop,
+          ...(target.cached && { cached: true as const }),
         })),
       },
     }),
@@ -1908,14 +1906,12 @@ function plural(count: number, noun: string): string {
   return `${count} ${noun}${count === 1 ? "" : "s"}`;
 }
 
-/** The warning for a history database that differs from what this build
- *  reads in a way that can hide content; undefined on a database it reads
- *  in full (a normal install). */
+/** The warning for a history database whose schema or reads show content
+ *  this build may miss; undefined while reads are clean (a normal install).
+ *  An untested newest migration alone is not one: every opencode release
+ *  adds migrations, and `coverage.history.migration` still reports it. */
 function driftWarning(history: HistoryCoverage): string | undefined {
   const found: string[] = [];
-  if (!history.migration.tested) {
-    found.push(`untested migration ${history.migration.newest ?? "(none recorded)"}`);
-  }
   if (history.unknownTables.length > 0) {
     found.push(`unknown tables ${history.unknownTables.join(", ")}`);
   }
@@ -1971,113 +1967,7 @@ function cutWarning(results: readonly SearchResult[], cards: CardsRuntime): stri
 
 // ── Output continuation ──────────────────────────────────────────────
 
-/**
- * Where a trimmed `recall` output resumes. The output lists the results,
- * then the expansions; this names the first record not shown.
- *
- * - `query`: a fingerprint of the normalized arguments of the search it
- *   continues. The caller passes the same arguments with the cursor; a
- *   different fingerprint is refused.
- * - `after`/`before`: the time bounds that search resolved, reused so a
- *   relative bound (`last: "7d"`) does not move between the calls.
- * - `result`: the anchor result (the first result not shown, or for a stop
- *   inside the expansions the result the expansion belongs to), by index and
- *   identity.
- * - `shown`: a fingerprint of what the anchor depends on: the results up to
- *   and including it, plus, for a stop inside the expansions, every result
- *   and the expansions up to and including the stopped one.
- * - `expansion`: for a stop inside the expansions, the expansion's index and
- *   where in it the output resumes (unset for its start).
- *
- * The continuation re-runs the search and resumes only while the re-run
- * reproduces all of these; otherwise it is refused, so no record is ever
- * skipped or shown twice. Token fields: `q`, `after`, `before`, `ri`, `rs`,
- * `rp`, `h`, `x`, `anchorId`, `part`, `field`, `offset`.
- */
-type RecallCursor = {
-  query: string;
-  after?: number;
-  before?: number;
-  result: { index: number; sessionID: string; partID: string };
-  shown: string;
-  expansion?: { index: number; at?: MessagePosition };
-};
-
-function encodeRecallCursor(c: RecallCursor): string {
-  const at = c.expansion?.at;
-  return encodeContinuation("recall", {
-    q: c.query,
-    after: c.after,
-    before: c.before,
-    ri: c.result.index,
-    rs: c.result.sessionID,
-    rp: c.result.partID,
-    h: c.shown,
-    x: c.expansion?.index,
-    anchorId: at?.message,
-    part: at?.at?.part,
-    field: at?.at?.field,
-    offset: at?.at?.offset,
-  });
-}
-
-function nonEmptyString(value: unknown): value is string {
-  return typeof value === "string" && value !== "";
-}
-
-function isIndex(value: unknown): value is number {
-  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
-}
-
-function isTime(value: unknown): value is number | undefined {
-  return value === undefined || (typeof value === "number" && Number.isFinite(value));
-}
-
-/** The part position in a token's fields: undefined when it names none,
- *  null when what it names is malformed. */
-function readPartPosition(fields: Record<string, unknown>): PartPosition | undefined | null {
-  const { part, field, offset } = fields;
-  if (part === undefined) return field === undefined && offset === undefined ? undefined : null;
-  if (!nonEmptyString(part)) return null;
-  if (field === undefined && offset === undefined) return { part };
-  if (!(PART_TEXT_FIELDS as readonly unknown[]).includes(field) || !isIndex(offset)) return null;
-  return { part, field: field as PartTextField, offset };
-}
-
-function decodeRecallCursor(cursor: string): Decoded<RecallCursor> {
-  const decoded = decodeContinuation("recall", cursor);
-  if (!decoded.ok) return decoded;
-  const invalid = { ok: false as const, error: `Invalid cursor: ${cursor.slice(0, 64)}` };
-  const { q, after, before, ri, rs, rp, h, x, anchorId } = decoded.value;
-  if (!nonEmptyString(q) || !nonEmptyString(rs) || !nonEmptyString(rp) || !nonEmptyString(h)) {
-    return invalid;
-  }
-  if (!isIndex(ri) || !isTime(after) || !isTime(before)) return invalid;
-  const at = readPartPosition(decoded.value);
-  if (at === null || (anchorId !== undefined && !nonEmptyString(anchorId))) return invalid;
-  // A position inside an expansion needs the expansion, and a part needs the
-  // message it is in.
-  if (x === undefined ? anchorId !== undefined || at !== undefined : !isIndex(x)) return invalid;
-  if (anchorId === undefined && at !== undefined) return invalid;
-  return {
-    ok: true,
-    value: {
-      query: q,
-      ...(after !== undefined && { after }),
-      ...(before !== undefined && { before }),
-      result: { index: ri, sessionID: rs, partID: rp },
-      shown: h,
-      ...(isIndex(x) && {
-        expansion: {
-          index: x,
-          ...(nonEmptyString(anchorId) && {
-            at: { message: anchorId, ...(at && { at }) },
-          }),
-        },
-      }),
-    },
-  };
-}
+// The continuation itself is a `RecallCursor` (see `output.ts`).
 
 /** The identity a continuation checks a result by. */
 function resultIdentity(result: SearchResult): [string, string, string] {
@@ -2172,7 +2062,7 @@ First call: for broad discovery use match:"smart", group:"session", ${mode ? 'sc
 
 If memory exists, store only durable findings: preferences, project decisions, reusable root causes, environment facts, behavior corrections, or repeatable success/failure. Do not store ephemeral details, one-off commands, transient errors, or implementation minutiae.
 
-Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (invalid pattern errors). Smart/fuzzy include score/matchedTerms and fall back to literal. Results are snippets; use recall_get/context for full content. coverage reports what was searched; coverage.loadErrors reports partial session-load failures. A trimmed result continues with cursor: continuation (same arguments).${mode ? '\n\nEphemeral mode is configured: no persistent content index (coverage.cards full:0/storeRecency:0 is the configured state, not an empty history). Ranking is metadata-quality; for content recall rely on drilled results, deep sweeps, or name sessions via sessions:[...]. The default scope in this mode is "project" (not global): limitedBy:["scope"] on defaulted queries is configured behavior, and an explicit scope:"global" always works.' : ""}`,
+Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (invalid pattern errors). Smart/fuzzy include score/matchedTerms and fall back to literal. Results are snippets; use recall_get/context for full content. coverage reports what was searched; coverage.loadErrors reports partial session-load failures. A trimmed result continues with cursor: continuation (same arguments); for a deep sweep that re-runs the sweep, which may differ and need a fresh search.${mode ? '\n\nEphemeral mode is configured: no persistent content index (coverage.cards full:0/storeRecency:0 is the configured state, not an empty history). Ranking is metadata-quality; for content recall rely on drilled results, deep sweeps, or name sessions via sessions:[...]. The default scope in this mode is "project" (not global): limitedBy:["scope"] on defaulted queries is configured behavior, and an explicit scope:"global" always works.' : ""}`,
     args: {
       query: tool.schema.string().min(1).describe("Search text"),
       // Ephemeral mode deliberately uses `.optional()` with NO schema default:
@@ -3602,7 +3492,6 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
         // surfaced is `semanticReserved` (populated only in the tier-1 branch).
         const semanticStatus = cards.semanticStatus();
         const semanticReservedSet = new Set(semanticReserved);
-        const history = historyCoverage(deps.history?.(), deps.repair?.());
         if (deps.discoveryTruncated?.()) {
           pushUnique(normalized.limitedBy, "providerLimit");
           normalized.warnings.push(
@@ -3628,12 +3517,9 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
             "The card store is still distilling; some sessions are metadata-only until it completes.",
           );
         }
-        if (history) {
-          const drifted = driftWarning(history);
-          if (drifted) normalized.warnings.push(drifted);
-          const repairing = history.repair && repairWarning(history.repair);
-          if (repairing) normalized.warnings.push(repairing);
-        }
+        // The drift and repair warnings go here, after the store's own, but
+        // are read only once the query's reads are done (see finish()).
+        const historyWarningsAt = normalized.warnings.length;
 
         // ── Build coverage + the finish() machinery from a drill result ──
         const buildOutputContext = (
@@ -3736,7 +3622,6 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
             ...(sourceUnavailable !== undefined && {
               source: { kind: source.kind, available: false as const, reason: sourceUnavailable },
             }),
-            ...(history && { history }),
           };
           const searchedSessions = drilledSessions.map(
             (id) => searchedMeta.get(id) ?? { id, title: "", directory: "" },
@@ -3924,8 +3809,20 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
           }
           const cut = cutWarning(final, cards);
           if (cut) warnings.push(cut);
+          const expanded = await includeExpansion(out, final, warnings, effectiveMatchMode);
+          // Read after every history read this query makes (the drill and the
+          // expansions), so what they could not project is reported now.
+          const history = historyCoverage(deps.history?.(), deps.repair?.());
+          if (history) {
+            outCtx.coverage.history = history;
+            const historyWarnings = [
+              driftWarning(history),
+              history.repair && repairWarning(history.repair),
+            ].filter((warning): warning is string => Boolean(warning));
+            warnings.splice(historyWarningsAt, 0, ...historyWarnings);
+          }
           return respond(
-            attachCommonOutput(await includeExpansion(out, final, warnings, effectiveMatchMode), {
+            attachCommonOutput(expanded, {
               final,
               searchedSessions: outCtx.searchedSessions,
               coverage: outCtx.coverage,

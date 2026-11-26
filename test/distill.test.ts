@@ -23,6 +23,7 @@ import {
   type DistillSync,
 } from "../src/distill.js";
 import type { HistorySource } from "../src/history/source.js";
+import type { HistorySession } from "../src/history/model.js";
 import { createV1HistorySource } from "../src/history/v1.js";
 import { v1EventToSignal } from "../src/history/v1-events.js";
 
@@ -2840,6 +2841,62 @@ describe("cold-pass progress reporting", () => {
     expect(other.indexing()).toBeUndefined();
     await other.stop();
     await holder.stop();
+    db.close();
+  });
+
+  it("a process without the lease reports that the holder's discovery stopped at its limit", async () => {
+    const graph = twoSessions();
+    const { source } = makeDistillFake(graph);
+    const { db, store } = await freshStore();
+    const other = createDistiller({
+      source,
+      store,
+      gate: makeSpyGate().gate,
+      limits: { ...TEST_LIMITS, coldPass: false },
+      instanceId: "other",
+      log: () => {},
+    });
+    expect(other.discoveryTruncated()).toBe(false);
+    let truncated = true;
+    const discover = async (): Promise<HistorySession[]> => {
+      const listing = await source.listSessions({ scope: "project", limit: 100 });
+      if (!listing.ok) throw new Error(listing.error);
+      return listing.items;
+    };
+    const holder = createDistiller({
+      source,
+      store,
+      gate: makeSpyGate().gate,
+      limits: TEST_LIMITS,
+      instanceId: "holder",
+      discover,
+      discoveryTruncated: () => truncated,
+      log: () => {},
+    });
+    holder.start();
+    await waitFor(() => holder.status().coldPass === "done");
+    expect(holder.status().leaseHeld).toBe(true);
+    expect(other.status().leaseHeld).toBe(false);
+    expect(other.discoveryTruncated()).toBe(true);
+    await holder.stop();
+
+    // The next holder's complete discovery clears it for everyone.
+    truncated = false;
+    const next = createDistiller({
+      source,
+      store,
+      gate: makeSpyGate().gate,
+      limits: TEST_LIMITS,
+      instanceId: "next",
+      discover,
+      discoveryTruncated: () => truncated,
+      log: () => {},
+    });
+    next.start();
+    await waitFor(() => next.status().coldPass === "done");
+    expect(other.discoveryTruncated()).toBe(false);
+    await next.stop();
+    await other.stop();
     db.close();
   });
 

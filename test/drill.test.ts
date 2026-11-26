@@ -1417,7 +1417,7 @@ describe("drill per-target accounting", () => {
     ]);
   });
 
-  it("reports cached, with the same counts, when the cache held every page and lookup", async () => {
+  it("flags cached, with the same counts and stop, when the cache held every page and lookup", async () => {
     const graph: Graph = {
       messagesBySession: {
         "s-a": [
@@ -1437,7 +1437,9 @@ describe("drill per-target accounting", () => {
     expect(cold.targets).toEqual([
       { sessionId: "s-a", fetched: 3, candidate: 3, eligible: 3, stop: "anchor" },
     ]);
-    expect(warm.targets).toEqual([{ ...cold.targets[0]!, stop: "cached" }]);
+    expect(cold.targets[0]).not.toHaveProperty("cached");
+    expect(warm.targets).toEqual([{ ...cold.targets[0]!, cached: true }]);
+    expect(warm.pools[0]!.stats).toEqual({ ...cold.pools[0]!.stats, cached: true });
   });
 
   it("counts messages read, those with a candidate, and those the filters keep, apart", async () => {
