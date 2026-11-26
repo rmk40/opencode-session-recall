@@ -104,3 +104,113 @@ describe("v1 archive changes", () => {
     expect(await listedArchived(h, "s-current")).toBe(false);
   });
 });
+
+describe("v1 archive changes during a distill of the session", () => {
+  const SID = "s-current";
+
+  /** The fake host's session archived at `at`, or not archived, in both its
+   *  listings, as session.updated reports it. */
+  function setArchived(h: FakeHarness, at: number | undefined): Event {
+    const i = h.globalSessions.findIndex((s) => s.id === SID);
+    const info = h.globalSessions[i]!;
+    const next: GlobalSession = { ...info, time: { ...info.time } };
+    if (at === undefined) delete next.time.archived;
+    else next.time.archived = at;
+    h.globalSessions[i] = next;
+    const j = h.sessions.findIndex((s) => s.id === SID);
+    if (j >= 0) h.sessions[j] = { ...h.sessions[j]!, time: { ...next.time } };
+    return updated(next);
+  }
+
+  /** A distiller whose reads of the session's messages wait while held. */
+  function pausable(h: FakeHarness) {
+    let hold: Promise<void> | undefined;
+    let held = false;
+    let release = (): void => {};
+    const d = createDistiller({
+      source: {
+        ...h.source,
+        messagePage: async (o) => {
+          if (hold && o.sessionID === SID) {
+            held = true;
+            await hold;
+          }
+          return h.source.messagePage(o);
+        },
+      },
+      store,
+      gate: createFetchGate({ concurrency: 2 }),
+      limits: { ...TEST_LIMITS, distillDelayMs: 0 },
+      instanceId: "v1-archive-race",
+      idleDebounceMs: 1,
+    });
+    distiller = d;
+    return {
+      distiller: d,
+      pause(): void {
+        held = false;
+        hold = new Promise((resolve) => (release = resolve));
+      },
+      held: () => held,
+      release(): void {
+        hold = undefined;
+        release();
+      },
+    };
+  }
+
+  const signal = (event: Event) => {
+    const mapped = v1EventToSignal(event);
+    if (!mapped) throw new Error(`${event.type} mapped to no signal`);
+    return mapped;
+  };
+
+  it.each([
+    { label: "archive", from: undefined, to: 1_700_000_000_000 },
+    { label: "unarchive", from: 1_700_000_000_000, to: undefined },
+  ])("reaches the card that a re-distill rewrites ($label)", async ({ from, to }) => {
+    const h = makeFakeHarness();
+    setArchived(h, from);
+    const p = pausable(h);
+    p.distiller.start();
+    await waitFor(() => p.distiller.status().coldPass === "done");
+    expect(store.getCard(SID)?.timeArchived).toBe(from);
+
+    // The re-distill reads the session's metadata, then waits on its read
+    // while the archive state changes.
+    p.pause();
+    p.distiller.onEvent({ type: "turn-ended", sessionID: SID });
+    await waitFor(p.held);
+    const rev = store.cardStats().cardsRev;
+    p.distiller.onEvent(signal(setArchived(h, to)));
+    expect(store.getCard(SID)?.timeArchived).toBe(to);
+    p.release();
+    // The re-distill writes, then the metadata is read again.
+    await waitFor(() => store.cardStats().cardsRev > rev + 1);
+    await waitFor(() => store.getCard(SID)?.timeArchived === to);
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    expect(store.getCard(SID)?.timeArchived).toBe(to);
+  });
+
+  it.each([
+    { label: "archive", from: undefined, to: 1_700_000_000_000 },
+    { label: "unarchive", from: 1_700_000_000_000, to: undefined },
+  ])(
+    "reaches a card the cold pass creates after discovering the session ($label)",
+    async ({ from, to }) => {
+      const h = makeFakeHarness();
+      setArchived(h, from);
+      const p = pausable(h);
+      p.pause();
+      p.distiller.start();
+      await waitFor(p.held);
+      expect(store.getCard(SID)).toBeUndefined();
+      p.distiller.onEvent(signal(setArchived(h, to)));
+      p.release();
+      await waitFor(() => p.distiller.status().coldPass === "done");
+      await waitFor(() => store.getCard(SID)?.timeArchived === to);
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      expect(store.getCard(SID)?.timeArchived).toBe(to);
+    },
+  );
+});

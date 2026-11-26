@@ -602,7 +602,11 @@ describe("v2 writes over a running tail", () => {
     expect(hits("racedword")).toEqual(["ses_a"]);
     const card = store.getCard("ses_a");
     expect(before).toBeDefined();
-    expect(JSON.parse(card?.distillCursor ?? "null")).toEqual(JSON.parse(before ?? "null"));
+    // Marked as a moved read's, so it is never taken for an unchanged tail.
+    expect(JSON.parse(card?.distillCursor ?? "null")).toEqual({
+      ...(JSON.parse(before ?? "null") as object),
+      moved: true,
+    });
     expect(inspectCheckpoint(card?.distillCursor)).toMatchObject({ settled: false, boundary: 1 });
     expect(card?.settledBase).toMatchObject({ seq: 1 });
 

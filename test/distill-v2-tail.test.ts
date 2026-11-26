@@ -2,11 +2,20 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createDistiller, type Distiller, type DistillerOptions } from "../src/distill.js";
+import {
+  createDistiller,
+  deriveCard,
+  type DeriveCardInput,
+  type Distiller,
+  type DistillerOptions,
+  type DistillSync,
+} from "../src/distill.js";
 import { createFetchGate } from "../src/fetch-gate.js";
+import type { HistoryMessage } from "../src/history/model.js";
+import type { HistorySource } from "../src/history/source.js";
 import { createV2HistorySource, openOpencodeDb } from "../src/history/v2.js";
 import { V2_PROJECTOR_GEN } from "../src/history/v2-project.js";
-import { createV2Sync, type V2SyncOptions } from "../src/history/v2-sync.js";
+import { createV2Sync, inspectCheckpoint, type V2SyncOptions } from "../src/history/v2-sync.js";
 import { openSqlite, type ReadOnlyDb, type SqliteDb } from "../src/sqlite.js";
 import { openStore, type Card, type Store } from "../src/store.js";
 import { TEST_LIMITS } from "./helpers.js";
@@ -65,9 +74,16 @@ const WORDS = [
 type Model = {
   sessionID: string;
   seq: number;
-  /** The running reply, if any: its id, row `seq` and part rows so far. */
-  running?: { id: string; seq: number; parts: number };
+  /** The running reply, if any: its id, row `seq`, part rows so far, the
+   *  ordinals of those that make one slim-index row (so rewriting one as
+   *  text keeps the row count), and user rows queued after it. */
+  running?: { id: string; seq: number; parts: number; single: number[]; queued: number };
 };
+
+/** Whether a part makes exactly one slim-index row: text, reasoning, or an
+ *  edit call (its JSON input). A bash call makes two (command and input). */
+const singleRow = (data: Record<string, unknown>): boolean =>
+  data.type !== "tool" || data.name === "edit";
 
 const WRITES = new Set([
   "replaceSessionParts",
@@ -136,23 +152,27 @@ function startDistiller(
   o: Omit<Partial<DistillerOptions>, "sync"> & {
     syncOptions?: V2SyncOptions;
     logs?: string[];
+    wrapSync?: (inner: DistillSync) => DistillSync;
+    wrapSource?: (inner: HistorySource) => HistorySource;
   } = {},
 ): Distiller {
-  const { syncOptions, logs, ...rest } = o;
+  const { syncOptions, logs, wrapSync, wrapSource, ...rest } = o;
+  const sync = createV2Sync(reader, {
+    // No poll: each step signals the distillers itself.
+    pollIntervalMs: 1e9,
+    sessionScanEveryMs: 1e12,
+    reconcileEveryMs: 1e12,
+    yieldBetween: noYield,
+    ...syncOptions,
+  });
+  const source = createV2HistorySource(reader, { yieldBetween: noYield });
   const distiller = createDistiller({
-    source: createV2HistorySource(reader, { yieldBetween: noYield }),
+    source: wrapSource ? wrapSource(source) : source,
     store,
     gate: createFetchGate({ concurrency: 2 }),
     limits: { ...TEST_LIMITS, coldPass: false, distillDelayMs: 0, distillConcurrency: 1 },
     instanceId: `tail-${Math.random()}`,
-    sync: createV2Sync(reader, {
-      // No poll: each step signals the distillers itself.
-      pollIntervalMs: 1e9,
-      sessionScanEveryMs: 1e12,
-      reconcileEveryMs: 1e12,
-      yieldBetween: noYield,
-      ...syncOptions,
-    }),
+    sync: wrapSync ? wrapSync(sync) : sync,
     projectorGen: V2_PROJECTOR_GEN,
     idleDebounceMs: 1,
     yieldBetween: noYield,
@@ -253,17 +273,20 @@ function addReply(m: Model, rand: () => number, running: boolean, parts = 2): vo
     time_updated: running ? Date.now() + ++tick : T0 + seq,
     data: replyData(seq, !running),
   });
+  const single: number[] = [];
   for (let ordinal = 0; ordinal < parts; ordinal++) {
+    const data = part(rand, running);
+    if (singleRow(data)) single.push(ordinal);
     insertPart(v2db.db, {
       message_id: id,
       session_id: m.sessionID,
       ordinal,
       time_created: T0 + seq,
       time_updated: running ? Date.now() + ++tick : T0 + seq,
-      data: part(rand, running),
+      data,
     });
   }
-  if (running) m.running = { id, seq, parts };
+  if (running) m.running = { id, seq, parts, single, queued: 0 };
 }
 
 function settleRunning(m: Model): void {
@@ -279,11 +302,27 @@ function settleRunning(m: Model): void {
 /** The ops a step picks from, each applicable to the session as it is. */
 type Op = { name: string; tailOnly: boolean; run: () => void };
 
-function ops(m: Model, rand: () => number): Op[] {
-  const out: Op[] = [
-    { name: "user", tailOnly: m.running !== undefined, run: () => addUser(m, rand) },
-  ];
+/**
+ * The ops a step may take. `growing` keeps to those under which an append
+ * of the same messages is defined: the session only grows, no row behind a
+ * boundary changes, a rewritten part keeps its row count, and a running tail
+ * stays short (at most four parts and two queued user rows).
+ */
+function ops(m: Model, rand: () => number, growing = false): Op[] {
   const r = m.running;
+  const out: Op[] =
+    growing && r && r.queued >= 2
+      ? []
+      : [
+          {
+            name: "user",
+            tailOnly: r !== undefined,
+            run: () => {
+              addUser(m, rand);
+              if (r) r.queued++;
+            },
+          },
+        ];
   if (!r) {
     out.push({
       name: "turn",
@@ -296,36 +335,45 @@ function ops(m: Model, rand: () => number): Op[] {
     out.push({ name: "reply", tailOnly: false, run: () => addReply(m, rand, true) });
     return out;
   }
-  out.push(
-    {
+  if (!growing || r.parts < 4) {
+    out.push({
       name: "grow",
       tailOnly: true,
       run: () => {
+        const data = part(rand, true);
+        if (singleRow(data)) r.single.push(r.parts);
         insertPart(v2db.db, {
           message_id: r.id,
           session_id: m.sessionID,
           ordinal: r.parts++,
           time_created: T0 + r.seq,
           time_updated: Date.now() + ++tick,
-          data: part(rand, true),
+          data,
         });
       },
-    },
-    {
+    });
+  }
+  const rewritable = growing ? r.single : Array.from({ length: r.parts }, (_, i) => i);
+  if (rewritable.length > 0) {
+    out.push({
       name: "rewrite tail",
       tailOnly: true,
       run: () => {
+        const ordinal = rewritable[Math.floor(rand() * rewritable.length)]!;
+        if (!r.single.includes(ordinal)) r.single.push(ordinal);
         v2db.db.run(
           "UPDATE session_part SET type = 'text', data = ?, time_updated = ? WHERE message_id = ? AND ordinal = ?",
           [
             JSON.stringify({ type: "text", text: text(rand, 5) }),
             Date.now() + ++tick,
             r.id,
-            Math.floor(rand() * r.parts),
+            ordinal,
           ],
         );
       },
-    },
+    });
+  }
+  out.push(
     { name: "settle", tailOnly: true, run: () => settleRunning(m) },
     {
       name: "step",
@@ -335,6 +383,9 @@ function ops(m: Model, rand: () => number): Op[] {
         addReply(m, rand, true, 1);
       },
     },
+  );
+  if (growing) return out;
+  out.push(
     {
       name: "revert tail",
       tailOnly: true,
@@ -488,4 +539,339 @@ describe.each([
     expect(logs.filter((line) => line.includes("re-indexing"))).toEqual([]);
     expect(logs.find((line) => /range check sweep 1 done/.test(line))).toMatch(/, 0 changed$/);
   }, 120_000);
+});
+
+/** Every message of a session, read in pages with no row cap. */
+async function allMessages(source: HistorySource, sessionID: string): Promise<HistoryMessage[]> {
+  const out: HistoryMessage[] = [];
+  let before: string | undefined;
+  do {
+    const page = await source.messagePage({ sessionID, limit: 50, before });
+    out.push(...page.items);
+    before = page.nextCursor ?? undefined;
+  } while (before);
+  return out;
+}
+
+/** A checkpoint without the row floor its write recorded. */
+function withoutFloor(cursor: string | null | undefined): unknown {
+  const value = JSON.parse(cursor ?? "null") as Record<string, unknown> | null;
+  if (value) delete value.floor;
+  return value;
+}
+
+describe("tail re-reads over random streaming sequences past the row cap", () => {
+  it("store what an append of the same messages stores, and the rows a capped full read stores", async () => {
+    const CAP = 16;
+    const limits = {
+      ...TEST_LIMITS,
+      coldPass: false,
+      distillDelayMs: 0,
+      distillConcurrency: 1,
+      ftsRowsPerSession: CAP,
+    };
+    const tail = await openTestStore("tail");
+    const full = await openTestStore("full");
+    const tailCalls: string[] = [];
+    const fullCalls: string[] = [];
+    // Appends between turns: on these sequences every write after a
+    // session's first is an append or a tail write.
+    const tailDistiller = startDistiller(recording(tail.store, tailCalls), {
+      limits,
+      appendThresholdParts: 0,
+      pageMessages: 3,
+    });
+    const fullDistiller = startDistiller(recording(full.store, fullCalls), {
+      limits,
+      pageMessages: 2,
+    });
+    const source = createV2HistorySource(reader, { yieldBetween: noYield });
+
+    const SEQUENCES = 8;
+    const STEPS = 16;
+    let evicting = 0;
+    for (let s = 0; s < SEQUENCES; s++) {
+      const rand = random(5_000 + s);
+      const m: Model = { sessionID: `ses_cap_${s}`, seq: 0 };
+      insertSession(v2db.db, {
+        id: m.sessionID,
+        project_id: PROJECT,
+        directory: DIR,
+        title: `Session ${s}`,
+        time_created: T0,
+        time_updated: T0,
+      });
+      addUser(m, rand);
+      for (let step = 0; step < STEPS; step++) {
+        const last = step === STEPS - 1;
+        const choices = ops(m, rand, true).filter(
+          (op) => !last || op.name === (m.running ? "settle" : "user"),
+        );
+        const op = choices[Math.floor(rand() * choices.length)]!;
+        op.run();
+
+        const tailWrites = tailCalls.length;
+        const fullWrites = fullCalls.length;
+        tailDistiller.onEvent({ type: "turn-ended", sessionID: m.sessionID });
+        fullDistiller.onEvent({ type: "removal", sessionID: m.sessionID });
+        await waitFor(() => tailCalls.length > tailWrites && fullCalls.length > fullWrites);
+        await new Promise((resolve) => setTimeout(resolve, 2));
+        const how = tailCalls.at(-1)!;
+        const where = `sequence ${s}, step ${step} (${op.name}), written by ${how}`;
+        if (step > 0) expect(["appendSessionParts", "replaceSessionTail"], where).toContain(how);
+
+        // The append oracle: the whole session's messages, with the row cap.
+        const card = tail.store.getCard(m.sessionID);
+        const boundary = inspectCheckpoint(card?.distillCursor)?.boundary;
+        const messages = await allMessages(source, m.sessionID);
+        const input: DeriveCardInput = {
+          session: {
+            id: m.sessionID,
+            parentId: null,
+            title: "",
+            slug: "",
+            directory: "",
+            projectId: "",
+            agent: null,
+            model: null,
+            timeCreated: 0,
+            timeUpdated: 0,
+          },
+          messages,
+          parentById: new Map([[m.sessionID, null]]),
+          caps: { ftsRowsPerSession: CAP },
+          ...(boundary !== undefined && { settledThrough: boundary }),
+        };
+        const oracle = deriveCard(input);
+        const content = (c: Card | undefined) => ({
+          partCount: c?.partCount,
+          retainedChars: c?.retainedChars,
+          summaryHead: c?.summaryHead,
+          outcomeHead: c?.outcomeHead,
+          inventory: c?.inventory,
+          files: c?.files,
+          tools: c?.tools,
+          errors: c?.errors,
+          distilledThrough: c?.distilledThrough,
+        });
+        expect(content(card), where).toEqual(content(oracle.card));
+        expect(card?.settledBase, where).toEqual(oracle.settledBase);
+        // Rows, pointers included, as the append stores them.
+        const rows = storedRows(tail.db, m.sessionID);
+        expect(rows, where).toEqual(
+          oracle.rows.map((row) => ({
+            part_id: row.partId,
+            message_id: row.messageId,
+            prev_message_id: row.prevMessageId,
+            next_message_id: row.nextMessageId,
+            class: row.class,
+            time_created: row.timeCreated,
+            raw: row.raw,
+            norm: row.norm,
+          })),
+        );
+        // The same rows, in the same order, as a capped full read keeps.
+        const text = (db: SqliteDb) =>
+          db
+            .all("SELECT part_id, raw FROM part_text WHERE session_id = ? ORDER BY id", [
+              m.sessionID,
+            ])
+            .map((row) => [row.part_id, row.raw]);
+        expect(text(tail.db), where).toEqual(text(full.db));
+        // The checkpoint a full read stamps, but for the floor: an append's is
+        // the message that owns the oldest row left once rows were evicted.
+        expect(withoutFloor(card?.distillCursor), where).toEqual(
+          withoutFloor(full.store.getCard(m.sessionID)?.distillCursor),
+        );
+        const produced = deriveCard({ ...input, caps: { ftsRowsPerSession: 1e9 } }).rows.length;
+        const owner = messages.find((msg) => msg.info.id === oracle.rows[0]?.messageId);
+        const floor = produced > CAP ? owner?.info.seq : undefined;
+        if (produced > CAP) evicting++;
+        expect(inspectCheckpoint(card?.distillCursor)?.floor, where).toBe(floor);
+      }
+    }
+    expect(evicting).toBeGreaterThan(SEQUENCES);
+
+    await tailDistiller.stop();
+    const logs: string[] = [];
+    startDistiller(tail.store, { logs, limits, syncOptions: { pollIntervalMs: 5 } });
+    await waitFor(() => logs.some((line) => /range check sweep 1 done/.test(line)), 20_000);
+    expect(logs.filter((line) => line.includes("re-indexing"))).toEqual([]);
+    expect(logs.find((line) => /range check sweep 1 done/.test(line))).toMatch(/, 0 changed$/);
+  }, 120_000);
+});
+
+// ── Races and skips ──────────────────────────────────────────────────────────
+
+/** A session of a user row, a settled reply (the boundary) and a running
+ *  reply, each part row one word. */
+function streamingSession(sessionID: string, extra: { time_archived?: number } = {}): Model {
+  const rand = random(42);
+  const m: Model = { sessionID, seq: 0 };
+  insertSession(v2db.db, {
+    id: sessionID,
+    project_id: PROJECT,
+    directory: DIR,
+    title: `Title ${sessionID}`,
+    time_created: T0,
+    time_updated: T0,
+    ...extra,
+  });
+  addUser(m, rand);
+  addReply(m, rand, false, 1);
+  addReply(m, rand, true, 1);
+  return m;
+}
+
+/** Signal one re-distill and wait for the card write it makes. */
+async function redistilled(d: Distiller, calls: string[], sessionID: string): Promise<string> {
+  const from = calls.length;
+  d.onEvent({ type: "turn-ended", sessionID });
+  await waitFor(() => calls.length > from);
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  return calls.at(-1)!;
+}
+
+const found = (store: Store, word: string): string[] =>
+  store.ftsSearch({ strong: [word], weak: [] }).map((hit) => hit.sessionId);
+
+describe("tail re-reads and the rows behind the boundary", () => {
+  it("read in full when a part behind the boundary changes right after the compare that chose the tail", async () => {
+    const tail = await openTestStore("tail");
+    const calls: string[] = [];
+    let race: (() => void) | undefined;
+    const d = startDistiller(recording(tail.store, calls), {
+      wrapSync: (inner) => ({
+        ...inner,
+        compare: async (sessionID, stored) => {
+          const change = await inner.compare(sessionID, stored);
+          const run = race;
+          if (run && change === "tail") {
+            race = undefined;
+            run();
+          }
+          return change;
+        },
+      }),
+    });
+    const m = streamingSession("ses_race");
+    expect(await redistilled(d, calls, m.sessionID)).toBe("replaceSessionParts");
+    expect(tail.store.getCard(m.sessionID)?.settledBase?.seq).toBe(2);
+
+    // The running reply grows, and the boundary's own part is rewritten
+    // between the compare and the tail read's first checkpoint.
+    const r = m.running!;
+    insertPart(v2db.db, {
+      message_id: r.id,
+      session_id: m.sessionID,
+      ordinal: r.parts++,
+      time_created: T0 + r.seq,
+      time_updated: Date.now() + ++tick,
+      data: { type: "text", text: "yankeegrown" },
+    });
+    race = () =>
+      v2db.db.run(
+        "UPDATE session_part SET type = 'text', data = ?, time_updated = ? WHERE message_id = ? AND ordinal = 0",
+        [JSON.stringify({ type: "text", text: "zuluraced" }), T0 + 200_000, `msg_${m.sessionID}_2`],
+      );
+    expect(await redistilled(d, calls, m.sessionID)).toBe("replaceSessionParts");
+    expect(race).toBeUndefined();
+    expect(found(tail.store, "zuluraced")).toEqual([m.sessionID]);
+    expect(found(tail.store, "yankeegrown")).toEqual([m.sessionID]);
+  });
+
+  it("read and write nothing while nothing past the boundary changes", async () => {
+    const tail = await openTestStore("tail");
+    const calls: string[] = [];
+    let checkpoints = 0;
+    let pages = 0;
+    const d = startDistiller(recording(tail.store, calls), {
+      wrapSync: (inner) => ({
+        ...inner,
+        checkpoint: async (sessionID) => {
+          checkpoints++;
+          return inner.checkpoint(sessionID);
+        },
+      }),
+      wrapSource: (inner) => ({
+        ...inner,
+        messagePage: async (o) => {
+          pages++;
+          return inner.messagePage(o);
+        },
+      }),
+    });
+    const m = streamingSession("ses_quiet");
+    expect(await redistilled(d, calls, m.sessionID)).toBe("replaceSessionParts");
+    const card = tail.store.getCard(m.sessionID);
+    const read = { checkpoints, pages };
+    d.onEvent({ type: "turn-ended", sessionID: m.sessionID });
+    await waitFor(() => checkpoints > read.checkpoints);
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    expect({ calls: calls.length, pages }).toEqual({ calls: 1, pages: read.pages });
+    expect(tail.store.getCard(m.sessionID)).toEqual(card);
+
+    // A change past the boundary is read again.
+    v2db.db.run(
+      "UPDATE session_part SET type = 'text', data = ?, time_updated = ? WHERE message_id = ? AND ordinal = 0",
+      [JSON.stringify({ type: "text", text: "xraylater" }), Date.now() + ++tick, m.running!.id],
+    );
+    expect(await redistilled(d, calls, m.sessionID)).toBe("replaceSessionTail");
+    expect(found(tail.store, "xraylater")).toEqual([m.sessionID]);
+  });
+});
+
+describe("v2 metadata patched while a distill of the session is in progress", () => {
+  it.each([
+    { label: "archive", from: undefined, to: T0 + 9_000 },
+    { label: "unarchive", from: T0 + 8_000, to: undefined },
+  ])("survives the distill's write ($label)", async ({ from, to }) => {
+    const store = (await openTestStore("meta")).store;
+    const calls: string[] = [];
+    let hold: Promise<void> | undefined;
+    let held = false;
+    const d = startDistiller(recording(store, calls), {
+      wrapSource: (inner) => ({
+        ...inner,
+        messagePage: async (o) => {
+          if (hold) {
+            held = true;
+            await hold;
+          }
+          return inner.messagePage(o);
+        },
+      }),
+    });
+    const m = streamingSession("ses_meta", from === undefined ? {} : { time_archived: from });
+    settleRunning(m);
+    await redistilled(d, calls, m.sessionID);
+    expect(store.getCard(m.sessionID)?.timeArchived).toBe(from);
+
+    // A new row makes the next distill read; it reads the session's metadata
+    // first, then waits on its read while the session is archived or not.
+    addUser(m, random(7));
+    let release!: () => void;
+    hold = new Promise((resolve) => (release = resolve));
+    const writes = calls.length;
+    d.onEvent({ type: "turn-ended", sessionID: m.sessionID });
+    await waitFor(() => held);
+    hold = undefined;
+    v2db.db.run("UPDATE session_v2 SET time_archived = ?, time_updated = ? WHERE id = ?", [
+      to ?? null,
+      T0 + 10_000,
+      m.sessionID,
+    ]);
+    // The patch the session scan sends.
+    d.onEvent({
+      type: "meta",
+      sessionID: m.sessionID,
+      patch: { title: `Title ${m.sessionID}`, timeArchived: to ?? null },
+    });
+    expect(store.getCard(m.sessionID)?.timeArchived).toBe(to);
+    release();
+    await waitFor(() => calls.length > writes);
+    await waitFor(() => store.getCard(m.sessionID)?.timeArchived === to);
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    expect(store.getCard(m.sessionID)?.timeArchived).toBe(to);
+  });
 });

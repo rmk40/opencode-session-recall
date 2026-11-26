@@ -2043,11 +2043,15 @@ describe("tail writes", () => {
   /** A row of the tail, whose message follows the base's newest one. */
   const tailRow = (partId: string, raw: string, messageId = "m-3"): PartTextRow =>
     makePart(partId, raw, { messageId, prevMessageId: "m-2" });
+  /** The store the running test seeded: a tail carries the card's revision
+   *  as it reads now, as a caller that just read the card's rows would. */
+  let current: Store | undefined;
   const tail = (over: Partial<SessionTail> = {}): SessionTail => ({
     base,
     evict: 0,
     rows: [tailRow("p3", "gammaold")],
     firstMessageId: "m-3",
+    writeRev: current?.cardWriteRev("s1") ?? null,
     ...over,
   });
   const found = (store: Store, word: string): string[] =>
@@ -2056,6 +2060,7 @@ describe("tail writes", () => {
   /** s1 as a full write over its running tail stores it, with one range hash. */
   async function seeded() {
     const ctx = await fresh();
+    current = ctx.store;
     const card = makeCard("s1", {
       distillState: "full",
       distilledThrough: "m-3",
@@ -2075,18 +2080,17 @@ describe("tail writes", () => {
     return { ...ctx, card, rows };
   }
 
-  it("replaces the rows past the base, keeps the base's, and recomputes the card from both with one revision", async () => {
+  it("replaces the rows past the base, keeps the base's, and stores the card with one revision", async () => {
     const { db, store, card, rows } = await seeded();
     const next = [tailRow("p3", "gammanew"), tailRow("p4", "delta")];
-    let recomputedFrom: PartTextRow[] = [];
     const moved = counterMoves(store, () =>
-      store.replaceSessionTail("s1", tail({ rows: next }), (all) => {
-        recomputedFrom = all;
-        return { ...card, partCount: all.length, distillCursor: "c-2" };
+      store.replaceSessionTail("s1", tail({ rows: next }), {
+        ...card,
+        partCount: 4,
+        distillCursor: "c-2",
       }),
     );
     expect(moved).toMatchObject({ result: { changed: true }, rev: 1, stamped: 1 });
-    expect(recomputedFrom).toEqual([...baseRows, ...next]);
     expect(store.getCard("s1")).toMatchObject({
       partCount: 4,
       distillCursor: "c-2",
@@ -2106,10 +2110,10 @@ describe("tail writes", () => {
   ])("points the base's newest message at $name, leaving older ones", async ({ first, next }) => {
     const { db, store, card, rows } = await seeded();
     expect(
-      store.replaceSessionTail("s1", tail({ rows: next, firstMessageId: first }), (all) => ({
+      store.replaceSessionTail("s1", tail({ rows: next, firstMessageId: first }), {
         ...card,
-        partCount: all.length,
-      })),
+        partCount: 2 + next.length,
+      }),
     ).toEqual({ changed: true });
     expect(rows().map((row) => [row.message_id, row.next_message_id])).toEqual([
       ["m-1", "m-2"],
@@ -2123,10 +2127,7 @@ describe("tail writes", () => {
     const { db, store, card, rows } = await seeded();
     const next = [tailRow("p3", "gammaold"), tailRow("p4", "delta")];
     expect(
-      store.replaceSessionTail("s1", tail({ evict: 1, rows: next }), (all) => ({
-        ...card,
-        partCount: all.length,
-      })),
+      store.replaceSessionTail("s1", tail({ evict: 1, rows: next }), { ...card, partCount: 3 }),
     ).toEqual({ changed: true });
     expect(rows().map((row) => row.part_id)).toEqual(["p2", "p3", "p4"]);
     expect(found(store, "alpha")).toEqual([]);
@@ -2143,7 +2144,7 @@ describe("tail writes", () => {
       store.replaceSessionTail(
         "s1",
         tail(),
-        () => ({ ...card, distillCursor: "c-2", projectorGen: 3, settledBase: later }),
+        { ...card, distillCursor: "c-2", projectorGen: 3, settledBase: later },
         { rangeHashes: [rangeHash(500)] },
       ),
     );
@@ -2166,7 +2167,7 @@ describe("tail writes", () => {
   ])("rewrites with a revision when the write $name", async ({ tail: over, card: change }) => {
     const { db, store, card } = await seeded();
     const moved = counterMoves(store, () =>
-      store.replaceSessionTail("s1", tail(over), () => ({ ...card, ...change })),
+      store.replaceSessionTail("s1", tail(over), { ...card, ...change }),
     );
     expect(moved).toMatchObject({ result: { changed: true }, rev: 1, stamped: 1 });
     expect(store.getCard("s1")?.writeRev).toBe(store.cardStats().cardsRev);
@@ -2176,9 +2177,9 @@ describe("tail writes", () => {
   it("matches the stored base whatever order the caller's fields come in", async () => {
     const { db, store, card } = await seeded();
     const reordered = Object.fromEntries(Object.entries(base).reverse()) as SettledBase;
-    expect(store.replaceSessionTail("s1", tail({ base: reordered, rows: [] }), () => card)).toEqual(
-      { changed: true },
-    );
+    expect(store.replaceSessionTail("s1", tail({ base: reordered, rows: [] }), card)).toEqual({
+      changed: true,
+    });
     db.close();
   });
 
@@ -2213,6 +2214,7 @@ describe("tail writes", () => {
     { name: "the eviction is negative", tail: { evict: -1 } },
     { name: "the eviction passes the base", tail: { evict: 3 } },
     { name: "the eviction is not a whole row count", tail: { evict: 0.5 } },
+    { name: "the card was written since its rows were read", tail: { writeRev: 0 } },
   ])("refuses as base-changed and writes nothing when $name", async ({ setup, tail: over }) => {
     const { db, store, card, rows } = await seeded();
     setup?.(store, card);
@@ -2223,7 +2225,7 @@ describe("tail writes", () => {
       store.replaceSessionTail(
         "s1",
         tail({ rows: [tailRow("p4", "refusedword")], ...over }),
-        (all) => ({ ...card, partCount: all.length }),
+        { ...card, partCount: 3 },
         { rangeHashes: [rangeHash(500)], replaceRangeHashes: true },
       ),
     );
@@ -2247,7 +2249,7 @@ describe("tail writes", () => {
       store.replaceSessionTail(
         "s1",
         tail({ evict: 1, rows: [tailRow("p4", "rolledback", "m-4")], firstMessageId: "m-4" }),
-        (all) => ({ ...card, partCount: all.length, projectorGen: 1 }),
+        { ...card, partCount: 2, projectorGen: 1 },
         { rangeHashes: [rangeHash(500)], replaceRangeHashes: true },
       ),
     );
@@ -2268,23 +2270,23 @@ describe("tail writes", () => {
     const { db, store, card } = await seeded();
     const unstamped: Card = { ...card };
     delete unstamped.projectorGen;
-    store.replaceSessionTail("s1", tail({ rows: [tailRow("p3", "gammanew")] }), () => unstamped);
+    store.replaceSessionTail("s1", tail({ rows: [tailRow("p3", "gammanew")] }), unstamped);
     expect(store.getCard("s1")?.projectorGen).toBe(2);
-    store.replaceSessionTail("s1", tail({ rows: [tailRow("p3", "gammanewer")] }), () => ({
+    store.replaceSessionTail("s1", tail({ rows: [tailRow("p3", "gammanewer")] }), {
       ...card,
       projectorGen: 3,
-    }));
+    });
     expect(store.getCard("s1")?.projectorGen).toBe(3);
     db.close();
   });
 
   it("stores range hashes with the write, replacing the session's only when asked", async () => {
     const { db, store, card } = await seeded();
-    store.replaceSessionTail("s1", tail({ rows: [tailRow("p3", "gammanew")] }), () => card, {
+    store.replaceSessionTail("s1", tail({ rows: [tailRow("p3", "gammanew")] }), card, {
       rangeHashes: [rangeHash(500)],
     });
     expect(store.getRangeHashes("s1")).toEqual([rangeHash(0), rangeHash(500)]);
-    store.replaceSessionTail("s1", tail({ rows: [tailRow("p3", "gammanewer")] }), () => card, {
+    store.replaceSessionTail("s1", tail({ rows: [tailRow("p3", "gammanewer")] }), card, {
       rangeHashes: [rangeHash(500, "trimmed")],
       replaceRangeHashes: true,
     });
@@ -2296,7 +2298,7 @@ describe("tail writes", () => {
     const { db, store, card } = await seeded();
     store.markRepairPending("s1", "malformed");
     expect(
-      store.replaceSessionTail("s1", tail({ rows: [tailRow("p3", "gammanew")] }), () => card),
+      store.replaceSessionTail("s1", tail({ rows: [tailRow("p3", "gammanew")] }), card),
     ).toEqual({ changed: true });
     expect(store.getCard("s1")?.repairReason).toBe("malformed");
     db.close();

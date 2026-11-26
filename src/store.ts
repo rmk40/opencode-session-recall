@@ -340,6 +340,9 @@ export type SessionTail = {
   /** The tail's first message, which the base's newest message's rows point
    *  at (`next_message_id`), or null when the tail has no message. */
   firstMessageId: string | null;
+  /** The card's {@link Card.writeRev} when the caller read its rows, null
+   *  for a card no stamped write has touched. */
+  writeRev: number | null;
 };
 
 /** A hash over one session's source rows from `startSeq` through `endSeq`
@@ -505,6 +508,9 @@ export type Store = {
   /** The message id of a session's slim-index row at `offset` in insertion
    *  (oldest-first) order, or undefined past the last row. */
   sessionRowMessage(sessionId: string, offset: number): string | undefined;
+  /** A session's slim-index rows in insertion (oldest-first) order, from
+   *  `offset`, at most `limit` (a positive integer; anything else reads one). */
+  sessionRows(sessionId: string, offset: number, limit: number): PartTextRow[];
   /** Every card's session id, without loading the cards. */
   cardSessionIds(): string[];
   /** How many cards the store holds. */
@@ -670,24 +676,25 @@ export type Store = {
    * settled base, in one transaction. The session's oldest `tail.base.rows`
    * slim-index rows are the base's: the oldest `tail.evict` of them are
    * evicted (the row cap), the rest are kept, and every row after them (the
-   * previous tail's) is replaced by `tail.rows`. The rows of the base's
-   * newest message ({@link SettledBase.messageId}) are repointed at
-   * `tail.firstMessageId`, as a full write of the same messages would store
-   * them. The card is then recomputed from every surviving row
-   * (`recompute`, oldest first).
+   * previous tail's) is replaced by `tail.rows` unless they already equal
+   * it. The rows of the base's newest message ({@link SettledBase.messageId})
+   * are repointed at `tail.firstMessageId`, as an append of the same
+   * messages would store them. `card` is the card the caller built from the
+   * rows it read ({@link sessionRows}) with those changes, so the
+   * transaction reads only the rows it replaces.
    *
    * Refused with `base-changed`, writing nothing, unless the card still holds
-   * exactly `tail.base` and at least its rows: another write replaced the
-   * card since the caller read it. Refused with `older-generation` like
-   * {@link appendSessionParts}, whose generation, suppression (no row
-   * evicted, replaced or repointed and an unchanged card write only the
-   * checkpoint, generation and settled base, with no revision), repair
-   * reason and range hash rules it follows.
+   * exactly `tail.base`, at least its rows and the revision `tail.writeRev`
+   * the caller read them at: another write changed the card since. Refused
+   * with `older-generation` like {@link appendSessionParts}, whose
+   * generation, suppression (no row evicted, replaced or repointed and an
+   * unchanged card write only the checkpoint, generation and settled base,
+   * with no revision), repair reason and range hash rules it follows.
    */
   replaceSessionTail(
     sessionId: string,
     tail: SessionTail,
-    recompute: (allRows: PartTextRow[]) => Card,
+    card: Card,
     opts?: { rangeHashes?: RangeHash[]; replaceRangeHashes?: boolean },
   ): SessionWrite;
   ftsSearch(input: { strong: string[]; weak: string[]; limit?: number }): FtsHit[];
@@ -810,8 +817,9 @@ const CARD_COMPARED_COLUMNS = CARD_COLUMNS.filter(
 /** Position of each compared column in {@link cardValues}' output. */
 const CARD_COMPARED_INDEXES = CARD_COMPARED_COLUMNS.map((c) => CARD_COLUMNS.indexOf(c));
 /** What a content write reads first: the stored generation (for the guard),
- *  the settled base (for a tail write's check) and every compared column. */
-const CARD_COMPARE_SQL = `SELECT projector_gen, settled_base, ${CARD_COMPARED_COLUMNS.join(", ")} FROM card WHERE session_id=?`;
+ *  the settled base and revision (for a tail write's check) and every
+ *  compared column. */
+const CARD_COMPARE_SQL = `SELECT projector_gen, settled_base, write_rev, ${CARD_COMPARED_COLUMNS.join(", ")} FROM card WHERE session_id=?`;
 
 const PART_ROW_COLUMNS =
   "part_id, message_id, prev_message_id, next_message_id, class, time_created, raw, norm";
@@ -1051,6 +1059,17 @@ function sameRows(stored: Row[], rows: PartTextRow[]): boolean {
       sameSqlValue(old.norm, row.norm)
     );
   });
+}
+
+/** Whether applying `next` would change any of a card's stored metadata. */
+function metaDiffers(stored: StoredCardMeta, next: StoredCardMeta): boolean {
+  return (
+    next.title !== stored.title ||
+    next.directory !== stored.directory ||
+    next.projectId !== stored.projectId ||
+    next.timeUpdated !== stored.timeUpdated ||
+    next.timeArchived !== stored.timeArchived
+  );
 }
 
 /** A stored slim-index row (read with {@link PART_ROW_COLUMNS}). */
@@ -1445,6 +1464,17 @@ class SqliteStore implements Store {
     );
   }
 
+  sessionRows(sessionId: string, offset: number, limit: number): PartTextRow[] {
+    const from = Number.isInteger(offset) && offset > 0 ? offset : 0;
+    const take = Number.isInteger(limit) && limit >= 1 ? limit : 1;
+    return this.db
+      .all(
+        `SELECT ${PART_ROW_COLUMNS} FROM part_text WHERE session_id=? ORDER BY id LIMIT ? OFFSET ?`,
+        [sessionId, take, from],
+      )
+      .map(rowToPart);
+  }
+
   sessionRowMessage(sessionId: string, offset: number): string | undefined {
     if (!Number.isInteger(offset) || offset < 0) return undefined;
     const row = this.db.get(
@@ -1710,15 +1740,34 @@ class SqliteStore implements Store {
     sessionId: string,
     patch: { title?: string; directory?: string; projectId?: string; timeArchived?: number | null },
   ): CardWrite {
-    return this.db.tx(() =>
-      this.writeCardMeta(sessionId, (stored) => ({
-        ...stored,
-        title: patch.title ?? stored.title,
-        directory: patch.directory ?? stored.directory,
-        projectId: patch.projectId ?? stored.projectId,
-        timeArchived: patch.timeArchived === undefined ? stored.timeArchived : patch.timeArchived,
-      })),
+    const patched = (stored: StoredCardMeta): StoredCardMeta => ({
+      ...stored,
+      title: patch.title ?? stored.title,
+      directory: patch.directory ?? stored.directory,
+      projectId: patch.projectId ?? stored.projectId,
+      timeArchived: patch.timeArchived === undefined ? stored.timeArchived : patch.timeArchived,
+    });
+    // Hosts send most patches with nothing new in them: a plain read settles
+    // those without a write transaction.
+    const current = this.readCardMeta(sessionId);
+    if (!current || !metaDiffers(current, patched(current))) return { changed: false };
+    return this.db.tx(() => this.writeCardMeta(sessionId, patched));
+  }
+
+  /** The session metadata a card stores, or undefined without a card. */
+  private readCardMeta(sessionId: string): StoredCardMeta | undefined {
+    const row = this.db.get(
+      "SELECT title, directory, project_id, time_updated, time_archived FROM card WHERE session_id=?",
+      [sessionId],
     );
+    if (!row) return undefined;
+    return {
+      title: asString(row.title),
+      directory: asString(row.directory),
+      projectId: asString(row.project_id),
+      timeUpdated: asNumber(row.time_updated),
+      timeArchived: asNullableNumber(row.time_archived),
+    };
   }
 
   refreshCardMeta(
@@ -1755,25 +1804,11 @@ class SqliteStore implements Store {
     next: (stored: StoredCardMeta) => StoredCardMeta,
     distillCursor?: string | null,
   ): CardWrite {
-    const row = this.db.get(
-      "SELECT title, directory, project_id, time_updated, time_archived FROM card WHERE session_id=?",
-      [sessionId],
-    );
-    if (!row) return { changed: false };
-    const stored: StoredCardMeta = {
-      title: asString(row.title),
-      directory: asString(row.directory),
-      projectId: asString(row.project_id),
-      timeUpdated: asNumber(row.time_updated),
-      timeArchived: asNullableNumber(row.time_archived),
-    };
+    const stored = this.readCardMeta(sessionId);
+    if (!stored) return { changed: false };
     const meta = next(stored);
     const embedded = meta.title !== stored.title || meta.directory !== stored.directory;
-    const changed =
-      embedded ||
-      meta.projectId !== stored.projectId ||
-      meta.timeUpdated !== stored.timeUpdated ||
-      meta.timeArchived !== stored.timeArchived;
+    const changed = metaDiffers(stored, meta);
     const cursorSet = distillCursor === undefined ? "" : ", distill_cursor=?, settled_base=NULL";
     const cursorParam: SqlValue[] = distillCursor === undefined ? [] : [distillCursor];
     if (!changed) {
@@ -1920,82 +1955,82 @@ class SqliteStore implements Store {
   replaceSessionTail(
     sessionId: string,
     tail: SessionTail,
-    recompute: (allRows: PartTextRow[]) => Card,
+    next: Card,
     opts?: { rangeHashes?: RangeHash[]; replaceRangeHashes?: boolean },
   ): SessionWrite {
     const { base, evict } = tail;
-    try {
-      return this.db.tx((): SessionWrite => {
-        const stored = this.db.get(CARD_COMPARE_SQL, [sessionId]);
-        if (!stored || stored.settled_base !== serializeSettledBase(base)) {
-          return { changed: false, refused: "base-changed" };
-        }
-        const old = this.db.all(
-          `SELECT id, ${PART_ROW_COLUMNS} FROM part_text WHERE session_id=? ORDER BY id`,
-          [sessionId],
-        );
-        if (old.length < base.rows || !Number.isInteger(evict) || evict < 0 || evict > base.rows) {
-          return { changed: false, refused: "base-changed" };
-        }
-        const evicted = old.slice(0, evict);
-        const oldTail = old.slice(base.rows);
-        // The base's newest message points at the tail's first one, as in a
-        // full write; only its rows can need repointing.
-        const kept = old.slice(evict, base.rows).map((row) => {
-          const part = rowToPart(row);
-          return base.messageId !== null && part.messageId === base.messageId
-            ? { ...part, nextMessageId: tail.firstMessageId }
-            : part;
-        });
-        const repoint =
-          base.messageId !== null &&
-          old
-            .slice(evict, base.rows)
-            .some(
-              (row) =>
-                row.message_id === base.messageId &&
-                !sameSqlValue(row.next_message_id, tail.firstMessageId),
-            );
-        const rowsChanged = evict > 0 || repoint || !sameRows(oldTail, tail.rows);
-        const recomputed = recompute([...kept, ...tail.rows]);
-        // Like an append, a tail write extends the card at its stored
-        // generation unless the recomputed card names one.
-        const card: Card =
-          recomputed.projectorGen === undefined
-            ? { ...recomputed, projectorGen: asNullableNumber(stored.projector_gen) }
-            : recomputed;
-        if (belowStoredGen(card.projectorGen, stored.projector_gen)) {
-          throw new OlderGenerationRefused();
-        }
-        if (rowsChanged) {
-          const dropped = [...evicted, ...oldTail];
-          this.evictFts(dropped);
-          for (const row of dropped) {
-            this.db.run("DELETE FROM part_text WHERE id=?", [asNumber(row.id)]);
-          }
-          if (repoint) {
-            this.db.run(
-              "UPDATE part_text SET next_message_id=? WHERE session_id=? AND message_id=?",
-              [tail.firstMessageId, sessionId, base.messageId],
-            );
-          }
-          for (const row of tail.rows) this.insertRow(sessionId, row);
-        }
-        const changed = rowsChanged || !sameCard(stored, card);
-        if (changed) this.writeStampedCard(card);
-        else this.writeCheckpoint(sessionId, card);
-        if (opts?.replaceRangeHashes) {
-          this.db.run("DELETE FROM range_hash WHERE session_id=?", [sessionId]);
-        }
-        this.writeRangeHashes(sessionId, opts?.rangeHashes);
-        return { changed };
-      });
-    } catch (error) {
-      if (error instanceof OlderGenerationRefused) {
+    return this.db.tx((): SessionWrite => {
+      const stored = this.db.get(CARD_COMPARE_SQL, [sessionId]);
+      if (
+        !stored ||
+        stored.settled_base !== serializeSettledBase(base) ||
+        asNullableNumber(stored.write_rev) !== tail.writeRev ||
+        !Number.isInteger(evict) ||
+        evict < 0 ||
+        evict > base.rows ||
+        this.sessionRowCount(sessionId) < base.rows
+      ) {
+        return { changed: false, refused: "base-changed" };
+      }
+      // Like an append, a tail write extends the card at its stored
+      // generation unless the card names one.
+      const card: Card =
+        next.projectorGen === undefined
+          ? { ...next, projectorGen: asNullableNumber(stored.projector_gen) }
+          : next;
+      if (belowStoredGen(card.projectorGen, stored.projector_gen)) {
         return { changed: false, refused: "older-generation" };
       }
-      throw error;
-    }
+      // Only the rows this write can change are read: the evicted ones, the
+      // previous tail's and those of the base's newest message, which point
+      // at the tail's first message.
+      const evicted =
+        evict > 0
+          ? this.db.all(
+              "SELECT id, raw, norm FROM part_text WHERE session_id=? ORDER BY id LIMIT ?",
+              [sessionId, evict],
+            )
+          : [];
+      const oldTail = this.db.all(
+        `SELECT id, ${PART_ROW_COLUMNS} FROM part_text WHERE session_id=? ORDER BY id LIMIT -1 OFFSET ?`,
+        [sessionId, base.rows],
+      );
+      const gone = new Set(evicted.map((row) => asNumber(row.id)));
+      const repoint =
+        base.messageId !== null &&
+        this.db
+          .all("SELECT id, next_message_id FROM part_text WHERE session_id=? AND message_id=?", [
+            sessionId,
+            base.messageId,
+          ])
+          .some(
+            (row) =>
+              !gone.has(asNumber(row.id)) &&
+              !sameSqlValue(row.next_message_id, tail.firstMessageId),
+          );
+      const tailChanged = !sameRows(oldTail, tail.rows);
+      const dropped = tailChanged ? [...evicted, ...oldTail] : evicted;
+      this.evictFts(dropped);
+      for (const row of dropped) {
+        this.db.run("DELETE FROM part_text WHERE id=?", [asNumber(row.id)]);
+      }
+      if (repoint) {
+        this.db.run("UPDATE part_text SET next_message_id=? WHERE session_id=? AND message_id=?", [
+          tail.firstMessageId,
+          sessionId,
+          base.messageId,
+        ]);
+      }
+      if (tailChanged) for (const row of tail.rows) this.insertRow(sessionId, row);
+      const changed = evict > 0 || repoint || tailChanged || !sameCard(stored, card);
+      if (changed) this.writeStampedCard(card);
+      else this.writeCheckpoint(sessionId, card);
+      if (opts?.replaceRangeHashes) {
+        this.db.run("DELETE FROM range_hash WHERE session_id=?", [sessionId]);
+      }
+      this.writeRangeHashes(sessionId, opts?.rangeHashes);
+      return { changed };
+    });
   }
 
   /** Insert one slim-index row into `part_text` and mirror it into the

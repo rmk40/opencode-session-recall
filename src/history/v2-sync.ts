@@ -123,10 +123,11 @@ type Checkpoint = {
   unsettled: number | null;
   /** With a running tail, the boundary: the newest row below the running
    *  ones (its `seq` and id) and the hash of the rows ending at it, as `fp`
-   *  hashes those ending at `seq`. Absent when the checkpoint is
-   *  settled, or when no row below the running ones is among the rows it
-   *  inspected (so none is known to be settled). */
-  base?: { seq: number; id: string; fp: string };
+   *  hashes those ending at `seq`. `covered` when `fp` covers every row past
+   *  the boundary. Absent when the checkpoint is settled, or when no row
+   *  below the running ones is among the rows it inspected (so none is known
+   *  to be settled). */
+  base?: { seq: number; id: string; fp: string; covered?: true };
   /** Part rows of the newest row and their newest `time_updated` (0 when
    *  it has none). */
   parts: number;
@@ -139,6 +140,10 @@ type Checkpoint = {
   floor?: number;
   /** Messages the card holds cut short (they end in a placeholder). */
   cut?: number;
+  /** The write that stored this checkpoint found the tail moved during its
+   *  read: the checkpoint is the one taken before the read, and the card may
+   *  hold rows newer than it describes. */
+  moved?: true;
 };
 
 /** A stored checkpoint of any version: the fields every version shares,
@@ -224,7 +229,8 @@ function parseCheckpoint(stored: string | null | undefined): Checkpoint | null {
     typeof value.fp !== "string" ||
     !(value.floor === undefined || isNumber(value.floor)) ||
     !(value.cut === undefined || isNumber(value.cut)) ||
-    !(value.base === undefined || isBase(value.base))
+    !(value.base === undefined || isBase(value.base)) ||
+    !(value.moved === undefined || value.moved === true)
   ) {
     return null;
   }
@@ -234,7 +240,12 @@ function parseCheckpoint(stored: string | null | undefined): Checkpoint | null {
 function isBase(value: unknown): value is Checkpoint["base"] {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
   const base = value as Record<string, unknown>;
-  return isNumber(base.seq) && typeof base.id === "string" && typeof base.fp === "string";
+  return (
+    isNumber(base.seq) &&
+    typeof base.id === "string" &&
+    typeof base.fp === "string" &&
+    (base.covered === undefined || base.covered === true)
+  );
 }
 
 /**
@@ -257,20 +268,50 @@ export function inspectCheckpoint(stored: string | null | undefined): Checkpoint
     ...(!settled && cp.base !== undefined && { boundary: cp.base.seq }),
     ...(cp.floor !== undefined && { floor: cp.floor }),
     ...(cp.cut !== undefined && cp.cut > 0 && { cut: cp.cut }),
+    ...(cp.moved && { moved: true }),
   };
 }
 
-/** `stored` with a write's row floor and cut messages recorded; any other
- *  value (an older version, garbage) is returned unchanged. */
-export function annotateCheckpoint(stored: string, info: { floor?: number; cut?: number }): string {
+/** `stored` with a write's row floor, cut messages and moved read recorded;
+ *  any other value (an older version, garbage) is returned unchanged. */
+export function annotateCheckpoint(
+  stored: string,
+  info: { floor?: number; cut?: number; moved?: boolean },
+): string {
   const cp = parseCheckpoint(stored);
   if (!cp) return stored;
   const next: Checkpoint = { ...cp };
   delete next.floor;
   delete next.cut;
+  delete next.moved;
   if (info.floor !== undefined) next.floor = info.floor;
   if (info.cut !== undefined && info.cut > 0) next.cut = info.cut;
+  if (info.moved) next.moved = true;
   return JSON.stringify(next);
+}
+
+/**
+ * Whether `current`, a checkpoint just taken, shows that nothing past the
+ * boundary of `stored`, a card's checkpoint, changed: both describe the same
+ * running tail field for field (the write's annotations aside), and
+ * `current`'s fingerprint covers every row past the boundary, so no row
+ * there changed unseen. Never for a checkpoint a moved read stored, whose
+ * card may hold rows newer than it describes.
+ */
+export function sameTail(stored: string | null | undefined, current: string): boolean {
+  const before = parseCheckpoint(stored);
+  const now = parseCheckpoint(current);
+  if (!before || !now || before.moved || before.unsettled === null || !now.base?.covered) {
+    return false;
+  }
+  const strip = (cp: Checkpoint): string => {
+    const rest: Checkpoint = { ...cp };
+    delete rest.floor;
+    delete rest.cut;
+    delete rest.moved;
+    return JSON.stringify(rest);
+  };
+  return strip(before) === strip(now);
 }
 
 export function createV2Sync(db: ReadOnlyDb, opts: V2SyncOptions = {}): DistillSync {
@@ -375,7 +416,9 @@ export function createV2Sync(db: ReadOnlyDb, opts: V2SyncOptions = {}): DistillS
    * rows newest first, each as `(seq, id, time_updated, part count, newest
    * part time_updated)`, read by two bounded statements. Rows after `seq`
    * are outside it, so appended rows never change it. `newest` is the row
-   * at the top of the window, with its part state (the belt).
+   * at the top of the window, with its part state (the belt). `reaches` is
+   * the lowest `seq` the window covers: the oldest row in it, or none when
+   * the window holds every row through `seq`.
    */
   async function fingerprint(
     sessionID: string,
@@ -383,6 +426,7 @@ export function createV2Sync(db: ReadOnlyDb, opts: V2SyncOptions = {}): DistillS
   ): Promise<{
     hash: string;
     newest?: { seq: number; id: string; updated: number; parts: number; partsUpdated: number };
+    reaches: number;
   }> {
     await pause();
     const rows = db.all(
@@ -411,7 +455,11 @@ export function createV2Sync(db: ReadOnlyDb, opts: V2SyncOptions = {}): DistillS
         `${entry.seq}\t${entry.id}\t${entry.updated}\t${entry.parts}\t${entry.partsUpdated}`,
       );
     }
-    return { hash: cyrb53(lines.join("\n")), ...(newest && { newest }) };
+    const reaches =
+      rows.length < fingerprintRows
+        ? Number.NEGATIVE_INFINITY
+        : (num(rows[rows.length - 1]?.seq) ?? Number.POSITIVE_INFINITY);
+    return { hash: cyrb53(lines.join("\n")), ...(newest && { newest }), reaches };
   }
 
   async function checkpoint(sessionID: string): Promise<DistillCheckpoint | null> {
@@ -433,12 +481,16 @@ export function createV2Sync(db: ReadOnlyDb, opts: V2SyncOptions = {}): DistillS
     const unsettled = unsettledSeq(rows, now());
     const seq = num(tail?.seq) ?? 0;
     const msgId = str(tail?.id);
-    const fp = msgId === null ? { hash: cyrb53("") } : await fingerprint(sessionID, seq);
+    const fp =
+      msgId === null
+        ? { hash: cyrb53(""), reaches: Number.NEGATIVE_INFINITY }
+        : await fingerprint(sessionID, seq);
     // The belt is the tail row's own part state; a fingerprint whose newest
     // row is another one (the tail was removed between the statements) then
     // fails the next compare, as it should.
-    const belt = fp.newest?.id === msgId ? fp.newest : undefined;
-    const base = unsettled === null ? undefined : await boundary(sessionID, rows, unsettled);
+    const belt = "newest" in fp && fp.newest?.id === msgId ? fp.newest : undefined;
+    const found = unsettled === null ? undefined : await boundary(sessionID, rows, unsettled);
+    const base = found && fp.reaches <= found.seq ? { ...found, covered: true as const } : found;
     const value: Checkpoint = {
       v: 2,
       seq,
@@ -759,5 +811,6 @@ export function createV2Sync(db: ReadOnlyDb, opts: V2SyncOptions = {}): DistillS
     seqOf,
     inspect: inspectCheckpoint,
     annotate: annotateCheckpoint,
+    sameTail,
   };
 }
