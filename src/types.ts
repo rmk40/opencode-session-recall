@@ -315,7 +315,29 @@ export type ExpandedResult = {
   hasMoreAfter?: boolean;
 };
 
-export type MessageOutput = {
+/**
+ * Set on a tool output that does not hold everything it was asked for (see
+ * `output.ts`): `continuation` is what the tool takes as its `cursor` to
+ * return the rest. Both are written before the output's record arrays, so a
+ * reader that sees only the start of the output still finds them. Distinct
+ * from `recall`'s `truncated`, which means more results exist.
+ */
+export type TrimmedFields = {
+  trimmed?: true;
+  continuation?: string;
+};
+
+/** A message a history read cut short (opencode v2 only): `omittedParts`
+ *  content items were left out, `omittedBytes` bytes of part rows among
+ *  them. On a message listed by `recall_messages` or `recall_context`,
+ *  `cursor` is what `recall_get` takes to read them. */
+export type PartialOutput = {
+  omittedParts: number;
+  omittedBytes: number;
+  cursor?: string;
+};
+
+export type MessageOutput = TrimmedFields & {
   ok: true;
   message: {
     id: string;
@@ -324,12 +346,20 @@ export type MessageOutput = {
     agent?: string;
     model?: string;
   };
+  /** Present when the history read stopped before the message's end; the
+   *  output is then `trimmed` and its `continuation` leads to the rest. */
+  partial?: PartialOutput;
   parts: PartOutput[];
   context: {
     sessionTitle?: string;
     directory?: string;
   };
 };
+
+/** The part fields that hold text an output can cut. Offsets into them count
+ *  UTF-16 code units of the string, or of the JSON text for an `input` that
+ *  is not a string. */
+export type PartTextField = "content" | "title" | "input" | "output" | "error";
 
 export type PartOutput = {
   id: string;
@@ -338,9 +368,18 @@ export type PartOutput = {
   content?: string;
   toolName?: string;
   title?: string;
+  /** The tool input. A part cut or resumed inside it carries its JSON text
+   *  (or a slice of it) as a string. */
   input?: unknown;
   output?: string;
   error?: string;
+  /** Set on a part an output resumed from a continuation: the text fields
+   *  before `field` are left out, and `field` starts at `offset`. */
+  resumedAt?: { field: PartTextField; offset: number };
+  /** Set on a part the output cut short: `field` stops at `offset` of its
+   *  `length`, the text fields after it are left out, and the output's
+   *  `continuation` resumes there. */
+  cutAt?: { field: PartTextField; offset: number; length: number };
 };
 
 export type MessageItem = {
@@ -352,10 +391,12 @@ export type MessageItem = {
     model?: string;
   };
   parts: PartOutput[];
+  /** Present when the history read cut this message short. */
+  partial?: PartialOutput;
   center?: boolean;
 };
 
-export type ContextOutput = {
+export type ContextOutput = TrimmedFields & {
   ok: true;
   messages: MessageItem[];
   context: {
@@ -366,7 +407,7 @@ export type ContextOutput = {
   hasMoreAfter: boolean;
 };
 
-export type MessagesOutput = {
+export type MessagesOutput = TrimmedFields & {
   ok: true;
   messages: MessageItem[];
   context: {
@@ -374,9 +415,10 @@ export type MessagesOutput = {
     directory?: string;
   };
   /** Cursor-based pagination over one bounded newest-first page. `nextCursor`
-   *  (opaque) continues from where this page stopped; absent means the last
-   *  page. `returned` counts messages after role/query filtering within the
-   *  page, so it can be less than `limit`. */
+   *  (opaque) continues from where this output stopped: the next page, or,
+   *  on a trimmed output, its `continuation`. Absent means the last page.
+   *  `returned` counts the messages shown, whole or in part, after
+   *  role/query filtering within the page, so it can be less than `limit`. */
   pagination: {
     limit: number;
     returned: number;
@@ -441,9 +483,10 @@ export function indexingWarning(progress: IndexingProgress): string {
     : "Indexing in progress: sessions are still being discovered; older history may be missing.";
 }
 
-export type SessionsOutput = {
+export type SessionsOutput = TrimmedFields & {
   ok: true;
   sessions: SessionItem[];
+  /** Sessions shown. On a trimmed output, fewer than the listing selected. */
   returned: number;
   scope: string;
   /** Children branch only: echoes the resolved parent session ID. Its presence
@@ -451,8 +494,12 @@ export type SessionsOutput = {
   parentID?: string;
   /** Children branch only: the post-filter, pre-slice child count (withheld
    *  foreign rows excluded). `childCount > returned` means the listing was
-   *  truncated by `limit`. */
+   *  truncated by `limit` (or the output trimmed). */
   childCount?: number;
+  /** Children branch only: the parent has more children than one call reads,
+   *  so `childCount` and the listing cover only the children read (the
+   *  first ones in id order). */
+  truncated?: true;
   /** Explains a caveat in how the listing was produced — e.g. a since/until
    *  filter that could only be applied within the newest-limit window because no
    *  card store was available to resolve older sessions authoritatively. */

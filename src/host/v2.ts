@@ -9,6 +9,7 @@ import type {
 import { createFileSink, createLogger, type FileSink, type Logger } from "../log.js";
 import { parseOptions, type ResolvedOptions } from "../options.js";
 import { errmsg, settleWithin, TOOLS, type ErrorOutput } from "../types.js";
+import { boundResult } from "../output.js";
 import { NUDGE_BASE_TEXT, NUDGE_SENTINEL } from "../hooks/system-nudge.js";
 import { v2ToolContext } from "./tool-io.js";
 import {
@@ -216,9 +217,11 @@ function lru<K, V>(size: number) {
   };
 }
 
+/** An error result, bounded like every other result: a rejection's message
+ *  can be as large as anything a tool returns. */
 function errorContent(error: string): V2ToolResult {
   const out: ErrorOutput = { ok: false, error };
-  return { content: JSON.stringify(out) };
+  return { content: boundResult(JSON.stringify(out)) };
 }
 
 async function start(ctx: V2PluginContext): Promise<V2Cleanup> {
@@ -371,7 +374,12 @@ async function wire(
       const result = runtime
         ? await runtime.track(liveTools(runtime)[name].execute(args, toolContext))
         : await standIn[name].execute(args, toolContext);
-      return { content: typeof result === "string" ? result : JSON.stringify(result) };
+      // The backstop: whatever a tool returns or rejects with (through
+      // `errorContent`), OpenCode never receives a result it would cut (see
+      // `boundResult`).
+      return {
+        content: boundResult(typeof result === "string" ? result : JSON.stringify(result)),
+      };
     } catch (error) {
       return errorContent(errmsg(error));
     }

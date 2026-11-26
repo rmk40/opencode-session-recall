@@ -6,6 +6,7 @@ import { search } from "../src/search.js";
 import { sessions as sessionsTool } from "../src/sessions.js";
 import { createFetchGate, type FetchGate } from "../src/fetch-gate.js";
 import { cardsLiteFromSessions } from "../src/cards.js";
+import type { HistorySource } from "../src/history/source.js";
 import type {
   ContextOutput,
   ErrorOutput,
@@ -319,6 +320,41 @@ describe("recall_get", () => {
     expect(ok.context.directory).toBeUndefined();
   });
 
+  it("names an oversized header, not the records, when the header leaves no room", async () => {
+    // The session title rides in the header's `context`; one over the whole
+    // output budget leaves no room for any part.
+    const h = makeFakeHarness();
+    const source: HistorySource = {
+      ...h.source,
+      getSession: async () => ({
+        ok: true,
+        value: session("s-current", "T".repeat(45_000), PROJECT_DIR, 1_000),
+      }),
+    };
+    const out = await runTool<ErrorOutput & { trimmed?: true }>(getTool(source, gate), {
+      sessionID: "s-current",
+      messageID: "m-current-1",
+    });
+    expect(out).toMatchObject({ ok: false, trimmed: true });
+    expect(out.error).toContain("header alone is");
+    expect(out.error).toContain('"context" field');
+    expect(out.error).not.toContain("first record");
+  });
+
+  it("survives a raw non-string or blank cursor (host path): reads the whole message", async () => {
+    const h = makeFakeHarness();
+    for (const cursor of [123, {}, "   "]) {
+      const out = await runToolRaw<MessageOutput>(getTool(h.source, gate), {
+        sessionID: "s-current",
+        messageID: "m-current-3",
+        cursor,
+      });
+      expect(out.ok).toBe(true);
+      expect(out.trimmed).toBeUndefined();
+      expect(out.parts[0]).toMatchObject({ type: "tool", toolName: "bash" });
+    }
+  });
+
   it("routes its fetches through the shared gate", async () => {
     const h = makeFakeHarness();
     const { gate: spy, queries } = makeSpyGate();
@@ -425,6 +461,25 @@ describe("recall_context", () => {
     expect(out.messages.some((m) => m.center)).toBe(true);
   });
 
+  it("survives a raw non-string or blank cursor (host path): returns the window from its start", async () => {
+    const h = makeFakeHarness();
+    for (const cursor of [42, { anchorId: "m-current-4" }, ""]) {
+      const out = await runToolRaw<ContextOutput>(contextTool(h.source, gate, TEST_LIMITS), {
+        sessionID: "s-current",
+        messageID: "m-current-3",
+        window: 1,
+        cursor,
+      });
+      expect(out.ok).toBe(true);
+      expect(out.trimmed).toBeUndefined();
+      expect(out.messages.map((m) => m.message.id)).toEqual([
+        "m-current-2",
+        "m-current-3",
+        "m-current-4",
+      ]);
+    }
+  });
+
   it("fetches only bounded pages, never the whole session", async () => {
     // A 60-message session: a small window around a recent message must be
     // served by bounded newest-first pages, never an unpaginated whole-session
@@ -465,6 +520,120 @@ describe("recall_context", () => {
   });
 });
 
+describe("recall_sessions continuations across listing changes", () => {
+  type Listed = SessionsOutput & { continuation?: string; error?: string };
+
+  /** A harness listing 100 project sessions with ~1 KB titles, over the
+   *  output budget, newest first in array order (as the fake lists them). */
+  function harness(): ReturnType<typeof makeFakeHarness> {
+    const h = makeFakeHarness();
+    const now = Date.now();
+    for (let i = 0; i < 120; i++) {
+      const id = `s-walk-${String(i).padStart(3, "0")}`;
+      h.sessions.push(session(id, `Walk ${i} ${"€".repeat(300)}`, PROJECT_DIR, now - 10_000 - i));
+    }
+    return h;
+  }
+
+  /** Session `id` updated now: newer `time.updated`, first in the listing. */
+  function touch(h: ReturnType<typeof makeFakeHarness>, id: string): void {
+    const index = h.sessions.findIndex((s) => s.id === id);
+    const [moved] = h.sessions.splice(index, 1);
+    h.sessions.unshift({ ...moved!, time: { ...moved!.time, updated: Date.now() + 60_000 } });
+  }
+
+  const run = (h: ReturnType<typeof makeFakeHarness>, cursor?: string): Promise<Listed> =>
+    runTool<Listed>(sessionsTool(h.source, true, TEST_LIMITS), {
+      limit: 100,
+      ...(cursor && { cursor }),
+    });
+
+  it("walks an unchanged listing to its end, each session once and in order", async () => {
+    const h = harness();
+    const expected = h.sessions.filter((s) => s.directory === PROJECT_DIR).slice(0, 100);
+    const ids: string[] = [];
+    let out = await run(h);
+    for (let calls = 1; ; calls++) {
+      expect(out.ok).toBe(true);
+      ids.push(...out.sessions.map((s) => s.id));
+      if (!out.continuation) break;
+      expect(calls).toBeLessThan(20);
+      out = await run(h, out.continuation);
+    }
+    expect(ids).toEqual(expected.map((s) => s.id));
+  });
+
+  it("rejects the continuation when a session not yet shown was updated in between", async () => {
+    const h = harness();
+    const first = await run(h);
+    expect(first.continuation).toBeDefined();
+    touch(h, "s-walk-090");
+    const out = await run(h, first.continuation);
+    expect(out).toMatchObject({ ok: false, error: expect.stringContaining("list again") });
+  });
+
+  it("rejects the continuation when its anchor session was updated in between", async () => {
+    const h = harness();
+    const first = await run(h);
+    const anchor = h.sessions.filter((s) => s.directory === PROJECT_DIR)[first.sessions.length]!;
+    touch(h, anchor.id);
+    const out = await run(h, first.continuation);
+    expect(out).toMatchObject({ ok: false, error: expect.stringContaining("list again") });
+  });
+
+  it("rejects the continuation when a new session arrived in between", async () => {
+    const h = harness();
+    const first = await run(h);
+    h.sessions.unshift(session("s-walk-new", "New", PROJECT_DIR, Date.now() + 60_000));
+    const out = await run(h, first.continuation);
+    expect(out).toMatchObject({ ok: false, error: expect.stringContaining("list again") });
+  });
+
+  it("rejects the continuation when a session filtered out of the listing took a slot in between", async () => {
+    // A summarizer worker is dropped after the source listing, so it leaves
+    // the anchor and the sessions before it alone but pushes the window's
+    // last session out of the `limit` the source returns.
+    const h = harness();
+    const first = await run(h);
+    h.sessions.unshift(
+      session("s-walk-worker", "[recall-summarizer] worker", PROJECT_DIR, Date.now() + 60_000),
+    );
+    const out = await run(h, first.continuation);
+    expect(out).toMatchObject({ ok: false, error: expect.stringContaining("list again") });
+  });
+
+  it("rejects the continuation when a session was inserted below the anchor in between", async () => {
+    // The card index's initial pass can add a card with an old update time,
+    // which sorts below the anchor on the card path (`since`/`until`).
+    const h = harness();
+    const cards = h.sessions.filter((s) => s.directory === PROJECT_DIR).slice(0, 100);
+    const tool = sessionsTool(h.source, true, TEST_LIMITS, {
+      cards: () => cardsLiteFromSessions(cards),
+    });
+    const call = (cursor?: string): Promise<Listed> =>
+      runTool<Listed>(tool, { limit: 100, since: "7d", ...(cursor && { cursor }) });
+    const first = await call();
+    expect(first.continuation).toBeDefined();
+    const anchorUpdated = cards[first.sessions.length]!.time.updated;
+    cards.push(session("s-walk-late", "Late card", PROJECT_DIR, anchorUpdated - 1));
+    const out = await call(first.continuation);
+    expect(out).toMatchObject({ ok: false, error: expect.stringContaining("list again") });
+  });
+
+  it("resumes when a session already shown was updated in between, without repeating it", async () => {
+    const h = harness();
+    const first = await run(h);
+    const shown = first.sessions.map((s) => s.id);
+    touch(h, shown[1]!);
+    const out = await run(h, first.continuation);
+    expect(out.ok).toBe(true);
+    expect(out.sessions.some((s) => shown.includes(s.id))).toBe(false);
+    expect(out.sessions[0]!.id).toBe(
+      h.sessions.filter((s) => s.directory === PROJECT_DIR)[shown.length]!.id,
+    );
+  });
+});
+
 describe("recall_sessions defensive args", () => {
   it("survives raw MCP-bypass args (undefined scope/limit default to project)", async () => {
     const h = makeFakeHarness();
@@ -487,6 +656,18 @@ describe("recall_sessions defensive args", () => {
     expect(out.ok).toBe(true);
     // Non-string bounds were ignored, so every listed session came through.
     expect(out.sessions.length).toBeGreaterThan(0);
+  });
+
+  it("survives a raw non-string or blank cursor (host path): lists from the start", async () => {
+    const h = makeFakeHarness();
+    for (const cursor of [7, ["s-project-2"], "  "]) {
+      const out = await runToolRaw<SessionsOutput>(sessionsTool(h.source, true, TEST_LIMITS), {
+        cursor,
+      });
+      expect(out.ok).toBe(true);
+      expect(out.trimmed).toBeUndefined();
+      expect(out.sessions.map((s) => s.id)).toEqual(["s-current", "s-project-2"]);
+    }
   });
 });
 
