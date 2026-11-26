@@ -2,10 +2,24 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { existsSync, mkdtempSync, realpathSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { v2RuntimeFactory, type V2Runtime, type V2RuntimeOptions } from "../src/host/v2-runtime.js";
+import {
+  V2_PLUGIN_BUILD,
+  v2RuntimeFactory,
+  type V2Runtime,
+  type V2RuntimeOptions,
+} from "../src/host/v2-runtime.js";
+import { V2_PROJECTOR_GEN } from "../src/history/v2-project.js";
 import { openSqlite } from "../src/sqlite.js";
-import { openStore } from "../src/store.js";
-import { makeV2Db, type V2TestDb } from "./v2-db.js";
+import { openStore, pluginBuild } from "../src/store.js";
+import {
+  insertMessage,
+  insertPart,
+  insertProject,
+  insertSession,
+  makeV2Db,
+  makeV2PartsDb,
+  type V2TestDb,
+} from "./v2-db.js";
 import { TEST_LIMITS } from "./helpers.js";
 
 /**
@@ -106,6 +120,81 @@ describe("v2 runtime source canonicalization", () => {
     );
     expect(runtime.cards.coverage().degraded).toBe(true);
     expect((await storeMeta(storePath)).source_db).toBe("/elsewhere/opencode.db");
+  });
+});
+
+describe("v2 runtime repair wiring", () => {
+  it("discovers archived sessions and stamps cards and the lease with the projector generation", async () => {
+    const v2 = await makeV2PartsDb();
+    dbs.push(v2);
+    insertProject(v2.db, { id: "prj", worktree: "/w" });
+    const session = (id: string, archived: number | null) =>
+      insertSession(v2.db, {
+        id,
+        project_id: "prj",
+        directory: "/w",
+        time_created: 1_000,
+        time_updated: 1_000,
+        time_archived: archived,
+      });
+    session("ses_live", null);
+    session("ses_arch", 1_500);
+    insertMessage(v2.db, {
+      id: "msg_1",
+      session_id: "ses_arch",
+      type: "assistant",
+      seq: 1,
+      time_created: 1_100,
+      data: {
+        agent: "build",
+        model: { id: "m", providerID: "p" },
+        content: [],
+        time: { created: 1_100, completed: 1_101 },
+      },
+    });
+    insertPart(v2.db, {
+      message_id: "msg_1",
+      session_id: "ses_arch",
+      ordinal: 0,
+      time_created: 1_100,
+      data: { type: "text", text: "archived answer" },
+    });
+
+    const factory = v2RuntimeFactory({
+      options: options({ opencodeDbPath: v2.path, limits: { ...TEST_LIMITS, coldPass: true } }),
+      channel: "latest",
+      log: () => {},
+      sync: { pollIntervalMs: 20 },
+      idleDebounceMs: 5,
+    });
+    const runtime = await factory.create(await factory.resolve());
+    runtimes.push(runtime);
+    const store = runtime.store!;
+    const start = Date.now();
+    while (runtime.repair()?.sweep?.running !== false) {
+      if (Date.now() - start > 5_000) throw new Error("the repair sweep never finished");
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+
+    expect(store.getCard("ses_arch")).toMatchObject({
+      projectorGen: V2_PROJECTOR_GEN,
+      timeArchived: 1_500,
+    });
+    expect(store.getCard("ses_live")).toMatchObject({ projectorGen: V2_PROJECTOR_GEN });
+    expect(V2_PLUGIN_BUILD).toBe(pluginBuild("opencode-v2", V2_PROJECTOR_GEN));
+    expect(store.leaseStatus()?.build).toBe(V2_PLUGIN_BUILD);
+    expect(runtime.repair()?.sweep).toMatchObject({ gen: V2_PROJECTOR_GEN, pending: 0 });
+    // One drift state over every facade: the distiller's reads show in it.
+    const drift = runtime.history();
+    expect(drift?.capabilities.parts).toBe(true);
+    expect(drift?.reads).toBeGreaterThan(0);
+    expect(runtime.sourceFor("prj").history?.()).toEqual(runtime.history());
+  });
+
+  it("reports no drift or repair state without opencode.db", async () => {
+    const { runtime } = await run(options({ opencodeDbPath: join(dir, "missing.db") }));
+    expect(runtime.history()).toBeUndefined();
+    expect(runtime.repair()).toBeUndefined();
   });
 });
 
