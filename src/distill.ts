@@ -195,8 +195,10 @@ export const PROGRESS_STALE_MS = 5 * 60_000;
  *  ({@link RepairProgress}, as JSON), so every process can report it. */
 export const REPAIR_PROGRESS_KEY = "repair_progress";
 /** Meta key naming the projector generation the stored repair reasons were
- *  recorded under. A sweep at another generation clears them first, so every
- *  card a previous generation could not repair is tried again. */
+ *  recorded under. A distiller at a higher generation clears them before it
+ *  records its first reason or runs its first sweep, so every card a previous
+ *  generation could not repair is tried again and no reason recorded at the
+ *  current generation is lost. */
 export const REPAIR_GEN_KEY = "repair_gen";
 
 /** The repair sweep's progress: it rebuilds every card below the projector
@@ -1659,8 +1661,32 @@ export function createDistiller(options: DistillerOptions): Distiller {
     return spans;
   }
 
+  /**
+   * Make the stored repair reasons this distiller's projector generation's,
+   * before it records one or the sweep reads the stale set. When
+   * {@link REPAIR_GEN_KEY} names no generation or a lower one, every reason
+   * belongs to an earlier generation: they are cleared, so those cards are
+   * tried again, and this generation is stamped. Every reason this distiller
+   * records is preceded by this call, so a reason recorded at the current
+   * generation (by the cold pass, a re-distill or the sweep) is never
+   * cleared. A higher stamp is a newer build's, whose reasons are left
+   * alone. No-op without a projector generation.
+   */
+  function adoptRepairGeneration(): void {
+    if (projectorGen === undefined) return;
+    const raw = store.getMeta(REPAIR_GEN_KEY);
+    const stamped = raw !== undefined && /^-?\d+$/.test(raw) ? Number(raw) : undefined;
+    if (stamped !== undefined && stamped >= projectorGen) return;
+    const cleared = store.clearRepairReasons();
+    store.setMeta(REPAIR_GEN_KEY, String(projectorGen));
+    if (cleared > 0) {
+      logMsg(`cleared ${cleared} repair reason(s) for projector generation ${projectorGen}`);
+    }
+  }
+
   /** Record a read's projection loss as the card's repair reason. */
   function markLoss(sessionId: string, loss: string, kept: boolean): void {
+    adoptRepairGeneration();
     store.markRepairPending(sessionId, loss);
     logMsg(`session ${sessionId} ${kept ? "kept its card" : "is repair-pending"}: ${loss}`);
   }
@@ -2348,6 +2374,7 @@ export function createDistiller(options: DistillerOptions): Distiller {
       // (a transport failure) leaves the card stale for the next sweep.
       if (!(error instanceof MalformedSessionError) && !(error instanceof TypeError)) throw error;
       if (stopped || !ownsLease()) return "skipped";
+      adoptRepairGeneration();
       store.markRepairPending(sessionId, `malformed: ${errmsg(error)}`);
       logMsg(`session ${sessionId} is repair-pending: ${errmsg(error)}`);
       return "marked";
@@ -2368,12 +2395,7 @@ export function createDistiller(options: DistillerOptions): Distiller {
   async function runRepairSweep(gen: number): Promise<void> {
     if (stopped || !ownsLease()) return;
     // A new generation retries every card an earlier one could not repair.
-    if (store.getMeta(REPAIR_GEN_KEY) !== String(gen)) {
-      const cleared = store.clearRepairReasons();
-      store.setMeta(REPAIR_GEN_KEY, String(gen));
-      if (cleared > 0)
-        logMsg(`cleared ${cleared} repair reason(s) for projector generation ${gen}`);
-    }
+    adoptRepairGeneration();
     const stale = store.staleCards(gen);
     const repairPending = (): number => store.cardStats().repairPending;
     if (stale.length === 0) {
