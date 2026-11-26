@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
+import { createOpencodeClient as createHostClient } from "@opencode-ai/sdk/client";
 import type { OpencodeClient, Session } from "@opencode-ai/sdk/v2";
-import { createV1HistorySource, fetchMessagePage } from "../src/history/v1.js";
+import { createV1Clients, createV1HistorySource, fetchMessagePage } from "../src/history/v1.js";
 import { MalformedSessionError } from "../src/history/source.js";
 import {
   apiFailure,
@@ -8,6 +9,7 @@ import {
   makeFakeHarness,
   session,
   userMessage,
+  OTHER_DIR,
   PROJECT_DIR,
 } from "./helpers.js";
 
@@ -459,5 +461,169 @@ describe("fetchMessagePage", () => {
     await expect(
       fetchMessagePage(client, { sessionID: "s", limit: 5, strict: true }),
     ).rejects.toThrow("successful message response was not an array");
+  });
+});
+
+// ── createV1Clients ──────────────────────────────────────────────────────────
+
+describe("createV1Clients", () => {
+  const AUTH = "Basic b3BlbmNvZGU6c2VjcmV0";
+
+  /** A transport that records every request it is handed and answers `[]`. */
+  function recordingFetch() {
+    const requests: Request[] = [];
+    const fetch = async (request: Request): Promise<Response> => {
+      requests.push(request);
+      return new Response("[]", { headers: { "content-type": "application/json" } });
+    };
+    return { fetch, requests };
+  }
+
+  /** A plugin context whose host client hands out `config` as its transport. */
+  function hostContext(config: Record<string, unknown>, directory = PROJECT_DIR) {
+    return { client: { _client: { getConfig: () => config } }, directory };
+  }
+
+  /** The directory a request names. The SDK sends it as an encoded header, and
+   *  moves it to the `directory` query parameter on a GET. */
+  function directoryOf(request: Request): string | null {
+    const header = request.headers.get("x-opencode-directory");
+    if (header !== null) return decodeURIComponent(header);
+    return new URL(request.url).searchParams.get("directory");
+  }
+
+  /** Lists sessions once through each rebuilt client and returns what each sent. */
+  async function sendThroughBoth(
+    ctx: { client: unknown; directory: string },
+    requests: Request[],
+  ): Promise<{ scoped: Request; unscoped: Request }> {
+    const { scoped, unscoped } = createV1Clients(ctx);
+    await scoped.session.list();
+    await unscoped.session.list();
+    expect(requests).toHaveLength(2);
+    return { scoped: requests[0]!, unscoped: requests[1]! };
+  }
+
+  it("keeps the host's Authorization on both clients when its config holds a Headers instance", async () => {
+    // A real v1 host client, built the way the host builds the one it hands to
+    // plugins: Basic auth for a password-protected server and the project
+    // directory. https://github.com/rmk40/opencode-session-recall/pull/5
+    const { fetch, requests } = recordingFetch();
+    const host = createHostClient({
+      baseUrl: "http://opencode.internal",
+      fetch,
+      directory: PROJECT_DIR,
+      headers: { Authorization: AUTH },
+    });
+    const config = (
+      host as unknown as { _client: { getConfig(): { headers?: unknown } } }
+    )._client.getConfig();
+    expect(config.headers).toBeInstanceOf(Headers);
+
+    const sent = await sendThroughBoth({ client: host, directory: PROJECT_DIR }, requests);
+    expect(sent.scoped.headers.get("authorization")).toBe(AUTH);
+    expect(sent.unscoped.headers.get("authorization")).toBe(AUTH);
+    expect(directoryOf(sent.scoped)).toBe(PROJECT_DIR);
+    expect(directoryOf(sent.unscoped)).toBeNull();
+  });
+
+  it("keeps headers given as [name, value] pairs on both clients", async () => {
+    const { fetch, requests } = recordingFetch();
+    const headers = [
+      ["Authorization", AUTH],
+      ["X-Trace", "t-1"],
+      ["x-opencode-directory", encodeURIComponent(PROJECT_DIR)],
+    ];
+    const sent = await sendThroughBoth(
+      hostContext({ baseUrl: "http://opencode.internal", fetch, headers }),
+      requests,
+    );
+    for (const request of [sent.scoped, sent.unscoped]) {
+      expect(request.headers.get("authorization")).toBe(AUTH);
+      expect(request.headers.get("x-trace")).toBe("t-1");
+    }
+    expect(directoryOf(sent.scoped)).toBe(PROJECT_DIR);
+    expect(directoryOf(sent.unscoped)).toBeNull();
+  });
+
+  it("keeps headers given as a plain record on both clients", async () => {
+    const { fetch, requests } = recordingFetch();
+    const headers = {
+      Authorization: AUTH,
+      "X-Trace": "t-1",
+      "x-opencode-directory": encodeURIComponent(PROJECT_DIR),
+    };
+    const sent = await sendThroughBoth(
+      hostContext({ baseUrl: "http://opencode.internal", fetch, headers }),
+      requests,
+    );
+    for (const request of [sent.scoped, sent.unscoped]) {
+      expect(request.headers.get("authorization")).toBe(AUTH);
+      expect(request.headers.get("x-trace")).toBe("t-1");
+    }
+    expect(directoryOf(sent.scoped)).toBe(PROJECT_DIR);
+    expect(directoryOf(sent.unscoped)).toBeNull();
+  });
+
+  it("drops the host's directory header from the unscoped client whatever its case", async () => {
+    for (const name of ["X-OpenCode-Directory", "X-OPENCODE-DIRECTORY"]) {
+      const { fetch, requests } = recordingFetch();
+      const sent = await sendThroughBoth(
+        hostContext({
+          baseUrl: "http://opencode.internal",
+          fetch,
+          headers: { Authorization: AUTH, [name]: encodeURIComponent(PROJECT_DIR) },
+        }),
+        requests,
+      );
+      expect(directoryOf(sent.unscoped)).toBeNull();
+      expect(sent.unscoped.headers.get("authorization")).toBe(AUTH);
+    }
+  });
+
+  it("sends the caller's directory from the scoped client, not the one in the host's headers", async () => {
+    const { fetch, requests } = recordingFetch();
+    const sent = await sendThroughBoth(
+      hostContext(
+        {
+          baseUrl: "http://opencode.internal",
+          fetch,
+          headers: new Headers({ "x-opencode-directory": encodeURIComponent(OTHER_DIR) }),
+        },
+        PROJECT_DIR,
+      ),
+      requests,
+    );
+    expect(directoryOf(sent.scoped)).toBe(PROJECT_DIR);
+    expect(directoryOf(sent.unscoped)).toBeNull();
+  });
+
+  it("sends no header the host left unset in a plain record", async () => {
+    const { fetch, requests } = recordingFetch();
+    const sent = await sendThroughBoth(
+      hostContext({
+        baseUrl: "http://opencode.internal",
+        fetch,
+        headers: { Authorization: AUTH, "X-Unset": undefined, "X-Null": null },
+      }),
+      requests,
+    );
+    for (const request of [sent.scoped, sent.unscoped]) {
+      expect(request.headers.has("x-unset")).toBe(false);
+      expect(request.headers.has("x-null")).toBe(false);
+      expect(request.headers.get("authorization")).toBe(AUTH);
+    }
+  });
+
+  it("builds both clients when the host config has no headers", async () => {
+    const { fetch, requests } = recordingFetch();
+    const sent = await sendThroughBoth(
+      hostContext({ baseUrl: "http://opencode.internal", fetch }),
+      requests,
+    );
+    expect(sent.scoped.headers.has("authorization")).toBe(false);
+    expect(sent.unscoped.headers.has("authorization")).toBe(false);
+    expect(directoryOf(sent.scoped)).toBe(PROJECT_DIR);
+    expect(directoryOf(sent.unscoped)).toBeNull();
   });
 });

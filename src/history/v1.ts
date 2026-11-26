@@ -41,13 +41,19 @@ export function createV1Clients(ctx: { client: unknown; directory: string }): V1
   const cfg = inner.getConfig();
   if (!cfg.fetch) throw new Error("opencode-session-recall: SDK client has no custom fetch");
 
-  // eslint-disable-next-line @typescript-eslint/no-unused-vars
-  const { "x-opencode-directory": _, ...rest } = (cfg.headers ?? {}) as Record<string, string>;
+  // The rebuilt clients spread their headers, so they must be a plain object:
+  // the SDK keeps them as a `Headers` instance, which spreads to `{}` and would
+  // drop `Authorization` (a server that requires Basic auth then answers 401).
+  const headers = plainHeaders(cfg.headers);
+  const rest: Record<string, string> = {};
+  for (const [name, value] of Object.entries(headers)) {
+    if (name.toLowerCase() !== "x-opencode-directory") rest[name] = value;
+  }
 
   const scoped = createOpencodeClient({
     baseUrl: cfg.baseUrl,
     fetch: cfg.fetch,
-    headers: cfg.headers,
+    headers: rest,
     directory: ctx.directory,
   });
 
@@ -58,6 +64,31 @@ export function createV1Clients(ctx: { client: unknown; directory: string }): V1
   });
 
   return { scoped, unscoped };
+}
+
+/** Headers in any form the SDK config may hold (`Headers`, entry pairs or a
+ *  plain record) as a plain record of string values. */
+function plainHeaders(input: unknown): Record<string, string> {
+  const out: Record<string, string> = {};
+  if (input == null) return out;
+  if (typeof Headers !== "undefined" && input instanceof Headers) {
+    input.forEach((value, name) => {
+      out[name] = value;
+    });
+    return out;
+  }
+  if (Array.isArray(input)) {
+    for (const pair of input) {
+      if (Array.isArray(pair) && pair.length >= 2) out[String(pair[0])] = String(pair[1]);
+    }
+    return out;
+  }
+  if (typeof input === "object") {
+    for (const [name, value] of Object.entries(input as Record<string, unknown>)) {
+      if (value != null) out[name] = String(value);
+    }
+  }
+  return out;
 }
 
 /** Read `X-Next-Cursor` from a fields-style response's fetch `Response`, case-

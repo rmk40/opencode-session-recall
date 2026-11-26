@@ -171,7 +171,7 @@ describe("plugin entry", () => {
     expect(createOpencodeClient).toHaveBeenNthCalledWith(1, {
       baseUrl: "http://server",
       fetch,
-      headers,
+      headers: { authorization: "Bearer test" },
       directory: PROJECT_DIR,
     });
     expect(createOpencodeClient).toHaveBeenNthCalledWith(2, {
