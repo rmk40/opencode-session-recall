@@ -4,7 +4,7 @@ import type { Hooks, PluginInput, ToolDefinition } from "../src/host/opencode-v1
 import { mkdtempSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { TOOLS } from "../src/types.js";
+import { DISCOVERY_LIMIT, TOOLS } from "../src/types.js";
 import { LITE_REFRESH_WINDOW_MS } from "../src/lite-refresh.js";
 import { openSqlite } from "../src/sqlite.js";
 import { defaultStorePath, openStore } from "../src/store.js";
@@ -1012,6 +1012,53 @@ describe("plugin entry", () => {
       dateNow.mockRestore();
     }
   });
+
+  it.each([
+    { listed: DISCOVERY_LIMIT + 1, limited: true },
+    { listed: 2, limited: false },
+  ])(
+    "reports providerLimit through the plugin entry only when discovery listed past its limit ($listed)",
+    async ({ listed, limited }) => {
+      // The listing asks for one row past its limit; a response holding it
+      // means older sessions were left out.
+      const rows = Array.from({ length: listed }, (_, i) => ({
+        id: `s${i}`,
+        title: `Session ${i}`,
+        directory: PROJECT_DIR,
+        time: { created: 1, updated: 2 + i },
+      }));
+      const listGlobal = vi.fn(async () => ({ data: rows }));
+      createOpencodeClient
+        .mockImplementationOnce((options: unknown) => ({
+          ...(options as object),
+          session: {
+            messages: vi.fn(async () => ({ data: [] })),
+            list: vi.fn(async () => ({ data: [] })),
+          },
+        }))
+        .mockImplementationOnce((options: unknown) => ({
+          ...(options as object),
+          experimental: { session: { list: listGlobal } },
+        }));
+
+      const hooks = await server(ctx({ fetch: vi.fn() }), { mode: "ephemeral" });
+      await vi.waitFor(() => expect(listGlobal).toHaveBeenCalledTimes(1));
+      await vi.waitFor(async () => {
+        const out = JSON.parse(
+          String(
+            await mustTool(hooks.tool?.recall).execute(
+              { query: "checkout", scope: "global" },
+              makeContext().ctx as never,
+            ),
+          ),
+        );
+        expect(out.ok).toBe(true);
+        // The discovered sessions are in the card set, so discovery has run.
+        expect(out.coverage.sessionsDiscovered).toBeGreaterThanOrEqual(listed - 1);
+        expect((out.coverage.limitedBy ?? []).includes("providerLimit")).toBe(limited);
+      });
+    },
+  );
 
   it("ephemeral runs no background content work beyond the permitted metadata list", async () => {
     const messages = vi.fn(async () => ({ data: [] }));

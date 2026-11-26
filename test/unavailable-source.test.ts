@@ -108,6 +108,47 @@ describe("unavailable history source", () => {
     }
   });
 
+  it("recall from cards lists each searched session as read to its end, with nothing fetched", async () => {
+    const h = makeFakeHarness();
+    const { deps, cleanup } = await makeRecallDeps(h, TEST_LIMITS);
+    try {
+      const { source } = countingUnavailable();
+      const drill = createDrill({ source, gate: deps.gate, limits: TEST_LIMITS });
+      const recall = search(source, true, TEST_LIMITS, { ...deps, drill });
+      const all = await runTool<SearchOutput>(recall, {
+        query: "rateLimit",
+        scope: "project",
+        excludeCurrentSession: false,
+      });
+      const stops = all.coverage?.sessionStops;
+      expect(stops?.count).toBeGreaterThan(0);
+      // Each card offers its summary head as the one message it can.
+      for (const stop of stops?.sessions ?? []) {
+        expect(stop).toMatchObject({ fetched: 0, candidate: 1, eligible: 1, stop: "end" });
+      }
+      expect(all.coverage).toMatchObject({
+        messagesFetched: 0,
+        messagesCandidate: stops?.count,
+        messagesEligible: stops?.count,
+      });
+
+      // A tool-only search cannot use a summary head: still a candidate, not
+      // eligible.
+      const tools = await runTool<SearchOutput>(recall, {
+        query: "rateLimit",
+        scope: "project",
+        excludeCurrentSession: false,
+        type: "tool",
+      });
+      expect(tools.coverage?.sessionStops?.count).toBeGreaterThan(0);
+      for (const stop of tools.coverage?.sessionStops?.sessions ?? []) {
+        expect(stop).toMatchObject({ fetched: 0, candidate: 1, eligible: 0, stop: "end" });
+      }
+    } finally {
+      cleanup();
+    }
+  });
+
   it("recall from cards keeps scope and eligibility filters", async () => {
     const h = makeFakeHarness();
     const { deps, cleanup } = await makeRecallDeps(h, TEST_LIMITS);

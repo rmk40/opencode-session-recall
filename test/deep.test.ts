@@ -509,6 +509,35 @@ describe("deep budget stop and cursor continuation", () => {
     }
   });
 
+  it("lists each scoped session's stop: swept to its end, or left by the budget", async () => {
+    const { h, ids } = buildHarness();
+    const limits: Limits = { ...TEST_LIMITS, deepCharsPerQuery: 400 };
+    const { deps, cleanup } = await recallDeps(h, limits);
+    try {
+      const recall = search(h.source, true, limits, deps);
+      const out = await runTool<SearchOutput>(recall, {
+        query: SHARED,
+        deep: true,
+        sessions: ids,
+      });
+      expect(out.coverage?.sessionStops).toEqual({
+        count: 3,
+        sessions: [
+          { sessionID: "s-deepA", fetched: 1, candidate: 1, eligible: 1, stop: "end" },
+          { sessionID: "s-deepB", fetched: 1, candidate: 1, eligible: 1, stop: "end" },
+          { sessionID: "s-deepC", fetched: 0, candidate: 0, eligible: 0, stop: "budget" },
+        ],
+      });
+      expect(out.coverage).toMatchObject({
+        messagesFetched: 2,
+        messagesCandidate: 2,
+        messagesEligible: 2,
+      });
+    } finally {
+      cleanup();
+    }
+  });
+
   it("stops cleanly on the wall-clock budget between pages", async () => {
     const { h, ids } = buildHarness();
     // A clock that jumps past the wall-clock budget after the first read, so the

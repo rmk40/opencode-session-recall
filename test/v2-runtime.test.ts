@@ -11,7 +11,11 @@ import {
 import { V2_PROJECTOR_GEN } from "../src/history/v2-project.js";
 import { openSqlite } from "../src/sqlite.js";
 import { openStore, pluginBuild } from "../src/store.js";
+import { search } from "../src/search.js";
+import { emptyReadCounts } from "../src/history/source.js";
+import type { SearchOutput } from "../src/types.js";
 import {
+  V2_PARTS_MIGRATION,
   insertMessage,
   insertPart,
   insertProject,
@@ -20,7 +24,7 @@ import {
   makeV2PartsDb,
   type V2TestDb,
 } from "./v2-db.js";
-import { TEST_LIMITS } from "./helpers.js";
+import { TEST_LIMITS, makeContext, toolResultText } from "./helpers.js";
 
 /**
  * The v2 runtime's store and source identity, through the registry factory
@@ -196,6 +200,128 @@ describe("v2 runtime repair wiring", () => {
     expect(runtime.history()).toBeUndefined();
     expect(runtime.repair()).toBeUndefined();
   });
+});
+
+describe("v2 runtime recall coverage", () => {
+  /** Project `prj` with session `ses_a`: a user prompt and an assistant answer
+   *  in a part row, both mentioning "zephyr". */
+  function seed(db: V2TestDb["db"]): void {
+    insertProject(db, { id: "prj", worktree: "/w" });
+    insertSession(db, {
+      id: "ses_a",
+      project_id: "prj",
+      directory: "/w",
+      time_created: 1_000,
+      time_updated: 1_200,
+    });
+    insertMessage(db, {
+      id: "msg_u",
+      session_id: "ses_a",
+      type: "user",
+      seq: 1,
+      time_created: 1_100,
+      data: { text: "please look at zephyr", time: { created: 1_100 } },
+    });
+    insertMessage(db, {
+      id: "msg_a",
+      session_id: "ses_a",
+      type: "assistant",
+      seq: 2,
+      time_created: 1_150,
+      data: {
+        agent: "build",
+        model: { id: "m", providerID: "p" },
+        content: [],
+        time: { created: 1_150, completed: 1_151 },
+      },
+    });
+    insertPart(db, {
+      message_id: "msg_a",
+      session_id: "ses_a",
+      ordinal: 0,
+      time_created: 1_150,
+      data: { type: "text", text: "zephyr answer" },
+    });
+  }
+
+  /** A runtime over `v2` once its cold pass and repair sweep have finished. */
+  async function settled(v2: V2TestDb): Promise<V2Runtime> {
+    const factory = v2RuntimeFactory({
+      options: options({ opencodeDbPath: v2.path, limits: { ...TEST_LIMITS, coldPass: true } }),
+      channel: "latest",
+      log: () => {},
+      sync: { pollIntervalMs: 20 },
+      idleDebounceMs: 5,
+    });
+    const runtime = await factory.create(await factory.resolve());
+    runtimes.push(runtime);
+    const start = Date.now();
+    while (
+      runtime.repair()?.sweep?.running !== false ||
+      runtime.distiller.indexing() !== undefined
+    ) {
+      if (Date.now() - start > 10_000) throw new Error("the cold pass never finished");
+      await new Promise((resolve) => setTimeout(resolve, 5));
+    }
+    return runtime;
+  }
+
+  async function recallOn(runtime: V2Runtime): Promise<SearchOutput> {
+    const tool = search(runtime.sourceFor("prj"), true, runtime.options.limits, runtime.deps);
+    const text = toolResultText(
+      await tool.execute({ query: "zephyr" } as never, makeContext().ctx),
+    );
+    return JSON.parse(text) as SearchOutput;
+  }
+
+  it("reports a database it reads in full in coverage.history, and warns of nothing", async () => {
+    const v2 = await makeV2PartsDb();
+    dbs.push(v2);
+    seed(v2.db);
+    const out = await recallOn(await settled(v2));
+
+    expect(out.ok).toBe(true);
+    expect(out.results.some((r) => r.sessionID === "ses_a")).toBe(true);
+    expect(out.coverage?.history).toMatchObject({
+      capabilities: { parts: true },
+      migration: { newest: V2_PARTS_MIGRATION, tested: true },
+      unknownTables: [],
+      counts: emptyReadCounts(),
+      repair: { pending: 0, repairPending: 0, running: false },
+    });
+    expect(out.coverage?.history).not.toHaveProperty("missingColumns");
+    expect(out.coverage?.history).not.toHaveProperty("unknownPartTypeNames");
+    expect(out.coverage?.history?.reads).toBeGreaterThan(0);
+    expect(out.coverage?.limitedBy ?? []).not.toContain("providerLimit");
+    expect(out.warnings).toBeUndefined();
+  }, 30_000);
+
+  it("warns when the database has tables and part types this build does not know", async () => {
+    const v2 = await makeV2PartsDb();
+    dbs.push(v2);
+    seed(v2.db);
+    v2.db.exec("CREATE TABLE session_future (id TEXT PRIMARY KEY)");
+    insertPart(v2.db, {
+      message_id: "msg_a",
+      session_id: "ses_a",
+      ordinal: 1,
+      time_created: 1_150,
+      data: { type: "hologram", text: "zephyr light" },
+    });
+    const out = await recallOn(await settled(v2));
+
+    expect(out.ok).toBe(true);
+    expect(out.coverage?.history).toMatchObject({
+      unknownTables: ["session_future"],
+      unknownPartTypeNames: ["hologram"],
+    });
+    const drift = out.warnings?.filter((w) =>
+      /differs from what this plugin version reads/.test(w),
+    );
+    expect(drift).toHaveLength(1);
+    expect(drift![0]).toContain("unknown tables session_future");
+    expect(drift![0]).toMatch(/parts? of unknown types \(hologram\)/);
+  }, 30_000);
 });
 
 describe("v2 runtime store canonicalization", () => {

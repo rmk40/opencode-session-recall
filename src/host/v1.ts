@@ -138,13 +138,18 @@ export const server: Plugin = async (ctx, options) => {
 
   // Session discovery for the distiller cold pass: global scope reads the
   // unscoped experimental list, otherwise the directory-scoped list. Always
-  // sends an explicit limit (the server defaults to 100 rows).
+  // sends an explicit limit (the server defaults to 100 rows). Whether the
+  // last listing stopped at that limit is kept for `recall` to report: the
+  // distiller records it in the store for every process, and without a store
+  // each process lists for itself and reports its own listing.
+  let discoveryTruncated = false;
   const discover = async (): Promise<HistorySession[]> => {
     const listing = await source.listSessions({
       scope: global ? "global" : "project",
       limit: DISCOVERY_LIMIT,
     });
     if (!listing.ok) throw new Error(listing.error);
+    discoveryTruncated = listing.truncated;
     return listing.items;
   };
 
@@ -261,6 +266,7 @@ export const server: Plugin = async (ctx, options) => {
     build: PLUGIN_BUILD,
     gen: EMBED_REPRESENTATION,
     discover,
+    discoveryTruncated: () => discoveryTruncated,
     // Yield between sessions and inside a card's derivation, so a large
     // session never holds the host's event loop in one slice.
     yieldBetween: () => new Promise((resolve) => setTimeout(resolve, 0)),
@@ -310,6 +316,7 @@ export const server: Plugin = async (ctx, options) => {
     ...(ephemeral && { mode: "ephemeral" as const }),
     ...(liteRefreshHook && { maybeRefresh: () => liteRefreshHook.maybeRefresh() }),
     indexing: () => distiller.indexing(),
+    discoveryTruncated: store ? () => distiller.discoveryTruncated() : () => discoveryTruncated,
   };
   // recall_sessions serves the card store directly when it exists (digest, top
   // files/tools, family rollups); degraded mode leaves listings bare.

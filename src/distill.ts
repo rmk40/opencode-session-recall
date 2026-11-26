@@ -167,6 +167,10 @@ export const COLD_PASS_COMPLETE_KEY = "coldpass_complete";
 export const COLD_PASS_PROGRESS_KEY = "coldpass_progress";
 /** The holder writes {@link COLD_PASS_PROGRESS_KEY} at most this often. */
 export const PROGRESS_WRITE_MS = 2_000;
+/** Meta key where the lease holder records whether its last session
+ *  discovery stopped at its limit (`"1"`, else `"0"`), so every process
+ *  sharing the store can report it (see {@link Distiller.discoveryTruncated}). */
+export const DISCOVERY_TRUNCATED_KEY = "discovery_truncated";
 /** A completed pass that leaves sessions skipped arms another pass after
  *  `coldPassRetryMs` times this, doubling with each consecutive pass that
  *  indexes none of them, up to {@link SKIPPED_RETRY_MAX_FACTOR} (10 minutes
@@ -514,6 +518,13 @@ export type Distiller = {
    * two meta reads.
    */
   repair(): RepairStatus | undefined;
+  /**
+   * Whether the lease holder's last session discovery stopped at its limit,
+   * so older sessions may be missing from the store, as the holder records
+   * it in {@link DISCOVERY_TRUNCATED_KEY}; false before any discovery and
+   * without a store. Query-path cost: one meta read.
+   */
+  discoveryTruncated(): boolean;
 };
 
 export type DistillerOptions = {
@@ -529,6 +540,11 @@ export type DistillerOptions = {
    *  global-vs-scoped variant. Returns raw session rows (mapped to card metadata
    *  internally); the distiller still routes the call through the fetch gate. */
   discover?: () => Promise<HistorySession[]>;
+  /** Whether the last {@link discover} call stopped at its limit, read right
+   *  after each discovery and recorded in {@link DISCOVERY_TRUNCATED_KEY}.
+   *  The default discovery reports its own listing's `truncated`; with an
+   *  injected `discover` and no reader, nothing is recorded. */
+  discoveryTruncated?: () => boolean;
   /** Plugin build tag recorded in the distill-lease value for cross-process
    *  diagnosis (see the plugin entry). Defaults to `"unknown"`. */
   build?: string;
@@ -1211,6 +1227,7 @@ export function createDistiller(options: DistillerOptions): Distiller {
       status: noopStatus,
       indexing: () => undefined,
       repair: () => undefined,
+      discoveryTruncated: () => false,
     };
   }
   const store: Store = options.store;
@@ -1374,21 +1391,37 @@ export function createDistiller(options: DistillerOptions): Distiller {
     pageDelayTimers.clear();
   }
 
+  let defaultDiscoveryTruncated = false;
   const discover =
     options.discover ??
     (async (): Promise<HistorySession[]> => {
       const listing = await source.listSessions({ scope: "project", limit: DISCOVERY_LIMIT });
       if (!listing.ok) throw new Error(listing.error);
+      defaultDiscoveryTruncated = listing.truncated;
       return listing.items;
     });
+  const discoveryTruncated: (() => boolean) | undefined =
+    options.discoveryTruncated ?? (options.discover ? undefined : () => defaultDiscoveryTruncated);
+
+  /** Record whether the discovery just made stopped at its limit, writing
+   *  only when that changed. Holder-only. */
+  function shareDiscoveryTruncated(truncated: boolean): void {
+    if (stopped || !leaseHeld) return;
+    const value = truncated ? "1" : "0";
+    if (store.getMeta(DISCOVERY_TRUNCATED_KEY) === value || !ownsLease()) return;
+    store.setMeta(DISCOVERY_TRUNCATED_KEY, value);
+  }
 
   // ── Fetch primitives (all through the gate at background priority) ──
 
   async function discoverSessions(): Promise<DistillSessionMeta[]> {
+    let listed = false;
     const sessions = await gate.runBackground(() => {
       if (stopped || !leaseHeld) return Promise.resolve([]);
+      listed = true;
       return discover();
     });
+    if (listed && discoveryTruncated) shareDiscoveryTruncated(discoveryTruncated());
     // Never distill the summarizer's worker session — its prompts embed card
     // digests, which recall must not surface (see isSummarizerTitle).
     return sessions.map(toMeta).filter((meta) => !isSummarizerTitle(meta.title));
@@ -3420,6 +3453,10 @@ export function createDistiller(options: DistillerOptions): Distiller {
       }
       const reconcile = parseReconcileProgress(store.getMeta(RECONCILE_PROGRESS_KEY));
       return { ...(sweep && { sweep }), ...(reconcile && { reconcile }) };
+    },
+
+    discoveryTruncated(): boolean {
+      return store.getMeta(DISCOVERY_TRUNCATED_KEY) === "1";
     },
 
     status(): DistillStatus {

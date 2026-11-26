@@ -784,3 +784,75 @@ export function decodeSessionsCursor(cursor: string): Decoded<SessionsCursor> {
     return { anchor, shown, ids, rest };
   });
 }
+
+/**
+ * A `recall` position. The output lists the results, then the expansions;
+ * this names the first record not shown.
+ *
+ * - `query`: a fingerprint of the normalized arguments of the search it
+ *   continues. The caller passes the same arguments with the cursor; a
+ *   different fingerprint is refused.
+ * - `after`/`before`: the time bounds that search resolved, reused so a
+ *   relative bound (`last: "7d"`) does not move between the calls.
+ * - `result`: the anchor result (the first result not shown, or for a stop
+ *   inside the expansions the result the expansion belongs to), by index and
+ *   identity.
+ * - `shown`: a fingerprint of what the anchor depends on: the results up to
+ *   and including it, plus, for a stop inside the expansions, every result
+ *   and the expansions up to and including the stopped one.
+ * - `expansion`: for a stop inside the expansions, the expansion's index and
+ *   where in it the output resumes (unset for its start).
+ *
+ * The continuation re-runs the search and resumes only while the re-run
+ * reproduces all of these; otherwise it is refused, so no record is ever
+ * skipped or shown twice. Token fields: `q`, `after`, `before`, `ri`, `rs`,
+ * `rp`, `h`, `x`, `anchorId`, `part`, `field`, `offset`.
+ */
+export type RecallCursor = {
+  query: string;
+  after?: number;
+  before?: number;
+  result: { index: number; sessionID: string; partID: string };
+  shown: string;
+  expansion?: { index: number; at?: MessagePosition };
+};
+
+export function encodeRecallCursor(c: RecallCursor): string {
+  const at = c.expansion?.at;
+  return encodeContinuation("recall", {
+    q: c.query,
+    after: c.after,
+    before: c.before,
+    ri: c.result.index,
+    rs: c.result.sessionID,
+    rp: c.result.partID,
+    h: c.shown,
+    x: c.expansion?.index,
+    anchorId: at?.message,
+    ...positionFields(at?.at),
+  });
+}
+
+function isTime(value: unknown): value is number | undefined {
+  return value === undefined || (typeof value === "number" && Number.isFinite(value));
+}
+
+export function decodeRecallCursor(cursor: string): Decoded<RecallCursor> {
+  return decodeWith("recall", cursor, (fields) => {
+    const { q: query, after, before, ri: index, rs: sessionID, rp: partID, h: shown, x } = fields;
+    if (!nonEmptyString(query) || !nonEmptyString(shown)) return null;
+    if (!nonEmptyString(sessionID) || !nonEmptyString(partID) || !isOffset(index)) return null;
+    if (!isTime(after) || !isTime(before)) return null;
+    // A position inside an expansion needs the expansion.
+    const at = readMessagePosition(fields);
+    if (at === null || (x === undefined ? at !== undefined : !isOffset(x))) return null;
+    return {
+      query,
+      ...(after !== undefined && { after }),
+      ...(before !== undefined && { before }),
+      result: { index, sessionID, partID },
+      shown,
+      ...(isOffset(x) && { expansion: { index: x, ...(at && { at }) } }),
+    };
+  });
+}

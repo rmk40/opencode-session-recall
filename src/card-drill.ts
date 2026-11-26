@@ -8,14 +8,18 @@ import type { CardsRuntime } from "./cards.js";
 import { bm25Search } from "./bm25.js";
 import { authorshipOf, type Authorship, type AuthorshipCounts } from "./authorship.js";
 import { tokenize } from "./normalize.js";
-import type {
-  DeepOutput,
-  Drill,
-  DrillInput,
-  DrillOutput,
-  DrillPoolsOutput,
-  DrillTarget,
-  DrilledPool,
+import type { DrillSessionStats } from "./types.js";
+import {
+  countMessages,
+  unreadTargets,
+  type DeepOutput,
+  type Drill,
+  type DrillInput,
+  type DrillOutput,
+  type DrillPoolsOutput,
+  type DrillTarget,
+  type DrillTargetStats,
+  type DrilledPool,
 } from "./drill.js";
 
 /**
@@ -85,23 +89,24 @@ function summaryCandidate(
   return candidate;
 }
 
-function cardCandidates(
-  target: DrillTarget,
-  cards: CardsRuntime,
-  narrow: CardDrillFilters,
-): Candidate[] {
+/** The card's summary head as a candidate, whatever the query asks for;
+ *  undefined when there is no card or it has no summary head. */
+function cardSummary(target: DrillTarget, cards: CardsRuntime): Candidate | undefined {
   const card = cards.get(target.sessionId);
-  if (!card) return [];
+  if (!card) return undefined;
+  const messageID = card.distilledThrough ?? `${card.sessionId}:card`;
+  return summaryCandidate(target, messageID, card.summaryHead, card.timeCreated);
+}
+
+/** Whether what the query narrows by lets the summary head be offered. */
+function summaryAllowed(narrow: CardDrillFilters): boolean {
   const { filters } = narrow;
-  const summaryAllowed =
+  return (
     (filters.role === "all" || filters.role === "user") &&
     filters.type === "all" &&
     !filters.toolName &&
-    !narrow.authorshipNarrowed;
-  if (!summaryAllowed) return [];
-  const messageID = card.distilledThrough ?? `${card.sessionId}:card`;
-  const candidate = summaryCandidate(target, messageID, card.summaryHead, card.timeCreated);
-  return candidate ? [candidate] : [];
+    !narrow.authorshipNarrowed
+  );
 }
 
 /** The session title as a standalone candidate: no message behind it, so it
@@ -128,20 +133,29 @@ function standaloneTitle(
 }
 
 /** The drill's pool stages over card candidates: eligibility, the title
- *  candidate, then authorship (see drill.ts `poolFor`). */
+ *  candidate, then authorship (see drill.ts `poolFor`). The stats count the
+ *  card's summary head as the one message it can offer, and nothing as
+ *  fetched: the card drill reads no history. */
 function poolOf(
   target: DrillTarget,
   cards: CardsRuntime,
   narrow: CardDrillFilters,
   input: Pick<DrillInput, "filter" | "searchTitles" | "authorship">,
 ): DrilledPool {
-  const all = cardCandidates(target, cards, narrow);
+  const summary = cardSummary(target, cards);
+  const all = summary && summaryAllowed(narrow) ? [summary] : [];
+  const stats = (candidates: Candidate[]): DrillSessionStats => ({
+    fetched: 0,
+    candidate: summary ? 1 : 0,
+    eligible: countMessages(candidates),
+    stop: "end",
+  });
   let pool = input.filter ? all.filter(input.filter) : all;
   if (input.searchTitles) {
     const title = standaloneTitle(target, cards, narrow);
     if (title && (!input.filter || input.filter(title))) pool = [...pool, title];
   }
-  if (!input.authorship) return { target, candidates: pool };
+  if (!input.authorship) return { target, candidates: pool, stats: stats(pool) };
   const kept: Candidate[] = [];
   const authorshipDropped: AuthorshipCounts = {};
   let authorshipRemoved = 0;
@@ -155,18 +169,25 @@ function poolOf(
     if (candidate.partType === "title") continue;
     authorshipDropped[bucket] = (authorshipDropped[bucket] ?? 0) + 1;
   }
-  return { target, candidates: kept, authorshipDropped, authorshipRemoved };
+  return { target, candidates: kept, stats: stats(kept), authorshipDropped, authorshipRemoved };
 }
 
 export function createCardDrill(cards: CardsRuntime, narrow: CardDrillFilters): Drill {
   const collect = (input: DrillInput): DrillPoolsOutput => {
     const pools: DrilledPool[] = [];
-    for (const target of input.sessions) {
-      if (input.abort?.aborted) break;
-      pools.push(poolOf(target, cards, narrow, input));
+    const targets: DrillTargetStats[] = [];
+    for (let i = 0; i < input.sessions.length; i++) {
+      if (input.abort?.aborted) {
+        targets.push(...unreadTargets(input.sessions, i, "aborted"));
+        break;
+      }
+      const pool = poolOf(input.sessions[i]!, cards, narrow, input);
+      pools.push(pool);
+      targets.push({ sessionId: pool.target.sessionId, ...pool.stats });
     }
     return {
       pools,
+      targets,
       // Only a session whose card offered at least one candidate was really
       // searched; a card-less target (or one its filters emptied) was not.
       drilledSessions: pools

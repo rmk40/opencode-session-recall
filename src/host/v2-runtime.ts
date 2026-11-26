@@ -562,6 +562,8 @@ async function createV2Runtime(
     ...(options.ephemeral && { mode: "ephemeral" as const }),
     ...(liteRefreshHook && { maybeRefresh: () => liteRefreshHook.maybeRefresh() }),
     indexing: () => distiller.indexing(),
+    history: () => drift?.snapshot(),
+    repair: () => distiller.repair(),
   };
   const enrichment: SessionEnrichment | undefined = store
     ? { cards: () => store.allCards(), indexing: () => distiller.indexing() }
