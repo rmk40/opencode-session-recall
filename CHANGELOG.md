@@ -4,6 +4,19 @@ All notable changes to this project are documented here. This project follows
 [Conventional Commits](https://www.conventionalcommits.org/) and
 [Semantic Versioning](https://semver.org/).
 
+## 3.0.1
+
+### Fixed
+
+- **opencode v1 servers that require authentication work again.** The plugin
+  rebuilds its SDK clients from the host's transport, and it copied the
+  host's headers by spreading them. The SDK keeps them as a `Headers`
+  object, which spreads to nothing, so `Authorization` was dropped. A
+  server with Basic auth (for example one started with
+  `OPENCODE_SERVER_PASSWORD`) then answered every request with 401 and
+  recall indexed nothing. Both clients now keep every host header.
+  Reported with a fix by @air391 in #5.
+
 ## 3.0.0
 
 ### Added
