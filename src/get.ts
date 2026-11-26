@@ -9,12 +9,23 @@ import {
   decodeGetCursor,
   encodeGetCursor,
   fitPart,
+  OUTPUT_BUDGET,
   resumeParts,
   section,
   writeError,
   writeOutput,
   type PartPosition,
 } from "./output.js";
+
+/**
+ * Body bytes a continuation into a message's part rows reads ahead: twice
+ * what one output shows, since a part as stored can carry more than the part
+ * as shown. A continuation starts at the part the last output stopped in, so
+ * a call reads that part (whatever its size), about this much after it and
+ * nothing before it. A message's inline content cannot be read in pieces,
+ * so a call that reaches it reads it whole.
+ */
+const CONTINUATION_READ_BYTES = 2 * OUTPUT_BUDGET.bytes;
 
 export function get(source: HistorySource, gate: FetchGate): ToolDefinition {
   return tool({
@@ -39,6 +50,7 @@ If memory exists, store only durable findings surfaced here; skip ephemeral deta
       if (!sessionID || !messageID) return writeError("sessionID and messageID are required");
       let ordinal: number | undefined;
       let at: PartPosition | undefined;
+      let atFirst = false;
       if (cursor) {
         const decoded = decodeGetCursor(cursor);
         if (!decoded.ok) return writeError(decoded.error);
@@ -49,7 +61,12 @@ If memory exists, store only durable findings surfaced here; skip ephemeral deta
         }
         ordinal = decoded.value.ordinal;
         at = decoded.value.at;
+        atFirst = decoded.value.atFirst === true;
       }
+      // A read into the part rows is capped when the output starts at its
+      // first part; a cursor whose part lies further into its read gets the
+      // whole read, so that the part is in it.
+      const capped = ordinal !== undefined && (at === undefined || atFirst);
       ctx.metadata({
         title: `Retrieving message ${messageID.slice(0, 20)}...`,
       });
@@ -58,12 +75,20 @@ If memory exists, store only durable findings surfaced here; skip ephemeral deta
         const result = await gate.runQuery(() =>
           ordinal === undefined
             ? source.getMessage(sessionID, messageID)
-            : source.getMessage(sessionID, messageID, { partOrdinal: ordinal }),
+            : source.getMessage(sessionID, messageID, {
+                partOrdinal: ordinal,
+                ...(capped && { maxBytes: CONTINUATION_READ_BYTES }),
+              }),
         );
         if (!result.ok) return writeError(result.error ?? `Message not found: ${messageID}`);
 
         const item = formatMsg(result.value);
-        let parts: PartOutput[] = item.parts;
+        const partial = result.value.partial;
+        // A partial message ends in the reader's note on where the rest
+        // starts. After a capped read the output's continuation reads on from
+        // there, so the note, which would only interrupt the parts, is left
+        // out.
+        let parts: PartOutput[] = capped && partial ? item.parts.slice(0, -1) : item.parts;
         if (at) {
           const resumed = resumeParts(parts, at);
           if (!resumed) {
@@ -73,7 +98,7 @@ If memory exists, store only durable findings surfaced here; skip ephemeral deta
           }
           parts = resumed;
         }
-        const partial = result.value.partial;
+        const partOrdinals = result.partOrdinals;
 
         let title: string | undefined;
         let directory: string | undefined;
@@ -93,16 +118,23 @@ If memory exists, store only durable findings surfaced here; skip ephemeral deta
           title: `${item.message.role} message (${parts.length} part${parts.length !== 1 ? "s" : ""})${title ? ` from "${title}"` : ""}`,
         });
 
-        // The output stops inside this read (its continuation re-reads from
-        // the same ordinal and resumes at the part it stopped at), or, when
-        // the read itself was cut short, continues at the ordinal it stopped
-        // at.
+        // The output stops inside this read, and its continuation reads from
+        // the row of the part it stopped at (or, for a part without a row of
+        // its own, from this read's ordinal) and resumes at that part; or,
+        // when the read itself was cut short, it continues at the ordinal the
+        // read stopped at.
+        const resumeAt = (stopped: PartPosition): string => {
+          const from = partOrdinals?.get(stopped.part);
+          return from !== undefined && Number.isSafeInteger(from) && from >= 0
+            ? encodeGetCursor({ message: messageID, ordinal: from, at: stopped, atFirst: true })
+            : encodeGetCursor({ message: messageID, ordinal, at: stopped });
+        };
         return writeOutput<PartPosition>({
           sections: [section("parts", parts, fitPart)],
           head: (stop) => {
             const stopped = stop?.rest ?? (stop && { part: parts[stop.index]!.id });
             const continuation = stopped
-              ? encodeGetCursor({ message: messageID, ordinal, at: stopped })
+              ? resumeAt(stopped)
               : partial
                 ? encodeGetCursor({ message: messageID, ordinal: partial.nextOrdinal })
                 : undefined;

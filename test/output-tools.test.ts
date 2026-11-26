@@ -477,8 +477,13 @@ describe("a message the history read cut short (v2)", () => {
     const texts = Array.from({ length: 6 }, (_, i) => `${i} ${"abc€😀 ".repeat(5_000)}`);
     const { cut, whole } = await v2CutSession(texts, { pageByteCeiling: 120_000 });
     const { outs, joiner } = await readMessage(getTool(cut, gate), "ses_cut", "msg_long");
-    // Three reads, each over the budget: more outputs than reads.
-    expect(joiner.parts.filter((p) => /:cut\d+$/.test(p.id as string))).toHaveLength(2);
+    // Every row is over the output budget on its own, so outputs stop inside
+    // parts, and the reads are cut short between rows. Each continuation
+    // reads from the row its output stopped in, so no read's note on where
+    // its rest starts falls inside what an output shows.
+    expect(joiner.parts.filter((p) => /:cut\d+$/.test(p.id as string))).toHaveLength(0);
+    expect(outs.some((out) => (out.parts as PartOutput[]).some((p) => p.cutAt))).toBe(true);
+    expect(outs.some((out) => out.partial !== undefined)).toBe(true);
     expect(outs.length).toBeGreaterThan(3);
     expect(withoutCutNotes(joiner.parts)).toEqual(await wholeParts(whole));
   }, 30_000);

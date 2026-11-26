@@ -230,6 +230,60 @@ describe("recall_messages", () => {
     expect(h.calls.messages.every((c) => c.before === undefined)).toBe(true);
   });
 
+  it("survives a raw order that is not one it knows (host path): browses newest first", async () => {
+    const h = makeFakeHarness();
+    for (const order of [7, "sideways", null]) {
+      const out = await runToolRaw<MessagesOutput>(messagesTool(h.source, gate, TEST_LIMITS), {
+        sessionID: "s-current",
+        limit: 2,
+        order,
+      });
+      expect(out.ok, String(order)).toBe(true);
+      expect(out.pagination.order).toBe("newest");
+      expect(out.messages.map((m) => m.message.id)).toEqual(["m-current-6", "m-current-5"]);
+    }
+  });
+
+  it("reports a raw order oldest as unsupported on a source that pages newest first only", async () => {
+    const h = makeFakeHarness();
+    const out = await runToolRaw<ErrorOutput>(messagesTool(h.source, gate, TEST_LIMITS), {
+      sessionID: "s-current",
+      order: "oldest",
+    });
+    expect(out.ok).toBe(false);
+    expect(out.error).toContain('order "oldest" is not supported');
+    expect(h.calls.messages).toEqual([]);
+  });
+
+  it("survives a raw scan budget that is missing, not a number or out of range (host path)", async () => {
+    const h = makeFakeHarness();
+    const tool = messagesTool(h.source, gate, TEST_LIMITS);
+    // Not a number reads as the default, which covers the whole small session.
+    for (const scan of ["lots", undefined, Number.NaN]) {
+      const out = await runToolRaw<MessagesOutput>(tool, {
+        sessionID: "s-current",
+        role: "user",
+        scan,
+      });
+      expect(out.ok, String(scan)).toBe(true);
+      expect(out.pagination).toMatchObject({ scanned: 6, stop: "end", hasMore: false });
+    }
+    // Below the minimum it clamps to one message read.
+    const low = await runToolRaw<MessagesOutput>(tool, {
+      sessionID: "s-current",
+      role: "user",
+      scan: -3,
+    });
+    expect(low.pagination).toMatchObject({ scanned: 1, stop: "scanBudget", hasMore: true });
+    // Above the maximum it clamps rather than failing.
+    const high = await runToolRaw<MessagesOutput>(tool, {
+      sessionID: "s-current",
+      role: "user",
+      scan: 1e9,
+    });
+    expect(high.pagination).toMatchObject({ scanned: 6, stop: "end" });
+  });
+
   it("routes its fetches through the shared gate", async () => {
     const h = makeFakeHarness();
     const { gate: spy, queries } = makeSpyGate();

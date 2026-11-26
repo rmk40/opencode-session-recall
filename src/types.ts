@@ -540,6 +540,17 @@ export type ContextOutput = TrimmedFields & {
   hasMoreAfter: boolean;
 };
 
+/** The order `recall_messages` browses in. */
+export type MessagesOrder = "newest" | "oldest";
+
+/**
+ * Why a `recall_messages` scan stopped: `limit` messages matched, the
+ * matches fill the output budget (`outputBudget`), it read as many messages
+ * or pages as one call may (`scanBudget`), or the session has no more
+ * messages in its order (`end`).
+ */
+export type MessagesStop = "limit" | "outputBudget" | "scanBudget" | "end";
+
 export type MessagesOutput = TrimmedFields & {
   ok: true;
   messages: MessageItem[];
@@ -547,14 +558,21 @@ export type MessagesOutput = TrimmedFields & {
     sessionTitle?: string;
     directory?: string;
   };
-  /** Cursor-based pagination over one bounded newest-first page. `nextCursor`
-   *  (opaque) continues from where this output stopped: the next page, or,
-   *  on a trimmed output, its `continuation`. Absent means the last page.
-   *  `returned` counts the messages shown, whole or in part, after
-   *  role/query filtering within the page, so it can be less than `limit`. */
+  /** Cursor-based pagination over bounded pages in `order`. The call scans
+   *  pages until `matched` reaches `limit` or `stop` says why it did not.
+   *  `scanned` counts the messages it read and tested against the role and
+   *  query filters, `matched` those that passed and `returned` those shown,
+   *  whole or in part, so `returned` is less than `matched` only on a
+   *  trimmed output. `nextCursor` (opaque) continues from where this output
+   *  stopped: on a trimmed output its `continuation`, otherwise right after
+   *  the last message scanned. Absent means the session has no more. */
   pagination: {
     limit: number;
+    order: MessagesOrder;
     returned: number;
+    matched: number;
+    scanned: number;
+    stop: MessagesStop;
     hasMore: boolean;
     nextCursor?: string;
   };

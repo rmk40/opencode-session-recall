@@ -676,29 +676,36 @@ function decodeWith<T>(
 /**
  * A `recall_get` position: the message, the part ordinal its history read
  * starts at (unset for a read from the start) and where in that read the
- * output resumes (unset for its start). Token fields: `m`, `ordinal`, `part`,
- * `field`, `offset`.
+ * output resumes (unset for its start). `atFirst` says `at` names the part
+ * row at `ordinal` itself, the first part that read returns, so the read
+ * need not reach further than the output can show; without it, `at` can lie
+ * anywhere in the read. Token fields: `m`, `ordinal`, `part`, `field`,
+ * `offset`, `f`.
  */
-export type GetCursor = { message: string; ordinal?: number; at?: PartPosition };
+export type GetCursor = { message: string; ordinal?: number; at?: PartPosition; atFirst?: true };
 
 export function encodeGetCursor(c: GetCursor): string {
   return encodeContinuation("recall_get", {
     m: c.message,
     ordinal: c.ordinal,
     ...positionFields(c.at),
+    f: c.atFirst ? 1 : undefined,
   });
 }
 
 export function decodeGetCursor(cursor: string): Decoded<GetCursor> {
   return decodeWith("recall_get", cursor, (fields) => {
-    const { m: message, ordinal } = fields;
+    const { m: message, ordinal, f } = fields;
     const at = readPosition(fields);
     if (!nonEmptyString(message) || at === null) return null;
     if (ordinal !== undefined && !isOffset(ordinal)) return null;
+    // `atFirst` names the part at the read's ordinal, so it needs both.
+    if (f !== undefined && (f !== 1 || ordinal === undefined || at === undefined)) return null;
     return {
       message,
       ...(isOffset(ordinal) && { ordinal }),
       ...(at && { at }),
+      ...(f === 1 && { atFirst: true as const }),
     };
   });
 }
@@ -728,17 +735,23 @@ export function decodeContextCursor(cursor: string): Decoded<ContextCursor> {
 }
 
 /**
- * A `recall_messages` position: the session, the history source's cursor of
- * the page (null for the newest page) and, when the output resumes inside
- * that page rather than at its start, the message (and place in it) it
- * resumes at. Token fields: `s`, `page`, `anchorId`, `part`, `field`,
- * `offset`.
+ * A `recall_messages` position: the session, the order it pages in (unset
+ * for newest first), the history source's cursor of the page (null for the
+ * first page in that order) and, when the output resumes inside that page
+ * rather than at its start, the message (and place in it) it resumes at.
+ * Token fields: `s`, `o`, `page`, `anchorId`, `part`, `field`, `offset`.
  */
-export type MessagesCursor = { session: string; page: string | null; at?: MessagePosition };
+export type MessagesCursor = {
+  session: string;
+  order?: "oldest";
+  page: string | null;
+  at?: MessagePosition;
+};
 
 export function encodeMessagesCursor(c: MessagesCursor): string {
   return encodeContinuation("recall_messages", {
     s: c.session,
+    o: c.order,
     page: c.page,
     anchorId: c.at?.message,
     ...positionFields(c.at?.at),
@@ -747,12 +760,13 @@ export function encodeMessagesCursor(c: MessagesCursor): string {
 
 export function decodeMessagesCursor(cursor: string): Decoded<MessagesCursor> {
   return decodeWith("recall_messages", cursor, (fields) => {
-    const session = fields.s;
+    const { s: session, o: order } = fields;
     const page =
       fields.page === null ? null : nonEmptyString(fields.page) ? fields.page : undefined;
     const at = readMessagePosition(fields);
     if (!nonEmptyString(session) || page === undefined || at === null) return null;
-    return { session, page, ...(at && { at }) };
+    if (order !== undefined && order !== "oldest") return null;
+    return { session, ...(order === "oldest" && { order }), page, ...(at && { at }) };
   });
 }
 
