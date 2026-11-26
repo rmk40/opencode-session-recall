@@ -2863,6 +2863,24 @@ describe("recall toolName aliases and misses", () => {
     expect(suggestion?.example).toEqual({ authorship: "any" });
     expect(out.suggestions?.filter((s) => /authorship/.test(s.reason))).toHaveLength(1);
   });
+
+  it("does not offer a tool the authorship filter removed as the closest name", async () => {
+    // Every read call is on an assistant message, so authorship:"injected"
+    // removes it; "read" is the same name as "Read" in another case.
+    const out = await runTool<SearchOutput>(await recallTool(toolHarness()), {
+      ...base,
+      toolName: "Read",
+      authorship: "injected",
+    });
+    expect(out.results).toEqual([]);
+    expect(out.coverage?.toolNames?.closest).not.toBe("read");
+    const namesRead = (out.suggestions ?? []).filter(
+      (s) => s.example?.toolName === "read" || s.action.includes('toolName:"read"'),
+    );
+    expect(namesRead).toEqual([]);
+    // The authorship filter is still named as what emptied the result.
+    expect(out.suggestions?.some((s) => s.example?.authorship === "any")).toBe(true);
+  });
 });
 
 describe("recall drill cache", () => {

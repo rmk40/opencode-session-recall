@@ -1261,6 +1261,14 @@ describe("closestToolName", () => {
     expect(closest("glob", { glib: 2, blob: 2 })).toBe("blob");
   });
 
+  it("gives an alias filter the same answer whichever of its names was asked for", () => {
+    // Each history holds a tool close to only one name of the shell pair.
+    expect(closest("shell", { bash_session: 1 })).toBe("bash_session");
+    expect(closest("bash", { bash_session: 1 })).toBe("bash_session");
+    expect(closest("bash", { shellcheck: 1 })).toBe("shellcheck");
+    expect(closest("SHELL", { shellcheck: 1 })).toBe("shellcheck");
+  });
+
   it("never names a tool the filter already accepts", () => {
     expect(closest("bash", { Bash: 10, SHELL: 3, bash_session: 1 })).toBe("bash_session");
     expect(closest("bash", { Bash: 10, shell: 3 })).toBeUndefined();
