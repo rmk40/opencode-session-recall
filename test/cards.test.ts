@@ -882,4 +882,29 @@ describe("cards exclusion family", () => {
       expect(fromCards, `family(${id})`).toEqual(fromDiscovery);
     }
   });
+
+  it("collects the subagents of a current session that has a parent itself", () => {
+    // root → kid → grand, plus a sibling of kid and an unrelated session.
+    const tree: Array<[string, string | undefined]> = [
+      ["root", undefined],
+      ["kid", "root"],
+      ["grand", "kid"],
+      ["sib", "root"],
+      ["other", undefined],
+    ];
+    const metas = tree.map(([id, parentID]) => ({
+      id,
+      title: id,
+      directory: "",
+      updated: 0,
+      parentID,
+    }));
+    const cards = tree.map(([id, parentId]) => makeCard(id, { parentId: parentId ?? null }));
+    const expected = ["grand", "kid", "root", "sib"];
+
+    for (const id of ["kid", "root", "grand"]) {
+      expect([...exclusionFamilyFromCards(cards, id)].sort(), `cards(${id})`).toEqual(expected);
+      expect([...exclusionFamily(metas, id)].sort(), `discovery(${id})`).toEqual(expected);
+    }
+  });
 });

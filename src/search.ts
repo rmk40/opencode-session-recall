@@ -255,8 +255,11 @@ export function exclusionFamily(
     root = parentID;
   }
 
-  // Collect the root's subtree (bounded, cycle-guarded).
-  const family = new Set([currentSessionID, root]);
+  // Collect the root's subtree (bounded, cycle-guarded). Seeded with the root
+  // alone, so a current session below it is reached as a child and its own
+  // subagents are collected too; it is added afterwards for the cycle and
+  // depth-cap cases the walk does not reach it in.
+  const family = new Set([root]);
   let frontier = [root];
   for (let depth = 0; depth < MAX_FAMILY_DEPTH && frontier.length > 0; depth++) {
     const next: string[] = [];
@@ -269,6 +272,7 @@ export function exclusionFamily(
     }
     frontier = next;
   }
+  family.add(currentSessionID);
   return family;
 }
 

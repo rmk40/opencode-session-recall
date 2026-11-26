@@ -443,12 +443,13 @@ describe("deep finds output-only needles that non-deep honestly misses", () => {
 describe("deep sweep of a scoped listing", () => {
   it("leaves out only the current session by default, and its whole family with excludeFamily", async () => {
     const h = makeFakeHarness();
-    // The caller (s-dl-kid) is a subagent of s-dl-root, with a sibling that
-    // has a subagent of its own; s-dl-out is unrelated. Each holds the needle
-    // in a tool output, which only a deep sweep reads.
+    // The caller (s-dl-kid) is a subagent of s-dl-root with a subagent of its
+    // own, and has a sibling with a subagent; s-dl-out is unrelated. Each
+    // holds the needle in a tool output, which only a deep sweep reads.
     const family: Array<[string, string | undefined]> = [
       ["s-dl-root", undefined],
       ["s-dl-kid", "s-dl-root"],
+      ["s-dl-kidsub", "s-dl-kid"],
       ["s-dl-sib", "s-dl-root"],
       ["s-dl-grand", "s-dl-sib"],
       ["s-dl-out", undefined],
@@ -479,11 +480,18 @@ describe("deep sweep of a scoped listing", () => {
         return [...new Set(out.results.map((r) => r.sessionID))].sort();
       };
 
-      expect(await swept({})).toEqual(["s-dl-grand", "s-dl-out", "s-dl-root", "s-dl-sib"]);
+      expect(await swept({})).toEqual([
+        "s-dl-grand",
+        "s-dl-kidsub",
+        "s-dl-out",
+        "s-dl-root",
+        "s-dl-sib",
+      ]);
       expect(await swept({ excludeFamily: true })).toEqual(["s-dl-out"]);
       expect(await swept({ excludeCurrentSession: false })).toEqual([
         "s-dl-grand",
         "s-dl-kid",
+        "s-dl-kidsub",
         "s-dl-out",
         "s-dl-root",
         "s-dl-sib",

@@ -387,7 +387,7 @@ function toDoc(card: Card): CardDoc {
 /**
  * The current session's family within the card graph: ascend `parentId` to the
  * highest known ancestor (bounded, cycle-guarded), then collect that ancestor's
- * whole subtree via `rootId`. Produces the SAME set `search.ts`'s
+ * whole subtree through `parentId` links. Produces the SAME set `search.ts`'s
  * `exclusionFamily()` derives from a discovery walk — so family exclusion
  * (recall's `excludeFamily`, the v1 hooks) and recall's family diversity work
  * without any part fetch. Exported for the equivalence test.
@@ -417,8 +417,11 @@ export function exclusionFamilyFromCards(
     root = parentId;
   }
 
-  // Collect the root's subtree (bounded, cycle-guarded).
-  const family = new Set([currentSessionId, root]);
+  // Collect the root's subtree (bounded, cycle-guarded). Seeded with the root
+  // alone, so a current session below it is reached as a child and its own
+  // subagents are collected too; it is added afterwards for the cycle and
+  // depth-cap cases the walk does not reach it in.
+  const family = new Set([root]);
   let frontier = [root];
   for (let depth = 0; depth < MAX_FAMILY_DEPTH && frontier.length > 0; depth++) {
     const next: string[] = [];
@@ -431,6 +434,7 @@ export function exclusionFamilyFromCards(
     }
     frontier = next;
   }
+  family.add(currentSessionId);
   return family;
 }
 
