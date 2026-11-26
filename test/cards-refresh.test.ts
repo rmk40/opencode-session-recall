@@ -492,6 +492,38 @@ describe("search index updates", () => {
     expect(omega()).toEqual(updated);
   });
 
+  it("never ranks a card on terms only its old document had while a chunked update runs", async () => {
+    const { runtime, slices, change } = await indexedStore(140);
+    // Cards c000-c064 now read "omega shared" instead of "alpha shared".
+    change(65);
+    slowSlices();
+    const consistent = (label: string): void => {
+      for (const term of ["alpha", "omega"]) {
+        for (const hit of runtime.rank(parseQuery(term), {})) {
+          expect(hit.card.inventory, `${label}: "${term}" hit ${hit.sessionId}`).toContain(term);
+        }
+      }
+    };
+
+    // The first rank() starts the update, which stops after its first slice.
+    consistent("update started");
+    let finished = false;
+    const done = runtime.ready({ index: true }).then(() => {
+      finished = true;
+    });
+    let slicesSeen = 0;
+    while (!finished) {
+      consistent(`after ${slicesSeen} slices`);
+      slices.step();
+      await settle();
+      slicesSeen++;
+    }
+    await done;
+    expect(slicesSeen).toBeGreaterThan(1);
+    expect(runtime.rank(parseQuery("alpha"), {})).toHaveLength(75);
+    expect(runtime.rank(parseQuery("omega"), {})).toHaveLength(66);
+  });
+
   it("shares one chunked index build between concurrent ready() calls", async () => {
     const store = await freshStore();
     for (const id of ["s1", "s2", "s3"]) put(store, id, { inventory: `${id} ${SUBST}` });
@@ -517,6 +549,42 @@ describe("search index updates", () => {
     // One build embeds each card once.
     expect(embed).toHaveBeenCalledTimes(3);
     expect(runtime.semanticStatus()?.cardsWithVectors).toBe(3);
+  });
+});
+
+describe("ready() without the index", () => {
+  it("resolves beside a paused index build and applies map changes meanwhile", async () => {
+    const store = await freshStore();
+    for (let i = 0; i < 20; i++) put(store, cardId(i), { inventory: `alpha ${i}` });
+    const { source, reads } = countedSource(store);
+    const slices = gate();
+    const runtime = createCardsRuntime({
+      source,
+      refreshIntervalMs: 0,
+      yieldBetween: slices.yieldBetween,
+    });
+    slowSlices();
+    // The map loads in one page; the index build then stops after one slice.
+    const building = runtime.ready({ index: true });
+    await settle();
+    expect(slices.yields()).toBe(1);
+
+    put(store, "late", { title: "Late arrival" });
+    let mapReady = false;
+    const reading = runtime.ready().then(() => {
+      mapReady = true;
+    });
+    await settle();
+    expect(mapReady).toBe(true);
+    expect(runtime.get("late")?.title).toBe("Late arrival");
+    // The change arrived incrementally, and the build is still waiting.
+    expect(reads.fullLoads).toBe(1);
+    expect(slices.yields()).toBe(1);
+
+    slices.open();
+    await Promise.all([building, reading]);
+    await runtime.ready({ index: true });
+    expect(ids(runtime.rank(parseQuery("arrival"), {}))).toEqual(["late"]);
   });
 });
 
