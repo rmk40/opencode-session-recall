@@ -756,17 +756,31 @@ export function decodeMessagesCursor(cursor: string): Decoded<MessagesCursor> {
   });
 }
 
-/** A `recall_sessions` position: the first session not shown, which the
- *  same listing resumes at. Token field: `anchorId`. */
-export type SessionsCursor = { anchor: string };
+/**
+ * A `recall_sessions` position: the first session not shown (`anchor`), the
+ * `updated` time it was listed with, and the sessions listed before it, as
+ * their count (`shown`) and a fingerprint of their ids (`ids`). The same
+ * listing resumes at the anchor only while all of these still hold, so a
+ * session that moved past the anchor between calls is never skipped and an
+ * anchor that moved is never shown twice. Token fields: `anchorId`,
+ * `updated`, `n`, `h`.
+ */
+export type SessionsCursor = { anchor: string; updated: number; shown: number; ids: string };
 
 export function encodeSessionsCursor(c: SessionsCursor): string {
-  return encodeContinuation("recall_sessions", { anchorId: c.anchor });
+  return encodeContinuation("recall_sessions", {
+    anchorId: c.anchor,
+    updated: c.updated,
+    n: c.shown,
+    h: c.ids,
+  });
 }
 
 export function decodeSessionsCursor(cursor: string): Decoded<SessionsCursor> {
   return decodeWith("recall_sessions", cursor, (fields) => {
-    const anchor = fields.anchorId;
-    return nonEmptyString(anchor) ? { anchor } : null;
+    const { anchorId: anchor, updated, n: shown, h: ids } = fields;
+    if (!nonEmptyString(anchor) || !nonEmptyString(ids)) return null;
+    if (typeof updated !== "number" || !Number.isFinite(updated) || !isOffset(shown)) return null;
+    return { anchor, updated, shown, ids };
   });
 }

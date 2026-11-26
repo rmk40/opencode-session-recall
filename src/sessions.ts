@@ -15,12 +15,14 @@ import type { Card } from "./store.js";
 import { isSummarizerTitle } from "./extract.js";
 import { unavailableHistoryError, type HistorySource } from "./history/source.js";
 import type { HistorySession } from "./history/model.js";
+import { cyrb53 } from "./hash.js";
 import {
   decodeSessionsCursor,
   encodeSessionsCursor,
   section,
   writeError,
   writeOutput,
+  type SessionsCursor,
 } from "./output.js";
 
 /** Card-backed enrichment for the sessions browser: a snapshot of all cards the
@@ -43,6 +45,12 @@ const MAX_TOOLS = 5;
  *  `truncated`. */
 const CHILDREN_PAGE = 1_000;
 const CHILDREN_PAGES_MAX = 10;
+
+/** A fingerprint of a set of sessions: their ids in id order, hashed, so a
+ *  session that moves within the set leaves it unchanged. */
+function idsFingerprint(items: readonly SessionItem[]): string {
+  return cyrb53(JSON.stringify(items.map((item) => item.id).sort()));
+}
 
 /** Every child of `parentID`, paged in id order so a child updated during the
  *  walk is neither skipped nor listed twice, up to
@@ -117,31 +125,56 @@ export function sessions(
     const warning = indexingWarning(progress);
     return { ...out, indexing: progress, note: out.note ? `${out.note} ${warning}` : warning };
   };
-  /** The listing as output: from the cursor's session on when there is one,
-   *  trimmed to the budget with a continuation at the first session not
-   *  shown. */
-  const respond = (out: SessionsOutput, anchor: string | undefined): string => {
+  /**
+   * The listing as output: from the cursor's session on when there is one,
+   * trimmed to the budget with a continuation at the first session not shown.
+   * The listing is in recency order and rebuilt on every call, so a cursor
+   * resumes only when its anchor kept its `updated` time and the sessions
+   * before it are exactly the ones already shown; a session that changed
+   * between calls would otherwise be skipped (it moved ahead of the anchor)
+   * or shown twice (the anchor moved).
+   */
+  const respond = (out: SessionsOutput, cursor: SessionsCursor | undefined): string => {
     const listed = out.sessions;
     const rest: Record<string, unknown> = {};
     for (const [key, value] of Object.entries(out)) {
       if (key !== "ok" && key !== "sessions") rest[key] = value;
     }
-    let shown = listed;
-    if (anchor !== undefined) {
-      const index = listed.findIndex((item) => item.id === anchor);
-      if (index === -1) {
+    let start = 0;
+    if (cursor) {
+      start = listed.findIndex((item) => item.id === cursor.anchor);
+      if (start === -1) {
         return writeError(
-          `This cursor's session ${anchor} is no longer in this listing; list again without cursor`,
+          `This cursor's session ${cursor.anchor} is no longer in this listing; list again without cursor`,
         );
       }
-      shown = listed.slice(index);
+      if (
+        listed[start]!.time.updated !== cursor.updated ||
+        start !== cursor.shown ||
+        idsFingerprint(listed.slice(0, start)) !== cursor.ids
+      ) {
+        return writeError(
+          `This listing changed since the cursor was made (session ${cursor.anchor} or one listed before it was updated, added or removed); list again without cursor`,
+        );
+      }
     }
+    const shown = listed.slice(start);
     return writeOutput({
       sections: [section("sessions", shown)],
-      head: (stop, counts) => ({
-        ...(stop && { continuation: encodeSessionsCursor({ anchor: shown[stop.index]!.id }) }),
-        fields: { ...rest, returned: counts.sessions ?? 0 },
-      }),
+      head: (stop, counts) => {
+        const next = stop && start + stop.index;
+        return {
+          ...(next !== undefined && {
+            continuation: encodeSessionsCursor({
+              anchor: listed[next]!.id,
+              updated: listed[next]!.time.updated,
+              shown: next,
+              ids: idsFingerprint(listed.slice(0, next)),
+            }),
+          }),
+          fields: { ...rest, returned: counts.sessions ?? 0 },
+        };
+      },
     }).text;
   };
   return tool({
@@ -193,12 +226,12 @@ export function sessions(
       const now = Date.now();
       const since = parseTimeBound(optionalString(args.since), now);
       const until = parseTimeBound(optionalString(args.until), now);
-      const cursor = optionalString(args.cursor);
-      let anchor: string | undefined;
-      if (cursor) {
-        const decoded = decodeSessionsCursor(cursor);
+      const rawCursor = optionalString(args.cursor);
+      let resume: SessionsCursor | undefined;
+      if (rawCursor) {
+        const decoded = decodeSessionsCursor(rawCursor);
         if (!decoded.ok) return writeError(decoded.error);
-        anchor = decoded.value.anchor;
+        resume = decoded.value;
       }
 
       ctx.metadata({
@@ -321,7 +354,7 @@ export function sessions(
             ...(resolvedParent && { parentID: resolvedParent, childCount: selected.length }),
             note: `${unavailable}. This listing comes from the card index, which may lag the live history.`,
           };
-          return respond(withIndexing(out), anchor);
+          return respond(withIndexing(out), resume);
         }
 
         // ── Children branch: live parent/child lookup, index-free ──
@@ -400,7 +433,7 @@ export function sessions(
             ...(result.truncated && { truncated: true as const }),
             ...(notes.length > 0 && { note: notes.join(" ") }),
           };
-          return respond(out, anchor);
+          return respond(out, resume);
         }
 
         // ── Card-authoritative time filtering ──
@@ -464,7 +497,7 @@ export function sessions(
               returned: selected.length,
               scope,
             };
-            return respond(withIndexing(out), anchor);
+            return respond(withIndexing(out), resume);
           }
         }
 
@@ -557,7 +590,7 @@ export function sessions(
             : {}),
         };
         // A live listing does not depend on the card index: no indexing note.
-        return respond(out, anchor);
+        return respond(out, resume);
       } catch (e) {
         return writeError(errmsg(e));
       }

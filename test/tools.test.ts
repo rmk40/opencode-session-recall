@@ -520,6 +520,89 @@ describe("recall_context", () => {
   });
 });
 
+describe("recall_sessions continuations across listing changes", () => {
+  type Listed = SessionsOutput & { continuation?: string; error?: string };
+
+  /** A harness listing 100 project sessions with ~1 KB titles, over the
+   *  output budget, newest first in array order (as the fake lists them). */
+  function harness(): ReturnType<typeof makeFakeHarness> {
+    const h = makeFakeHarness();
+    const now = Date.now();
+    for (let i = 0; i < 120; i++) {
+      const id = `s-walk-${String(i).padStart(3, "0")}`;
+      h.sessions.push(session(id, `Walk ${i} ${"€".repeat(300)}`, PROJECT_DIR, now - 10_000 - i));
+    }
+    return h;
+  }
+
+  /** Session `id` updated now: newer `time.updated`, first in the listing. */
+  function touch(h: ReturnType<typeof makeFakeHarness>, id: string): void {
+    const index = h.sessions.findIndex((s) => s.id === id);
+    const [moved] = h.sessions.splice(index, 1);
+    h.sessions.unshift({ ...moved!, time: { ...moved!.time, updated: Date.now() + 60_000 } });
+  }
+
+  const run = (h: ReturnType<typeof makeFakeHarness>, cursor?: string): Promise<Listed> =>
+    runTool<Listed>(sessionsTool(h.source, true, TEST_LIMITS), {
+      limit: 100,
+      ...(cursor && { cursor }),
+    });
+
+  it("walks an unchanged listing to its end, each session once and in order", async () => {
+    const h = harness();
+    const expected = h.sessions.filter((s) => s.directory === PROJECT_DIR).slice(0, 100);
+    const ids: string[] = [];
+    let out = await run(h);
+    for (let calls = 1; ; calls++) {
+      expect(out.ok).toBe(true);
+      ids.push(...out.sessions.map((s) => s.id));
+      if (!out.continuation) break;
+      expect(calls).toBeLessThan(20);
+      out = await run(h, out.continuation);
+    }
+    expect(ids).toEqual(expected.map((s) => s.id));
+  });
+
+  it("rejects the continuation when a session not yet shown was updated in between", async () => {
+    const h = harness();
+    const first = await run(h);
+    expect(first.continuation).toBeDefined();
+    touch(h, "s-walk-090");
+    const out = await run(h, first.continuation);
+    expect(out).toMatchObject({ ok: false, error: expect.stringContaining("list again") });
+  });
+
+  it("rejects the continuation when its anchor session was updated in between", async () => {
+    const h = harness();
+    const first = await run(h);
+    const anchor = h.sessions.filter((s) => s.directory === PROJECT_DIR)[first.sessions.length]!;
+    touch(h, anchor.id);
+    const out = await run(h, first.continuation);
+    expect(out).toMatchObject({ ok: false, error: expect.stringContaining("list again") });
+  });
+
+  it("rejects the continuation when a new session arrived in between", async () => {
+    const h = harness();
+    const first = await run(h);
+    h.sessions.unshift(session("s-walk-new", "New", PROJECT_DIR, Date.now() + 60_000));
+    const out = await run(h, first.continuation);
+    expect(out).toMatchObject({ ok: false, error: expect.stringContaining("list again") });
+  });
+
+  it("resumes when a session already shown was updated in between, without repeating it", async () => {
+    const h = harness();
+    const first = await run(h);
+    const shown = first.sessions.map((s) => s.id);
+    touch(h, shown[1]!);
+    const out = await run(h, first.continuation);
+    expect(out.ok).toBe(true);
+    expect(out.sessions.some((s) => shown.includes(s.id))).toBe(false);
+    expect(out.sessions[0]!.id).toBe(
+      h.sessions.filter((s) => s.directory === PROJECT_DIR)[shown.length]!.id,
+    );
+  });
+});
+
 describe("recall_sessions defensive args", () => {
   it("survives raw MCP-bypass args (undefined scope/limit default to project)", async () => {
     const h = makeFakeHarness();
