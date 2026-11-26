@@ -12,9 +12,17 @@ import type { HistorySource } from "../src/history/source.js";
 import { createV2HistorySource, openOpencodeDb, type V2SourceOptions } from "../src/history/v2.js";
 import type { MessageItem, PartOutput } from "../src/types.js";
 import {
+  MessageJoiner,
+  PartJoiner,
+  flatMessage,
+  flatPart,
+  parseBounded,
+  type Flat,
+  type Out,
+} from "./output-join.js";
+import {
   PROJECT_DIR,
   TEST_LIMITS,
-  UNBOUNDED_MESSAGES_ERROR,
   assistantMessage,
   bundle,
   completedToolPart,
@@ -56,168 +64,22 @@ afterEach(() => {
   while (v2Cleanups.length > 0) v2Cleanups.pop()!();
 });
 
-const BUDGET = { bytes: 40 * 1024, lines: 1_900 };
-const LONE_SURROGATE = /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/;
-const TEXT_FIELDS: readonly string[] = ["content", "title", "input", "output", "error"];
 const noYield = async (): Promise<void> => {};
-
-type Out = {
-  ok: boolean;
-  trimmed?: boolean;
-  continuation?: string;
-  error?: string;
-  [key: string]: unknown;
-};
-type Flat = Record<string, unknown>;
 
 // ── Running a tool ───────────────────────────────────────────────────────────
 
 /**
  * Run a tool with raw arguments, as the host passes them, and check the
- * result's shape: within the budget, valid JSON, `ok` first, `trimmed` and
- * `continuation` right after it and on the first line, and every record of
- * every record array on a line of its own.
+ * result's shape (see {@link parseBounded}).
  */
 async function call(
   definition: ToolDefinition,
   args: Record<string, unknown>,
   ctx = makeContext().ctx,
 ): Promise<Out> {
-  const text = toolResultText(
-    await definition.execute(args as Parameters<typeof definition.execute>[0], ctx),
+  return parseBounded(
+    toolResultText(await definition.execute(args as Parameters<typeof definition.execute>[0], ctx)),
   );
-  const lines = text.split("\n");
-  expect(Buffer.byteLength(text, "utf8")).toBeLessThanOrEqual(BUDGET.bytes);
-  expect(lines.length).toBeLessThanOrEqual(BUDGET.lines);
-  expect(text).not.toContain(UNBOUNDED_MESSAGES_ERROR);
-  const out = JSON.parse(text) as Out;
-  const keys = Object.keys(out);
-  expect(keys[0]).toBe("ok");
-  if (out.trimmed !== undefined || out.continuation !== undefined) {
-    expect(out.trimmed).toBe(true);
-    if (out.ok) {
-      expect(keys.slice(0, 3)).toEqual(["ok", "trimmed", "continuation"]);
-      expect(lines[0]).toContain(`"continuation":${JSON.stringify(out.continuation)}`);
-    }
-  }
-  const recordLines = new Set(lines.map((line) => line.replace(/,$/, "")));
-  for (const value of Object.values(out)) {
-    if (!Array.isArray(value)) continue;
-    for (const record of value) expect(recordLines.has(JSON.stringify(record))).toBe(true);
-  }
-  return out;
-}
-
-// ── Joining trimmed outputs back together ────────────────────────────────────
-
-const roundTrip = <T>(value: T): T => JSON.parse(JSON.stringify(value)) as T;
-const asText = (value: unknown): string =>
-  typeof value === "string" ? value : JSON.stringify(value);
-
-/** A part as one whole result shows it, its text fields as text (a
- *  non-string `input` as its JSON). */
-function flatPart(part: PartOutput): Flat {
-  const out: Flat = {};
-  for (const [key, value] of Object.entries(roundTrip(part))) {
-    out[key] = TEXT_FIELDS.includes(key) ? asText(value) : value;
-  }
-  return out;
-}
-
-function flatMessage(item: MessageItem): Flat {
-  const { parts, ...envelope } = roundTrip(item);
-  return { ...envelope, parts: parts.map(flatPart) };
-}
-
-/**
- * Parts from consecutive outputs joined back into whole parts. A piece that
- * resumes a part must start exactly where the previous piece was cut, and a
- * part that is not resumed must be new, so a gap or a repeat fails here.
- */
-class PartJoiner {
-  readonly parts: Flat[] = [];
-  /** Text fields some piece was cut inside. */
-  readonly cutFields = new Set<string>();
-  private readonly seen = new Set<string>();
-  private open: { id: string; field: string; offset: number } | undefined;
-
-  add(piece: PartOutput): void {
-    const { cutAt, resumedAt, ...fields } = piece;
-    let target: Flat;
-    if (resumedAt) {
-      expect(this.open, `part ${piece.id} resumes where it was cut`).toEqual({
-        id: piece.id,
-        field: resumedAt.field,
-        offset: resumedAt.offset,
-      });
-      target = this.parts.at(-1)!;
-    } else {
-      expect(this.open, `part ${piece.id} starts before ${this.open?.id} ends`).toBeUndefined();
-      expect(this.seen.has(piece.id), `part ${piece.id} shown twice`).toBe(false);
-      this.seen.add(piece.id);
-      target = {};
-      this.parts.push(target);
-    }
-    for (const [key, value] of Object.entries(fields)) {
-      if (TEXT_FIELDS.includes(key)) {
-        const text = asText(value);
-        expect(text).not.toMatch(LONE_SURROGATE);
-        if (key === resumedAt?.field) {
-          target[key] = `${target[key] as string}${text}`;
-        } else {
-          expect(target, `field ${key} of part ${piece.id} shown twice`).not.toHaveProperty(key);
-          target[key] = text;
-        }
-      } else if (key in target) {
-        expect(value, `${key} of part ${piece.id}`).toEqual(target[key]);
-      } else {
-        target[key] = value;
-      }
-    }
-    this.open = undefined;
-    if (cutAt) {
-      expect((target[cutAt.field] as string).length).toBe(cutAt.offset);
-      this.open = { id: piece.id, field: cutAt.field, offset: cutAt.offset };
-      this.cutFields.add(cutAt.field);
-    }
-  }
-
-  end(): void {
-    expect(this.open, "the last part was left cut").toBeUndefined();
-  }
-}
-
-/** Messages from consecutive outputs joined back into whole messages. */
-class MessageJoiner {
-  private readonly entries: Array<{ id: string; envelope: Flat; parts: PartJoiner }> = [];
-
-  add(items: readonly MessageItem[]): void {
-    for (const item of items) {
-      const { parts, ...envelope } = item;
-      let entry = this.entries.at(-1);
-      if (entry?.id === item.message.id) {
-        expect(envelope).toEqual(entry.envelope);
-      } else {
-        entry?.parts.end();
-        expect(
-          this.entries.map((e) => e.id),
-          `message ${item.message.id} shown twice`,
-        ).not.toContain(item.message.id);
-        entry = { id: item.message.id, envelope, parts: new PartJoiner() };
-        this.entries.push(entry);
-      }
-      for (const part of parts) entry.parts.add(part);
-    }
-  }
-
-  messages(): Flat[] {
-    this.entries.at(-1)?.parts.end();
-    return this.entries.map((e) => ({ ...e.envelope, parts: e.parts.parts }));
-  }
-
-  cutFields(): Set<string> {
-    return new Set(this.entries.flatMap((e) => [...e.parts.cutFields]));
-  }
 }
 
 /** Every output of `recall_get` for one message, following its

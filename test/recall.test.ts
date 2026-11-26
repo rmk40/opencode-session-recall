@@ -4,7 +4,15 @@ import { buildSuggestions, search, type SearchDeps } from "../src/search.js";
 import { cardsLiteFromSessions, createCardsRuntime } from "../src/cards.js";
 import { createDrill } from "../src/drill.js";
 import { createFetchGate } from "../src/fetch-gate.js";
-import type { Limits, SearchCoverage, SearchOutput, ErrorOutput } from "../src/types.js";
+import {
+  DISCOVERY_LIMIT,
+  type Limits,
+  type SearchCoverage,
+  type SearchOutput,
+  type ErrorOutput,
+} from "../src/types.js";
+import { emptyReadCounts, type HistoryDrift } from "../src/history/source.js";
+import type { RepairProgress, RepairStatus, ReconcileProgress } from "../src/distill.js";
 import {
   PROJECT_DIR,
   TEST_LIMITS,
@@ -1797,6 +1805,47 @@ describe("recall", () => {
     // Discovery is the distiller's cold pass, not a search-time session.list:
     // providerLimit fires only when the host reports that its last discovery
     // stopped at its limit (SearchDeps.discoveryTruncated, wired by v1).
+    it.each([
+      { truncated: true, limited: true },
+      { truncated: false, limited: false },
+      { truncated: undefined, limited: false },
+    ])(
+      "reports providerLimit only when discovery stopped at its limit ($truncated)",
+      async ({ truncated, limited }) => {
+        const h = makeFakeHarness();
+        const { deps, cleanup } = await makeRecallDeps(h);
+        cleanups.push(cleanup);
+        const recall = search(h.source, true, TEST_LIMITS, {
+          ...deps,
+          ...(truncated !== undefined && { discoveryTruncated: () => truncated }),
+        });
+        const out = await runTool<SearchOutput>(recall, { query: "rate" });
+        expect((out.coverage?.limitedBy ?? []).includes("providerLimit")).toBe(limited);
+        expect(
+          out.warnings?.some((w) => w.includes("Session discovery stopped at its limit")),
+        ).toBe(limited || undefined);
+      },
+    );
+
+    it("does not report providerLimit for a card store at the discovery limit", async () => {
+      const h = makeFakeHarness();
+      const now = Date.now();
+      const many = Array.from({ length: DISCOVERY_LIMIT }, (_, i) =>
+        globalSessionFrom(session(`s-lim-${i}`, `Limit ${i}`, OTHER_DIR, now - 10_000 - i)),
+      );
+      const liteCards = cardsLiteFromSessions([...h.globalSessions, ...many]);
+      const cards = createCardsRuntime({
+        source: { getCards: () => liteCards, revision: () => undefined, degraded: true },
+      });
+      expect(cards.coverage().totalCards).toBeGreaterThanOrEqual(DISCOVERY_LIMIT);
+      const gate = createFetchGate({ concurrency: 2 });
+      const drill = createDrill({ source: h.source, gate, limits: TEST_LIMITS });
+      const recall = search(h.source, true, TEST_LIMITS, { gate, store: null, cards, drill });
+      const out = await runTool<SearchOutput>(recall, { query: "rate" });
+      expect(out.ok).toBe(true);
+      expect(out.coverage?.limitedBy ?? []).not.toContain("providerLimit");
+      expect(out.warnings?.some((w) => /discover/i.test(w))).toBeFalsy();
+    });
   });
 
   describe("exclusion family", () => {
@@ -2517,5 +2566,372 @@ describe("explicit shortlist includes uncarded sessions", () => {
     expect(out.ok).toBe(true);
     expect(out.results.some((r) => r.sessionID === "s-worker-cross")).toBe(false);
     expect(out.coverage?.sessionsSearched).toBe(0);
+  });
+});
+
+// ── Drill accounting ─────────────────────────────────────────────────────────
+
+describe("recall drill accounting", () => {
+  // "rate" matches both project sessions. s-current holds six messages, one
+  // of them a recall call of our own that builds no candidate; s-project-2
+  // holds three.
+  const RATE = { query: "rate", scope: "project", excludeCurrentSession: false };
+  type Stops = NonNullable<SearchCoverage["sessionStops"]>;
+  const byId = (stops: Stops | undefined) =>
+    Object.fromEntries((stops?.sessions ?? []).map(({ sessionID, ...s }) => [sessionID, s]));
+
+  it("counts the messages read, those with a candidate and those the filters keep, per target", async () => {
+    const recall = await recallTool(makeFakeHarness());
+    const all = await runTool<SearchOutput>(recall, RATE);
+    expect(all.coverage).toMatchObject({
+      messagesFetched: 9,
+      messagesCandidate: 8,
+      messagesEligible: 8,
+    });
+    expect(all.coverage?.sessionStops?.count).toBe(2);
+    expect(byId(all.coverage?.sessionStops)).toEqual({
+      "s-current": { fetched: 6, candidate: 5, eligible: 5, stop: "end" },
+      "s-project-2": { fetched: 3, candidate: 3, eligible: 3, stop: "end" },
+    });
+
+    // The same tool again: every page comes from the drill cache, and a role
+    // filter narrows only what is eligible.
+    const users = await runTool<SearchOutput>(recall, { ...RATE, role: "user" });
+    expect(users.coverage).toMatchObject({
+      messagesFetched: 9,
+      messagesCandidate: 8,
+      messagesEligible: 2,
+    });
+    expect(byId(users.coverage?.sessionStops)).toEqual({
+      "s-current": { fetched: 6, candidate: 5, eligible: 1, stop: "cached" },
+      "s-project-2": { fetched: 3, candidate: 3, eligible: 1, stop: "cached" },
+    });
+  });
+
+  it("lists the first ten targets in drill order and counts every one", async () => {
+    const h = makeFakeHarness();
+    const now = Date.now();
+    for (let i = 0; i < 12; i++) {
+      const s = session(`s-many-${i}`, `Many ${i}`, PROJECT_DIR, now - 5_000 - i);
+      h.sessions.push(s);
+      h.globalSessions.push(globalSessionFrom(s));
+      h.messagesBySession[s.id] = [
+        bundle(userMessage(`m-many-${i}`, s.id, now - 6_000 - i), [
+          textPart(`p-many-${i}`, s.id, `m-many-${i}`, `zephyrine note ${i}`),
+        ]),
+      ];
+    }
+    const out = await runTool<SearchOutput>(await recallTool(h), {
+      query: "zephyrine",
+      scope: "project",
+    });
+    const stops = out.coverage!.sessionStops!;
+    expect(stops.count).toBe(out.coverage!.sessionsSearched);
+    expect(stops.count).toBeGreaterThan(10);
+    expect(stops.sessions).toHaveLength(10);
+    const listed = stops.sessions.reduce((sum, s) => sum + s.fetched, 0);
+    expect(out.coverage!.messagesFetched).toBeGreaterThan(listed);
+    expect(out.coverage!.messagesFetched).toBeGreaterThanOrEqual(out.coverage!.messagesCandidate);
+    expect(out.coverage!.messagesCandidate).toBeGreaterThanOrEqual(out.coverage!.messagesEligible);
+  });
+
+  it("lists the targets the per-query budget left unread, with nothing counted for them", async () => {
+    const limits: Limits = { ...TEST_LIMITS, drillCharsPerQuery: 1 };
+    const out = await runTool<SearchOutput>(
+      await recallTool(makeFakeHarness(), true, limits),
+      RATE,
+    );
+    const [read, unread] = out.coverage!.sessionStops!.sessions;
+    expect(read!.stop).toBe("end");
+    expect(unread).toEqual({
+      sessionID: unread!.sessionID,
+      fetched: 0,
+      candidate: 0,
+      eligible: 0,
+      stop: "queryBudget",
+    });
+    expect(out.coverage!.messagesFetched).toBe(read!.fetched);
+  });
+
+  it("lists a target whose history failed to load as loadError", async () => {
+    const h = makeFakeHarness({ messageThrows: new Set(["s-project-2"]) });
+    const out = await runTool<SearchOutput>(await recallTool(h), RATE);
+    expect(byId(out.coverage?.sessionStops)["s-project-2"]).toEqual({
+      fetched: 0,
+      candidate: 0,
+      eligible: 0,
+      stop: "loadError",
+    });
+    expect(out.coverage).toMatchObject({ messagesFetched: 6, sessionsSearched: 1 });
+  });
+});
+
+// ── History drift, card repair and cut messages ──────────────────────────────
+
+describe("recall history coverage", () => {
+  const RATE = { query: "rate", scope: "project", excludeCurrentSession: false };
+  const DRIFT = /differs from what this plugin version reads/;
+  const REPAIR = /Card repair|could not be rebuilt/;
+
+  /** The drift state of a database this build reads in full. */
+  const clean = (): HistoryDrift => ({
+    capabilities: { parts: true },
+    migration: { newest: "20261120004954_machine-key", tested: true },
+    unknownTables: [],
+    missingColumns: [],
+    unknownPartTypeNames: [],
+    reads: 12,
+    counts: emptyReadCounts(),
+  });
+  const sweep = (over: Partial<RepairProgress> = {}): RepairProgress => ({
+    pending: 0,
+    repairPending: 0,
+    done: 7,
+    gen: 3,
+    at: 1_000,
+    running: false,
+    ...over,
+  });
+  const reconcile = (over: Partial<ReconcileProgress> = {}): ReconcileProgress => ({
+    sweep: 4,
+    session: "s-x",
+    after: 120,
+    startedAt: 5_000,
+    previousStartedAt: 3_000,
+    checked: 9,
+    mismatched: 1,
+    at: 6_000,
+    ...over,
+  });
+
+  async function recallWith(extra: Partial<SearchDeps>, h = makeFakeHarness()) {
+    const { deps, store, cleanup } = await makeRecallDeps(h);
+    cleanups.push(cleanup);
+    return { recall: search(h.source, true, TEST_LIMITS, { ...deps, ...extra }), store };
+  }
+  const warningsOf = async (extra: Partial<SearchDeps>): Promise<string[]> => {
+    const { recall } = await recallWith(extra);
+    return (await runTool<SearchOutput>(recall, RATE)).warnings ?? [];
+  };
+
+  it("leaves coverage.history out when the host has no drift state to report", async () => {
+    for (const extra of [{}, { history: () => undefined, repair: () => undefined }]) {
+      const { recall } = await recallWith(extra);
+      const out = await runTool<SearchOutput>(recall, RATE);
+      expect(out.coverage?.history).toBeUndefined();
+    }
+  });
+
+  it("reports the drift state, the repair sweep and the range check, and warns of none of them when all is well", async () => {
+    const drift = { ...clean(), counts: { ...emptyReadCounts(), partialMessages: 2 } };
+    const { recall } = await recallWith({
+      history: () => drift,
+      repair: () => ({ sweep: sweep(), reconcile: reconcile() }),
+    });
+    const out = await runTool<SearchOutput>(recall, RATE);
+    expect(out.coverage?.history).toEqual({
+      capabilities: { parts: true },
+      migration: { newest: "20261120004954_machine-key", tested: true },
+      unknownTables: [],
+      reads: 12,
+      counts: { ...emptyReadCounts(), partialMessages: 2 },
+      repair: { pending: 0, repairPending: 0, done: 7, running: false, at: 1_000 },
+      reconcile: {
+        sweeps: 4,
+        oldestUnchecked: { session: "s-x", after: 120 },
+        lastSweepCompletedAt: 5_000,
+        checkedSince: 3_000,
+        lastCheckAt: 6_000,
+      },
+    });
+    expect(out.warnings?.some((w) => DRIFT.test(w) || REPAIR.test(w))).toBeFalsy();
+  });
+
+  it("reports missing columns, unknown part types, a stalled sweep and a range check before its first sweep", async () => {
+    const drift: HistoryDrift = {
+      ...clean(),
+      capabilities: { parts: false },
+      missingColumns: ["session_part.ordinal"],
+      unknownPartTypeNames: ["hologram"],
+      counts: { ...emptyReadCounts(), unknownPartTypes: 1 },
+    };
+    const status: RepairStatus = {
+      sweep: { ...sweep({ pending: 2, running: true }), stalled: true },
+      reconcile: reconcile({ previousStartedAt: null, session: null, after: null }),
+    };
+    const { recall } = await recallWith({ history: () => drift, repair: () => status });
+    const history = (await runTool<SearchOutput>(recall, RATE)).coverage?.history;
+    expect(history).toMatchObject({
+      capabilities: { parts: false },
+      missingColumns: ["session_part.ordinal"],
+      unknownPartTypeNames: ["hologram"],
+      repair: { pending: 2, running: true, stalled: true },
+      reconcile: {
+        sweeps: 4,
+        oldestUnchecked: { session: null, after: null },
+        lastSweepCompletedAt: null,
+        checkedSince: null,
+      },
+    });
+  });
+
+  it.each<[string, Partial<HistoryDrift>, string]>([
+    [
+      "an untested migration",
+      { migration: { newest: "20270101000000_future", tested: false } },
+      "untested migration 20270101000000_future",
+    ],
+    [
+      "no migration recorded",
+      { migration: { newest: null, tested: false } },
+      "untested migration (none recorded)",
+    ],
+    [
+      "unknown tables",
+      { unknownTables: ["session_future", "session_x"] },
+      "unknown tables session_future, session_x",
+    ],
+    [
+      "missing columns",
+      { missingColumns: ["session_part.data"] },
+      "missing columns session_part.data",
+    ],
+    [
+      "parts of unknown types",
+      { unknownPartTypeNames: ["hologram"], counts: { ...emptyReadCounts(), unknownPartTypes: 2 } },
+      "2 parts of unknown types (hologram)",
+    ],
+    [
+      "one part of an unnamed unknown type",
+      { counts: { ...emptyReadCounts(), unknownPartTypes: 1 } },
+      "1 part of unknown types",
+    ],
+    [
+      "assistant messages empty despite part rows",
+      { counts: { ...emptyReadCounts(), emptyWithParts: 3 } },
+      "3 assistant messages read empty despite part rows",
+    ],
+    [
+      "parts that do not decode",
+      { counts: { ...emptyReadCounts(), malformedParts: 1 } },
+      "1 part that do not decode",
+    ],
+  ])("warns once of drift: %s", async (_name, change, fragment) => {
+    const drift = { ...clean(), ...change };
+    const warnings = (await warningsOf({ history: () => drift })).filter((w) => DRIFT.test(w));
+    expect(warnings).toHaveLength(1);
+    // Each case is the only finding, so it is the whole list.
+    expect(warnings[0]).toContain(`reads (${fragment}); some content may be missing`);
+  });
+
+  it("lists every drift finding in one warning", async () => {
+    const drift: HistoryDrift = {
+      ...clean(),
+      migration: { newest: "20270101000000_future", tested: false },
+      unknownTables: ["session_future"],
+      counts: { ...emptyReadCounts(), malformedParts: 2 },
+    };
+    const warnings = (await warningsOf({ history: () => drift })).filter((w) => DRIFT.test(w));
+    expect(warnings).toEqual([
+      "opencode's history database differs from what this plugin version reads (untested migration 20270101000000_future; unknown tables session_future; 2 parts that do not decode); some content may be missing from results. Updating opencode-session-recall may fix it.",
+    ]);
+  });
+
+  it("gives no drift warning for reads that were only cut short, stray, oversized or changing", async () => {
+    const drift = {
+      ...clean(),
+      counts: {
+        ...emptyReadCounts(),
+        partialMessages: 3,
+        strayParts: 1,
+        oversizedParts: 2,
+        changedMessages: 1,
+      },
+    };
+    expect((await warningsOf({ history: () => drift })).some((w) => DRIFT.test(w))).toBe(false);
+  });
+
+  it.each<[string, RepairProgress, RegExp | undefined]>([
+    [
+      "in progress",
+      sweep({ pending: 3, running: true }),
+      /^Card repair in progress: 3 session cards not yet rebuilt; /,
+    ],
+    [
+      "in progress for one card, with others given up on",
+      sweep({ pending: 1, repairPending: 2, running: true }),
+      /^Card repair in progress: 1 session card not yet rebuilt \(2 more cards could not be rebuilt\);/,
+    ],
+    [
+      "stalled",
+      { ...sweep({ pending: 4, running: true }), stalled: true },
+      /^Card repair has stalled with 4 session cards not yet rebuilt; .*Restarting opencode resumes it\.$/,
+    ],
+    [
+      "finished with cards it could not rebuild",
+      sweep({ repairPending: 1 }),
+      /^1 session card could not be rebuilt by this plugin version;/,
+    ],
+    ["finished", sweep(), undefined],
+  ])("warns of card repair %s", async (_name, progress, expected) => {
+    const warnings = (
+      await warningsOf({ history: clean, repair: () => ({ sweep: progress }) })
+    ).filter((w) => REPAIR.test(w));
+    if (expected) {
+      expect(warnings).toHaveLength(1);
+      expect(warnings[0]).toMatch(expected);
+    } else {
+      expect(warnings).toEqual([]);
+    }
+  });
+
+  it("names the result sessions whose cards were indexed with messages cut short", async () => {
+    const { recall, store } = await recallWith({});
+    const checkpoint = (cut: number | undefined): string =>
+      JSON.stringify({
+        v: 2,
+        seq: 3,
+        msgId: "m",
+        msgUpdated: 1,
+        sessKey: 1,
+        unsettled: null,
+        parts: 0,
+        partsUpdated: 0,
+        fp: "f",
+        ...(cut !== undefined && { cut }),
+      });
+    const setCursor = (id: string, cursor: string): void => {
+      const card = store.getCard(id)!;
+      store.refreshCardMeta(
+        id,
+        {
+          title: card.title,
+          directory: card.directory,
+          projectId: card.projectId,
+          timeUpdated: card.timeUpdated,
+        },
+        cursor,
+      );
+    };
+    setCursor("s-project-2", checkpoint(2));
+    setCursor("s-current", checkpoint(1));
+    // An older build's checkpoint records no cut.
+    setCursor("s-other", JSON.stringify({ v: 1, seq: 2, unsettled: null }));
+    store.setMeta("cards_rev", "99");
+    const cutWarning = (out: SearchOutput) => out.warnings?.filter((w) => /cut short/.test(w));
+
+    const both = await runTool<SearchOutput>(recall, RATE);
+    expect(cutWarning(both)).toEqual([
+      "2 result sessions were indexed with 3 messages cut short, so the index misses part of them; recall_get reads a message in full.",
+    ]);
+    const one = await runTool<SearchOutput>(recall, { ...RATE, sessionID: "s-project-2" });
+    expect(cutWarning(one)).toEqual([
+      "1 result session was indexed with 2 messages cut short, so the index misses part of them; recall_get reads a message in full.",
+    ]);
+    // Neither cut session is a result.
+    const other = await runTool<SearchOutput>(recall, { query: "walkthrough", scope: "global" });
+    expect(other.results.length).toBeGreaterThan(0);
+    expect(other.results.every((r) => r.sessionID === "s-other")).toBe(true);
+    expect(cutWarning(other) ?? []).toEqual([]);
   });
 });

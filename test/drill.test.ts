@@ -17,6 +17,7 @@ import {
   apiFailure,
   assistantMessage,
   bundle,
+  completedToolPart,
   messagesResponse,
   paginateBundles,
   PROJECT_DIR,
@@ -1319,5 +1320,317 @@ describe("drill cache entries dropped mid-query", () => {
     const again = await drill.pools(poolsInput([revised("s-x", 2)], "needle"));
     expect(ctl.pages).toHaveLength(2);
     expect(poolTexts(again, "s-x")).toEqual([repaired]);
+  });
+});
+
+// ── Per-target accounting: what each target's read fetched and why it
+// stopped, for every target in drill order, read or not. ──
+
+/** Zero counts with `stop`: a target that was never read. */
+const unread = (sessionId: string, stop: string) => ({
+  sessionId,
+  fetched: 0,
+  candidate: 0,
+  eligible: 0,
+  stop,
+});
+
+describe("drill per-target accounting", () => {
+  it("stops at the anchor when a later page matches nothing, and at the end when that page was the last", async () => {
+    // Page size 1: each session's second page lacks "alpha". s-a has a third
+    // page left; s-b's second page is its last.
+    const graph: Graph = {
+      messagesBySession: {
+        "s-a": [
+          note("s-a", "a1", 1000, "beta oldest"),
+          note("s-a", "a2", 2000, "beta middle"),
+          note("s-a", "a3", 3000, "alpha newest"),
+        ],
+        "s-b": [note("s-b", "b1", 1000, "beta oldest"), note("s-b", "b2", 2000, "alpha newest")],
+      },
+    };
+    const { source } = makeControlledSource(graph);
+    const drill = newDrill(source, { drillPageMessages: 1 });
+
+    const out = await drill.pools(poolsInput([revised("s-a"), revised("s-b")], "alpha"));
+    expect(out.targets).toEqual([
+      { sessionId: "s-a", fetched: 2, candidate: 2, eligible: 2, stop: "anchor" },
+      { sessionId: "s-b", fetched: 2, candidate: 2, eligible: 2, stop: "end" },
+    ]);
+    // Each drilled pool carries the same stats.
+    expect(out.pools.map((p) => ({ sessionId: p.target.sessionId, ...p.stats }))).toEqual(
+      out.targets,
+    );
+  });
+
+  it("stops on the per-session budget while pages remain", async () => {
+    const graph: Graph = {
+      messagesBySession: {
+        "s-a": [
+          note("s-a", "a1", 1000, sized("alpha one", 200)),
+          note("s-a", "a2", 2000, sized("alpha two", 200)),
+        ],
+      },
+    };
+    const { source } = makeControlledSource(graph);
+    const drill = newDrill(source, { drillPageMessages: 1, drillCharsPerSession: 100 });
+
+    const out = await drill.pools(poolsInput([revised("s-a")], "alpha"));
+    expect(out.targets).toEqual([
+      { sessionId: "s-a", fetched: 1, candidate: 1, eligible: 1, stop: "sessionBudget" },
+    ]);
+  });
+
+  it("reports targetsCut when the budget runs out before every point lookup, unless paging spent it", async () => {
+    // Page size 1. In s-a the walk reads a5 and a4 and stops at the anchor,
+    // with budget left for the a1 lookup but not the a2 one. In s-b the first
+    // page alone spends the budget, so its stop stays sessionBudget.
+    const graph: Graph = {
+      messagesBySession: {
+        "s-a": [
+          note("s-a", "a1", 1000, sized("alpha archived", 500)),
+          note("s-a", "a2", 2000, "alpha archived too"),
+          note("s-a", "a3", 3000, "chatter"),
+          note("s-a", "a4", 4000, "chatter"),
+          note("s-a", "a5", 5000, "alpha recent"),
+        ],
+        "s-b": [
+          note("s-b", "b1", 1000, "alpha archived"),
+          note("s-b", "b2", 2000, "chatter"),
+          note("s-b", "b3", 3000, sized("alpha recent", 400)),
+        ],
+      },
+    };
+    const { source, ctl } = makeControlledSource(graph);
+    const drill = newDrill(source, { drillPageMessages: 1, drillCharsPerSession: 300 });
+
+    const out = await drill.pools(
+      poolsInput([revised("s-a"), revised("s-b")], "alpha", {
+        "s-a": [ftsHit("s-a", "a1"), ftsHit("s-a", "a2")],
+        "s-b": [ftsHit("s-b", "b1")],
+      }),
+    );
+    expect(ctl.lookups.map((l) => l.messageID)).toEqual(["a1"]);
+    expect(out.targets).toEqual([
+      { sessionId: "s-a", fetched: 3, candidate: 3, eligible: 3, stop: "targetsCut" },
+      { sessionId: "s-b", fetched: 1, candidate: 1, eligible: 1, stop: "sessionBudget" },
+    ]);
+  });
+
+  it("reports cached, with the same counts, when the cache held every page and lookup", async () => {
+    const graph: Graph = {
+      messagesBySession: {
+        "s-a": [
+          note("s-a", "a1", 1000, "alpha archived"),
+          note("s-a", "a2", 2000, "chatter"),
+          note("s-a", "a3", 3000, "alpha recent"),
+        ],
+      },
+    };
+    const { source } = makeControlledSource(graph);
+    const drill = newDrill(source, { drillPageMessages: 1 });
+    const input = poolsInput([revised("s-a")], "alpha", { "s-a": [ftsHit("s-a", "a1")] });
+
+    const cold = await drill.pools(input);
+    const warm = await drill.pools(input);
+    // The walk stops at a2, which lacks the anchor; a1 comes from its lookup.
+    expect(cold.targets).toEqual([
+      { sessionId: "s-a", fetched: 3, candidate: 3, eligible: 3, stop: "anchor" },
+    ]);
+    expect(warm.targets).toEqual([{ ...cold.targets[0]!, stop: "cached" }]);
+  });
+
+  it("counts messages read, those with a candidate, and those the filters keep, apart", async () => {
+    // A recall call of our own builds no candidate; the role filter keeps
+    // only the user message; the title candidate is not a message.
+    const graph: Graph = {
+      messagesBySession: {
+        "s-a": [
+          note("s-a", "a1", 1000, "alpha asked"),
+          bundle(assistantMessage("a2", "s-a", 2000), [
+            textPart("a2-p", "s-a", "a2", "alpha answered"),
+          ]),
+          bundle(assistantMessage("a3", "s-a", 3000), [
+            completedToolPart("a3-p", "s-a", "a3", "recall", { query: "alpha" }, "alpha recalled"),
+          ]),
+        ],
+      },
+    };
+    const { source } = makeControlledSource(graph);
+    const drill = newDrill(source);
+
+    const out = await drill.pools({
+      ...poolsInput([revised("s-a")], "alpha"),
+      filter: (candidate) => candidate.role === "user",
+      searchTitles: true,
+    });
+    expect(out.pools[0]!.candidates.some((c) => c.partType === "title")).toBe(true);
+    expect(out.targets).toEqual([
+      { sessionId: "s-a", fetched: 3, candidate: 2, eligible: 1, stop: "end" },
+    ]);
+  });
+
+  it("lists the targets the per-query budget left unread as queryBudget", async () => {
+    const graph: Graph = {
+      messagesBySession: {
+        "s-a": [note("s-a", "a1", 1000, "alpha one")],
+        "s-b": [note("s-b", "b1", 1000, "alpha two")],
+        "s-c": [note("s-c", "c1", 1000, "alpha three")],
+      },
+    };
+    const { source } = makeControlledSource(graph);
+    const drill = newDrill(source, { drillCharsPerQuery: 1 });
+
+    const out = await drill.pools(
+      poolsInput(
+        ["s-a", "s-b", "s-c"].map((id) => revised(id)),
+        "alpha",
+      ),
+    );
+    expect(out.targets).toEqual([
+      { sessionId: "s-a", fetched: 1, candidate: 1, eligible: 1, stop: "end" },
+      unread("s-b", "queryBudget"),
+      unread("s-c", "queryBudget"),
+    ]);
+  });
+
+  it("marks a session whose read failed as loadError and reads the next", async () => {
+    const graph: Graph = {
+      messagesBySession: {
+        "s-a": [note("s-a", "a1", 1000, "alpha one")],
+        "s-b": [note("s-b", "b1", 1000, "alpha two")],
+      },
+    };
+    const { source, ctl } = makeControlledSource(graph);
+    ctl.failPage = (req) => req.sessionID === "s-a";
+    const drill = newDrill(source);
+
+    const out = await drill.pools(poolsInput([revised("s-a"), revised("s-b")], "alpha"));
+    expect(out.loadErrors).toHaveLength(1);
+    expect(out.targets).toEqual([
+      unread("s-a", "loadError"),
+      { sessionId: "s-b", fetched: 1, candidate: 1, eligible: 1, stop: "end" },
+    ]);
+  });
+
+  it("marks every target from an abort on as aborted", async () => {
+    const graph: Graph = {
+      messagesBySession: {
+        "s-a": [note("s-a", "a1", 1000, "alpha one")],
+        "s-b": [note("s-b", "b1", 1000, "alpha two")],
+      },
+    };
+    const { source, ctl } = makeControlledSource(graph);
+    const drill = newDrill(source);
+    const targets = [revised("s-a"), revised("s-b")];
+
+    const before = new AbortController();
+    before.abort();
+    const none = await drill.pools({ ...poolsInput(targets, "alpha"), abort: before.signal });
+    expect(none.targets).toEqual([unread("s-a", "aborted"), unread("s-b", "aborted")]);
+
+    // Aborted while s-a's page is in flight: s-a finishes, s-b is not read.
+    const during = new AbortController();
+    ctl.holdPage = (req) => req.sessionID === "s-a";
+    const pending = drill.pools({ ...poolsInput(targets, "alpha"), abort: during.signal });
+    await waitFor(() => ctl.held.length === 1);
+    during.abort();
+    ctl.held[0]!();
+    const out = await pending;
+    expect(out.targets).toEqual([
+      { sessionId: "s-a", fetched: 1, candidate: 1, eligible: 1, stop: "end" },
+      unread("s-b", "aborted"),
+    ]);
+  });
+
+  describe("in a deep sweep", () => {
+    /** `count` messages of `chars` chars each, all matching "alpha". */
+    const long = (sid: string, count: number, chars = 50): MessageBundle[] =>
+      Array.from({ length: count }, (_, i) =>
+        note(sid, `${sid}-m${i}`, 1000 + i, sized(`alpha ${i}`, chars)),
+      );
+    const deepInput = (ids: string[], charsPerQuery: number, abort?: AbortSignal) => ({
+      sessions: ids.map((id) => revised(id)),
+      query: parseQuery("alpha"),
+      charsPerQuery,
+      ...(abort && { abort }),
+    });
+
+    it("sweeps whole sessions to their end, and marks those left with the budget that stopped it", async () => {
+      // s-a alone spends the budget, on its only page.
+      const { source } = makeControlledSource({
+        messagesBySession: { "s-a": long("s-a", 3), "s-b": long("s-b", 3), "s-c": long("s-c", 3) },
+      });
+      const out = await newDrill(source).deep(deepInput(["s-a", "s-b", "s-c"], 100));
+      expect(out.targets).toEqual([
+        { sessionId: "s-a", fetched: 3, candidate: 3, eligible: 3, stop: "end" },
+        unread("s-b", "budget"),
+        unread("s-c", "budget"),
+      ]);
+      expect(out.pools.map((p) => p.stats.stop)).toEqual(["end"]);
+    });
+
+    it("marks the session a budget stopped inside with that budget", async () => {
+      // Sixty messages: the sweep reads 50 per page, so s-a has a second page.
+      const { source } = makeControlledSource({
+        messagesBySession: { "s-a": long("s-a", 60), "s-b": long("s-b", 3) },
+      });
+      const out = await newDrill(source).deep(deepInput(["s-a", "s-b"], 100));
+      expect(out.targets).toEqual([
+        { sessionId: "s-a", fetched: 50, candidate: 50, eligible: 50, stop: "budget" },
+        unread("s-b", "budget"),
+      ]);
+    });
+
+    it("marks the sessions the wall clock stopped inside and before as wallClock", async () => {
+      // The clock passes the deadline once s-a's first page is read.
+      let reads = 0;
+      const graph: Graph = { messagesBySession: { "s-a": long("s-a", 60), "s-b": long("s-b", 3) } };
+      const { source } = makeControlledSource(graph);
+      const counting: HistorySource = {
+        ...source,
+        messagePage: async (o) => {
+          reads++;
+          return source.messagePage(o);
+        },
+      };
+      const drill = createDrill({
+        source: counting,
+        gate: createFetchGate({ concurrency: 4 }),
+        limits: TEST_LIMITS,
+        now: () => (reads === 0 ? 0 : 1_000_000),
+        deepWallClockMs: 1_000,
+      });
+      const out = await drill.deep(deepInput(["s-a", "s-b"], 1_000_000));
+      expect(out.targets).toEqual([
+        { sessionId: "s-a", fetched: 50, candidate: 50, eligible: 50, stop: "wallClock" },
+        unread("s-b", "wallClock"),
+      ]);
+    });
+
+    it("marks every session as aborted when the sweep was cancelled before it began", async () => {
+      const { source, ctl } = makeControlledSource({
+        messagesBySession: { "s-a": long("s-a", 3), "s-b": long("s-b", 3) },
+      });
+      const controller = new AbortController();
+      controller.abort();
+      const out = await newDrill(source).deep(
+        deepInput(["s-a", "s-b"], 1_000_000, controller.signal),
+      );
+      expect(ctl.pages).toEqual([]);
+      expect(out.targets).toEqual([unread("s-a", "aborted"), unread("s-b", "aborted")]);
+    });
+
+    it("marks a session whose read failed as loadError and sweeps the next", async () => {
+      const { source, ctl } = makeControlledSource({
+        messagesBySession: { "s-a": long("s-a", 3), "s-b": long("s-b", 3) },
+      });
+      ctl.failPage = (req) => req.sessionID === "s-a";
+      const out = await newDrill(source).deep(deepInput(["s-a", "s-b"], 1_000_000));
+      expect(out.targets).toEqual([
+        unread("s-a", "loadError"),
+        { sessionId: "s-b", fetched: 3, candidate: 3, eligible: 3, stop: "end" },
+      ]);
+    });
   });
 });
