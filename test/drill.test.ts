@@ -1636,3 +1636,85 @@ describe("drill per-target accounting", () => {
     });
   });
 });
+
+describe("drill tool-name counts", () => {
+  // A user note, then two bash calls and one read call on assistant messages.
+  // The predicate under test admits the parts older than 3000 only.
+  const toolGraph = (): Graph => ({
+    messagesBySession: {
+      "s-a": [
+        note("s-a", "a1", 1000, "alpha asked"),
+        bundle(assistantMessage("a2", "s-a", 2000), [
+          completedToolPart("a2-p", "s-a", "a2", "bash", { command: "alpha" }, "alpha out"),
+          completedToolPart("a2-q", "s-a", "a2", "read", { filePath: "alpha.ts" }, "alpha src"),
+        ]),
+        bundle(assistantMessage("a3", "s-a", 3000), [
+          completedToolPart("a3-p", "s-a", "a3", "bash", { command: "alpha" }, "alpha again"),
+        ]),
+      ],
+    },
+  });
+  const olderThan3000 = (candidate: { time: number }): boolean => candidate.time < 3000;
+  const expected = new Map([
+    ["bash", 1],
+    ["read", 1],
+  ]);
+
+  it("counts the tool parts countTools admits, whatever the filter keeps", async () => {
+    const { source } = makeControlledSource(toolGraph());
+    const out = await newDrill(source).pools({
+      ...poolsInput([revised("s-a")], "alpha"),
+      filter: (candidate) => candidate.partType !== "tool",
+      countTools: olderThan3000,
+    });
+    expect(out.pools[0]!.candidates.map((c) => c.partType)).toEqual(["text"]);
+    expect(out.pools[0]!.toolNames).toEqual(expected);
+  });
+
+  it("counts the tool parts the authorship stage removes apart from those it keeps", async () => {
+    const { source } = makeControlledSource(toolGraph());
+    const drill = newDrill(source);
+    const removing = await drill.pools({
+      ...poolsInput([revised("s-a")], "alpha"),
+      authorship: new Set(["human"] as const),
+      countTools: olderThan3000,
+    });
+    expect(removing.pools[0]!.candidates.some((c) => c.partType === "tool")).toBe(false);
+    expect(removing.pools[0]!.toolNames).toEqual(new Map());
+    expect(removing.pools[0]!.authorshipToolNames).toEqual(expected);
+
+    // Tool parts on assistant messages classify as model-authored.
+    const keeping = await drill.pools({
+      ...poolsInput([revised("s-a")], "alpha"),
+      authorship: new Set(["model"] as const),
+      countTools: olderThan3000,
+    });
+    expect(keeping.pools[0]!.toolNames).toEqual(expected);
+    expect(keeping.pools[0]!.authorshipToolNames).toEqual(new Map());
+  });
+
+  it("counts nothing without countTools", async () => {
+    const { source } = makeControlledSource(toolGraph());
+    const out = await newDrill(source).pools(poolsInput([revised("s-a")], "alpha"));
+    expect(out.pools[0]).not.toHaveProperty("toolNames");
+  });
+
+  it("counts the same way in a deep sweep", async () => {
+    const { source } = makeControlledSource(toolGraph());
+    const drill = newDrill(source);
+    const sweep = {
+      sessions: [revised("s-a")],
+      query: parseQuery("alpha"),
+      charsPerQuery: 1_000_000,
+      filter: () => false,
+      authorship: new Set(["human"] as const),
+    };
+    const counted = await drill.deep({ ...sweep, countTools: olderThan3000 });
+    expect(counted.pools[0]!.candidates).toEqual([]);
+    expect(counted.pools[0]!.toolNames).toEqual(new Map());
+    expect(counted.pools[0]!.authorshipToolNames).toEqual(expected);
+
+    const uncounted = await drill.deep(sweep);
+    expect(uncounted.pools[0]).not.toHaveProperty("toolNames");
+  });
+});

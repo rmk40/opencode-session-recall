@@ -22,6 +22,7 @@ import {
   type IndexingStatus,
   type HistoryCoverage,
   type HistoryRepairCoverage,
+  type ToolNamesCoverage,
   indexingWarning,
   DISCOVERY_LIMIT,
 } from "./types.js";
@@ -40,7 +41,16 @@ import {
   type AuthorshipCounts,
 } from "./authorship.js";
 import { parseQuery } from "./query.js";
-import { candidateEligible, type Candidate, type CandidateFilters } from "./candidates.js";
+import {
+  candidateFilter,
+  closestToolName,
+  compileToolFilter,
+  toolFilterMatches,
+  toolFilterNames,
+  type Candidate,
+  type CandidateFilters,
+  type ToolFilter,
+} from "./candidates.js";
 import type { CandidateEmbedder } from "./corpus.js";
 import { cosineSimilarity } from "./semantic/similarity.js";
 import { clamp01, bm25Search, type Bm25Hit } from "./bm25.js";
@@ -1735,6 +1745,43 @@ export function buildSuggestions(input: {
     }
   }
 
+  // A toolName that matched no tool part the other filters keep. When the
+  // authorship filter removed the parts it did match, that filter emptied the
+  // result; otherwise the name did, so name what is there. A deep sweep that
+  // stopped early has not seen every scoped session, so it asks for the rest
+  // of the sweep before another name.
+  const tools = input.coverage.toolNames;
+  let toolAuthorshipHint = false;
+  if (input.results.length === 0 && tools && tools.matched === 0) {
+    const sweptSoFar = input.coverage.deep?.exhaustedBudget === true;
+    const where = sweptSoFar ? "the sessions swept so far" : "the searched sessions";
+    const named = `toolName:${JSON.stringify(tools.filter)}`;
+    if (tools.excludedByAuthorship) {
+      toolAuthorshipHint = true;
+      const count = tools.excludedByAuthorship;
+      add(0, {
+        reason: `${named} matched ${count} tool part${count === 1 ? "" : "s"} in ${where}, but the authorship:${JSON.stringify(input.authorship ?? [])} filter removed ${count === 1 ? "it" : "them all"}.`,
+        action:
+          'Tool parts classify as "model" on assistant messages and "injected" on user messages: add those to authorship, or pass authorship:"any".',
+        example: { authorship: "any" },
+      });
+    } else {
+      const listed = tools.top
+        .slice(0, 3)
+        .map((entry) => `${entry.name} (${entry.count})`)
+        .join(", ");
+      add(0, {
+        reason: `${named} matched none of the ${tools.parts} tool part${tools.parts === 1 ? "" : "s"} in ${where}; the most frequent ${tools.top.length === 1 ? "is" : "are"} ${listed}.`,
+        action: sweptSoFar
+          ? "The sweep has not reached every scoped session: pass nextCursor as deepCursor to search the rest before changing toolName."
+          : tools.closest
+            ? `Retry with toolName:${JSON.stringify(tools.closest)}, the closest name found.`
+            : "Retry with a name from coverage.toolNames.top, or drop toolName.",
+        ...(!sweptSoFar && tools.closest && { example: { toolName: tools.closest } }),
+      });
+    }
+  }
+
   // Routing hint: never override the caller, only suggest a better-fitting mode.
   const routed = classifyQuery(input.query, input.matchMode);
   if (routed.suggested === "regex") {
@@ -1786,7 +1833,14 @@ export function buildSuggestions(input: {
     });
   }
 
-  if (input.results.length === 0 && input.authorship && input.authorship.length > 0) {
+  // The tool-name hint above already names the authorship filter and how to
+  // widen it, for the parts it removed.
+  if (
+    input.results.length === 0 &&
+    input.authorship &&
+    input.authorship.length > 0 &&
+    !toolAuthorshipHint
+  ) {
     // Only name the delegated bucket when it is actually being withheld —
     // otherwise the reason contradicts an authorship:"delegated" request.
     const hidesDelegated = !input.authorship.includes("delegated");
@@ -2048,6 +2102,66 @@ function drillAccounting(
         })),
       },
     }),
+  };
+}
+
+/** Tool names `coverage.toolNames.top` lists. */
+const TOOL_NAMES_SHOWN = 10;
+
+/** Tool parts per tool name across the pools: `kept` from each pool's
+ *  `toolNames`, `removed` from its `authorshipToolNames` (see
+ *  {@link DrilledPool}). */
+function poolToolNames(pools: readonly DrilledPool[]): {
+  kept: Map<string, number>;
+  removed: Map<string, number>;
+} {
+  const kept = new Map<string, number>();
+  const removed = new Map<string, number>();
+  const add = (into: Map<string, number>, from: ReadonlyMap<string, number> | undefined) => {
+    for (const [name, count] of from ?? []) into.set(name, (into.get(name) ?? 0) + count);
+  };
+  for (const pool of pools) {
+    add(kept, pool.toolNames);
+    add(removed, pool.authorshipToolNames);
+  }
+  return { kept, removed };
+}
+
+/** `coverage.toolNames` for a `toolName` filter over the counted tool parts
+ *  the authorship filter kept (`counts`) and those it removed
+ *  (`authorshipRemoved`, of which only the names the filter accepts count);
+ *  undefined when neither holds a part. Exported for direct unit tests. */
+export function toolNamesCoverage(
+  requested: string,
+  filter: ToolFilter,
+  counts: ReadonlyMap<string, number>,
+  authorshipRemoved: ReadonlyMap<string, number> = new Map(),
+): ToolNamesCoverage | undefined {
+  let parts = 0;
+  let matched = 0;
+  for (const [name, count] of counts) {
+    parts += count;
+    if (toolFilterMatches(filter, name)) matched += count;
+  }
+  let excludedByAuthorship = 0;
+  for (const [name, count] of authorshipRemoved) {
+    if (toolFilterMatches(filter, name)) excludedByAuthorship += count;
+  }
+  if (parts === 0 && excludedByAuthorship === 0) return undefined;
+  const top = [...counts.entries()]
+    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+    .slice(0, TOOL_NAMES_SHOWN)
+    .map(([name, count]) => ({ name, count }));
+  const closest = closestToolName(requested, counts, filter);
+  return {
+    filter: requested,
+    accepted: toolFilterNames(filter),
+    matched,
+    ...(excludedByAuthorship > 0 && { excludedByAuthorship }),
+    parts,
+    distinct: counts.size,
+    top,
+    ...(closest !== undefined && { closest }),
   };
 }
 
@@ -2362,7 +2476,12 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
         .optional()
         .describe("true=current project only; a path filters to that project dir"),
       fallback: tool.schema.boolean().default(false).describe("Broaden directory search if needed"),
-      toolName: tool.schema.string().optional().describe("Exact tool name; tool parts only"),
+      toolName: tool.schema
+        .string()
+        .optional()
+        .describe(
+          "Tool name, exact; tool parts only. Aliases match in any case: bash/shell, task/subagent, apply_patch/patch",
+        ),
       expand: tool.schema
         .enum(["none", "context", "message"])
         .default("none")
@@ -2831,6 +2950,13 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
         const smartMode: "smart" | "fuzzy" = matchMode === "fuzzy" ? "fuzzy" : "smart";
         const searchTitles = canSearchTitles(partType, toolName);
         const filters: CandidateFilters = { type: partType, role, before, after, toolName };
+        const eligibleFilter = candidateFilter(filters);
+        const toolFilter = toolName ? compileToolFilter(toolName) : undefined;
+        // Every filter but toolName: the drill counts the tool parts it admits
+        // by name, so a toolName that matches none can say what is there.
+        const countTools = toolFilter
+          ? candidateFilter({ type: partType, role, before, after })
+          : undefined;
         if (authorshipActive) pushUnique(normalized.limitedBy, "authorship");
         const groupMode: GroupMode = groupArg;
         const isGrouped = groupMode === "session";
@@ -3789,7 +3915,8 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
           ftsBySession,
           query: queryMeta,
           explain,
-          filter: (candidate: Candidate) => candidateEligible(candidate, filters),
+          filter: eligibleFilter,
+          ...(countTools && { countTools }),
           searchTitles,
           authorship: authorshipFilter,
           abort: ctx.abort,
@@ -3849,6 +3976,8 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
           /** Statement half of the empty-pool warning, when the authorship pass
            *  emptied at least one drilled session. finish() adds the advice. */
           authorshipEmptied?: string;
+          /** Tool parts per name across the pools, under a `toolName` filter. */
+          toolCounts?: ReturnType<typeof poolToolNames>;
         } => {
           let partsSearched = 0;
           let authorshipEmptied: string | undefined;
@@ -3946,6 +4075,7 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
             loadErrorCount,
             incomplete: loadErrorCount > 0,
             ...(authorshipEmptied != null && { authorshipEmptied }),
+            ...(toolFilter && { toolCounts: poolToolNames(pools) }),
           };
         };
 
@@ -4135,6 +4265,11 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
             ].filter((warning): warning is string => Boolean(warning));
             warnings.splice(historyWarningsAt, 0, ...historyWarnings);
           }
+          if (final.length === 0 && toolName && toolFilter && outCtx.toolCounts) {
+            const { kept, removed } = outCtx.toolCounts;
+            const toolNames = toolNamesCoverage(toolName, toolFilter, kept, removed);
+            if (toolNames) outCtx.coverage.toolNames = toolNames;
+          }
           return respond(
             attachCommonOutput(expanded, {
               final,
@@ -4281,7 +4416,8 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
           const deepResult = await activeDrill.deep({
             sessions: drillTargets,
             query: queryMeta,
-            filter: (candidate: Candidate) => candidateEligible(candidate, filters),
+            filter: eligibleFilter,
+            ...(countTools && { countTools }),
             searchTitles,
             authorship: authorshipFilter,
             charsPerQuery: limits.deepCharsPerQuery,
