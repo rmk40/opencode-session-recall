@@ -2190,6 +2190,47 @@ describe("incremental", () => {
     db.close();
   });
 
+  it("keeps a root's family rollup through a full re-index of the root", async () => {
+    const root = session("R", "Root Session", PROJECT_DIR, 9000);
+    const child = session("C", "Child Session", PROJECT_DIR, 4000, undefined, "R");
+    const graph: Graph = {
+      sessions: [root, child],
+      messagesBySession: {
+        R: [bundle(userMessage("mR", "R", 100), [textPart("pR", "R", "mR", "root content")])],
+        C: [bundle(userMessage("mC", "C", 100), [textPart("pC", "C", "mC", "child content")])],
+      },
+    };
+    const { source } = makeDistillFake(graph);
+    const { db, store } = await freshStore();
+    const { gate } = makeSpyGate();
+    const distiller = createDistiller({
+      source,
+      store,
+      gate,
+      limits: TEST_LIMITS,
+      instanceId: "holder",
+      idleDebounceMs: 5,
+    });
+    distiller.start();
+    await waitFor(() => distiller.status().coldPass === "done");
+    const rollup = store.getCard("R")!.familyRollup;
+    expect(rollup.map((e) => e.sessionId)).toEqual(["C"]);
+
+    // One part is far below the append threshold, so the root re-indexes in
+    // full, from a derived card whose rollup is empty.
+    graph.messagesBySession.R!.push(
+      bundle(userMessage("mR2", "R", 200), [textPart("pR2", "R", "mR2", "rootfollowup_marker")]),
+    );
+    feed(distiller, idleEvent("R"));
+    await waitFor(
+      () => ftsSessions(store.ftsSearch({ strong: ["rootfollowup_marker"], weak: [] })).length > 0,
+    );
+
+    expect(store.getCard("R")!.familyRollup).toEqual(rollup);
+    distiller.stop();
+    db.close();
+  });
+
   it("append mode fetches only new pages and its card equals a full re-distill", async () => {
     const s1 = session("s1", "Growing", PROJECT_DIR, 3000);
     const initial: MessageBundle[] = [
