@@ -105,6 +105,9 @@ class RetryFailed extends Error {
 const RANGE_ROWS = 500;
 /** A `seq` below every history row's (they are non-negative). */
 const BEFORE_FIRST_SEQ = -1;
+/** Cards the range check looks at, at most, per poll while it searches for
+ *  one it may check. With the single range it checks, this is its budget. */
+const RECONCILE_SCAN_LIMIT = 64;
 /** The placeholder texts a tolerant read puts in place of a part row whose
  *  data does not decode; a strict read rejects such a row instead. */
 const MALFORMED_PART_TEXTS = new Set([
@@ -2456,6 +2459,196 @@ export function createDistiller(options: DistillerOptions): Distiller {
     }
   }
 
+  // ── Range check (hosts with a projector generation and range digests) ──
+
+  /** This process's sorted card ids for the running range-check sweep, read
+   *  when it first needs them and dropped when the sweep completes. */
+  let reconcileIds: string[] | undefined;
+
+  function readReconcile(): ReconcileProgress {
+    return (
+      parseReconcileProgress(store.getMeta(RECONCILE_PROGRESS_KEY)) ?? {
+        sweep: 0,
+        session: null,
+        after: null,
+        startedAt: now(),
+        previousStartedAt: null,
+        checked: 0,
+        mismatched: 0,
+        at: 0,
+      }
+    );
+  }
+
+  /** The checkpoint of a card the range check may look at now, or
+   *  undefined: it must be fully indexed at this generation with a settled
+   *  checkpoint and no repair reason, and no write may be pending for it. */
+  function checkable(card: Card): CheckpointInfo | undefined {
+    const id = card.sessionId;
+    if (card.distillState !== "full" || card.repairReason !== undefined) return undefined;
+    if (card.projectorGen !== projectorGen) return undefined;
+    if (
+      unsettled.has(id) ||
+      inFlight.has(id) ||
+      sweeping.has(id) ||
+      reDistillQueue.has(id) ||
+      debounceTimers.has(id) ||
+      pendingRerun.has(id) ||
+      removalSince.has(id)
+    ) {
+      return undefined;
+    }
+    const info = sync?.inspect?.(card.distillCursor);
+    return info && info.version !== 1 && info.settled ? info : undefined;
+  }
+
+  /** The first index in sorted `ids` whose id is at or after `id`. */
+  function lowerBound(ids: string[], id: string): number {
+    let lo = 0;
+    let hi = ids.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >>> 1;
+      if (ids[mid]! < id) lo = mid + 1;
+      else hi = mid;
+    }
+    return lo;
+  }
+
+  /**
+   * Check one range for a change no poll window sees (a part row rewritten
+   * in a settled session moves neither the message nor the session
+   * watermark). Runs from the poll, at most one range per poll, only while
+   * this process holds the lease, no cold pass or repair sweep runs and no
+   * foreground query is in the fetch gate.
+   *
+   * It walks the cards in session id order, skipping any it may not check
+   * ({@link checkable}), at most {@link RECONCILE_SCAN_LIMIT} per poll. For a
+   * card it starts at the range holding its floor (the lowest `seq` its last
+   * full write read, rows below it are not in the card) or at the session's
+   * start, and walks range by range to its checkpoint. Each check reads one
+   * digest after the previous range's end and compares it with the stored
+   * hash that starts at its first row. A match moves on and records the
+   * current sweep in the hash; a mismatch, or rows with no stored hash,
+   * dispatches a removal, so the session is re-indexed in full and that
+   * write records fresh hashes. The position, the sweep count and the
+   * counters persist in {@link RECONCILE_PROGRESS_KEY}.
+   */
+  async function checkOneRange(): Promise<void> {
+    const digest = sync?.rangeDigest;
+    if (!rangesOn || !digest || projectorGen === undefined) return;
+    if (stopped || coldPassState === "running" || sweepPromise || gate.activeQueries() > 0) return;
+    if (!ownsLease()) return;
+    reconcileIds ??= store.cardSessionIds().sort();
+    const ids = reconcileIds;
+    if (ids.length === 0) {
+      reconcileIds = undefined;
+      return;
+    }
+    let state = readReconcile();
+    let index = state.session === null ? 0 : lowerBound(ids, state.session);
+    let after = state.session !== null && ids[index] === state.session ? state.after : null;
+
+    const save = (): void => {
+      if (!stopped && ownsLease()) store.setMeta(RECONCILE_PROGRESS_KEY, JSON.stringify(state));
+    };
+    /** Move to the next card, completing the sweep past the last one. */
+    const advance = (): void => {
+      index++;
+      after = null;
+      if (index < ids.length) {
+        state = { ...state, session: ids[index]!, after: null };
+        return;
+      }
+      logMsg(
+        `range check sweep ${state.sweep + 1} done: ${state.checked} range(s), ${state.mismatched} changed`,
+      );
+      state = {
+        sweep: state.sweep + 1,
+        session: null,
+        after: null,
+        startedAt: now(),
+        previousStartedAt: state.startedAt,
+        checked: 0,
+        mismatched: 0,
+        at: state.at,
+      };
+      reconcileIds = undefined;
+    };
+
+    for (let scanned = 0; scanned < RECONCILE_SCAN_LIMIT; scanned++) {
+      if (index >= ids.length) {
+        // A stored position past every card: the sweep is done.
+        index = ids.length - 1;
+        advance();
+        save();
+        return;
+      }
+      const id = ids[index]!;
+      const card = store.getCard(id);
+      const info = card ? checkable(card) : undefined;
+      if (!info) {
+        advance();
+        if (index >= ids.length) {
+          save();
+          return;
+        }
+        continue;
+      }
+      const spans = store.getRangeHashes(id);
+      let from = after;
+      if (from === null) {
+        const floor = info.floor;
+        if (floor === undefined) from = BEFORE_FIRST_SEQ;
+        else {
+          const holder = spans.find((span) => span.startSeq <= floor && span.endSeq >= floor);
+          from = (holder ? holder.startSeq : floor) - 1;
+        }
+      }
+      if (from >= info.seq) {
+        advance();
+        if (index >= ids.length) {
+          save();
+          return;
+        }
+        continue;
+      }
+      const start = from;
+      const rows = await gate.runBackground(() => {
+        if (stopped || !leaseHeld) return Promise.resolve<RangeRow[] | null>(null);
+        return digest(id, start, RANGE_ROWS);
+      });
+      if (rows === null || stopped || !ownsLease()) return;
+      state = { ...state, session: id, after: from, checked: state.checked + 1, at: now() };
+      const first = rows[0];
+      if (!first || first.seq > info.seq) {
+        // Nothing left at or below the checkpoint: the card is checked.
+        advance();
+        save();
+        return;
+      }
+      const span = spans.find((stored) => stored.startSeq === first.seq);
+      const covered = span ? rows.filter((row) => row.seq <= span.endSeq) : [];
+      if (span && covered.length === span.rowCount && rangeHashOf(covered) === span.hash) {
+        if (span.sweepGen !== state.sweep) {
+          store.putRangeHashes(id, [{ ...span, sweepGen: state.sweep }]);
+        }
+        if (span.endSeq >= info.seq) advance();
+        else state = { ...state, after: span.endSeq };
+        save();
+        return;
+      }
+      logMsg(
+        `session ${id} changed in rows ${first.seq} and on (${span ? "hash differs" : "no stored hash"}); re-indexing it`,
+      );
+      state = { ...state, mismatched: state.mismatched + 1 };
+      advance();
+      save();
+      dispatch({ type: "removal", sessionID: id });
+      return;
+    }
+    save();
+  }
+
   function quarantine(session: DistillSessionMeta, error: unknown): void {
     // A malformed session is quarantined, not failing: drop any fetch strikes
     // so it is not counted twice or kept alive by the skipped-pass backoff.
@@ -2737,6 +2930,8 @@ export function createDistiller(options: DistillerOptions): Distiller {
         lastReconcileAt = Date.now();
         await reconcileDeletions();
       }
+      // Changes no poll window sees, one range at a time.
+      await checkOneRange();
     } catch (error) {
       lastError = errmsg(error);
       logMsg(`poll failed: ${lastError}`);
