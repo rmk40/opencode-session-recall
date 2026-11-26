@@ -93,10 +93,10 @@ export const EVAL_CASES: EvalCase[] = [
   {
     // Field report: historical-workflow discovery. The current conversation
     // (e-cur) parrots the whole query and is excluded by default. Its
-    // subagent (e-cur-sub) is searchable, but its best match is the prompt
-    // e-cur wrote it, an echo of the query, so the real workflow session
-    // (e-flow, misleading title in the ghostauth directory) must rank above
-    // it.
+    // subagent (e-cur-sub) stays searchable, but its best match is the prompt
+    // e-cur wrote it, an echo of the query, so family diversity demotes it
+    // and the real workflow session (e-flow, misleading title in the
+    // ghostauth directory) must rank above it.
     name: "field-report: prior ghostauth/tuistory workflow outranks the current session's subagent echo",
     args: {
       query: "ghostauth tuistory test opencode plugin auth login debug workflow",
@@ -116,10 +116,10 @@ export const EVAL_CASES: EvalCase[] = [
     },
   },
   {
-    // A relative whose reply (not its prompt) parrots the query: family
-    // diversity does not demote a reply, so only excludeFamily keeps it out
-    // and lets the real session (e-harbor) surface, as default family
-    // exclusion once did for every search.
+    // A relative whose reply (not its prompt) parrots the query. Family
+    // diversity demotes only a delegated-prompt echo, so a reply echo stays
+    // out only under excludeFamily:true, which lets the real session
+    // (e-harbor) rank first.
     name: "excludeFamily: a subagent's reply echoing the query stays out",
     args: {
       query: "harborlight retry backoff jitter",

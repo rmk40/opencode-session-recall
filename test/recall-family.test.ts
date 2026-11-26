@@ -477,7 +477,7 @@ describe("the suggestion naming excluded sessions that match", () => {
       expect(findSuggestion(asked, "current session")).toBeUndefined();
     });
 
-    it("still names the exclusion on an empty result the current session did not match", async () => {
+    it("names the exclusion on an empty result the current session did not match", async () => {
       const { tool } = await recallOver(makeFakeHarness());
       const out = await runTool<SearchOutput>(tool, { query: "zzqnomatchword", match: "smart" });
       expect(out.results).toEqual([]);
