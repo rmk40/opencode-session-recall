@@ -193,7 +193,11 @@ describe.each([
     const noMessage = await source.getMessage("s-current", "m-nope");
     expect(noMessage.ok).toBe(false);
 
-    expect(await source.listChildren("s-current")).toEqual({ ok: true, items: [] });
+    expect(await source.listChildren("s-current")).toEqual({
+      ok: true,
+      items: [],
+      truncated: false,
+    });
   });
 
   it("lists project sessions newest first and global sessions across projects", async () => {
@@ -1116,6 +1120,13 @@ describe("openOpencodeDb: unavailable sources", () => {
     if (!out.ok) throw new Error(out.reason);
     cleanups.push(() => out.db.close());
     expect(out.migration).toBe("29990101000000_future");
-    expect(checkV2Schema(out.db)).toEqual({ ok: true, migration: "29990101000000_future" });
+    expect(checkV2Schema(out.db)).toEqual({
+      ok: true,
+      migration: "29990101000000_future",
+      migrationTested: false,
+      parts: false,
+      missingOptional: [],
+      unknownTables: [],
+    });
   });
 });

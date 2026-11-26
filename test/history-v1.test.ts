@@ -32,8 +32,9 @@ describe("v1 history source", () => {
     expect(global.ok && global.items.map((s) => s.id)).toEqual(["s-other"]);
     expect(global.ok && global.items[0]?.project?.worktree).toBe("/workspace/other");
 
-    expect(h.calls.projectList).toEqual([{ search: undefined, limit: 1 }]);
-    expect(h.calls.globalList).toEqual([{ search: "walkthrough", limit: 5 }]);
+    // One row past the limit decides `truncated`.
+    expect(h.calls.projectList).toEqual([{ search: undefined, limit: 2 }]);
+    expect(h.calls.globalList).toEqual([{ search: "walkthrough", limit: 6 }]);
   });
 
   it("returns a listing error with the host's message", async () => {
@@ -50,7 +51,11 @@ describe("v1 history source", () => {
       const h = makeFakeHarness({ listBody: { unexpected: true } });
       const source = createV1HistorySource({ scoped: h.client, unscoped: h.unscoped });
       // Discovery (not strict) keeps v1's `Array.isArray(data) ? data : []`.
-      expect(await source.listSessions({ scope, limit: 5 })).toEqual({ ok: true, items: [] });
+      expect(await source.listSessions({ scope, limit: 5 })).toEqual({
+        ok: true,
+        items: [],
+        truncated: false,
+      });
       await expect(source.listSessions({ scope, limit: 5, strict: true })).rejects.toThrow(
         "session listing response was not an array",
       );
@@ -60,6 +65,7 @@ describe("v1 history source", () => {
       expect(await emptySource.listSessions({ scope, limit: 5, strict: true })).toEqual({
         ok: true,
         items: [],
+        truncated: false,
       });
     }
   });
@@ -123,7 +129,11 @@ describe("v1 history source", () => {
 
     const odd = makeFakeHarness({ childrenNonArray: true });
     const oddSource = createV1HistorySource({ scoped: odd.client, unscoped: odd.unscoped });
-    expect(await oddSource.listChildren("s-current")).toEqual({ ok: true, items: [] });
+    expect(await oddSource.listChildren("s-current")).toEqual({
+      ok: true,
+      items: [],
+      truncated: false,
+    });
 
     const failed = makeFakeHarness({ childrenError: "no children for you" });
     const failedSource = createV1HistorySource({

@@ -4,6 +4,7 @@ import type { HistoryMessage, HistorySession } from "./model.js";
 import {
   assertBoundedLimit,
   MalformedSessionError,
+  type ArchivedFilter,
   type HistorySource,
   type Listing,
   type Lookup,
@@ -151,11 +152,25 @@ function errorLookup(resp: SdkResponse): {
 }
 
 /** A listing response: an error return keeps the host's message, and a
- *  non-array body is an empty listing. */
-function toListing(resp: SdkResponse): Listing<HistorySession> {
+ *  non-array body is an empty listing. `limit`, when given, is how many rows
+ *  the caller asked for; the request asked for one more, and a response that
+ *  holds it is truncated. `archived: "exclude"` drops archived sessions after
+ *  the cut, for endpoints that cannot filter them. */
+function toListing(
+  resp: SdkResponse,
+  o: { limit?: number; archived?: ArchivedFilter } = {},
+): Listing<HistorySession> {
   if (resp.error) return { ok: false, error: errmsg(resp.error) };
-  return { ok: true, items: Array.isArray(resp.data) ? (resp.data as HistorySession[]) : [] };
+  let items = Array.isArray(resp.data) ? (resp.data as HistorySession[]) : [];
+  const truncated = o.limit !== undefined && items.length > o.limit;
+  if (truncated) items = items.slice(0, o.limit);
+  if (o.archived === "exclude") items = items.filter((s) => s.time.archived == null);
+  return { ok: true, items, truncated };
 }
+
+/** Why a part continuation fails on v1. */
+const NO_PART_ORDINALS =
+  "the v1 history source has no part ordinals, so it cannot continue a message";
 
 export function createV1HistorySource(clients: V1Clients): HistorySource {
   const { scoped, unscoped } = clients;
@@ -168,11 +183,21 @@ export function createV1HistorySource(clients: V1Clients): HistorySource {
     scopedLookup: scoped !== unscoped,
 
     async listSessions(o): Promise<Listing<HistorySession>> {
+      // The v1 endpoints page by time, not by id.
+      if (o.order === "id" || o.after !== undefined) {
+        return { ok: false, error: "the v1 history source cannot list sessions in id order" };
+      }
+      // One row past the limit decides `truncated`.
       const params =
-        o.search !== undefined ? { search: o.search, limit: o.limit } : { limit: o.limit };
+        o.search !== undefined ? { search: o.search, limit: o.limit + 1 } : { limit: o.limit + 1 };
+      // Only the global endpoint filters archived sessions (it hides them
+      // unless asked); the project endpoint returns them and the exclusion
+      // happens here.
       const resp: SdkResponse =
         o.scope === "global"
-          ? await unscoped.experimental.session.list(params)
+          ? await unscoped.experimental.session.list(
+              o.archived === "include" ? { ...params, archived: true } : params,
+            )
           : await scoped.session.list(params);
       // v1 compatibility: the sessions tool used to iterate the body with
       // for-of, so a truthy non-array body threw a TypeError that the tool's
@@ -182,7 +207,10 @@ export function createV1HistorySource(clients: V1Clients): HistorySource {
       if (o.strict && !resp.error && resp.data && !Array.isArray(resp.data)) {
         throw new TypeError("session listing response was not an array");
       }
-      return toListing(resp);
+      return toListing(resp, {
+        limit: o.limit,
+        archived: o.scope === "project" ? o.archived : undefined,
+      });
     },
 
     async getSession(id, o): Promise<Lookup<HistorySession>> {
@@ -195,15 +223,21 @@ export function createV1HistorySource(clients: V1Clients): HistorySource {
       return { ok: true, value: resp.data as HistorySession };
     },
 
-    async listChildren(parentID): Promise<Listing<HistorySession>> {
-      return toListing(await scoped.session.children({ sessionID: parentID }));
+    async listChildren(parentID, o = {}): Promise<Listing<HistorySession>> {
+      // The endpoint has no paging, so every child comes back at once.
+      return toListing(await scoped.session.children({ sessionID: parentID }), {
+        archived: o.archived,
+      });
     },
 
     async messagePage(o): Promise<MessagePage> {
       return fetchMessagePage(scoped, o);
     },
 
-    async getMessage(sessionID, messageID): Promise<Lookup<HistoryMessage>> {
+    async getMessage(sessionID, messageID, o = {}): Promise<Lookup<HistoryMessage>> {
+      if (o.partOrdinal !== undefined) {
+        return { ok: false, reason: "unsupported", error: NO_PART_ORDINALS };
+      }
       const resp: SdkResponse = await scoped.session.message({ sessionID, messageID });
       if (resp.error) return errorLookup(resp);
       if (!resp.data) return { ok: false, reason: "not-found" };
