@@ -217,11 +217,12 @@ for the v1 host (the filename is fixed at `store-v1.db` regardless of schema;
 `defaultStorePath(host)` gives the v2 host `store-opencode-v2.db`; `storePath`
 overrides the whole path). It is derived state, never authoritative: safe to delete
 at any time, and it rebuilds in the background on the next run. `store.ts` stamps
-`schema_version` in the `meta` table (currently `SCHEMA_VERSION = 4`). On open: a
-matching stamp is used as-is; a v1, v2 or v3 stamp is migrated **additively in
+`schema_version` in the `meta` table (currently `SCHEMA_VERSION = 5`). On open: a
+matching stamp is used as-is; a v1, v2, v3 or v4 stamp is migrated **additively in
 place** (`migrateV1ToV2` adds the summary columns, `migrateV2ToV3` adds
 `embedding_gen`, `migrateV3ToV4` adds `distill_cursor` and stamps
-`store_host = 'opencode-v1'`, with no data loss and no re-distill); an absent stamp
+`store_host = 'opencode-v1'`, `migrateV4ToV5` adds the schema-5 columns and the
+`range_hash` table, with no data loss and no re-distill); an absent stamp
 or a foreign layout is dropped and rebuilt; a **newer** stamp makes `openStore`
 refuse (`{ ok: false, reason: "newer" }`) so the plugin degrades to cards-lite
 rather than misreading a format it doesn't understand. So the migration story for a
@@ -265,11 +266,51 @@ coordinated by a single `distill_lease` row in `meta` (holder, heartbeat, 30s TT
 plus the writer's build/gen for diagnosis); only the lease holder writes, stale
 leases are taken over on expiry, and per-session writes are transactional so readers
 never see half a session. Two revision counters drive lazy reader reloads and they
-are NOT interchangeable: the distiller bumps `cards_rev` after every lexical write
-(the tier-1 runtime watches it), while `writeCardEmbeddings` bumps `vectors_rev`
-instead, because vectors are invisible to the lexical index, so bumping `cards_rev` for
-them would churn every reader for nothing. Forget the right bump and the reader
-serves a stale snapshot until its time-gated refresh fires.
+are NOT interchangeable. `cards_rev` covers lexical card writes and the tier-1
+runtime watches it. The store allocates it inside each write's own transaction (see
+the next section), so the distiller and the summarizer never bump it themselves.
+`writeCardEmbeddings` bumps `vectors_rev` instead, because vectors are invisible to
+the lexical index, so bumping `cards_rev` for them would churn every reader for
+nothing. Allocate the wrong one, or none, and the reader serves a stale snapshot
+until its time-gated refresh fires.
+
+## Schema 5 card writes account for their own revisions
+
+Schema 5 adds five nullable `card` columns and one table. Existing rows read NULL in
+each column.
+
+- `projector_gen` is the history projector generation the card was built under (see
+  the projector section below). The v1 host leaves it NULL.
+- `write_rev` is the `cards_rev` revision of the last stamped write to the card,
+  indexed for `cardsSince`.
+- `repair_reason` says why a stale card could not be rebuilt (`markRepairPending`).
+- `settled_base` is reserved and stays NULL, which means the session is re-read in
+  full.
+- `time_archived` is when the session was archived. Both hosts fill it from the
+  session's metadata.
+- The `range_hash` table holds hashes of source row ranges per session, keyed by
+  the range's first `seq`, for the v2 range check.
+
+Every lexical write (`replaceSessionParts`, `appendSessionParts`, `patchCardMeta`,
+`refreshCardMeta`, `writeSummary`, `setFamilyRollup`) allocates the next `cards_rev`
+through the store's private `nextRev()` inside its own transaction, stamps it on the
+row as `write_rev` and advances the `cards_stamped` meta counter with it.
+`deleteSession` allocates a revision too, with no row left to stamp, advances
+`cards_deleted` and clears the session's range hashes. An older build bumps
+`cards_rev` alone, so the gap between `cards_rev` and `cards_stamped` grows with each
+of its writes and never closes. `cardStats()` reads every counter in one statement.
+**A new lexical write path allocates through `nextRev()` in its own transaction**,
+never by bumping `cards_rev` from outside the store.
+
+Each write returns `{ changed }`, true only when it changed what a reader sees and
+so allocated a revision. When `replaceSessionParts` finds the stored card and rows
+equal to the new ones, it writes the checkpoint, the projector generation and any
+range hashes it was handed, clears the repair reason, allocates no revision and keeps
+the vector. `patchCardMeta`, `refreshCardMeta`, `writeSummary` and `setFamilyRollup`
+allocate a revision only when a value changed. The distiller skips rollup recomputes and summarizer work after
+an unchanged write. `family_rollup` is store-owned. Card writes keep the stored
+value and only `setFamilyRollup` replaces it, so re-indexing a root never clears its
+rollup.
 
 ## Embedding representation changes MUST ride a schema bump
 
@@ -293,9 +334,78 @@ wholesale reject of any lower-`gen` write, so an old build can never downgrade a
 newer vector) is the belt for same-schema drift. Bump both together.
 
 Mixed builds are diagnosable, not silent: the lease and every `coverage.semantic`
-carry a `pluginVersion` build tag (`schema{N}.gen{M}.{host}`, from `pluginBuild(host)`
-in `store.ts`, derived from `SCHEMA_VERSION`, `EMBED_REPRESENTATION` and the host), so
-one lease read or one tool response shows which build and host wrote what.
+carry a `pluginVersion` build tag (`schema{N}.gen{M}.{host}`, or
+`schema{N}.gen{M}.proj{P}.{host}` for a host with a projector generation, from
+`pluginBuild(host, projectorGen?)` in `store.ts`, derived from `SCHEMA_VERSION`,
+`EMBED_REPRESENTATION`, the projector generation and the host), so one lease read or
+one tool response shows which build and host wrote what.
+
+## Projector generation changes ride a schema bump too
+
+`V2_PROJECTOR_GEN` in `src/history/v2-project.ts` stamps what a v2 card's content
+_means_, which is how the projector turns `session_message` and `session_part` rows
+into messages. The v2 host stamps it on every card it writes in full
+(`card.projector_gen`). A change to what the projector produces from the same rows
+bumps it. **That bump must ride a `SCHEMA_VERSION` bump in the same change-set**, for
+the same reason as `EMBED_REPRESENTATION`. Without it a build of the older projection
+keeps opening the store and writes its cards over repaired ones.
+
+The store backs the generation with a guard. A replace or append whose card names a
+lower generation than the stored one is refused (`refused: "older-generation"`) and
+writes nothing. `staleCards(gen)` lists cards below the generation (NULL included)
+and cards whose checkpoint is `v: 1`, which only an older build writes, leaving out
+cards with a `repair_reason`. A distiller at a higher generation than
+`meta.repair_gen` clears every stored repair reason before it records a reason or
+runs a sweep, so the cards an earlier generation gave up on are tried again.
+
+All of it is inert on v1, which passes no generation. `staleCards` returns nothing,
+the guard does nothing, the repair sweep and the range check never start and v1
+cards keep a NULL `projector_gen`. Put any new v2-only mechanism in shared code
+behind the same check.
+
+## The repair sweep and the range check (v2 only)
+
+Both run only in the lease holder and only with a projector generation and the v2
+sync. They write through the same lease-checked paths as every other distiller write.
+
+The repair sweep (`runRepairSweep` in `distill.ts`) starts after each cold pass,
+which leaves cards below the generation to it. It takes `staleCards(gen)`, archived
+sessions included, puts the sessions that have part rows first (`withParts`) and
+rebuilds each with `distillFull` at `distillConcurrency` through the fetch gate's
+background lane. A session already being re-distilled is skipped, since that write
+stamps the generation too. A session that is gone is left to the deletion reconcile.
+A malformed session, or a card the loss guard kept, gets a `repair_reason` and leaves
+the stale set. A card leaves it only when its rebuild commits or it gets a reason, so
+an interrupted sweep resumes from the store. Progress goes in
+`meta.repair_progress` (`{ pending, repairPending, done, gen, at, running }`), which
+every process reports as `coverage.history.repair`.
+
+The loss guard protects existing cards from a projection that lost content. When a
+read holds part rows of unknown types, or completed assistant messages that project
+empty although part rows exist, the distiller keeps the stored card as it is and
+records the loss as its repair reason. Later changes to a repair-pending card take
+the capped full read, never an append, so the card is replaced once the lossy
+message falls past the per-session row cap.
+
+The range check (`checkOneRange`) finds changes no poll window sees. A part-only
+change in a settled session moves neither the message poll nor the session scan. The
+check runs from `runPoll`, reads one range digest (at most 500 rows) per poll and
+looks at no more than 64 cards per poll for one it may check. It runs only while no
+cold pass or sweep is running and `gate.activeQueries()` is zero. It checks only
+fully indexed cards at the current generation with a settled `v: 2` checkpoint, no
+repair reason and no write pending. Within a card it checks only rows at or above the
+lowest `seq` the card's last full write read (its floor). A mismatch, or a range with
+no stored hash,
+dispatches a removal, which re-indexes the session in full. Its position and counters
+live in `meta.reconcile_progress`.
+
+The hashes come from the index writes themselves. Every write over a settled tail (a
+full write, an append, a sweep rebuild) takes a range digest of the rows it is about
+to read before it reads them. It stores the hashes in its own transaction, a
+suppressed write included. A row that changes in between is recorded in its older
+state and fails the next check. A write over a running tail or a repair-pending card
+keeps the stored hashes. Since a range with no hash counts as changed, no hash ever
+exists without an index write that read the same rows.
 
 ## The summarizer only runs while holding the distill lease
 
@@ -331,13 +441,74 @@ intentionally exercise the legacy full-return path (some distiller fixtures) opt
 out by leaving strict mode off. If you add a new fetch site, route it through
 `source.messagePage` and cover it under a strict-mode suite.
 
-The second is `src/history/v2-sync.ts`, the v2 distiller's poll and checkpoint
-reads, which query opencode v2's `session_message` table directly (the v2 history
-source in `src/history/v2.ts` does too, behind `messagePage`). There the rule is
-"every `session_message` statement binds `LIMIT ?`", enforced by the `limitSpy`
-wrapper in `test/v2-db.ts`, which fails any such statement without it. Any new
-suite that exercises code reading `session_message` must hand it a `limitSpy`-wrapped
-handle, and new code must not add a third reader.
+The second is `src/history/v2-sync.ts`, the v2 distiller's poll, checkpoint and
+range-digest reads, which query opencode v2's `session_message` and `session_part`
+tables directly (the v2 history source in `src/history/v2.ts` does too, behind
+`messagePage` and `getMessage`). Those two files are the only places that read
+`session_part`. Part sizes, part bodies and part state come from their own
+statements scoped by session id and the message ids in hand. No `session_message`
+statement reads `session_part`. There the rule is "every `session_message` and
+`session_part` statement binds `LIMIT ?`", enforced by the `limitSpy` wrapper in
+`test/v2-db.ts`, which fails any such statement that does not end in `LIMIT ?` with
+a positive integer bound. Any new suite that exercises code reading either table
+must hand it a `limitSpy`-wrapped handle. New code must not add a third reader.
+
+A v2 read also stops at bytes. One byte ceiling (`pageByteCeiling`, 4 MiB by
+default) covers a page's message rows and their part rows together. A part-row cap
+(`pagePartRows`, 2,000 by default) covers the part rows. When the first message
+of a page does not fit, the read loads its parts in ordinal order up to the cut,
+ends the message with one placeholder part and marks it `partial`
+(`{ nextOrdinal, omittedParts, omittedBytes }`). `getMessage(..., { partOrdinal })`
+reads the rest. A continuation charges the envelope's metadata rather than its
+inline content, so it may pass the ceiling by at most `CONTINUATION_METADATA_MAX`
+(16 KiB) and always moves forward. v1 has no part ordinals and answers a
+`partOrdinal` with `unsupported`.
+
+## What the v2 reader relies on in opencode 2.4
+
+The v2 reader was written against opencode 2.4.1's stored layout (the full
+migration list is `TESTED_MIGRATIONS` in `src/history/v2.ts`). These behaviors are
+not visible from this repository's code. A change to any of them is a reader change.
+
+- A new assistant message stores `data.content = []` in `session_message` and one
+  `session_part` row per content item, keyed by `(message_id, ordinal)`. The part's
+  `type` column is authoritative.
+- Writing a part sets the part's `time_updated` and never touches the message row.
+  The row gets a later `time_updated` only when its envelope changes, at completion.
+  While a message streams, its parts can be newer than its row. This is why the v2
+  checkpoint (`v: 2`) records the newest row's part count and newest part
+  `time_updated` and why its fingerprint covers each of the 64 rows ending at the
+  checkpoint with their part state.
+- opencode reads a message as its part rows by ordinal followed by any inline
+  content. The projector merges in the same order. Part ids are positions in that
+  merged list (`${messageId}:${i}`), so a session with no part rows projects exactly
+  as it did before 2.4.
+- opencode moves inline content into part rows lazily, appending it after the
+  existing ordinals on the next part write, which keeps every merged position. A
+  read whose envelope held inline content re-checks the row's `time_updated` and
+  size after its part read and reads again when they changed. After 3 attempts it
+  returns the message `partial` with the inline content left for the continuation,
+  so nothing is read twice.
+- Forks copy the parent's message rows as stored and its part rows remapped to the
+  fork's message and session ids. The older 2.2.5 layout inlined the parts into the
+  copied rows instead. The reader handles both.
+- A database without `session_part` (opencode before 2.4) reads inline content
+  only. A missing table or column turns the capability off and is never a refusal.
+
+## Tool output goes through `src/output.ts`
+
+OpenCode passes a tool result to the model whole only up to 2,000 lines and 50 KiB.
+Past either it cuts at a line boundary, so a one-line JSON result over the limit
+reaches the model with none of its content. Every tool therefore returns through
+`writeOutput` (or `writeError`), which writes the header fields first and one record
+per line and stays within `OUTPUT_BUDGET` (40 KiB, 1,900 lines). When the records do
+not all fit it sets `trimmed: true` and a `continuation` (an `rc.` token naming its
+tool) ahead of the record arrays. The tool takes the continuation back as `cursor`.
+Both hosts then run `boundResult` on what a tool returns at `HOST_OUTPUT_LIMIT` and
+replace anything over it with a small error that carries `trimmed: true`. On v1 a
+rejected `execute` becomes the same kind of bounded error result. A new tool or a new return path in an existing
+one goes through `writeOutput` and takes a defensively coerced `cursor`. The host
+backstop is there for a path that forgets.
 
 ## Perf gates are behind `RECALL_PERF=1`
 

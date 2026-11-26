@@ -23,6 +23,13 @@ All notable changes to this project are documented here. This project follows
     the host and the database it was built from. One process runtime
     serves every location and indexes every project; `global: false`
     limits queries, not indexing.
+  - Discovery walks every session in pages by session id, with no overall
+    cap and archived sessions included, so `recall` searches archived
+    sessions too.
+  - `recall_sessions` with `parentID` reads the children in pages by
+    session id, up to 10,000, so a child updated during the walk is neither
+    skipped nor listed twice. A parent with more children gets
+    `truncated: true` and a note.
   - A poll keeps the index fresh with no events: new messages within
     about 30 seconds, renames and other metadata-only changes within
     about 5 minutes. Each card checkpoints its session's tail, so a
@@ -42,6 +49,40 @@ All notable changes to this project are documented here. This project follows
     when `RECALL_DEBUG=1` is set, since v2 discards plugin console output.
   - The `@opencode-ai/plugin` peer dependency is now optional (and at
     least 1.3.4), so a v2-only install needs no v1 package.
+
+- **opencode 2.4 `session_part` content is read and indexed.** opencode 2.4
+  stores an assistant message's content in a separate `session_part` table.
+  The v2 history reader now reads those rows together with any inline
+  content, in the order opencode reads them, so that text, reasoning and
+  tool calls reach the index and every tool. A message too large for one
+  read (over 4 MiB with its parts, or more than 2,000 part rows) comes back
+  with `partial`. `recall_get` continues it from where the read stopped.
+  - Cards built without part rows are rebuilt by a background repair sweep
+    after each cold pass, sessions with part rows first. A rebuild whose
+    read looks like it lost content (part rows of an unknown type, or a
+    completed assistant message that reads empty despite its part rows)
+    keeps the existing card and marks it instead of overwriting it.
+  - opencode writes a part without touching its message row, so a
+    part-only change in a settled session moves neither poll. A background
+    range check finds it by comparing stored hashes of each session's rows
+    with `opencode.db`, one range per poll while no tool call is reading
+    history. It re-indexes a session whose rows changed.
+  - `recall` responses on v2 carry `coverage.history`, which reports whether
+    part rows are read, the newest opencode migration and whether this version was
+    tested against it, unknown history tables, counts of what reads could
+    not project and the progress of the repair sweep and the range check.
+
+- **Output trimming and continuations on every tool.** All five tools keep
+  a result within what OpenCode passes to the model whole (2,000 lines and
+  50 KiB). A result that does not fit in 40 KiB and 1,900 lines carries
+  `trimmed: true` and a `continuation`, written ahead of the records. Every
+  tool takes a new `cursor` argument that resumes exactly there. A part cut
+  or resumed inside a text field says so in `cutAt` or `resumedAt`.
+  `recall` trims expansions before results. Its continuation re-runs the
+  search with the time bounds the first call resolved. A continuation is refused, with a hint to start again without
+  it, when it is passed with different arguments or what it points at has
+  changed. Both hosts also withhold any result over OpenCode's limit and
+  return a small error with `trimmed: true` in its place.
 
 - **`authorship` filter on `recall`**: ask for what a human actually typed.
   `role: "user"` is a transport fact, not an authorship one — a survey of this
@@ -90,20 +131,63 @@ All notable changes to this project are documented here. This project follows
   same `[recall] ...` lines reach the console, and there is no new option.
   On opencode v2, which discards plugin console output, the same lines go
   to a debug log file instead (see the v2 entry under Added).
-- **The store moves to schema 4.** An existing `store-v1.db` upgrades in
-  place on first open, keeping every card, index row, vector and summary, and
-  gains a `card.distill_cursor` column that stays empty under opencode v1 (it
-  is reserved for the v2 host). The store now records which opencode host
+- **The store moves to schema 5.** An existing store at schema 3 or 4
+  (`store-v1.db`, or a v2 store at schema 4) upgrades in place on first
+  open, keeping every card, index row, vector and summary. The upgrade only adds columns and one table.
+  `card.distill_cursor` and `card.projector_gen` stay empty under opencode
+  v1 (they are for the v2 host). The others are `card.write_rev`,
+  `card.repair_reason`, `card.settled_base`, `card.time_archived` and the
+  `range_hash` table. The store now records which opencode host
   writes it (`meta.store_host`), so a store owned by another host is refused
   before any migration: the plugin runs in the degraded metadata-only mode and
   logs one `store refused (<reason>)` line instead of rebuilding the file.
-  Downgrade consequence: an older plugin build (schema 3) sees the upgraded
+  Every card write now allocates its revision in its own transaction and
+  stamps it on the card (`card.write_rev`, with the `cards_stamped` and
+  `cards_deleted` counters). A write that changes nothing a reader sees
+  allocates none.
+  **Restart every opencode process after upgrading.** The schema fence
+  takes effect when a process opens the store, so an older process that is
+  already running keeps writing to the store as the older version until it
+  restarts.
+  Downgrade consequence: an older plugin build (schema 3 or 4) sees the upgraded
   store as newer and runs degraded. To downgrade cleanly or reset a refused
   store, quit every opencode process sharing the store, delete the store
   file, and restart; it rebuilds in the background.
 - The build tag in `coverage.semantic.pluginVersion` and in the distill
-  lease's `build` field now names the host: `schema4.gen4.opencode-v1`
-  instead of `schema3.gen4`.
+  lease's `build` field now names the host: `schema5.gen4.opencode-v1`
+  instead of `schema3.gen4`. The v2 host also names its history projector
+  generation (`schema5.gen4.proj1.opencode-v2`).
+- **`coverage.messagesSearched` is replaced by three counts.**
+  `messagesFetched` is how many messages the drill read (from history or
+  from its cache), `messagesCandidate` how many of those produced a
+  searchable candidate and `messagesEligible` how many still had one after
+  the query's filters, which is what the match path searched.
+  `coverage.sessionStops` lists the first 10 target sessions with the same
+  counts and why the drill stopped reading each (`end`, `anchor`,
+  `sessionBudget`, `queryBudget`, `targetsCut`, `loadError`, `aborted`, or
+  `budget` and `wallClock` for a deep sweep), plus `cached: true` for a
+  session read entirely from the drill cache.
+- **Warnings name only content a search may have missed.** The warning
+  that the card store held the maximum discoverable sessions is gone, since
+  it fired on the number of cards alone. `coverage.limitedBy` gains
+  `"providerLimit"`, with a warning, only when session discovery stopped
+  at its limit. On v1 the lease holder records that in the store
+  (`meta.discovery_truncated`), so every process sharing it reports it. On
+  v2 a response warns when `opencode.db` holds content this version cannot
+  read or while cards are waiting to be rebuilt (or could not be). It also
+  warns when a result session was indexed with messages cut short. An opencode
+  migration this version was not tested against is reported in
+  `coverage.history` without a warning of its own.
+- **`recall_messages` cursors are continuation tokens.**
+  `pagination.nextCursor` is now an opaque `rc.` token. On a trimmed page it
+  resumes inside that page. Otherwise it reads the next one. A raw page
+  cursor from an earlier version is still accepted and reads that page from
+  its start.
+- On opencode v1 a tool whose `execute` rejects now returns a bounded
+  `{ ok: false, error }` result instead of passing the rejection to the
+  host.
+- On opencode v1, cards now record when their session was archived
+  (`card.time_archived`).
 - A session whose first user message starts with the exact line
   `You are a subagent spawned by another session.` no longer carries that
   line in its summary head (the card head and the session digest). This is opencode v2's

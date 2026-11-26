@@ -254,7 +254,9 @@ type SearchCoverage = {
   sessionsDiscovered: number;
   sessionsEligible: number;
   sessionsSearched: number;
-  messagesSearched: number;
+  messagesFetched: number;
+  messagesCandidate: number;
+  messagesEligible: number;
   partsSearched: number;
   sessionsSkipped: number;
   skippedByReason?: Record<string, number>;
@@ -294,7 +296,7 @@ Definitions and count relationships:
 - `skippedByReason` should use one primary reason per skipped session and should sum to `sessionsSkipped` when present.
 - `directoryBucketsSearched`: fallback buckets actually searched for this request.
 - `directoryBucketCounts`: number of final results returned from each fallback bucket.
-- `messagesSearched`: messages considered after session load.
+- `messagesFetched`: messages the drill read for the searched sessions. `messagesCandidate` counts those that produced at least one searchable candidate. `messagesEligible` counts those with a candidate left after the query's filters.
 - `partsSearched`: searchable message parts considered after message/type/role filters.
 - `limitedBy`: compact explanation of why the search may not represent all history. Use `rankingBudget` for ranking degradation and `timeBudget` when elapsed search time stops scanning.
 
