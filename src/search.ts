@@ -3165,24 +3165,36 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
          *  would reopen the original bug in its exact target scenario. This
          *  also keeps the carded and uncarded lists structurally disjoint. */
         const uncardedShortlist = (ids: string[]): string[] =>
-          ids.filter(
-            (id) =>
-              id !== excludeSessionID &&
-              // Skip the current session only on an EXPLICIT
-              // excludeCurrentSession:true. The implicit default (true for
-              // broad discovery) must not apply here: the caller targeted a
-              // specific session by id, matching the scope-aware-default
-              // philosophy above — and silently dropping an uncarded own id
-              // would reproduce the original sessionsEligible:0 signature for
-              // exactly the young-session population this path exists for.
-              // An explicit excludeFamily:true skips the ids it excludes the
-              // same way. (The carded shortlist half applies no exclusion at
-              // all — an older inconsistency, out of scope.)
-              !(excludeExplicit === true && currentSessionID === id) &&
-              !(excludeFamily && currentFamily().has(id)) &&
-              cards.get(id) == null &&
-              !workerCard(id),
-          );
+          ids.filter((id) => id !== excludeSessionID && cards.get(id) == null && !workerCard(id));
+
+        /** The named sessions (`sessions:` and a deep cursor's targets) the
+         *  exclusion arguments remove, carded or not. Naming a session asks
+         *  for it, so the implicit default exclusion does not apply: dropping
+         *  a young, uncarded own session there would leave a search with
+         *  nothing to drill. An explicit excludeCurrentSession:true removes
+         *  the current session, and excludeFamily:true its whole family. */
+        let namedExcludedMemo: Set<string> | undefined;
+        const namedExcluded = (): Set<string> =>
+          (namedExcludedMemo ??= !currentSessionID
+            ? new Set<string>()
+            : excludeFamily
+              ? currentFamily()
+              : excludeExplicit === true
+                ? new Set([currentSessionID])
+                : new Set<string>());
+        /** `ids` less the ones {@link namedExcluded} removes, each counted as
+         *  an `excludedSession` skip. Runs before any target slot is taken. */
+        const dropNamedExcluded = (ids: string[]): string[] => {
+          const excluded = namedExcluded();
+          if (excluded.size === 0) return ids;
+          const kept = ids.filter((id) => !excluded.has(id));
+          const dropped = ids.length - kept.length;
+          if (dropped > 0) {
+            skippedByReason.excludedSession = (skippedByReason.excludedSession ?? 0) + dropped;
+            pushUnique(normalized.limitedBy, "excludedSession");
+          }
+          return kept;
+        };
 
         /** One uncarded id's metadata probe: the project scope first, then one
          *  retry at GLOBAL scope — workers and cross-project sessions
@@ -3372,10 +3384,13 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
             // (or that an accompanying `sessions` arg explicitly allows), cap the
             // total, and report anything dropped. Resume stays stateless — the
             // cursor is the only carry-over, so a proportionate validation here is
-            // the whole defense.
-            const order = deepCursor.current
-              ? [deepCursor.current, ...deepCursor.remaining]
-              : [...deepCursor.remaining];
+            // the whole defense. The exclusion arguments drop their sessions
+            // before the cap counts any.
+            const order = dropNamedExcluded(
+              deepCursor.current
+                ? [deepCursor.current, ...deepCursor.remaining]
+                : [...deepCursor.remaining],
+            );
             const kept: string[] = [];
             const dropped: string[] = [];
             for (const id of order) {
@@ -3391,7 +3406,7 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
             // reconstitute directly from their card, while explicit-only ids
             // (readmitted purely via the repeated `sessions` arg) get the SAME
             // guards as a fresh uncarded shortlist — worker exclusion, live
-            // metadata probe, time bounds, current-session exclusion, warning.
+            // metadata probe, time bounds, warning.
             // Without this split a resume would bypass every uncarded guard.
             // Snapshot carded-ness ONCE before the await: cards.get refreshes
             // the card map, so two reads straddling the probe could disagree
@@ -3407,7 +3422,7 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
               else {
                 const r = resolvedById.get(id);
                 if (r) drillTargets.push(r.target);
-                // else: excluded by the uncarded guards (worker/bounds/current).
+                // else: excluded by the uncarded guards (worker/bounds).
               }
             }
             if (resolved.length > 0) {
@@ -3420,9 +3435,9 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
               );
             }
           } else if (explicitSessions.length > 0) {
-            const scoped = cards
-              .list(timeFilters)
-              .filter((card) => explicitSet.has(card.sessionId));
+            const named = dropNamedExcluded(explicitSessions);
+            const namedSet = new Set(named);
+            const scoped = cards.list(timeFilters).filter((card) => namedSet.has(card.sessionId));
             drillTargets = scoped
               .filter((card) => card.sessionId !== excludeSessionID)
               .map((card) => registerTarget(card, relevanceOf(card)));
@@ -3433,7 +3448,7 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
             // time bounds; a failed probe falls back to a bounds-bypassed
             // sweep. Carded-but-filtered ids are NOT resurrected here (they
             // have metadata and were filtered).
-            const uncarded = uncardedShortlist(explicitSessions);
+            const uncarded = uncardedShortlist(named);
             if (uncarded.length > 0) {
               // Deep has no session-count cap; the shortlist schema max is the
               // bound on this probe fan-out.
@@ -3466,7 +3481,8 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
           const timeFilters: CardFilters = {};
           if (after != null) timeFilters.since = after;
           if (before != null) timeFilters.until = before;
-          const wanted = new Set(explicitSessions);
+          const named = dropNamedExcluded(explicitSessions);
+          const wanted = new Set(named);
           let scopedCards = cards.list(timeFilters).filter((card) => wanted.has(card.sessionId));
           if (title) {
             const titleLower = title.toLowerCase();
@@ -3494,7 +3510,7 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
             .map((card) => registerTarget(card, relevanceOf(card)));
           // Probe lazily: only as many uncarded ids as the cap leaves room for
           // are resolved; the unprobed remainder is reported, not fetched.
-          const uncarded = uncardedShortlist(explicitSessions);
+          const uncarded = uncardedShortlist(named);
           const remaining = Math.max(0, cap - cardedTargets.length);
           const { resolved: uncardedTaken, unprobed } =
             uncarded.length > 0

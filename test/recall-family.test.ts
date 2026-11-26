@@ -2,6 +2,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import type { Part } from "@opencode-ai/sdk/v2";
 import type { ToolDefinition } from "../src/host/opencode-v1-types.js";
 import { buildSuggestions, search, type SearchDeps } from "../src/search.js";
+import { encodeDeepCursor } from "../src/drill.js";
 import { parseQuery } from "../src/query.js";
 import type {
   ErrorOutput,
@@ -376,6 +377,66 @@ describe("uncarded sessions named in sessions: under excludeFamily", () => {
     );
     const family = await runTool<SearchOutput>(tool, { ...args, excludeFamily: true }, ctx);
     expect(searched(family)).toEqual(new Set(["u-stranger"]));
+  });
+});
+
+describe("carded sessions named in a list under excludeFamily", () => {
+  // From f-kid, the family is f-root, f-kid, f-sib and f-nephew.
+  const named = ["f-root", "f-sib", "f-nephew", "f-out"];
+
+  it.each([{ deep: false }, { deep: true }])(
+    "drops the named relatives and counts them (deep: $deep)",
+    async ({ deep }) => {
+      const { tool } = await recallOver(familyTree());
+      const { ctx } = makeContext({ sessionID: "f-kid" });
+      const args = { query: "lanternfish", sessions: named, ...(deep && { deep: true }) };
+
+      const byDefault = await runTool<SearchOutput>(tool, args, ctx);
+      expect(new Set(sessionsOf(byDefault))).toEqual(new Set(named));
+
+      const family = await runTool<SearchOutput>(tool, { ...args, excludeFamily: true }, ctx);
+      expect(new Set(sessionsOf(family))).toEqual(new Set(["f-out"]));
+      expect(family.coverage?.sessionsSearched).toBe(1);
+      expect(family.coverage?.skippedByReason?.excludedSession).toBe(3);
+      expect(family.coverage?.limitedBy).toContain("excludedSession");
+    },
+  );
+
+  it("drops the relatives a deep cursor names before it takes any target", async () => {
+    const { tool } = await recallOver(familyTree());
+    const { ctx } = makeContext({ sessionID: "f-kid" });
+    const deepCursor = encodeDeepCursor({
+      v: 1,
+      remaining: ["f-sib", "f-nephew", "f-out"],
+      current: "f-root",
+      before: null,
+    });
+    const args = { query: "lanternfish", deepCursor };
+
+    const byDefault = await runTool<SearchOutput>(tool, args, ctx);
+    expect(new Set(sessionsOf(byDefault))).toEqual(new Set(named));
+
+    const family = await runTool<SearchOutput>(tool, { ...args, excludeFamily: true }, ctx);
+    expect(new Set(sessionsOf(family))).toEqual(new Set(["f-out"]));
+    expect(family.coverage?.sessionsSearched).toBe(1);
+    expect(family.coverage?.skippedByReason?.excludedSession).toBe(3);
+  });
+
+  it("drops a named current session only on an explicit excludeCurrentSession:true", async () => {
+    const { tool } = await recallOver(familyTree());
+    const { ctx } = makeContext({ sessionID: "f-kid" });
+    const args = { query: "lanternfish", sessions: ["f-kid", "f-out"] };
+
+    const byDefault = await runTool<SearchOutput>(tool, args, ctx);
+    expect(new Set(sessionsOf(byDefault))).toEqual(new Set(["f-kid", "f-out"]));
+
+    const explicit = await runTool<SearchOutput>(
+      tool,
+      { ...args, excludeCurrentSession: true },
+      ctx,
+    );
+    expect(sessionsOf(explicit)).toEqual(["f-out"]);
+    expect(explicit.coverage?.skippedByReason?.excludedSession).toBe(1);
   });
 });
 
