@@ -468,9 +468,10 @@ export function createDrill(deps: DrillDeps): Drill {
    * empty one when the cached entry was filled under another (time.updated,
    * writeRev) pair or has outlived its time bound. The cache holds one entry
    * per session id, so targets that stamp one session differently replace
-   * each other's entry rather than sharing the cache: a session-scoped query
-   * whose target has no `writeRev`, alternating with a carded target for the
-   * same session, refetches on every switch.
+   * each other's entry rather than sharing the cache. A session-scoped
+   * query's target carries the session's live `time.updated` and the live
+   * card's `writeRev`, a ranked target its snapshot card's, so the two
+   * refetch on every switch while the card or the snapshot lags the session.
    *
    * The key deliberately omits `target.parentID`. Two targets for the same
    * session CAN disagree about parentage under the same stamp — a card without

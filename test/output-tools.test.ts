@@ -46,6 +46,7 @@ import {
   limitSpy,
   makeV2Db,
   makeV2PartsDb,
+  type V2TestDb,
 } from "./v2-db.js";
 
 /**
@@ -219,6 +220,48 @@ function addContextSession(h: FakeHarness): string[] {
 
 /** `count` project sessions with ~1 KB multibyte titles, listed after the
  *  fixture's two. */
+/** Child `i` of `ses_parent` in {@link parentWithChildren}. */
+const child = (i: number): string => `ses_c${String(i).padStart(4, "0")}`;
+
+/** An opencode v2 database holding `ses_parent` and `count` children of it,
+ *  child `i` updated at 10,000 + i, so the newest child has the highest id
+ *  and sits on the last page by id. Returns the writer connection and a
+ *  source over a read-only handle. */
+async function parentWithChildren(
+  count: number,
+): Promise<{ db: V2TestDb["db"]; source: HistorySource }> {
+  const t = await makeV2Db();
+  v2Cleanups.push(t.cleanup);
+  insertProject(t.db, { id: "prj", worktree: "/w/app" });
+  t.db.exec("BEGIN");
+  insertSession(t.db, {
+    id: "ses_parent",
+    project_id: "prj",
+    directory: "/w/app",
+    time_created: 1_000,
+    time_updated: 1_000,
+  });
+  for (let i = 0; i < count; i++) {
+    insertSession(t.db, {
+      id: child(i),
+      project_id: "prj",
+      parent_id: "ses_parent",
+      directory: "/w/app",
+      time_created: 1_000,
+      time_updated: 10_000 + i,
+    });
+  }
+  t.db.exec("COMMIT");
+  const opened = await openOpencodeDb(t.path);
+  if (!opened.ok) throw new Error(opened.reason);
+  v2Cleanups.push(() => opened.db.close());
+  const source = createV2HistorySource(limitSpy(opened.db), {
+    yieldBetween: noYield,
+    projectID: "prj",
+  });
+  return { db: t.db, source };
+}
+
 function addListing(h: FakeHarness, count: number): void {
   const now = Date.now();
   for (let i = 0; i < count; i++) {
@@ -686,44 +729,16 @@ describe("recall_sessions over the output budget", () => {
   });
 
   it("lists a parent's children past the first thousand, so the newest child is found", async () => {
-    const t = await makeV2Db();
-    v2Cleanups.push(t.cleanup);
-    insertProject(t.db, { id: "prj", worktree: "/w/app" });
-    const child = (i: number): string => `ses_c${String(i).padStart(4, "0")}`;
-    t.db.exec("BEGIN");
-    insertSession(t.db, {
-      id: "ses_parent",
-      project_id: "prj",
-      directory: "/w/app",
-      time_created: 1_000,
-      time_updated: 1_000,
-    });
-    // The newest child has the highest id, so it is on the last page by id.
-    for (let i = 0; i < 2_500; i++) {
-      insertSession(t.db, {
-        id: child(i),
-        project_id: "prj",
-        parent_id: "ses_parent",
-        directory: "/w/app",
-        time_created: 1_000,
-        time_updated: 10_000 + i,
-      });
-    }
-    t.db.exec("COMMIT");
-    const opened = await openOpencodeDb(t.path);
-    if (!opened.ok) throw new Error(opened.reason);
-    v2Cleanups.push(() => opened.db.close());
-    const source = createV2HistorySource(limitSpy(opened.db), {
-      yieldBetween: noYield,
-      projectID: "prj",
-    });
+    const { source } = await parentWithChildren(2_500);
 
     const out = await call(sessionsTool(source, true, TEST_LIMITS), {
       parentID: "ses_parent",
       limit: 3,
     });
+    // More pages follow, but every child was read: no read-cap note.
     expect(out).toMatchObject({ ok: true, scope: "children", childCount: 2_500, returned: 3 });
-    expect(out.truncated).toBeUndefined();
+    expect(out.truncated).toBe(true);
+    expect(out.note).toBeUndefined();
     expect((out.sessions as Array<{ id: string }>).map((s) => s.id)).toEqual([
       child(2_499),
       child(2_498),
@@ -773,6 +788,71 @@ describe("recall_sessions over the output budget", () => {
       child(read - 1),
       child(read - 2),
     ]);
+  });
+});
+
+describe("recall_sessions pages past limit", () => {
+  const ARGS = { parentID: "ses_parent", limit: 100 };
+  const nextCursor = (out: Out): string | undefined => out.nextCursor as string | undefined;
+
+  it("pages through all 2,500 children of a parent, 100 at a time, each once and in order", async () => {
+    const { source } = await parentWithChildren(2_500);
+    const pages = await follow(sessionsTool(source, true, TEST_LIMITS), ARGS, nextCursor);
+    expect(pages).toHaveLength(25);
+    const ids: string[] = [];
+    pages.forEach((out, i) => {
+      const listed = (out.sessions as Array<{ id: string }>).map((s) => s.id);
+      expect(out).toMatchObject({ scope: "children", childCount: 2_500, returned: 100 });
+      expect(out.trimmed).toBeUndefined();
+      // Every page but the last says more children follow.
+      expect(out.truncated, `page ${i}`).toBe(i < 24 ? true : undefined);
+      ids.push(...listed);
+    });
+    // Newest first, from child 2,499 down to child 0.
+    expect(ids).toEqual(Array.from({ length: 2_500 }, (_, k) => child(2_499 - k)));
+  }, 60_000);
+
+  it("refuses the next page when a child not yet shown was updated in between", async () => {
+    const { db, source } = await parentWithChildren(2_500);
+    const tool = sessionsTool(source, true, TEST_LIMITS);
+    const first = await call(tool, ARGS);
+    expect(first.nextCursor).toEqual(expect.any(String));
+    // Child 5 becomes the newest, so it moves ahead of the next page's
+    // first child, into the part of the listing already shown.
+    db.run("UPDATE session_v2 SET time_updated = ? WHERE id = ?", [99_999, child(5)]);
+    expect(await call(tool, { ...ARGS, cursor: first.nextCursor })).toEqual({
+      ok: false,
+      error: expect.stringContaining("This listing changed"),
+    });
+  }, 60_000);
+
+  it("resumes a trimmed page up to its own end, so every page holds limit sessions", async () => {
+    const h = makeFakeHarness();
+    addListing(h, 170);
+    const outs = await follow(sessionsTool(h.source, true, TEST_LIMITS), { limit: 60 }, nextCursor);
+    // The outputs up to and including the first one not trimmed make a page.
+    const pages: Out[][] = [];
+    let page: Out[] = [];
+    for (const out of outs) {
+      // A trimmed output's next cursor is its continuation.
+      if (out.trimmed) expect(out.nextCursor).toBe(out.continuation);
+      page.push(out);
+      if (!out.trimmed) {
+        pages.push(page);
+        page = [];
+      }
+    }
+    expect(page).toEqual([]);
+    const ids = (group: Out[]): string[] =>
+      group.flatMap((out) => (out.sessions as Array<{ id: string }>).map((s) => s.id));
+    // 172 sessions (the fixture's two and 170 more): two full pages and the rest.
+    expect(pages.map((p) => ids(p).length)).toEqual([60, 60, 52]);
+    // Every page was over the budget, so each was trimmed and resumed.
+    expect(pages.every((p) => p.length > 1)).toBe(true);
+    expect(pages.flat().map((out) => out.truncated)).toEqual(
+      pages.flatMap((p, i) => p.map(() => (i < pages.length - 1 ? true : undefined))),
+    );
+    expect(ids(outs)).toEqual(h.sessions.map((s) => s.id));
   });
 });
 
@@ -865,7 +945,16 @@ describe("continuations", () => {
         { s: "s-ctx", page: 5 },
         { s: "s-ctx", page: null, part: "m-ctx-8-p0" },
       ],
-      recall_sessions: [{}, { anchorId: "" }, { anchorId: 5 }],
+      recall_sessions: [
+        {},
+        { anchorId: "" },
+        { anchorId: 5 },
+        // A position without the count of sessions its rest covers, or with
+        // none of them, or that resumes a trimmed page with none of it left.
+        { anchorId: "s-list-050", n: 52, h: "ids", t: "rest" },
+        { anchorId: "s-list-050", n: 52, h: "ids", t: "rest", r: 0 },
+        { anchorId: "s-list-050", n: 52, h: "ids", t: "rest", r: 1, l: 0 },
+      ],
     };
     for (const [name, { tool, args }] of Object.entries(tools)) {
       const cursors = [

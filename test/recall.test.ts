@@ -29,6 +29,7 @@ import {
   makeContext,
   makeFakeHarness,
   makeRecallDeps,
+  reindexSession,
   runTool,
   runToolRaw,
   seedStore,
@@ -2693,6 +2694,40 @@ describe("recall drill accounting", () => {
       stop: "loadError",
     });
     expect(out.coverage).toMatchObject({ messagesFetched: 6, sessionsSearched: 1 });
+  });
+});
+
+describe("recall drill cache", () => {
+  it("serves a session-scoped search the re-indexed content at once when the session time is unchanged", async () => {
+    const h = makeFakeHarness();
+    // Frozen clocks: the drill cache's time bound never runs out and the card
+    // snapshot never reloads, so only the live card's revision can reveal the
+    // re-index.
+    const frozen = Date.now();
+    const { deps, store, cleanup } = await makeRecallDeps(h, TEST_LIMITS, {
+      now: () => frozen,
+      cardsNow: () => frozen,
+    });
+    cleanups.push(cleanup);
+    const recall = search(h.source, true, TEST_LIMITS, deps);
+    const scoped = { scope: "project", sessionID: "s-other" };
+
+    const first = await runTool<SearchOutput>(recall, { ...scoped, query: "walkthrough" });
+    expect(first.results.map((r) => r.partID)).toContain("p-other-2");
+
+    // Rewrite the message in place and re-index the session; its time.updated
+    // in the session listing stays the same.
+    const created = messageTime(h, "s-other", "m-other-2");
+    h.messagesBySession["s-other"]![1] = bundle(assistantMessage("m-other-2", "s-other", created), [
+      textPart("p-other-2", "s-other", "m-other-2", "Use marigoldquest pages for the demo."),
+    ]);
+    const revision = store.getCard("s-other")?.writeRev;
+    reindexSession(store, h, "s-other");
+    expect(store.getCard("s-other")?.writeRev).not.toBe(revision);
+
+    const after = await runTool<SearchOutput>(recall, { ...scoped, query: "marigoldquest" });
+    expect(after.results.map((r) => r.partID)).toContain("p-other-2");
+    expect(after.coverage?.sessionStops?.sessions[0]).not.toHaveProperty("cached");
   });
 });
 

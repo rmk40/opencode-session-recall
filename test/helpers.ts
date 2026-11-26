@@ -817,14 +817,20 @@ function toDistillMeta(s: Session | GlobalSession): DistillSessionMeta {
  *  path can reach), the way a completed cold pass would leave it. Unions the
  *  project (`sessions`) and global (`globalSessions`) rows by id so tests that
  *  push to either list are picked up; the richer global row wins on conflict. */
-export function seedStore(
+type StoreFixture = {
+  sessions?: (Session | GlobalSession)[];
+  globalSessions: GlobalSession[];
+  messagesBySession: Record<string, { info: Message; parts: Part[] }[]>;
+};
+
+/** Derive the card and rows of each session in `ids` (every fixture session
+ *  when omitted) from the fixture's current messages and replace them in
+ *  the store, as the distiller does. */
+function distillFixture(
   store: Store,
-  fixture: {
-    sessions?: (Session | GlobalSession)[];
-    globalSessions: GlobalSession[];
-    messagesBySession: Record<string, { info: Message; parts: Part[] }[]>;
-  },
-  limits: Limits = TEST_LIMITS,
+  fixture: StoreFixture,
+  limits: Limits,
+  ids?: readonly string[],
 ): void {
   const byId = new Map<string, Session | GlobalSession>();
   for (const s of fixture.sessions ?? []) byId.set(s.id, s);
@@ -838,6 +844,7 @@ export function seedStore(
     inventoryTokens: limits.inventoryTokens,
   };
   for (const s of all) {
+    if (ids && !ids.includes(s.id)) continue;
     const { card, rows } = deriveCard({
       session: toDistillMeta(s),
       messages: fixture.messagesBySession[s.id] ?? [],
@@ -846,7 +853,24 @@ export function seedStore(
     });
     store.replaceSessionParts(s.id, rows, card);
   }
+}
+
+export function seedStore(store: Store, fixture: StoreFixture, limits: Limits = TEST_LIMITS): void {
+  distillFixture(store, fixture, limits);
   store.setMeta("cards_rev", "1");
+}
+
+/** Re-index one seeded session from the fixture's current messages, as the
+ *  distiller does after its history changed: the store gives the card a new
+ *  `writeRev`, while the session's `time.updated` stays whatever the fixture
+ *  says. */
+export function reindexSession(
+  store: Store,
+  fixture: StoreFixture,
+  sessionID: string,
+  limits: Limits = TEST_LIMITS,
+): void {
+  distillFixture(store, fixture, limits, [sessionID]);
 }
 
 /** Build the live `recall` deps over a seeded temp-file card store. Async only

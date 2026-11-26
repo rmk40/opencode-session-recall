@@ -2756,6 +2756,14 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
           return c != null && isSummarizerTitle(c.title);
         };
 
+        /** The `writeRev` of the session's card in the live store, for the
+         *  targets built from live metadata rather than a snapshot card. The
+         *  drill cache keys on it, so a re-index that leaves the session's
+         *  `time.updated` alone still drops cached pages at once, even before
+         *  the snapshot reloads. Undefined without a store, a card or a
+         *  stamped write. */
+        const liveWriteRev = (id: string): number | undefined => store?.cardWriteRev(id);
+
         /** The explicitly named ids to treat as UNCARDED. Uncarded-ness is
          *  decided from the SAME facade snapshot the carded filter reads
          *  (`cards.get`), NOT the live store: a just-carded session visible in
@@ -2870,6 +2878,7 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
                     directory: meta.directory,
                     timeUpdated: meta.updated,
                     parentID: meta.parentID,
+                    writeRev: liveWriteRev(id),
                   },
                   verified: true,
                 });
@@ -2879,7 +2888,13 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
                 // Both probes failed: `parentID` is OMITTED → `unknown`, never
                 // root. An unverified target must not be able to claim `human`.
                 resolved.push({
-                  target: { sessionId: id, title: "", directory: "", timeUpdated: 0 },
+                  target: {
+                    sessionId: id,
+                    title: "",
+                    directory: "",
+                    timeUpdated: 0,
+                    writeRev: liveWriteRev(id),
+                  },
                   verified: false,
                 });
               }
@@ -2939,6 +2954,7 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
               directory: sDir,
               timeUpdated: sUpdated,
               parentID: sParent,
+              writeRev: liveWriteRev(singleTarget),
             },
           ];
           deepSet = new Set([singleTarget]);

@@ -400,6 +400,9 @@ export type Store = {
    */
   upsertCard(card: Card): void;
   getCard(sessionId: string): Card | undefined;
+  /** The card's {@link Card.writeRev} alone, from one indexed read;
+   *  undefined when there is no card or no stamped write has touched it. */
+  cardWriteRev(sessionId: string): number | undefined;
   allCards(opts?: { withEmbeddings?: boolean }): Card[];
   /**
    * Cards whose last stamped write is newer than revision `rev`, oldest
@@ -1248,6 +1251,11 @@ class SqliteStore implements Store {
   getCard(sessionId: string): Card | undefined {
     const row = this.db.get(`SELECT ${CARD_COLUMNS_ALL} FROM card WHERE session_id=?`, [sessionId]);
     return row ? rowToCard(row) : undefined;
+  }
+
+  cardWriteRev(sessionId: string): number | undefined {
+    const row = this.db.get("SELECT write_rev FROM card WHERE session_id=?", [sessionId]);
+    return asNullableNumber(row?.write_rev) ?? undefined;
   }
 
   allCards(opts?: { withEmbeddings?: boolean }): Card[] {

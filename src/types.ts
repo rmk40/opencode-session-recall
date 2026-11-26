@@ -619,20 +619,26 @@ export function indexingWarning(progress: IndexingProgress): string {
 export type SessionsOutput = TrimmedFields & {
   ok: true;
   sessions: SessionItem[];
-  /** Sessions shown. On a trimmed output, fewer than the listing selected. */
+  /** Sessions shown: at most `limit`, and fewer on a trimmed output. */
   returned: number;
   scope: string;
   /** Children branch only: echoes the resolved parent session ID. Its presence
    *  is NOT the discrimination rule — check `scope === "children"`. */
   parentID?: string;
-  /** Children branch only: the post-filter, pre-slice child count (withheld
-   *  foreign rows excluded). `childCount > returned` means the listing was
-   *  truncated by `limit` (or the output trimmed). */
+  /** Children branch only: the total number of children the listing holds
+   *  across all its pages, after the filters (withheld foreign rows
+   *  excluded). Every page carries the same count, the last one included,
+   *  so `nextCursor` is what says another page follows. */
   childCount?: number;
-  /** Children branch only: the parent has more children than one call reads,
-   *  so `childCount` and the listing cover only the children read (the
-   *  first ones in id order). */
+  /** More sessions match than this page holds. `nextCursor` reads them,
+   *  except where the listing could not reach them, which `note` explains:
+   *  the children branch reads at most a fixed number of children (the
+   *  first ones in id order), and `childCount` then covers only those. */
   truncated?: true;
+  /** Taken back as `cursor` (with the same arguments) to read on: the
+   *  `continuation` of a trimmed output, otherwise the next page when
+   *  `truncated`. Absent at the end of the listing. */
+  nextCursor?: string;
   /** Explains a caveat in how the listing was produced — e.g. a since/until
    *  filter that could only be applied within the newest-limit window because no
    *  card store was available to resolve older sessions authoritatively. */

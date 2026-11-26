@@ -760,12 +760,22 @@ export function decodeMessagesCursor(cursor: string): Decoded<MessagesCursor> {
  * A `recall_sessions` position in the listing it was made from: the first
  * session not shown (`anchor`), the sessions listed before it as their
  * count (`shown`) and a fingerprint of their ids in any order (`ids`), and a
- * fingerprint of the rest of the listing from the anchor on (`rest`). The
- * same listing resumes at the anchor only while all of these still hold, so
- * no session is skipped or shown twice. Token fields: `anchorId`, `n`, `h`,
- * `t`.
+ * fingerprint of the listing from the anchor on (`rest`) over the
+ * `restCount` sessions the call that made it held from there. The same
+ * listing resumes at the anchor only while all of these still hold, so no
+ * session is skipped or shown twice. A cursor that resumes a trimmed page
+ * says how many of the page's sessions are left from the anchor on
+ * (`left`); one without it starts the next page. Token fields: `anchorId`,
+ * `n`, `h`, `t`, `r`, `l`.
  */
-export type SessionsCursor = { anchor: string; shown: number; ids: string; rest: string };
+export type SessionsCursor = {
+  anchor: string;
+  shown: number;
+  ids: string;
+  rest: string;
+  restCount: number;
+  left?: number;
+};
 
 export function encodeSessionsCursor(c: SessionsCursor): string {
   return encodeContinuation("recall_sessions", {
@@ -773,15 +783,18 @@ export function encodeSessionsCursor(c: SessionsCursor): string {
     n: c.shown,
     h: c.ids,
     t: c.rest,
+    r: c.restCount,
+    l: c.left,
   });
 }
 
 export function decodeSessionsCursor(cursor: string): Decoded<SessionsCursor> {
   return decodeWith("recall_sessions", cursor, (fields) => {
-    const { anchorId: anchor, n: shown, h: ids, t: rest } = fields;
+    const { anchorId: anchor, n: shown, h: ids, t: rest, r: restCount, l: left } = fields;
     if (!nonEmptyString(anchor) || !nonEmptyString(ids) || !nonEmptyString(rest)) return null;
-    if (!isOffset(shown)) return null;
-    return { anchor, shown, ids, rest };
+    if (!isOffset(shown) || !isOffset(restCount) || restCount < 1) return null;
+    if (left !== undefined && (!isOffset(left) || left < 1)) return null;
+    return { anchor, shown, ids, rest, restCount, ...(left !== undefined && { left }) };
   });
 }
 
