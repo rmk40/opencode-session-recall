@@ -2353,7 +2353,7 @@ describe("explicit shortlist includes uncarded sessions", () => {
 
   it("drills a store-only fresh card the facade snapshot has not seen (refresh window)", async () => {
     const h = makeFakeHarness();
-    // Freeze the facade clock: refreshIfStale never re-checks the revision, so
+    // Freeze the facade clock: the card map never re-checks the revision, so
     // the pre-seed snapshot deterministically survives the second seed below.
     const { recall, store } = await setup(h, TEST_LIMITS, { cardsNow: () => 1_000 });
     // Force the runtime to take its snapshot of the seeded store NOW.

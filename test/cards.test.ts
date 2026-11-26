@@ -318,7 +318,9 @@ describe("cards semantic persistence", () => {
       semanticWeight: 0.5,
       semanticModel: "model-x",
     });
-    first.list({}); // triggers the rebuild → embed pass (list does no query embed)
+    // Builds the index and its vector pass without a query embed (list() reads
+    // the card map only and never touches vectors).
+    await first.ready({ index: true });
     expect(embed).toHaveBeenCalled();
     expect(store.getMeta("semantic_model")).toBe(cardVectorStamp("model-x"));
     expect(store.allCards({ withEmbeddings: true })[0]?.embedding).not.toBeNull();
@@ -332,7 +334,7 @@ describe("cards semantic persistence", () => {
       semanticWeight: 0.5,
       semanticModel: "model-x",
     });
-    second.list({});
+    await second.ready({ index: true });
     expect(embed).not.toHaveBeenCalled(); // vectors came from the store
 
     // The reused vector still ranks: a query embed happens now, blend works.
@@ -348,24 +350,24 @@ describe("cards semantic persistence", () => {
     store.setMeta("cards_rev", "1");
 
     // Seed the store as if an OLDER model had persisted a vector + stamp.
-    createCardsRuntime({
+    await createCardsRuntime({
       source: persistentSource(store),
       embedder,
       semanticWeight: 0.5,
       semanticModel: "model-old",
-    }).list({});
+    }).ready({ index: true });
     expect(store.getMeta("semantic_model")).toBe(cardVectorStamp("model-old"));
     expect(store.allCards({ withEmbeddings: true })[0]?.embedding).not.toBeNull();
 
     // A runtime on a DIFFERENT model must ignore the persisted vector, recompute,
     // and advance the stamp — even though a (stale-model) vector exists.
     embed.mockClear();
-    createCardsRuntime({
+    await createCardsRuntime({
       source: persistentSource(store),
       embedder,
       semanticWeight: 0.5,
       semanticModel: "model-new",
-    }).list({});
+    }).ready({ index: true });
     expect(embed).toHaveBeenCalled(); // recomputed despite an existing vector
     expect(store.getMeta("semantic_model")).toBe(cardVectorStamp("model-new")); // stamp advanced
     db.close();
@@ -381,12 +383,12 @@ describe("cards semantic persistence", () => {
     store.upsertCard(makeCard("s2", { inventory: `alpha two ${SUBST}` }));
     store.setMeta("cards_rev", "1");
 
-    createCardsRuntime({
+    await createCardsRuntime({
       source: persistentSource(store),
       embedder,
       semanticWeight: 0.5,
       semanticModel: "model-x",
-    }).list({}); // computes + persists both
+    }).ready({ index: true }); // computes + persists both
     expect(store.allCards({ withEmbeddings: true }).every((c) => c.embedding != null)).toBe(true);
 
     // Simulate a re-distill of s1: its content changed and the distiller upserted
@@ -395,12 +397,12 @@ describe("cards semantic persistence", () => {
     store.setMeta("cards_rev", "2");
 
     embed.mockClear();
-    createCardsRuntime({
+    await createCardsRuntime({
       source: persistentSource(store),
       embedder,
       semanticWeight: 0.5,
       semanticModel: "model-x",
-    }).list({}); // reuse s2, recompute s1
+    }).ready({ index: true }); // reuse s2, recompute s1
 
     const embeddedTexts = embed.mock.calls.map(([t]) => t);
     expect(embeddedTexts.some((t) => t.includes("gamma"))).toBe(true); // s1 recomputed
@@ -418,24 +420,24 @@ describe("cards semantic persistence", () => {
 
     // An older model persisted a vector for s1 under its stamp.
     const oldEmbedder = { ready: true, embed: vi.fn(() => Float32Array.from([1, 0])) };
-    createCardsRuntime({
+    await createCardsRuntime({
       source: persistentSource(store),
       embedder: oldEmbedder,
       semanticWeight: 0.5,
       semanticModel: "model-old",
-    }).list({});
+    }).ready({ index: true });
     expect(store.getMeta("semantic_model")).toBe(cardVectorStamp("model-old"));
     expect(store.allCards({ withEmbeddings: true })[0]?.embedding).not.toBeNull();
 
     // The new model cannot embed s1 (no in-vocab tokens → undefined). Its
     // old-model BLOB must be dropped, not left to be reused under the new stamp.
     const newEmbedder = { ready: true, embed: vi.fn(() => undefined) };
-    createCardsRuntime({
+    await createCardsRuntime({
       source: persistentSource(store),
       embedder: newEmbedder,
       semanticWeight: 0.5,
       semanticModel: "model-new",
-    }).list({});
+    }).ready({ index: true });
     expect(store.getMeta("semantic_model")).toBe(cardVectorStamp("model-new")); // stamp advanced
     expect(store.allCards({ withEmbeddings: true })[0]?.embedding).toBeNull(); // old BLOB cleared
     db.close();

@@ -2668,6 +2668,11 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
           }
         }
 
+        // Every branch reads the card map; only tier-1 ranking below waits for
+        // the search index, so a search scoped to one session or a named list
+        // never builds or updates it.
+        await cards.ready();
+
         const skippedByReason: Record<string, number> = {};
 
         const cardMeta = (card: Card): SessionMetaInternal => ({
@@ -2998,8 +3003,8 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
             // guards as a fresh uncarded shortlist — worker exclusion, live
             // metadata probe, time bounds, current-session exclusion, warning.
             // Without this split a resume would bypass every uncarded guard.
-            // Snapshot carded-ness ONCE before the await: cards.get triggers
-            // refreshIfStale, so two reads straddling the probe could disagree
+            // Snapshot carded-ness ONCE before the await: cards.get refreshes
+            // the card map, so two reads straddling the probe could disagree
             // (present→absent would drop an id with no warning — the round-1
             // dual-source bug in miniature).
             const cardedIds = new Set(kept.filter((id) => cards.get(id) != null));
@@ -3139,6 +3144,7 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
           // they had any signal. The directory/scope bucketing below is applied
           // to them here, since `rank` never sees it.
           const rankStats: RankStats = { rootOnlySkipped: [] };
+          await cards.ready({ index: true });
           let cardHits: CardHit[] = cards.rank(
             queryMeta,
             cardFilters,
