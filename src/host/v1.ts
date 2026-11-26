@@ -1,4 +1,4 @@
-import type { Plugin, ToolDefinition } from "./opencode-v1-types.js";
+import type { Plugin, ToolDefinition, ToolResult } from "./opencode-v1-types.js";
 import { sessions, type SessionEnrichment } from "../sessions.js";
 import { search, DISCOVERY_LIMIT, type SearchDeps, type SemanticSearchConfig } from "../search.js";
 import { get } from "../get.js";
@@ -32,6 +32,7 @@ import { parseOptions } from "../options.js";
 import { consoleSink, createLogger } from "../log.js";
 import { registry } from "./registry.js";
 import { TOOLS, errmsg, settleWithin, type ErrorOutput } from "../types.js";
+import { boundResult } from "../output.js";
 
 /** Per-phase bound on dispose()'s awaited waits. The host awaits dispose as a
  *  shutdown finalizer with no timeout of its own, so a never-settling in-flight
@@ -316,6 +317,13 @@ export const server: Plugin = async (ctx, options) => {
     ? { cards: () => store.allCards(), indexing: () => distiller.indexing() }
     : undefined;
 
+  // The backstop: whatever a tool returns, OpenCode never receives a result
+  // it would cut (see `boundResult`).
+  const bounded = (result: ToolResult): ToolResult =>
+    typeof result === "string"
+      ? boundResult(result)
+      : { ...result, output: boundResult(result.output) };
+
   const guardTool = (definition: ToolDefinition): ToolDefinition => ({
     ...definition,
     execute: (args, context) => {
@@ -328,7 +336,7 @@ export const server: Plugin = async (ctx, options) => {
         };
         return Promise.resolve(JSON.stringify(err));
       }
-      return track(definition.execute(args, context));
+      return track(definition.execute(args, context)).then(bounded);
     },
   });
 
