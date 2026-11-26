@@ -2389,6 +2389,7 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
             // reads `null` as root and can never express `unknown`. Accepted:
             // a card exists only for a session the distiller discovered.
             parentID: card.parentId,
+            writeRev: card.writeRev,
           };
         };
 
@@ -3073,6 +3074,7 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
                 directory: card?.directory ?? "",
                 timeUpdated: card?.timeUpdated ?? 0,
                 parentID: card?.parentId,
+                writeRev: card?.writeRev,
               };
             });
 
