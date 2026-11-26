@@ -14,6 +14,7 @@ import {
   type RankStats,
 } from "../src/cards.js";
 import { cardVectorStamp, EMBED_REPRESENTATION } from "../src/embedding-text.js";
+import { cardRecall, type CardRecallHit } from "../src/hooks/card-recall.js";
 import { parseQuery } from "../src/query.js";
 import { openV1Store } from "./helpers.js";
 
@@ -522,6 +523,39 @@ describe("search index updates", () => {
     expect(slicesSeen).toBeGreaterThan(1);
     expect(runtime.rank(parseQuery("alpha"), {})).toHaveLength(75);
     expect(runtime.rank(parseQuery("omega"), {})).toHaveLength(66);
+  });
+
+  it("lets the hooks' card query wait for a chunked build rather than build in place", async () => {
+    const store = await freshStore();
+    for (const id of ["s1", "s2", "s3"]) put(store, id, { inventory: `widget ${id} ${SUBST}` });
+    const embed = vi.fn(() => Float32Array.from([1, 0]));
+    const slices = gate();
+    const runtime = createCardsRuntime({
+      source: storeCardSource(store),
+      embedder: { ready: true, embed },
+      semanticWeight: 0.5,
+      semanticModel: MODEL,
+      now: () => 1_000,
+      yieldBetween: slices.yieldBetween,
+    });
+    slowSlices();
+    const building = runtime.ready({ index: true });
+    await settle();
+
+    let hits: CardRecallHit[] | undefined;
+    const recalling = cardRecall({ cards: runtime, store: null }, "widget", { limit: 5 }).then(
+      (found) => {
+        hits = found;
+      },
+    );
+    await settle();
+    expect(hits).toBeUndefined();
+
+    slices.open();
+    await Promise.all([building, recalling]);
+    expect(ids((hits ?? []).map((hit) => hit.card)).sort()).toEqual(["s1", "s2", "s3"]);
+    // One build embedded each card once; the one more call embedded the query.
+    expect(embed).toHaveBeenCalledTimes(4);
   });
 
   it("shares one chunked index build between concurrent ready() calls", async () => {

@@ -276,7 +276,7 @@ describe("summarizer worker-session exclusion", () => {
     expect(runtime.get("normal")?.sessionId).toBe("normal");
 
     // The card-recall FTS backfill (a direct store read) also rejects it.
-    const hits = cardRecall({ cards: runtime, store }, "GHOSTWIDGET", { limit: 10 });
+    const hits = await cardRecall({ cards: runtime, store }, "GHOSTWIDGET", { limit: 10 });
     const ids = hits.map((h) => h.card.sessionId);
     expect(ids).toContain("normal");
     expect(ids).not.toContain("worker");

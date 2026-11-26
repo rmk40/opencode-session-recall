@@ -165,7 +165,7 @@ export function autoRecall(deps: SearchDeps): NonNullable<Hooks["chat.message"]>
 
       // Pure card-tier query — no drill, no message fetch. The current session
       // and its family are excluded so auto-recall never cites the live turn.
-      const hits = cardRecall(deps, decision.query, {
+      const hits = await cardRecall(deps, decision.query, {
         limit: MAX_AUTO_HITS,
         filters: { excludeFamilyOf: input.sessionID },
       });
