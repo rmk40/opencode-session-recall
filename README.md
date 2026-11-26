@@ -299,14 +299,17 @@ recall_context({ sessionID: "ses_abc", messageID: "msg_def", before: 1, after: 5
 
 ### `recall_messages` (browse)
 
-One bounded page of a session's messages, newest first. Pass `cursor` from a prior page's `nextCursor` to walk further back; `limit` sets the page size. Optional `role` and `query` filter within the returned page. Defaults to the current session.
+Browse one session's messages in bounded pages, newest first unless you pass `order: "oldest"`. It defaults to the current session. `limit` (default 10, at most the `maxMessages` option) caps how many messages one call returns. With `role` or `query` set, the tool reads page after page until `limit` messages match, within the bounds below. `order: "oldest"` starts at the session's first message and reads forward. It needs opencode v2. On v1 the tool returns an error saying oldest-first browsing is unsupported there.
 
-`pagination.nextCursor` is an opaque `rc.` token. On a trimmed page it equals the `continuation` and resumes inside the page at the message where the output stopped. Otherwise it reads the next page. A raw page cursor from an earlier version is still accepted and reads that page from its start. As in `recall_context`, a message its history read cut short carries `partial` with a `cursor` for `recall_get`.
+Each call's reading is bounded. `scan` (default 500, at most 2,000) caps the messages it reads and tests against the filters. A call reads at most 40 pages, whatever `scan` allows, and stops once its matches fill the output budget, since no more of them could be shown. `pagination` says what the call did. `scanned` counts the messages it read, `matched` the ones that passed the filters and `returned` the ones the output shows, which is fewer than `matched` only on a trimmed output. `order` is the order it browsed in. `stop` gives the reason it stopped. It is `limit` when `limit` messages matched, `scanBudget` when it read `scan` messages or 40 pages first, `outputBudget` when its matches filled the output and `end` when the session has no more messages in that order.
+
+`pagination.nextCursor` is an opaque `rc.` token, absent only when the call reached the session's end and showed everything it found. On a trimmed output it equals the `continuation` and resumes inside the message where the output stopped. Otherwise it resumes right after the last message the call read, so a scan that ran out of budget picks up where it left off. Either cursor still resumes at its point when the next call changes `limit`, `role` or `query`. A cursor keeps the order it was made in, so leave `order` out when you pass one (a different `order` is refused). A raw page cursor from an earlier version is still accepted and reads that page from its start. As in `recall_context`, a message its history read cut short carries `partial` with a `cursor` for `recall_get`.
 
 ```
 recall_messages({ limit: 5, role: "user" })
 recall_messages({ sessionID: "ses_abc", limit: 10, cursor: "..." })
-recall_messages({ query: "npm", role: "user" })
+recall_messages({ query: "npm", role: "user", scan: 1000 })
+recall_messages({ sessionID: "ses_abc", order: "oldest", limit: 20 })
 ```
 
 ### `recall_sessions` (discover)
