@@ -629,6 +629,22 @@ describe("recall_sessions continuations across listing changes", () => {
     expect(out).toMatchObject({ ok: false, error: expect.stringContaining("list again") });
   });
 
+  it("says summarizer workers kept three reads from the rest of a trimmed page, rather than that the listing changed", async () => {
+    const h = harness();
+    const first = await run(h);
+    expect(first.continuation).toBeDefined();
+    // Workers never listed arrive right after the continuation's session,
+    // more than three reads reach past, so the anchor is found but the rest
+    // of the page it resumes is not.
+    const anchor = h.sessions.filter((s) => s.directory === PROJECT_DIR)[first.sessions.length]!;
+    const workers = Array.from({ length: 400 }, (_, i) =>
+      session(`s-walk-worker-${i}`, "[recall-summarizer] worker", PROJECT_DIR, anchor.time.updated),
+    );
+    h.sessions.splice(h.sessions.indexOf(anchor) + 1, 0, ...workers);
+    const out = await run(h, first.continuation);
+    expect(out).toMatchObject({ ok: false, error: expect.stringContaining("summarizer worker") });
+  });
+
   it("resumes when a session already shown was updated in between, without repeating it", async () => {
     const h = harness();
     const first = await run(h);
@@ -792,6 +808,20 @@ describe("recall_sessions pages past limit", () => {
       note: expect.stringContaining("summarizer worker"),
     });
     expect(out.nextCursor).toBeUndefined();
+  });
+
+  it("says summarizer workers kept three reads from the cursor's session, rather than that the listing changed", async () => {
+    const h = listing(10);
+    const tool = sessionsTool(h.source, true, TEST_LIMITS);
+    const first = await runTool<Page>(tool, { limit: 3 });
+    expect(first.nextCursor).toEqual(expect.any(String));
+    // Workers never listed arrive ahead of everything, more than three reads
+    // of the next page reach past.
+    for (let i = 0; i < 40; i++) h.sessions.unshift(worker(`s-worker-${i}`));
+    h.calls.projectList.length = 0;
+    const out = await runTool<Page>(tool, { limit: 3, cursor: first.nextCursor });
+    expect(h.calls.projectList).toHaveLength(3);
+    expect(out).toMatchObject({ ok: false, error: expect.stringContaining("summarizer worker") });
   });
 
   it("keeps a time-bounded live listing to one page of the newest limit sessions", async () => {

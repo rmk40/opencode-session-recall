@@ -45,9 +45,15 @@ const MAX_TOOLS = 5;
  *  `truncated`. */
 const CHILDREN_PAGE = 1_000;
 const CHILDREN_PAGES_MAX = 10;
-/** Reads one call makes of a live listing at most, each one longer by the
- *  rows the filters dropped from the one before. */
+/** Reads one call makes of a live listing, at most, the first one included.
+ *  A read that the filters left short of the sessions the call needs is
+ *  followed by one that asks for those sessions plus the rows the filters
+ *  dropped from it (the shortfall). */
 const LIVE_READS_MAX = 3;
+/** Why a live listing that summarizer workers fill ends short, after
+ *  {@link LIVE_READS_MAX} reads. */
+const WORKERS_CROWD =
+  "too many summarizer worker sessions (never listed) come first for one call to read that far; narrow the listing with search";
 
 /** A listing's output fields other than its sessions, which a page sets. */
 type ListingFields = Omit<SessionsOutput, "ok" | "sessions" | "returned">;
@@ -157,7 +163,10 @@ export function sessions(
    * the listing from the anchor on is unchanged, session for session, as far
    * as the call that made the cursor held it. A change in between could
    * otherwise skip a session (one moved ahead of the anchor) or show one
-   * twice (the anchor moved).
+   * twice (the anchor moved). When `more.short` is set, the reads ended
+   * before they reached every session the call needed, so a cursor whose
+   * anchor or rest lies past `listed` is refused for that reason, not as a
+   * change.
    */
   const respond = (
     fields: ListingFields,
@@ -166,13 +175,18 @@ export function sessions(
       cursor: SessionsCursor | undefined;
       limit: number;
       decorate?: (item: SessionItem) => SessionItem;
-      more?: { note: string };
+      more?: { short: boolean };
     },
   ): string => {
     const { cursor, limit } = page;
     let start = 0;
     if (cursor) {
       start = listed.findIndex((item) => item.id === cursor.anchor);
+      if (page.more?.short && (start === -1 || start + cursor.restCount > listed.length)) {
+        return writeError(
+          `This cursor's place in the listing could not be reached: ${WORKERS_CROWD}, then list again without cursor`,
+        );
+      }
       if (start === -1) {
         return writeError(
           `This cursor's session ${cursor.anchor} is no longer in this listing; list again without cursor`,
@@ -199,7 +213,8 @@ export function sessions(
     const rest: Record<string, unknown> = { ...fields };
     delete rest.truncated;
     if (page.more && end === listed.length) {
-      rest.note = fields.note ? `${fields.note} ${page.more.note}` : page.more.note;
+      const note = `More sessions exist past these, but ${WORKERS_CROWD}.`;
+      rest.note = fields.note ? `${fields.note} ${note}` : note;
     }
     /** A cursor at `next`; `pageEnd` makes it resume a trimmed page that
      *  ends there. */
@@ -450,8 +465,7 @@ export function sessions(
               return true;
             })
             .sort((a, b) => b.time.updated - a.time.updated || a.id.localeCompare(b.id));
-          // Post-filter, across every page: childCount > returned means more
-          // pages follow (or the output was trimmed).
+          // Post-filter, across every page: the same total on each page.
           const childCount = selected.length;
           const listed = selected.map(
             (s): SessionItem => ({
@@ -610,16 +624,12 @@ export function sessions(
         // A live listing does not depend on the card index: no indexing note.
         // On the staleness fallback, rows without a full card are marked
         // distilled:false here (never inside enrich()). Only summarizer
-        // workers can keep the reads from reaching a session past the page.
+        // workers can keep the reads from reaching every session they need.
         return respond(fields, listed, {
           cursor: resume,
           limit,
           decorate: staleFallback ? (item) => markUndistilled(enrich(item)) : enrich,
-          ...(more && {
-            more: {
-              note: "More sessions exist past these, but too many summarizer worker sessions (never listed) came first for this call to reach them; narrow the listing with search.",
-            },
-          }),
+          ...(more && { more: { short: listed.length < want } }),
         });
       } catch (e) {
         return writeError(errmsg(e));
