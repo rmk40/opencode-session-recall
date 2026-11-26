@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { context as contextTool } from "../src/context.js";
 import { get as getTool } from "../src/get.js";
 import { messages as messagesTool } from "../src/messages.js";
@@ -6,7 +6,9 @@ import { search } from "../src/search.js";
 import { sessions as sessionsTool } from "../src/sessions.js";
 import { createFetchGate, type FetchGate } from "../src/fetch-gate.js";
 import { cardsLiteFromSessions } from "../src/cards.js";
+import { encodeContinuation } from "../src/output.js";
 import { createUnavailableSource, type HistorySource } from "../src/history/source.js";
+import { createV2HistorySource, openOpencodeDb, type V2SourceOptions } from "../src/history/v2.js";
 import type {
   ContextOutput,
   ErrorOutput,
@@ -19,6 +21,7 @@ import {
   OTHER_DIR,
   PROJECT_DIR,
   TEST_LIMITS,
+  assistantMessage,
   bundle,
   globalSessionFrom,
   makeContext,
@@ -30,7 +33,9 @@ import {
   setStrictNoLimitMessages,
   textPart,
   userMessage,
+  type FakeHarness,
 } from "./helpers.js";
+import { insertMessage, insertProject, insertSession, limitSpy, makeV2Db } from "./v2-db.js";
 
 // Every browse/search tool must fetch bounded pages, never a whole session.
 beforeAll(() => setStrictNoLimitMessages(true));
@@ -253,6 +258,19 @@ describe("recall_messages", () => {
     expect(out.ok).toBe(false);
     expect(out.error).toContain('order "oldest" is not supported');
     expect(h.calls.messages).toEqual([]);
+
+    // A cursor made oldest first asks for the same order.
+    const cursor = encodeContinuation("recall_messages", {
+      s: "s-current",
+      o: "oldest",
+      page: null,
+    });
+    const fromCursor = await runTool<ErrorOutput>(messagesTool(h.source, gate, TEST_LIMITS), {
+      sessionID: "s-current",
+      cursor,
+    });
+    expect(fromCursor.error).toContain('order "oldest" is not supported');
+    expect(h.calls.messages).toEqual([]);
   });
 
   it("survives a raw scan budget that is missing, not a number or out of range (host path)", async () => {
@@ -290,6 +308,360 @@ describe("recall_messages", () => {
     await runTool<MessagesOutput>(messagesTool(h.source, spy, TEST_LIMITS), { limit: 2 });
     // The page fetch (and the session.get) must go through gate.runQuery.
     expect(queries()).toBeGreaterThan(0);
+  });
+});
+
+// ── recall_messages scans ────────────────────────────────────────────────────
+
+/** Messages in the scan sessions, oldest first: message `i` is a user
+ *  message every fifth, otherwise a reply, and mentions a needle every
+ *  seventh from the fourth. */
+const SCAN_COUNT = 120;
+const scanId = (i: number): string => `msg_scan_${String(i).padStart(3, "0")}`;
+const scanRole = (i: number): "user" | "assistant" => (i % 5 === 0 ? "user" : "assistant");
+const scanText = (i: number): string => `message ${i}${i % 7 === 3 ? " with a needle" : ""}`;
+const scanIds = (count: number): string[] => Array.from({ length: count }, (_, i) => scanId(i));
+const isNeedle = (id: string): boolean => Number(id.slice("msg_scan_".length)) % 7 === 3;
+const isUser = (id: string): boolean => scanRole(Number(id.slice("msg_scan_".length))) === "user";
+
+/** Session `s-scan` in the fake v1 harness. Returns its ids, oldest first. */
+function addScanSession(h: FakeHarness, count = SCAN_COUNT): string[] {
+  const sid = "s-scan";
+  h.messagesBySession[sid] = scanIds(count).map((id, i) => {
+    const created = 1_000_000 + i * 1_000;
+    const info =
+      scanRole(i) === "user" ? userMessage(id, sid, created) : assistantMessage(id, sid, created);
+    return bundle(info, [textPart(`${id}-p0`, sid, id, scanText(i))]);
+  });
+  return scanIds(count);
+}
+
+const v2Cleanups: Array<() => void> = [];
+afterEach(() => {
+  while (v2Cleanups.length > 0) v2Cleanups.pop()!();
+});
+
+/**
+ * Session `ses_scan` in an opencode v2 database, shaped as the v1 scan
+ * session with each text padded by `pad` characters, and a source over it
+ * that counts the pages it reads. Returns its ids, oldest first.
+ */
+async function v2ScanSession(count = SCAN_COUNT, opts: V2SourceOptions = {}, pad = 0) {
+  const t = await makeV2Db();
+  v2Cleanups.push(t.cleanup);
+  insertProject(t.db, { id: "prj", worktree: "/w/app" });
+  insertSession(t.db, {
+    id: "ses_scan",
+    project_id: "prj",
+    directory: "/w/app",
+    time_created: 1_000,
+    time_updated: 1_000,
+  });
+  t.db.exec("BEGIN");
+  for (let i = 0; i < count; i++) {
+    const text = `${scanText(i)} ${"-".repeat(pad)}`;
+    insertMessage(t.db, {
+      id: scanId(i),
+      session_id: "ses_scan",
+      type: scanRole(i),
+      seq: i + 1,
+      time_created: 2_000 + i,
+      data:
+        scanRole(i) === "user"
+          ? { text, time: { created: 0 } }
+          : {
+              agent: "build",
+              model: { id: "m-1", providerID: "p-1" },
+              content: [{ type: "text", text }],
+              time: { created: 0, completed: 1 },
+            },
+    });
+  }
+  t.db.exec("COMMIT");
+  const opened = await openOpencodeDb(t.path);
+  if (!opened.ok) throw new Error(opened.reason);
+  v2Cleanups.push(() => opened.db.close());
+  const inner = createV2HistorySource(limitSpy(opened.db), {
+    yieldBetween: async () => {},
+    projectID: "prj",
+    ...opts,
+  });
+  const reads = { pages: 0 };
+  const source: HistorySource = {
+    ...inner,
+    messagePage: (o) => {
+      reads.pages++;
+      return inner.messagePage(o);
+    },
+    messagePageAscending: (o) => {
+      reads.pages++;
+      return inner.messagePageAscending!(o);
+    },
+  };
+  return { source, reads, ids: scanIds(count) };
+}
+
+const idsOf = (out: MessagesOutput): string[] => out.messages.map((m) => m.message.id);
+
+/** Every output of a browse, following `pagination.nextCursor` to the end. */
+async function browseAll(
+  source: HistorySource,
+  args: Record<string, unknown>,
+): Promise<MessagesOutput[]> {
+  const tool = messagesTool(source, gate, TEST_LIMITS);
+  const outs: MessagesOutput[] = [];
+  let cursor: string | undefined;
+  for (let step = 0; step < 500; step++) {
+    const out = await runTool<MessagesOutput>(tool, { ...args, ...(cursor && { cursor }) });
+    expect(out.ok, JSON.stringify(out)).toBe(true);
+    outs.push(out);
+    cursor = out.pagination.nextCursor;
+    if (!cursor) return outs;
+  }
+  throw new Error("browse did not end");
+}
+
+describe("recall_messages scanning for matches", () => {
+  it("reads on past the first page until limit messages match, asking 50 messages a page", async () => {
+    const h = makeFakeHarness();
+    const ids = addScanSession(h);
+    const tool = messagesTool(h.source, gate, TEST_LIMITS);
+    const out = await runTool<MessagesOutput>(tool, {
+      sessionID: "s-scan",
+      query: "needle",
+      limit: 10,
+    });
+    const needles = [...ids].reverse().filter(isNeedle);
+    expect(idsOf(out)).toEqual(needles.slice(0, 10));
+    // The tenth needle from the newest is message 52, on the second page.
+    expect(out.pagination).toMatchObject({
+      limit: 10,
+      order: "newest",
+      returned: 10,
+      matched: 10,
+      scanned: SCAN_COUNT - 52,
+      stop: "limit",
+      hasMore: true,
+    });
+    expect(h.calls.messages.map((c) => c.limit)).toEqual([50, 50]);
+
+    // Unfiltered, a page asks for limit messages and every one matches.
+    const plain = makeFakeHarness();
+    addScanSession(plain);
+    const unfiltered = await runTool<MessagesOutput>(
+      messagesTool(plain.source, gate, TEST_LIMITS),
+      {
+        sessionID: "s-scan",
+        limit: 7,
+      },
+    );
+    expect(idsOf(unfiltered)).toEqual([...ids].reverse().slice(0, 7));
+    expect(unfiltered.pagination).toMatchObject({ matched: 7, scanned: 7, stop: "limit" });
+    expect(plain.calls.messages.map((c) => c.limit)).toEqual([7]);
+  });
+
+  it.each([7, 50])(
+    "stops at a scan budget of %i and resumes at the first message it did not read",
+    async (scan) => {
+      const h = makeFakeHarness();
+      const ids = addScanSession(h);
+      const tool = messagesTool(h.source, gate, TEST_LIMITS);
+      const out = await runTool<MessagesOutput>(tool, {
+        sessionID: "s-scan",
+        query: "no message says this",
+        scan,
+      });
+      expect(out.messages).toEqual([]);
+      expect(out.pagination).toMatchObject({
+        returned: 0,
+        matched: 0,
+        scanned: scan,
+        stop: "scanBudget",
+        hasMore: true,
+        nextCursor: expect.any(String),
+      });
+      const next = await runTool<MessagesOutput>(tool, {
+        sessionID: "s-scan",
+        limit: 50,
+        cursor: out.pagination.nextCursor,
+      });
+      expect(idsOf(next)[0]).toBe(ids[SCAN_COUNT - 1 - scan]);
+    },
+  );
+
+  // Eleven messages hold two or three user messages and one or two needles,
+  // so either budget can end a call.
+  it.each([
+    { name: "newest first on v1", v2: false, order: undefined, filter: { role: "user" }, limit: 3 },
+    { name: "newest first on v2", v2: true, order: undefined, filter: { role: "user" }, limit: 3 },
+    { name: "oldest first on v2", v2: true, order: "oldest", filter: { role: "user" }, limit: 3 },
+    {
+      name: "oldest first on v2 by query",
+      v2: true,
+      order: "oldest",
+      filter: { query: "needle" },
+      limit: 2,
+    },
+  ] as const)(
+    "walks a filtered browse to its end, $name: each match once, each message scanned once",
+    async ({ v2, order, filter, limit }) => {
+      let source: HistorySource;
+      let ids: string[];
+      let sessionID: string;
+      if (v2) {
+        ({ source, ids } = await v2ScanSession());
+        sessionID = "ses_scan";
+      } else {
+        const h = makeFakeHarness();
+        ids = addScanSession(h);
+        source = h.source;
+        sessionID = "s-scan";
+      }
+      const outs = await browseAll(source, {
+        sessionID,
+        ...filter,
+        limit,
+        scan: 11,
+        ...(order && { order }),
+      });
+      const inOrder = order === "oldest" ? ids : [...ids].reverse();
+      const keep = "role" in filter ? isUser : isNeedle;
+      expect(outs.flatMap(idsOf)).toEqual(inOrder.filter(keep));
+      expect(outs.reduce((sum, out) => sum + out.pagination.scanned, 0)).toBe(SCAN_COUNT);
+      for (const [i, out] of outs.entries()) {
+        const p = out.pagination;
+        expect(p.order).toBe(order ?? "newest");
+        expect(p.returned).toBe(p.matched);
+        expect(p.matched).toBeLessThanOrEqual(limit);
+        expect(p.scanned).toBeLessThanOrEqual(11);
+        if (i < outs.length - 1) {
+          expect(["limit", "scanBudget"]).toContain(p.stop);
+          expect(p.hasMore).toBe(true);
+        }
+      }
+      expect(outs.at(-1)!.pagination).toMatchObject({ stop: "end", hasMore: false });
+      expect(outs.at(-1)!.pagination).not.toHaveProperty("nextCursor");
+      // Both budgets stopped the walk somewhere along the way.
+      const stops = new Set(outs.map((out) => out.pagination.stop));
+      expect(stops).toEqual(new Set(["limit", "scanBudget", "end"]));
+    },
+  );
+
+  it("stops after 40 page reads, whatever its scan budget", async () => {
+    // Each ~640-byte message fills a 1,000-byte page on its own.
+    const { source, reads, ids } = await v2ScanSession(45, { pageByteCeiling: 1_000 }, 600);
+    const tool = messagesTool(source, gate, TEST_LIMITS);
+    const out = await runTool<MessagesOutput>(tool, {
+      sessionID: "ses_scan",
+      query: "no message says this",
+      scan: 2_000,
+    });
+    expect(reads.pages).toBe(40);
+    expect(out.pagination).toMatchObject({
+      matched: 0,
+      scanned: 40,
+      stop: "scanBudget",
+      hasMore: true,
+    });
+    const next = await runTool<MessagesOutput>(tool, {
+      sessionID: "ses_scan",
+      cursor: out.pagination.nextCursor,
+      limit: 50,
+    });
+    expect(idsOf(next)).toEqual(ids.slice(0, 5).reverse());
+    expect(next.pagination).toMatchObject({ stop: "end", hasMore: false });
+  });
+
+  it.each(["newest", "oldest"] as const)(
+    "fills limit %s first across pages a byte ceiling cut short",
+    async (order) => {
+      const { source, reads, ids } = await v2ScanSession(45, { pageByteCeiling: 1_000 }, 600);
+      const tool = messagesTool(source, gate, TEST_LIMITS);
+      const inOrder = order === "oldest" ? ids : [...ids].reverse();
+      const out = await runTool<MessagesOutput>(tool, { sessionID: "ses_scan", limit: 5, order });
+      expect(idsOf(out)).toEqual(inOrder.slice(0, 5));
+      expect(out.pagination).toMatchObject({
+        returned: 5,
+        matched: 5,
+        scanned: 5,
+        stop: "limit",
+        hasMore: true,
+      });
+      expect(reads.pages).toBe(5);
+      const next = await runTool<MessagesOutput>(tool, {
+        sessionID: "ses_scan",
+        limit: 5,
+        cursor: out.pagination.nextCursor,
+      });
+      expect(idsOf(next)).toEqual(inOrder.slice(5, 10));
+    },
+  );
+});
+
+describe("recall_messages order", () => {
+  it("browses oldest first on v2 and keeps that order through its cursor", async () => {
+    const { source, ids } = await v2ScanSession(10);
+    const tool = messagesTool(source, gate, TEST_LIMITS);
+    const first = await runTool<MessagesOutput>(tool, {
+      sessionID: "ses_scan",
+      limit: 3,
+      order: "oldest",
+    });
+    expect(idsOf(first)).toEqual(ids.slice(0, 3));
+    expect(first.pagination.order).toBe("oldest");
+    for (const order of [undefined, "oldest"]) {
+      const next = await runTool<MessagesOutput>(tool, {
+        sessionID: "ses_scan",
+        limit: 3,
+        cursor: first.pagination.nextCursor,
+        ...(order && { order }),
+      });
+      expect(idsOf(next), String(order)).toEqual(ids.slice(3, 6));
+      expect(next.pagination.order, String(order)).toBe("oldest");
+    }
+  });
+
+  it("rejects an order that conflicts with the order its cursor was made in", async () => {
+    const { source } = await v2ScanSession(10);
+    const tool = messagesTool(source, gate, TEST_LIMITS);
+    const cursors = {
+      newest: (await runTool<MessagesOutput>(tool, { sessionID: "ses_scan", limit: 3 })).pagination
+        .nextCursor,
+      oldest: (
+        await runTool<MessagesOutput>(tool, { sessionID: "ses_scan", limit: 3, order: "oldest" })
+      ).pagination.nextCursor,
+    };
+    for (const [made, other] of [
+      ["newest", "oldest"],
+      ["oldest", "newest"],
+    ] as const) {
+      const out = await runTool<ErrorOutput>(tool, {
+        sessionID: "ses_scan",
+        cursor: cursors[made],
+        order: other,
+      });
+      expect(out).toEqual({ ok: false, error: expect.stringContaining(`browses ${made} first`) });
+    }
+  });
+
+  it("reads a cursor that names no order as newest first", async () => {
+    const { source, ids } = await v2ScanSession(10);
+    const tool = messagesTool(source, gate, TEST_LIMITS);
+    const cursor = encodeContinuation("recall_messages", {
+      s: "ses_scan",
+      page: null,
+      anchorId: ids[7]!,
+    });
+    const out = await runTool<MessagesOutput>(tool, { sessionID: "ses_scan", limit: 2, cursor });
+    expect(idsOf(out)).toEqual([ids[7], ids[6]]);
+    expect(out.pagination.order).toBe("newest");
+    const conflict = await runTool<ErrorOutput>(tool, {
+      sessionID: "ses_scan",
+      limit: 2,
+      cursor,
+      order: "oldest",
+    });
+    expect(conflict.error).toContain("browses newest first");
   });
 });
 

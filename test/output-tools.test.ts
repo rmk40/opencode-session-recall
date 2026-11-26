@@ -46,6 +46,7 @@ import {
   limitSpy,
   makeV2Db,
   makeV2PartsDb,
+  writeV1Corpus,
   type V2TestDb,
 } from "./v2-db.js";
 
@@ -276,12 +277,15 @@ function expectedNewestFirst(h: FakeHarness, sid: string): Flat[] {
 }
 
 /** An opencode 2.4 database with session `ses_cut`: a user prompt, then
- *  assistant message `msg_long` whose part rows hold `texts`. Returns a
- *  source with `opts` and one with the default ceiling. */
+ *  assistant message `msg_long` whose part rows hold `texts` and whose
+ *  inline content holds `inline`. Returns a source with `opts`, whose reads
+ *  add the body bytes they load to `meter`, and one with the default
+ *  ceiling. */
 async function v2CutSession(
   texts: string[],
   opts: V2SourceOptions,
-): Promise<{ cut: HistorySource; whole: HistorySource }> {
+  inline: string[] = [],
+): Promise<{ cut: HistorySource; whole: HistorySource; meter: { bytes: number } }> {
   const t = await makeV2PartsDb();
   v2Cleanups.push(t.cleanup);
   insertProject(t.db, { id: "prj", worktree: "/w/app" });
@@ -309,7 +313,7 @@ async function v2CutSession(
     data: {
       agent: "build",
       model: { id: "m-1", providerID: "p-1" },
-      content: [],
+      content: inline.map((text) => ({ type: "text", text })),
       time: { created: 0, completed: 1 },
     },
   });
@@ -326,11 +330,39 @@ async function v2CutSession(
   if (!opened.ok) throw new Error(opened.reason);
   v2Cleanups.push(() => opened.db.close());
   const spy = limitSpy(opened.db);
+  const meter = { bytes: 0 };
+  const count = (row: Record<string, unknown> | undefined): void => {
+    for (const column of ["data", "meta", "content"]) {
+      const value = row?.[column];
+      if (typeof value === "string") meter.bytes += Buffer.byteLength(value, "utf8");
+    }
+  };
+  const metered: typeof spy = {
+    ...spy,
+    get: (sql, params) => {
+      const row = spy.get(sql, params);
+      count(row);
+      return row;
+    },
+    all: (sql, params) => {
+      const rows = spy.all(sql, params);
+      rows.forEach(count);
+      return rows;
+    },
+  };
   return {
-    cut: createV2HistorySource(spy, { yieldBetween: noYield, projectID: "prj", ...opts }),
+    cut: createV2HistorySource(metered, { yieldBetween: noYield, projectID: "prj", ...opts }),
     whole: createV2HistorySource(spy, { yieldBetween: noYield, projectID: "prj" }),
+    meter,
   };
 }
+
+/** The fields of a continuation token. */
+const tokenFields = (token: string): Record<string, unknown> =>
+  JSON.parse(Buffer.from(token.slice("rc.".length), "base64url").toString("utf8")) as Record<
+    string,
+    unknown
+  >;
 
 /** The parts of `msg_long` as one read without a ceiling returns them. */
 async function wholeParts(source: HistorySource): Promise<Flat[]> {
@@ -521,6 +553,110 @@ describe("a message the history read cut short (v2)", () => {
   }, 30_000);
 });
 
+describe("recall_get continuations into a v2 message's part rows", () => {
+  /** Every output of `recall_get` for `msg_long` from `cursor` on, with the
+   *  bytes each call's history read loaded and the parts joined. */
+  async function walk(
+    tool: ToolDefinition,
+    meter: { bytes: number },
+    cursor?: string,
+  ): Promise<{ outs: Out[]; loads: number[]; joiner: PartJoiner }> {
+    const outs: Out[] = [];
+    const loads: number[] = [];
+    const joiner = new PartJoiner();
+    let next = cursor;
+    for (let step = 0; step < 500; step++) {
+      meter.bytes = 0;
+      const out = await call(tool, {
+        sessionID: "ses_cut",
+        messageID: "msg_long",
+        ...(next && { cursor: next }),
+      });
+      expect(out.ok, out.error).toBe(true);
+      outs.push(out);
+      loads.push(meter.bytes);
+      for (const part of out.parts as PartOutput[]) joiner.add(part);
+      next = out.continuation;
+      if (!next) {
+        joiner.end();
+        return { outs, loads, joiner };
+      }
+    }
+    throw new Error("recall_get continuations did not end");
+  }
+
+  const rowBytes = (text: string): number =>
+    Buffer.byteLength(JSON.stringify({ type: "text", text }), "utf8");
+  /** What one continuation may read ahead of the part it resumes in. */
+  const READ_AHEAD = 2 * 40 * 1024;
+  /** Room for the envelope's metadata beside the part rows. */
+  const METADATA = 1_024;
+
+  it("reads each continuation from the row it stopped in, a bounded way ahead, and reassembles the message exactly", async () => {
+    // Thirty ~27 KB part rows: about 800 KB, far under the 4 MiB ceiling.
+    const texts = Array.from({ length: 30 }, (_, i) => `${i} ${"abc€😀 ".repeat(2_500)}`);
+    const { cut, whole, meter } = await v2CutSession(texts, {});
+    const { outs, loads, joiner } = await walk(getTool(cut, gate), meter);
+    expect(outs.length).toBeGreaterThan(10);
+    // No read is cut short by the ceiling, and a capped read's own cut never
+    // shows as a part.
+    expect(joiner.parts).toEqual(await wholeParts(whole));
+    const largest = Math.max(...texts.map(rowBytes));
+    // The first call reads the whole message; every other call reads the
+    // part it resumes in and at most the read-ahead after it.
+    expect(loads[0]).toBeGreaterThan(texts.length * largest * 0.9);
+    for (const [i, bytes] of loads.entries()) {
+      if (i === 0) continue;
+      expect(bytes, `call ${i}`).toBeLessThanOrEqual(READ_AHEAD + largest + METADATA);
+    }
+  }, 60_000);
+
+  it("re-reads from the read's ordinal when an output stops in a part without a row of its own", async () => {
+    // Three ~27 KB part rows, then an inline item over the read-ahead, which
+    // a continuation reads whole on its own and shows across outputs.
+    const texts = Array.from({ length: 3 }, (_, i) => `${i} ${"abc€😀 ".repeat(2_500)}`);
+    const inline = [`tail ${"inline€ ".repeat(12_000)}`];
+    const { cut, whole, meter } = await v2CutSession(texts, {}, inline);
+    const { outs, joiner } = await walk(getTool(cut, gate), meter);
+    expect(withoutCutNotes(joiner.parts)).toEqual(await wholeParts(whole));
+    const tokens = outs.flatMap((out) => (out.continuation ? [tokenFields(out.continuation)] : []));
+    // Outputs that stop in a part row continue from that row, flagged; one
+    // that stops in the inline item continues from the read's ordinal.
+    expect(tokens.some((t) => t.f === 1 && t.part !== undefined)).toBe(true);
+    const fallback = tokens.filter((t) => t.part === "msg_long:3");
+    expect(fallback.length).toBeGreaterThan(0);
+    for (const t of fallback) {
+      expect(t).toMatchObject({ ordinal: 3, field: "content", offset: expect.any(Number) });
+      expect(t).not.toHaveProperty("f");
+    }
+  }, 60_000);
+
+  it("reads a cursor without the first-part flag from its ordinal, uncapped, and resumes at its part", async () => {
+    // Six ~30 KB rows: rows 1 to 3 together are past the read-ahead, so only
+    // a read of the whole rest from ordinal 1 holds part 3.
+    const texts = Array.from({ length: 6 }, (_, i) => `${i} ${"x".repeat(30_000)}`);
+    const { cut, whole, meter } = await v2CutSession(texts, {});
+    const expected = await wholeParts(whole);
+    const tool = getTool(cut, gate);
+    const unflagged = encodeContinuation("recall_get", {
+      m: "msg_long",
+      ordinal: 1,
+      part: "msg_long:3",
+    });
+    const flagged = encodeContinuation("recall_get", {
+      m: "msg_long",
+      ordinal: 3,
+      part: "msg_long:3",
+      f: 1,
+    });
+    for (const cursor of [unflagged, flagged]) {
+      const { outs, joiner } = await walk(tool, meter, cursor);
+      expect((outs[0]!.parts as PartOutput[])[0]!.id, cursor).toBe("msg_long:3");
+      expect(joiner.parts, cursor).toEqual(expected.slice(3));
+    }
+  }, 60_000);
+});
+
 // ── recall_context ───────────────────────────────────────────────────────────
 
 describe("recall_context over the output budget", () => {
@@ -591,6 +727,115 @@ describe("recall_messages over the output budget", () => {
     expect(joiner.cutFields().size).toBeGreaterThan(0);
     expect(joiner.messages()).toEqual(expectedNewestFirst(h, "s-ctx"));
   });
+
+  it("stops scanning once the matches fill the output budget, and continues at the first one not shown", async () => {
+    const h = makeFakeHarness();
+    addContextSession(h);
+    const tool = messagesTool(h.source, gate, TEST_LIMITS);
+    // Each message is 20 to 30 KB, so two fill the 40 KiB budget.
+    const first = await call(tool, { sessionID: "s-ctx", limit: 50 });
+    const pagination = first.pagination as Pagination & {
+      matched: number;
+      scanned: number;
+      stop: string;
+    };
+    expect(pagination).toMatchObject({
+      stop: "outputBudget",
+      matched: 2,
+      scanned: 2,
+      hasMore: true,
+      nextCursor: first.continuation,
+    });
+    expect(first.trimmed).toBe(true);
+    expect(pagination.returned).toBeLessThanOrEqual(pagination.matched);
+    const outs = await follow(tool, { sessionID: "s-ctx", limit: 50 }, nextPage);
+    const joiner = new MessageJoiner();
+    for (const out of outs) joiner.add(out.messages as MessageItem[]);
+    expect(joiner.messages()).toEqual(expectedNewestFirst(h, "s-ctx"));
+  });
+
+  it.each(["newest", "oldest"] as const)(
+    "continues a trimmed output on the page its last message came from (%s first)",
+    async (order) => {
+      // Ten ~12 KB messages under a 15,000-byte ceiling: one message a page,
+      // so an output fills its budget from messages of four pages and stops
+      // in one more than the three pages a continuation looks ahead.
+      const t = await makeV2Db();
+      v2Cleanups.push(t.cleanup);
+      insertProject(t.db, { id: "prj", worktree: "/w/app" });
+      insertSession(t.db, {
+        id: "ses_pages",
+        project_id: "prj",
+        directory: "/w/app",
+        time_created: 1_000,
+        time_updated: 1_000,
+      });
+      for (let i = 0; i < 10; i++) {
+        insertMessage(t.db, {
+          id: `msg_page_${i}`,
+          session_id: "ses_pages",
+          type: "user",
+          seq: i + 1,
+          time_created: 2_000 + i,
+          data: { text: `${i} ${"word€ ".repeat(1_500)}`, time: { created: 0 } },
+        });
+      }
+      const opened = await openOpencodeDb(t.path);
+      if (!opened.ok) throw new Error(opened.reason);
+      v2Cleanups.push(() => opened.db.close());
+      const spy = limitSpy(opened.db);
+      const source = createV2HistorySource(spy, { yieldBetween: noYield, pageByteCeiling: 15_000 });
+      const whole = createV2HistorySource(spy, { yieldBetween: noYield });
+      const all = await whole.messagePageAscending!({ sessionID: "ses_pages", limit: 50 });
+      const chrono = all.items.map((m) => flatMessage(formatMsg(m)));
+
+      const outs = await follow(
+        messagesTool(source, gate, TEST_LIMITS),
+        { sessionID: "ses_pages", limit: 10, order },
+        nextPage,
+      );
+      const joiner = new MessageJoiner();
+      for (const out of outs) joiner.add(out.messages as MessageItem[]);
+      expect(outs[0]!.trimmed).toBe(true);
+      expect((outs[0]!.messages as MessageItem[]).length).toBeGreaterThanOrEqual(4);
+      expect(joiner.messages()).toEqual(order === "oldest" ? chrono : [...chrono].reverse());
+    },
+  );
+
+  it.each([undefined, "user"] as const)(
+    "browses a whole v2 session oldest first through trimmed outputs (role %s), each message and part once",
+    async (role) => {
+      const h = makeFakeHarness();
+      addContextSession(h);
+      const t = await makeV2Db();
+      v2Cleanups.push(t.cleanup);
+      writeV1Corpus(t.db, [session("s-ctx", "Context", PROJECT_DIR, 3_000_000)], {
+        "s-ctx": h.messagesBySession["s-ctx"]!,
+      });
+      const opened = await openOpencodeDb(t.path);
+      if (!opened.ok) throw new Error(opened.reason);
+      v2Cleanups.push(() => opened.db.close());
+      const source = createV2HistorySource(limitSpy(opened.db), { yieldBetween: noYield });
+      const all = await source.messagePageAscending!({ sessionID: "s-ctx", limit: 50 });
+      expect(all.nextCursor).toBeNull();
+      const expected = all.items
+        .filter((m) => role === undefined || m.info.role === role)
+        .map((m) => flatMessage(formatMsg(m)));
+
+      const outs = await follow(
+        messagesTool(source, gate, TEST_LIMITS),
+        { sessionID: "s-ctx", limit: 4, order: "oldest", ...(role && { role }) },
+        nextPage,
+      );
+      const joiner = new MessageJoiner();
+      for (const out of outs) {
+        joiner.add(out.messages as MessageItem[]);
+        expect((out.pagination as { order: string }).order).toBe("oldest");
+      }
+      expect(outs.filter((out) => out.trimmed).length).toBeGreaterThan(1);
+      expect(joiner.messages()).toEqual(expected);
+    },
+  );
 
   it.each(["user", "assistant"] as const)(
     "browses only %s messages through trimmed pages when a role filter is set",
@@ -938,6 +1183,12 @@ describe("continuations", () => {
         { m: "m-vast", part: "m-vast-p0", field: "bogus", offset: 1 },
         { m: "m-vast", part: "m-vast-p0", field: "content" },
         { m: "m-vast", offset: 3 },
+        // The first-part flag names the part at the read's ordinal, so it
+        // needs both, and it has one value.
+        { m: "m-vast", ordinal: 0, f: 1 },
+        { m: "m-vast", part: "m-vast-p0", f: 1 },
+        { m: "m-vast", ordinal: 0, part: "m-vast-p0", f: 2 },
+        { m: "m-vast", ordinal: 0, part: "m-vast-p0", f: "1" },
       ],
       recall_context: [
         { anchorId: "m-ctx-3" },
@@ -949,6 +1200,9 @@ describe("continuations", () => {
         { s: "s-ctx" },
         { s: "s-ctx", page: 5 },
         { s: "s-ctx", page: null, part: "m-ctx-8-p0" },
+        // Only oldest first is written down; newest first is the default.
+        { s: "s-ctx", page: null, o: "newest" },
+        { s: "s-ctx", page: null, o: 1 },
       ],
       recall_sessions: [
         {},
