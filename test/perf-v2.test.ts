@@ -1,8 +1,8 @@
 /**
- * v2 event-loop stall gate, gated behind RECALL_PERF=1
- * like test/perf.test.ts:
+ * v2 event-loop stall gates, gated behind RECALL_PERF=1
+ * like test/perf.test.ts (the verbose reporter prints passing gates' numbers):
  *
- *     RECALL_PERF=1 npx vitest run test/perf-v2.test.ts
+ *     RECALL_PERF=1 npx vitest run test/perf-v2.test.ts --reporter=verbose
  *
  * On opencode v2 the plugin runs inside the shared service process, so a long
  * synchronous slice stalls every session, not just one TUI. This builds a
@@ -14,10 +14,20 @@
  * card synchronously inside the store transaction, over every retained row).
  * Budget: no slice over 50 ms.
  *
+ * The other gates measure, each on its own database: a tail write over a
+ * 5,000-row card; a repair sweep over 400 stale cards (half of them with part
+ * rows an older build never read, the rest rebuilt by suppressed writes) in a
+ * 12,000-card store; paged discovery of 10,501 sessions and of a root's 2,400
+ * children; and one range check over a 500-row session. Each records its total
+ * time and its longest slice. Those gates assert the longest slice with V8's
+ * garbage-collection pauses taken out, and log the raw stall and the longest
+ * GC pause beside it: on a loaded machine a major collection alone can pause
+ * the loop past the budget, which says nothing about the code under test.
+ *
  * When the budget fails the report names the slowest synchronous calls it
- * could attribute (opencode.db statements and store transactions) and the
- * calls inside the worst stall, so the offending path is visible rather than
- * the budget being loosened.
+ * could attribute (opencode.db statements and store reads and transactions)
+ * and the calls inside the worst stall, so the offending path is visible
+ * rather than the budget being loosened. Every gate logs the load average.
  *
  * Status (2026-09-28, Apple Silicon, Node): all three pass. The cold pass
  * peaks at 38 to 48 ms, now set by one 4,000-row replaceSessionParts
@@ -33,9 +43,17 @@ import { describe, expect, it } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createDistiller, type PollMeta } from "../src/distill.js";
+import {
+  createDistiller,
+  RECONCILE_PROGRESS_KEY,
+  type Distiller,
+  type DistillSync,
+  type PollMeta,
+} from "../src/distill.js";
 import { createFetchGate } from "../src/fetch-gate.js";
-import { openStore } from "../src/store.js";
+import type { HistorySession } from "../src/history/model.js";
+import type { HistorySource } from "../src/history/source.js";
+import { openStore, type Store } from "../src/store.js";
 import { openSqlite, type ReadOnlyDb, type SqliteDb } from "../src/sqlite.js";
 import { createV2HistorySource, openOpencodeDb } from "../src/history/v2.js";
 import { V2_PROJECTOR_GEN } from "../src/history/v2-project.js";
@@ -45,9 +63,20 @@ import {
   POLL_WATERMARK_KEY,
   SESSION_CURSOR_KEY,
   SESSION_WATERMARK_KEY,
+  type V2SyncOptions,
 } from "../src/history/v2-sync.js";
 import { DEFAULTS, DISCOVERY_LIMIT } from "../src/types.js";
-import { insertProject, insertSession, makeV2Db } from "./v2-db.js";
+import { loadAverage, perfCorpus, stallProbe, type Stalls } from "./perf-helpers.js";
+import {
+  insertMessage,
+  insertPart,
+  insertProject,
+  insertSession,
+  limitSpy,
+  makeV2Db,
+  makeV2PartsDb,
+  type V2TestDb,
+} from "./v2-db.js";
 
 const ENABLED = process.env.RECALL_PERF === "1";
 const BUDGET_MS = 50;
@@ -60,43 +89,38 @@ const LOADED_HUGE_ROW_BYTES = 3 * 1024 * 1024; // under the 4 MiB page ceiling
 const OVERSIZED_ROW_BYTES = 6 * 1024 * 1024; // over it: a placeholder
 const APPEND_ROWS = 200;
 
-type SlowCall = { what: string; ms: number };
+/** Stale cards the repair sweep rebuilds, in a store of this many cards: the
+ *  rest of the store is what makes its whole-store reads long. */
+const SWEEP_SESSIONS = 400;
+const SWEEP_STORE_CARDS = 12_000;
+const SWEEP_TOTAL_BUDGET_MS = 30_000;
+/** Sessions discovery lists, one root's children among them. */
+const DISCOVERY_SESSIONS = 10_501;
+const ROOT_CHILDREN = 2_400;
+const LISTING_TOTAL_BUDGET_MS = 1_000;
+/** Rows of the session one range check reads, and checks measured. */
+const RANGE_SESSION_ROWS = 500;
+const RANGE_CHECKS = 8;
+const RANGE_CHECK_TOTAL_BUDGET_MS = 250;
 
-/** The longest gap between ticks of a 0 ms interval while it runs, and
- *  where it was (start and end times). */
-function stallProbe(): {
-  reset(): void;
-  max(): number;
-  worst(): { from: number; to: number };
-  stop(): void;
-} {
-  let last = performance.now();
-  let max = 0;
-  let worst = { from: 0, to: 0 };
-  const timer = setInterval(() => {
-    const now = performance.now();
-    if (now - last > max) {
-      max = now - last;
-      worst = { from: last, to: now };
-    }
-    last = now;
-  }, 0);
-  return {
-    reset() {
-      max = 0;
-      last = performance.now();
-    },
-    max: () => max,
-    worst: () => worst,
-    stop: () => clearInterval(timer),
-  };
+/** Wait for `pred`, failing after ten minutes. */
+async function until(pred: () => boolean, what: string): Promise<void> {
+  const start = performance.now();
+  while (!pred()) {
+    if (performance.now() - start > 600_000) throw new Error(`${what} did not finish`);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
 }
+
+type SlowCall = { what: string; ms: number };
 
 /** Record every synchronous call: the slowest, and a timeline to place the
  *  worst stall (calls that ran inside it, and the last one before it). */
 function slowLog(): {
   note(what: string, ms: number): void;
   top(n: number): SlowCall[];
+  /** The slowest calls that started inside `window`. */
+  topIn(window: { from: number; to: number }, n: number): SlowCall[];
   around(window: { from: number; to: number }): Array<{ at: number; what: string; ms: number }>;
 } {
   const calls: SlowCall[] = [];
@@ -107,6 +131,12 @@ function slowLog(): {
       timeline.push({ at: performance.now() - ms, what, ms: Math.round(ms * 10) / 10 });
     },
     top: (n) => [...calls].sort((a, b) => b.ms - a.ms).slice(0, n),
+    topIn: ({ from, to }, n) =>
+      timeline
+        .filter((e) => e.at >= from && e.at <= to)
+        .sort((a, b) => b.ms - a.ms)
+        .slice(0, n)
+        .map(({ what, ms }) => ({ what, ms })),
     around: ({ from, to }) => {
       // The slow calls inside the stall, and the last call before it.
       const inside = timeline.filter((e) => e.at >= from && e.at <= to && e.ms > 1);
@@ -158,6 +188,18 @@ function timedStoreDb(inner: SqliteDb, log: ReturnType<typeof slowLog>): SqliteD
         log.note(`store: ${sql.slice(0, 60)}`, performance.now() - start);
       }
     },
+    all(sql, params) {
+      const start = performance.now();
+      try {
+        return inner.all(sql, params);
+      } finally {
+        // A card read names its long column list first, so keep its FROM.
+        const flat = sql.replace(/\s+/g, " ");
+        const from = flat.indexOf(" FROM ");
+        const label = from > 40 ? `${flat.slice(0, 30)} …${flat.slice(from, from + 40)}` : flat;
+        log.note(`store: ${label.slice(0, 80)}`, performance.now() - start);
+      }
+    },
   };
 }
 
@@ -175,6 +217,105 @@ const words = [
 ];
 const sentence = (i: number, n = 12) =>
   Array.from({ length: n }, (_, k) => words[(i + k * 7) % words.length]).join(" ");
+
+// ── Fixtures for the sweep, discovery and range-check gates ──────────────────
+
+const macrotask = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0));
+
+/** Session discovery as the v2 runtime runs it: global, archived included,
+ *  in keyset pages of 2,000 by id, a macrotask between pages. */
+async function pagedDiscover(source: HistorySource): Promise<HistorySession[]> {
+  const sessions: HistorySession[] = [];
+  let after: string | undefined;
+  for (;;) {
+    const listing = await source.listSessions({
+      scope: "global",
+      limit: 2_000,
+      order: "id",
+      archived: "include",
+      ...(after !== undefined && { after }),
+    });
+    if (!listing.ok) throw new Error(listing.error);
+    sessions.push(...listing.items);
+    if (!listing.truncated || listing.nextCursor === undefined) return sessions;
+    after = listing.nextCursor;
+    await macrotask();
+  }
+}
+
+/** A parent's children as `recall_sessions` lists them: keyset pages of
+ *  1,000 by id, one after another. */
+async function pagedChildren(source: HistorySource, parentID: string): Promise<HistorySession[]> {
+  const children: HistorySession[] = [];
+  let after: string | undefined;
+  for (;;) {
+    const listing = await source.listChildren(parentID, {
+      order: "id",
+      limit: 1_000,
+      ...(after !== undefined && { after }),
+    });
+    if (!listing.ok) throw new Error(listing.error);
+    children.push(...listing.items);
+    if (!listing.truncated || listing.nextCursor === undefined) return children;
+    after = listing.nextCursor;
+  }
+}
+
+/** The read-only opencode.db connection a gate reads through (timed, and
+ *  failing any unbounded history statement), and a v2 store beside it. */
+async function openFixture(
+  v2: V2TestDb,
+  storeDir: string,
+  slow: ReturnType<typeof slowLog>,
+): Promise<{ reader: ReadOnlyDb; storeDb: SqliteDb; store: Store; close: () => void }> {
+  const opened = await openOpencodeDb(v2.path);
+  if (!opened.ok) throw new Error(opened.reason);
+  const reader = limitSpy(timedReader(opened.db, slow));
+  const storeDb = await openSqlite(join(storeDir, "store.db"));
+  if (!storeDb) throw new Error("no sqlite");
+  const result = openStore(timedStoreDb(storeDb, slow), { host: "opencode-v2", source: v2.path });
+  if (!result.ok) throw new Error(result.reason);
+  return {
+    reader,
+    storeDb,
+    store: result.store,
+    close: () => {
+      reader.close();
+      storeDb.close();
+    },
+  };
+}
+
+const textItem = (text: string) => ({ type: "text", text });
+const toolItem = (id: string, command: string, output: string, t: number) => ({
+  type: "tool",
+  id,
+  name: "bash",
+  state: {
+    status: "completed",
+    input: { command },
+    content: [{ type: "text", text: output }],
+    metadata: {},
+  },
+  time: { created: t, completed: t + 1 },
+});
+const userData = (text: string, t: number) => ({ text, time: { created: t } });
+const replyData = (content: unknown[], t: number) => ({
+  agent: "build",
+  model: { id: "m", providerID: "p" },
+  content,
+  time: { created: t, completed: t + 1 },
+});
+
+const round1 = (n: number): number => Math.round(n * 10) / 10;
+const rounded = (results: Record<string, number>): Record<string, number> =>
+  Object.fromEntries(Object.entries(results).map(([k, v]) => [k, round1(v)]));
+/** A gate's stall numbers under `prefix`. */
+const stallFields = (prefix: string, s: Stalls): Record<string, number> => ({
+  [`${prefix}MaxSliceMs`]: s.maxOutsideGcMs,
+  [`${prefix}MaxStallMs`]: s.maxMs,
+  [`${prefix}MaxGcPauseMs`]: s.maxGcMs,
+});
 
 describe.skipIf(!ENABLED)("perf: v2 event-loop stalls", () => {
   it(`cold pass, one poll, listSessions and an append never block the loop over ${BUDGET_MS} ms`, async () => {
@@ -288,6 +429,9 @@ describe.skipIf(!ENABLED)("perf: v2 event-loop stalls", () => {
         results.coldPassMaxSliceMs = probe.max();
         coldWorst = probe.worst();
         results.coldPassTotalMs = performance.now() - coldStart;
+        const coldStalls = await probe.stalls();
+        results.coldPassMaxOutsideGcMs = coldStalls.maxOutsideGcMs;
+        results.coldPassMaxGcPauseMs = coldStalls.maxGcMs;
         await distiller.stop();
 
         // ── One poll cycle (both queries; the session scan is due on a first poll) ──
@@ -538,6 +682,472 @@ describe.skipIf(!ENABLED)("perf: v2 event-loop stalls", () => {
       expect(results.tailWriteMaxSliceMs).toBeLessThan(BUDGET_MS);
       expect(results.tailWriteTotalMs).toBeLessThan(TAIL_BUDGET_TOTAL_MS);
       expect(results.unchangedMaxSliceMs).toBeLessThan(BUDGET_MS);
+    } finally {
+      v2.cleanup();
+      rmSync(storeDir, { recursive: true, force: true });
+    }
+  }, 300_000);
+
+  it(`a repair sweep over ${SWEEP_SESSIONS} stale cards in a ${SWEEP_STORE_CARDS}-card store never blocks the loop over ${BUDGET_MS} ms`, async () => {
+    const v2 = await makeV2PartsDb();
+    v2.db.exec("PRAGMA synchronous = OFF");
+    const storeDir = mkdtempSync(join(tmpdir(), "recall-perf-v2-sweep-"));
+    const slow = slowLog();
+    try {
+      const at = Date.now();
+      // Old enough that no poll window covers it and no reply counts as running.
+      const t0 = at - 30 * 86_400_000;
+      const w = v2.db;
+      /** Each session's first reply, with whether the sweep finds it changed. */
+      const firstReply = new Map<string, { id: string; changed: boolean }>();
+      w.tx(() => {
+        insertProject(w, { id: "prj", worktree: "/workspace/perf" });
+        for (let s = 0; s < SWEEP_SESSIONS; s++) {
+          const sid = `ses_sweep_${String(s).padStart(4, "0")}`;
+          const t = t0 + s * 1_000;
+          insertSession(w, {
+            id: sid,
+            project_id: "prj",
+            directory: "/workspace/perf",
+            title: `Sweep ${sentence(s, 4)}`,
+            time_created: t,
+            time_updated: t + 100,
+          });
+          for (let m = 1; m <= 8; m++) {
+            const id = `msg_${sid}_${m}`;
+            const mt = t + m;
+            if (m % 2 === 1) {
+              insertMessage(w, {
+                id,
+                session_id: sid,
+                type: "user",
+                seq: m,
+                time_created: mt,
+                data: userData(sentence(s + m, 30), mt),
+              });
+              continue;
+            }
+            const items = [
+              textItem(sentence(s + m, 60)),
+              toolItem(`call_${sid}_${m}`, `rg ${sentence(m, 3)}`, sentence(s, 80), mt),
+              textItem(sentence(s * m, 40)),
+            ];
+            // One reply keeps its content inline, as opencode wrote it
+            // before 2.4; the others are part rows.
+            const inline = m === 4;
+            insertMessage(w, {
+              id,
+              session_id: sid,
+              type: "assistant",
+              seq: m,
+              time_created: mt,
+              data: replyData(inline ? items : [], mt),
+            });
+            if (!inline) {
+              items.forEach((data, ordinal) =>
+                insertPart(w, { message_id: id, session_id: sid, ordinal, time_created: mt, data }),
+              );
+            }
+            if (m === 2) firstReply.set(sid, { id, changed: s % 2 === 0 });
+          }
+        }
+      });
+
+      const fx = await openFixture(v2, storeDir, slow);
+      const source = createV2HistorySource(fx.reader);
+      const inner = createV2Sync(fx.reader, { pollIntervalMs: 3_600_000 });
+      // The filler cards below stand for sessions of a long-used store that
+      // this opencode.db does not hold: the deletion reconcile keeps them.
+      const sync: DistillSync = { ...inner, missing: async () => [] };
+      let onLog: ((line: string) => void) | undefined;
+      const logs: string[] = [];
+      const running: Distiller[] = [];
+      const distiller = (instanceId: string): Distiller => {
+        const created = createDistiller({
+          source,
+          store: fx.store,
+          gate: createFetchGate({ concurrency: DEFAULTS.concurrency }),
+          limits: { ...DEFAULTS, distillDelayMs: 0 },
+          instanceId,
+          discover: () => pagedDiscover(source),
+          sync,
+          projectorGen: V2_PROJECTOR_GEN,
+          yieldBetween: macrotask,
+          log: (line) => {
+            logs.push(`${instanceId}: ${line}`);
+            onLog?.(line);
+          },
+        });
+        running.push(created);
+        return created;
+      };
+      const results: Record<string, number> = {};
+      const marks: Record<string, number> = {};
+      const probe = stallProbe();
+      let load = "";
+      try {
+        // 1. Every card built at the current generation.
+        const builder = distiller("perf-v2-sweep-build");
+        builder.start();
+        await until(
+          () => builder.status().coldPass === "done" && builder.repair()?.sweep?.running === false,
+          "the first build",
+        );
+        await builder.stop();
+        running.splice(running.indexOf(builder), 1);
+
+        // 2. The rest of a long-used store: cards at the current generation
+        // for sessions the sweep never reads.
+        const corpus = perfCorpus({ now: at });
+        for (let i = 0; i < SWEEP_STORE_CARDS - SWEEP_SESSIONS; i++) {
+          fx.store.replaceSessionParts(corpus.id(i), [], {
+            ...corpus.card(i),
+            projectorGen: V2_PROJECTOR_GEN,
+          });
+        }
+
+        // 3. Content an older build never read: a new part row on half the
+        // first replies. Then every sweep card as an older build leaves it,
+        // with no generation and no range hashes.
+        w.tx(() => {
+          for (const [sid, reply] of firstReply) {
+            if (!reply.changed) continue;
+            insertPart(w, {
+              message_id: reply.id,
+              session_id: sid,
+              ordinal: 3,
+              time_created: t0,
+              data: textItem(`a late part ${sentence(7, 20)}`),
+            });
+          }
+        });
+        for (const sid of firstReply.keys()) {
+          fx.storeDb.run("UPDATE card SET projector_gen = NULL WHERE session_id = ?", [sid]);
+          fx.store.clearRangeHashes(sid);
+        }
+        expect(fx.store.staleCards(V2_PROJECTOR_GEN)).toHaveLength(SWEEP_SESSIONS);
+
+        // 4. A new distiller. Its cold pass leaves the stale cards to the
+        // sweep that follows it; the sweep is measured from the pass's end.
+        let revAtSweepStart = 0;
+        onLog = (line) => {
+          if (line.includes("] cold pass done")) {
+            marks.coldDone = performance.now();
+            marks.coldMaxStall = probe.max();
+            revAtSweepStart = fx.store.cardStats().cardsRev;
+            probe.reset();
+          } else if (line.includes("] repair sweep done")) {
+            marks.sweepDone = performance.now();
+          }
+        };
+        const sweeper = distiller("perf-v2-sweep");
+        load = loadAverage();
+        probe.reset();
+        const start = performance.now();
+        sweeper.start();
+        await until(() => marks.sweepDone !== undefined, "the sweep");
+        results.coldPassMs = marks.coldDone! - start;
+        results.coldPassMaxStallMs = marks.coldMaxStall!;
+        results.sweepTotalMs = marks.sweepDone! - marks.coldDone!;
+        Object.assign(
+          results,
+          stallFields("sweep", await probe.stalls({ from: marks.coldDone!, to: marks.sweepDone! })),
+        );
+        results.rebuilt = sweeper.repair()?.sweep?.done ?? -1;
+        results.changedWrites = fx.store.cardStats().cardsRev - revAtSweepStart;
+        results.stillStale = fx.store.staleCards(V2_PROJECTOR_GEN).length;
+        results.cards = fx.store.cardCount();
+      } catch (error) {
+        console.log("distiller log:", JSON.stringify(logs.slice(-30)));
+        throw error;
+      } finally {
+        await Promise.all(running.map((d) => d.stop()));
+        probe.stop();
+        fx.close();
+      }
+
+      console.log(`v2 repair sweep perf (load ${load}):`, JSON.stringify(rounded(results)));
+      if (marks.sweepDone !== undefined) {
+        console.log(
+          "slowest synchronous calls in the sweep:",
+          JSON.stringify(slow.topIn({ from: marks.coldDone!, to: marks.sweepDone }, 8)),
+        );
+      }
+
+      expect(results.cards).toBe(SWEEP_STORE_CARDS);
+      expect(results.rebuilt).toBe(SWEEP_SESSIONS);
+      expect(results.stillStale).toBe(0);
+      // Only the sessions with new content changed what readers see; the
+      // rest were suppressed writes.
+      expect(results.changedWrites).toBe(SWEEP_SESSIONS / 2);
+      expect(results.sweepTotalMs).toBeLessThan(SWEEP_TOTAL_BUDGET_MS);
+      expect(results.sweepMaxSliceMs).toBeLessThan(BUDGET_MS);
+    } finally {
+      v2.cleanup();
+      rmSync(storeDir, { recursive: true, force: true });
+    }
+  }, 900_000);
+
+  it(`paged discovery of ${DISCOVERY_SESSIONS} sessions and a ${ROOT_CHILDREN}-child root never blocks the loop over ${BUDGET_MS} ms`, async () => {
+    const v2 = await makeV2PartsDb();
+    v2.db.exec("PRAGMA synchronous = OFF");
+    const slow = slowLog();
+    try {
+      const at = Date.now();
+      const w = v2.db;
+      let archived = 0;
+      w.tx(() => {
+        insertProject(w, { id: "prj", worktree: "/workspace/perf" });
+        const add = (id: string, i: number, parent: string | null) => {
+          const t = at - 90 * 86_400_000 + i * 60_000;
+          // One in twenty archived: discovery includes them.
+          const archive = i % 20 === 0;
+          if (archive) archived++;
+          insertSession(w, {
+            id,
+            project_id: "prj",
+            directory: `/workspace/perf/${i % 12}`,
+            parent_id: parent,
+            title: `${sentence(i, 6)} ${i}`,
+            time_created: t,
+            time_updated: t + 30_000,
+            time_archived: archive ? t + 60_000 : null,
+          });
+        };
+        add("ses_root", 0, null);
+        for (let c = 0; c < ROOT_CHILDREN; c++) {
+          add(`ses_${(c * 7_919).toString(36).padStart(5, "0")}_child`, c + 1, "ses_root");
+        }
+        for (let s = 0; s < DISCOVERY_SESSIONS - ROOT_CHILDREN - 1; s++) {
+          add(
+            `ses_${(s * 104_729).toString(36).padStart(6, "0")}_solo`,
+            ROOT_CHILDREN + 1 + s,
+            null,
+          );
+        }
+      });
+      const opened = await openOpencodeDb(v2.path);
+      if (!opened.ok) throw new Error(opened.reason);
+      const reader = limitSpy(timedReader(opened.db, slow));
+      const source = createV2HistorySource(reader);
+      const results: Record<string, number> = {};
+      const probe = stallProbe();
+      const load = loadAverage();
+      try {
+        probe.reset();
+        let start = performance.now();
+        const sessions = await pagedDiscover(source);
+        results.discoveryTotalMs = performance.now() - start;
+        Object.assign(results, stallFields("discovery", await probe.stalls()));
+        results.listed = sessions.length;
+        results.distinct = new Set(sessions.map((s) => s.id)).size;
+        results.archived = sessions.filter((s) => s.time.archived != null).length;
+
+        probe.reset();
+        start = performance.now();
+        const children = await pagedChildren(source, "ses_root");
+        results.childrenTotalMs = performance.now() - start;
+        Object.assign(results, stallFields("children", await probe.stalls()));
+        results.children = children.length;
+      } finally {
+        probe.stop();
+        reader.close();
+      }
+
+      console.log(`v2 paged discovery perf (load ${load}):`, JSON.stringify(rounded(results)));
+      console.log("slowest synchronous calls:", JSON.stringify(slow.top(4)));
+
+      expect(results.listed).toBe(DISCOVERY_SESSIONS);
+      expect(results.distinct).toBe(DISCOVERY_SESSIONS);
+      expect(results.archived).toBe(archived);
+      expect(results.children).toBe(ROOT_CHILDREN);
+      expect(results.discoveryMaxSliceMs).toBeLessThan(BUDGET_MS);
+      expect(results.childrenMaxSliceMs).toBeLessThan(BUDGET_MS);
+      expect(results.discoveryTotalMs).toBeLessThan(LISTING_TOTAL_BUDGET_MS);
+      expect(results.childrenTotalMs).toBeLessThan(LISTING_TOTAL_BUDGET_MS);
+    } finally {
+      v2.cleanup();
+    }
+  }, 300_000);
+
+  it(`one range check over a ${RANGE_SESSION_ROWS}-row session never blocks the loop over ${BUDGET_MS} ms`, async () => {
+    const v2 = await makeV2PartsDb();
+    v2.db.exec("PRAGMA synchronous = OFF");
+    const storeDir = mkdtempSync(join(tmpdir(), "recall-perf-v2-range-"));
+    const slow = slowLog();
+    try {
+      const at = Date.now();
+      const t0 = at - 30 * 86_400_000;
+      const w = v2.db;
+      const sid = "ses_range";
+      w.tx(() => {
+        insertProject(w, { id: "prj", worktree: "/workspace/perf" });
+        insertSession(w, {
+          id: sid,
+          project_id: "prj",
+          directory: "/workspace/perf",
+          time_created: t0,
+          time_updated: t0 + RANGE_SESSION_ROWS,
+        });
+        for (let seq = 1; seq <= RANGE_SESSION_ROWS; seq++) {
+          const id = `msg_${seq}`;
+          const t = t0 + seq;
+          if (seq % 2 === 1) {
+            insertMessage(w, {
+              id,
+              session_id: sid,
+              type: "user",
+              seq,
+              time_created: t,
+              data: userData(sentence(seq, 30), t),
+            });
+            continue;
+          }
+          insertMessage(w, {
+            id,
+            session_id: sid,
+            type: "assistant",
+            seq,
+            time_created: t,
+            data: replyData([], t),
+          });
+          insertPart(w, {
+            message_id: id,
+            session_id: sid,
+            ordinal: 0,
+            time_created: t,
+            data: textItem(sentence(seq, 60)),
+          });
+          insertPart(w, {
+            message_id: id,
+            session_id: sid,
+            ordinal: 1,
+            time_created: t,
+            data: toolItem(`call_${seq}`, `rg ${sentence(seq, 3)}`, sentence(seq, 80), t),
+          });
+        }
+      });
+
+      const fx = await openFixture(v2, storeDir, slow);
+      const source = createV2HistorySource(fx.reader);
+      const options: V2SyncOptions = { pollIntervalMs: 200, reconcileEveryMs: 1e12 };
+      const inner = createV2Sync(fx.reader, options);
+      /** One range check: from the end of the poll before it to its saved
+       *  progress, with its digest read. */
+      type Check = {
+        from: number;
+        digestStart: number;
+        digestEnd: number;
+        rows: number;
+        saved: number;
+      };
+      const checks: Check[] = [];
+      let checking = false;
+      let pollEnd = 0;
+      const sync: DistillSync = {
+        ...inner,
+        rangeDigest: async (id, after, limit) => {
+          // Digests before `checking` are the first build's own and those of
+          // checks that ran before the measurement started.
+          const check: Check | undefined = checking
+            ? { from: pollEnd, digestStart: performance.now(), digestEnd: 0, rows: 0, saved: 0 }
+            : undefined;
+          if (check) checks.push(check);
+          const rows = await inner.rangeDigest!(id, after, limit);
+          if (check) {
+            check.digestEnd = performance.now();
+            check.rows = rows.length;
+          }
+          return rows;
+        },
+        poll: async (meta) => {
+          const result = await inner.poll(meta);
+          pollEnd = performance.now();
+          return result;
+        },
+      };
+      const setMeta = fx.store.setMeta.bind(fx.store);
+      fx.store.setMeta = (key, value) => {
+        setMeta(key, value);
+        const last = checks[checks.length - 1];
+        if (key === RECONCILE_PROGRESS_KEY && last && last.saved === 0)
+          last.saved = performance.now();
+      };
+      const logs: string[] = [];
+      const distiller = createDistiller({
+        source,
+        store: fx.store,
+        gate: createFetchGate({ concurrency: DEFAULTS.concurrency }),
+        limits: { ...DEFAULTS, distillDelayMs: 0 },
+        instanceId: "perf-v2-range",
+        discover: () => pagedDiscover(source),
+        sync,
+        projectorGen: V2_PROJECTOR_GEN,
+        yieldBetween: macrotask,
+        log: (line) => logs.push(line),
+      });
+      const probe = stallProbe();
+      const load = loadAverage();
+      const results: Record<string, number> = {};
+      const measuredChecks: Array<{ totalMs: number; digestMs: number } & Stalls> = [];
+      let span = { from: 0, to: 0 };
+      try {
+        distiller.start();
+        await until(
+          () =>
+            distiller.status().coldPass === "done" && distiller.repair()?.sweep?.running === false,
+          "the first build",
+        );
+        probe.reset();
+        checking = true;
+        await until(
+          () => checks.filter((c) => c.saved > 0).length >= RANGE_CHECKS,
+          "the range checks",
+        );
+        await distiller.stop();
+        const done = checks.filter((c) => c.saved > 0).slice(0, RANGE_CHECKS);
+        span = { from: done[0]!.from, to: done[done.length - 1]!.saved };
+        for (const check of done) {
+          const stalls = await probe.stalls({ from: check.from, to: check.saved });
+          measuredChecks.push({
+            totalMs: check.saved - check.digestStart,
+            digestMs: check.digestEnd - check.digestStart,
+            ...stalls,
+          });
+          results.rows = check.rows;
+        }
+      } finally {
+        await distiller.stop();
+        probe.stop();
+        fx.close();
+      }
+      const worst = (pick: (c: (typeof measuredChecks)[number]) => number): number =>
+        Math.max(...measuredChecks.map(pick));
+      const median = (pick: (c: (typeof measuredChecks)[number]) => number): number =>
+        [...measuredChecks.map(pick)].sort((a, b) => a - b)[Math.floor(measuredChecks.length / 2)]!;
+      Object.assign(results, {
+        checks: measuredChecks.length,
+        checkMedianMs: median((c) => c.totalMs),
+        checkMaxMs: worst((c) => c.totalMs),
+        digestMedianMs: median((c) => c.digestMs),
+        digestMaxMs: worst((c) => c.digestMs),
+        checkMaxSliceMs: worst((c) => c.maxOutsideGcMs),
+        checkMaxStallMs: worst((c) => c.maxMs),
+        checkMaxGcPauseMs: worst((c) => c.maxGcMs),
+        reindexed: logs.filter((line) => line.includes("re-indexing")).length,
+      });
+
+      console.log(`v2 range check perf (load ${load}):`, JSON.stringify(rounded(results)));
+      console.log(
+        "slowest synchronous calls while the checks ran:",
+        JSON.stringify(slow.topIn(span, 4)),
+      );
+
+      expect(results.checks).toBe(RANGE_CHECKS);
+      expect(results.rows).toBe(RANGE_SESSION_ROWS);
+      expect(results.reindexed).toBe(0);
+      expect(results.checkMaxSliceMs).toBeLessThan(BUDGET_MS);
+      expect(results.checkMaxMs).toBeLessThan(RANGE_CHECK_TOTAL_BUDGET_MS);
     } finally {
       v2.cleanup();
       rmSync(storeDir, { recursive: true, force: true });
