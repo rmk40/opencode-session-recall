@@ -3776,6 +3776,13 @@ export function createDistiller(options: DistillerOptions): Distiller {
     reDistillQueue.delete(sessionID);
     reDistillFailures.delete(sessionID);
     setStrikes(sessionID, undefined);
+    metaFollowUp.delete(sessionID);
+    metaRetries.delete(sessionID);
+    const retry = metaRetryTimers.get(sessionID);
+    if (retry) {
+      clearTimeout(retry);
+      metaRetryTimers.delete(sessionID);
+    }
     if (rootId && rootId !== sessionID) recomputeRootRollup(rootId);
   }
 
