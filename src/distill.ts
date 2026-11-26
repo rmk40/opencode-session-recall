@@ -3014,8 +3014,27 @@ export function createDistiller(options: DistillerOptions): Distiller {
       if (limits.coldPass && coldPassState === "idle") void startColdPass();
     } else {
       leaseHeld = false;
+      noteForeignHolder();
       scheduleLeaseRetry();
     }
+  }
+
+  /** The holder and build last logged by {@link noteForeignHolder}. */
+  let foreignHolderLogged: string | undefined;
+  /**
+   * Log, once per holder, a lease held by another build: until that process
+   * restarts it keeps writing as its own build (an older one stamps no
+   * projector generation and writes cards the repair sweep must rebuild).
+   */
+  function noteForeignHolder(): void {
+    const holder = store.leaseStatus();
+    if (!holder?.holder || holder.holder === instanceId || holder.build === build) return;
+    const key = `${holder.holder} ${holder.build}`;
+    if (key === foreignHolderLogged) return;
+    foreignHolderLogged = key;
+    logMsg(
+      `lease held by ${holder.holder} running build ${holder.build || "(unknown, an older one)"}, not this build ${build}; restart every OpenCode process sharing the store to run one build`,
+    );
   }
 
   function ownsLease(): boolean {
