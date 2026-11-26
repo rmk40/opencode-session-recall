@@ -402,6 +402,22 @@ describe("carded sessions named in a list under excludeFamily", () => {
     },
   );
 
+  it("counts a named session once when excludeSessionID names it as well", async () => {
+    const { tool } = await recallOver(familyTree());
+    const { ctx } = makeContext({ sessionID: "f-kid" });
+    const args = { query: "lanternfish", sessions: named, excludeFamily: true };
+    const excludedFor = async (excludeSessionID: string): Promise<number | undefined> =>
+      (await runTool<SearchOutput>(tool, { ...args, excludeSessionID }, ctx)).coverage
+        ?.skippedByReason?.excludedSession;
+
+    // f-sib is a relative excludeFamily drops already.
+    expect(await excludedFor("f-sib")).toBe(3);
+    // f-out survives the family drop, so excludeSessionID removes it.
+    expect(await excludedFor("f-out")).toBe(4);
+    // An id the list does not name removes nothing from it.
+    expect(await excludedFor("s-other")).toBe(3);
+  });
+
   it("drops the relatives a deep cursor names before it takes any target", async () => {
     const { tool } = await recallOver(familyTree());
     const { ctx } = makeContext({ sessionID: "f-kid" });

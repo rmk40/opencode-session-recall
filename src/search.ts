@@ -3580,7 +3580,9 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
           deepSet = new Set(drillTargets.map((t) => t.sessionId));
           sessionsEligible = scopedCards.length + uncardedTaken.length + unprobed;
           shortlistIDs = drillTargets.map((t) => t.sessionId);
-          if (excludeSessionID) {
+          // Counted only when the list names it and the exclusion arguments
+          // have not dropped (and counted) it already.
+          if (excludeSessionID && named.includes(excludeSessionID)) {
             skippedByReason.excludedSession = (skippedByReason.excludedSession ?? 0) + 1;
             pushUnique(normalized.limitedBy, "excludedSession");
           }
