@@ -1154,7 +1154,8 @@ describe("drill cache bounds", () => {
 
   it("bounds cached messages by count, whatever chars they charge", async () => {
     // Messages without searchable text and not-found lookups charge no chars,
-    // so only the message bound (8 here) evicts them.
+    // so only the object bound evicts them. Each session's entry, page and six
+    // messages count 8, so the bound of 8 holds one session.
     const empty = (sid: string): MessageBundle[] =>
       Array.from({ length: 6 }, (_, i) => note(sid, `${sid}-${i}`, 1000 + i, ""));
     const graph: Graph = {
@@ -1169,21 +1170,21 @@ describe("drill cache bounds", () => {
       source,
       gate: createFetchGate({ concurrency: 4 }),
       limits: { ...TEST_LIMITS, drillPageMessages: 10 },
-      maxCachedMessages: 8,
+      maxCachedObjects: 8,
     });
     const run = (sid: string, fts?: Record<string, FtsHit[]>) =>
       drill.pools(poolsInput([revised(sid)], "needle", fts));
 
     await run("s-e");
-    await run("s-f"); // 12 messages: s-e, the least recently used, goes
+    await run("s-f"); // 16 objects: s-e, the least recently used, goes
     await run("s-f");
     await run("s-e");
     expect(ctl.pages.map((p) => p.sessionID)).toEqual(["s-e", "s-f", "s-e"]);
     expect(drill.cachedChars()).toBe(0);
 
-    // One page message and eight not-found lookups pass the bound alone, so
-    // the entry is dropped once its query has used it, and a repeat reads all
-    // of it again with the same result.
+    // The entry, its page and message and eight not-found lookups pass the
+    // bound alone, so the entry is dropped once its query has used it, and a
+    // repeat reads all of it again with the same result.
     const gone = { "s-n": Array.from({ length: 8 }, (_, i) => ftsHit("s-n", `gone-${i}`)) };
     const first = await run("s-n", gone);
     const again = await run("s-n", gone);
@@ -1191,6 +1192,70 @@ describe("drill cache bounds", () => {
     expect(ctl.pages.filter((p) => p.sessionID === "s-n")).toHaveLength(2);
     expect(poolTexts(again, "s-n")).toEqual(poolTexts(first, "s-n"));
     expect(poolTexts(first, "s-n")).toEqual(["needle"]);
+  });
+
+  /** A drill with an object bound of `maxCachedObjects` over `source`. */
+  const objectBounded = (source: HistorySource, maxCachedObjects: number) =>
+    createDrill({
+      source,
+      gate: createFetchGate({ concurrency: 4 }),
+      limits: TEST_LIMITS,
+      maxCachedObjects,
+    });
+
+  // `s-keep` caches three objects: its entry, its one page and its message.
+  const keepGraph = (): Graph => ({
+    messagesBySession: { "s-keep": [note("s-keep", "k1", 1000, "needle kept")] },
+  });
+
+  it("counts sessions with empty histories against the object bound", async () => {
+    // Each empty session caches its entry and one empty page, two objects and
+    // no chars, so a bound of 5 holds two of them and nothing else.
+    const { source, ctl } = makeControlledSource(keepGraph());
+    const drill = objectBounded(source, 5);
+    const run = (sid: string) => drill.pools(poolsInput([revised(sid)], "needle"));
+    const pagesOf = (sid: string) => ctl.pages.filter((p) => p.sessionID === sid).length;
+
+    await run("s-keep");
+    for (let i = 0; i < 10; i++) {
+      const out = await run(`s-empty-${i}`);
+      expect(out.drilledSessions).toEqual([`s-empty-${i}`]);
+      expect(out.pools[0]!.candidates).toEqual([]);
+    }
+    expect(drill.cachedChars()).toBe(0); // s-keep was evicted
+
+    await run("s-empty-9");
+    await run("s-empty-8");
+    expect(pagesOf("s-empty-9")).toBe(1);
+    expect(pagesOf("s-empty-8")).toBe(1);
+    await run("s-empty-7");
+    expect(pagesOf("s-empty-7")).toBe(2);
+    const kept = await run("s-keep");
+    expect(pagesOf("s-keep")).toBe(2);
+    expect(poolTexts(kept, "s-keep")).toEqual(["needle kept"]);
+  });
+
+  it("counts sessions whose first page read failed against the object bound", async () => {
+    // A failed first read caches the entry alone, one object and no chars, so
+    // a bound of 4 holds s-keep and one failed session, then evicts s-keep.
+    const { source, ctl } = makeControlledSource(keepGraph());
+    ctl.failPage = (req) => req.sessionID.startsWith("s-fail-");
+    const drill = objectBounded(source, 4);
+    const run = (sid: string) => drill.pools(poolsInput([revised(sid)], "needle"));
+
+    await run("s-keep");
+    const errors: string[] = [];
+    for (let i = 0; i < 10; i++) {
+      const out = await run(`s-fail-${i}`);
+      expect(out.drilledSessions).toEqual([]);
+      errors.push(...out.loadErrors);
+    }
+    expect(errors).toHaveLength(10);
+    expect(drill.cachedChars()).toBe(0); // s-keep was evicted
+
+    const kept = await run("s-keep");
+    expect(ctl.pages.filter((p) => p.sessionID === "s-keep")).toHaveLength(2);
+    expect(poolTexts(kept, "s-keep")).toEqual(["needle kept"]);
   });
 });
 

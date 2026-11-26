@@ -215,10 +215,10 @@ export type DrillDeps = {
   /** Soft wall-clock budget for a deep sweep in ms (default 20s). Injectable so
    *  tests can force a time stop without a real 20s wait. */
   deepWallClockMs?: number;
-  /** Messages the drill cache may hold across all sessions (default
-   *  {@link MAX_CACHED_MESSAGES}). Injectable so tests can reach the bound
+  /** Objects the drill cache may hold across all sessions (default
+   *  {@link MAX_CACHED_OBJECTS}). Injectable so tests can reach the bound
    *  without fetching tens of thousands of messages. */
-  maxCachedMessages?: number;
+  maxCachedObjects?: number;
 };
 
 /** Messages per page during a deep sweep (the spec's exhaustive page size). */
@@ -230,12 +230,13 @@ const DEFAULT_DEEP_WALL_CLOCK_MS = 20_000;
  *  an uncarded or unverified target may carry 0 there, so a short bound caps
  *  how stale those pages can get. */
 export const UNREVISED_ENTRY_TTL_MS = 30_000;
-/** Default bound on the messages the drill cache holds, counting each page
- *  message, point lookup and not-found lookup as one. `cacheMaxChars` bounds
- *  candidate chars only, and a message with no searchable text or a not-found
- *  lookup charges none, though each keeps its info object or id. So the cache
- *  evicts while either bound is passed. */
-export const MAX_CACHED_MESSAGES = 50_000;
+/** Default bound on the objects the drill cache holds, counting each session
+ *  entry, cached page, page message, point lookup and not-found lookup as one.
+ *  `cacheMaxChars` bounds candidate chars only, and an entry or page with no
+ *  messages, a message with no searchable text or a not-found lookup charges
+ *  none, though each stays in memory. So the cache evicts while either bound
+ *  is passed. */
+export const MAX_CACHED_OBJECTS = 50_000;
 
 // ── Deep continuation cursor (opaque base64url JSON) ─────────────────────────
 // btoa/atob are DOM globals (available under Bun and Node), so no Node Buffer is
@@ -326,8 +327,9 @@ type SliceBuild = {
  * produced each page ("" for the first page: a source never hands back an
  * empty cursor, since the paging loop reads one as the end of the session).
  * `points` holds point lookups by requested message id, with null for a
- * not-found. `chars` and `messages` are the entry's charge against
- * `cacheMaxChars` and the cached-message bound. The `build`'s candidates are
+ * not-found. `chars` and `objects` are the entry's charge against
+ * `cacheMaxChars` and the cached-object bound; `objects` counts the entry
+ * itself from the moment it is cached. The `build`'s candidates are
  * shallow copies of candidates the entry holds, sharing their strings, so
  * they add no charge; a build is cached only while every message under it is
  * still held. `live` turns false once the entry leaves the cache, after which
@@ -341,7 +343,7 @@ type SessionEntry = {
   points: Map<string, DrilledMessage | null>;
   pointChars: number;
   chars: number;
-  messages: number;
+  objects: number;
   build: SliceBuild | undefined;
   live: boolean;
 };
@@ -381,18 +383,18 @@ function estimateRetained(msg: HistoryMessage): number {
 export function createDrill(deps: DrillDeps): Drill {
   const { source, gate, limits } = deps;
   const clock = deps.now ?? Date.now;
-  const maxCachedMessages = deps.maxCachedMessages ?? MAX_CACHED_MESSAGES;
+  const maxCachedObjects = deps.maxCachedObjects ?? MAX_CACHED_OBJECTS;
   // Per-session LRU of fetched pages and point lookups; Map order is LRU order.
   const cache = new Map<string, SessionEntry>();
   let cachedTotal = 0;
-  let cachedMessages = 0;
+  let cachedObjects = 0;
 
-  function charge(entry: SessionEntry, chars: number, messages: number): void {
+  function charge(entry: SessionEntry, chars: number, objects: number): void {
     entry.chars += chars;
-    entry.messages += messages;
+    entry.objects += objects;
     if (!entry.live) return;
     cachedTotal += chars;
-    cachedMessages += messages;
+    cachedObjects += objects;
   }
 
   function drop(entry: SessionEntry): void {
@@ -400,12 +402,12 @@ export function createDrill(deps: DrillDeps): Drill {
     entry.live = false;
     cache.delete(entry.sessionId);
     cachedTotal -= entry.chars;
-    cachedMessages -= entry.messages;
+    cachedObjects -= entry.objects;
   }
 
   function evict(): void {
     for (const entry of cache.values()) {
-      if (cachedTotal <= limits.cacheMaxChars && cachedMessages <= maxCachedMessages) break;
+      if (cachedTotal <= limits.cacheMaxChars && cachedObjects <= maxCachedObjects) break;
       drop(entry);
     }
   }
@@ -453,11 +455,15 @@ export function createDrill(deps: DrillDeps): Drill {
       points: new Map(),
       pointChars: 0,
       chars: 0,
-      messages: 0,
+      objects: 0,
       build: undefined,
       live: true,
     };
     cache.set(target.sessionId, entry);
+    // The entry counts as one object for as long as it is cached, so entries
+    // that never cache a message (an empty history, a failed first read) still
+    // fill the bound and are evicted.
+    charge(entry, 0, 1);
     return entry;
   }
 
@@ -510,7 +516,8 @@ export function createDrill(deps: DrillDeps): Drill {
     entry.pages.set(key, cached);
     let chars = 0;
     for (const msg of cached.items) chars += msg.chars;
-    charge(entry, chars, cached.items.length);
+    // The page itself counts as one object, so an empty page is not free.
+    charge(entry, chars, cached.items.length + 1);
     return cached;
   }
 
