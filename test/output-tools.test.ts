@@ -825,6 +825,35 @@ describe("recall_sessions pages past limit", () => {
       error: expect.stringContaining("This listing changed"),
     });
   }, 60_000);
+
+  it("resumes a trimmed page up to its own end, so every page holds limit sessions", async () => {
+    const h = makeFakeHarness();
+    addListing(h, 170);
+    const outs = await follow(sessionsTool(h.source, true, TEST_LIMITS), { limit: 60 }, nextCursor);
+    // The outputs up to and including the first one not trimmed make a page.
+    const pages: Out[][] = [];
+    let page: Out[] = [];
+    for (const out of outs) {
+      // A trimmed output's next cursor is its continuation.
+      if (out.trimmed) expect(out.nextCursor).toBe(out.continuation);
+      page.push(out);
+      if (!out.trimmed) {
+        pages.push(page);
+        page = [];
+      }
+    }
+    expect(page).toEqual([]);
+    const ids = (group: Out[]): string[] =>
+      group.flatMap((out) => (out.sessions as Array<{ id: string }>).map((s) => s.id));
+    // 172 sessions (the fixture's two and 170 more): two full pages and the rest.
+    expect(pages.map((p) => ids(p).length)).toEqual([60, 60, 52]);
+    // Every page was over the budget, so each was trimmed and resumed.
+    expect(pages.every((p) => p.length > 1)).toBe(true);
+    expect(pages.flat().map((out) => out.truncated)).toEqual(
+      pages.flatMap((p, i) => p.map(() => (i < pages.length - 1 ? true : undefined))),
+    );
+    expect(ids(outs)).toEqual(h.sessions.map((s) => s.id));
+  });
 });
 
 // ── Continuations across tools ───────────────────────────────────────────────
@@ -916,7 +945,16 @@ describe("continuations", () => {
         { s: "s-ctx", page: 5 },
         { s: "s-ctx", page: null, part: "m-ctx-8-p0" },
       ],
-      recall_sessions: [{}, { anchorId: "" }, { anchorId: 5 }],
+      recall_sessions: [
+        {},
+        { anchorId: "" },
+        { anchorId: 5 },
+        // A position without the count of sessions its rest covers, or with
+        // none of them, or that resumes a trimmed page with none of it left.
+        { anchorId: "s-list-050", n: 52, h: "ids", t: "rest" },
+        { anchorId: "s-list-050", n: 52, h: "ids", t: "rest", r: 0 },
+        { anchorId: "s-list-050", n: 52, h: "ids", t: "rest", r: 1, l: 0 },
+      ],
     };
     for (const [name, { tool, args }] of Object.entries(tools)) {
       const cursors = [

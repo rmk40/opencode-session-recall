@@ -6,7 +6,7 @@ import { search } from "../src/search.js";
 import { sessions as sessionsTool } from "../src/sessions.js";
 import { createFetchGate, type FetchGate } from "../src/fetch-gate.js";
 import { cardsLiteFromSessions } from "../src/cards.js";
-import type { HistorySource } from "../src/history/source.js";
+import { createUnavailableSource, type HistorySource } from "../src/history/source.js";
 import type {
   ContextOutput,
   ErrorOutput,
@@ -640,6 +640,243 @@ describe("recall_sessions continuations across listing changes", () => {
     expect(out.sessions[0]!.id).toBe(
       h.sessions.filter((s) => s.directory === PROJECT_DIR)[shown.length]!.id,
     );
+  });
+});
+
+describe("recall_sessions pages past limit", () => {
+  type Page = SessionsOutput & { error?: string };
+  type Harness = ReturnType<typeof makeFakeHarness>;
+
+  /** The fake harness with `count` project sessions with short titles after
+   *  the fixture's two, newest first in array order (as the fake lists
+   *  them), so no page is trimmed. */
+  function listing(count: number): Harness {
+    const h = makeFakeHarness();
+    const now = Date.now();
+    for (let i = 0; i < count; i++) {
+      const id = `s-page-${String(i).padStart(3, "0")}`;
+      h.sessions.push(session(id, `Page ${i}`, PROJECT_DIR, now - 10_000 - i));
+    }
+    return h;
+  }
+
+  /** `count` sessions as the card index knows them, newest first. */
+  function carded(count: number): ReturnType<typeof session>[] {
+    const now = Date.now();
+    return Array.from({ length: count }, (_, i) =>
+      session(`s-card-${String(i).padStart(3, "0")}`, `Card ${i}`, PROJECT_DIR, now - 10_000 - i),
+    );
+  }
+
+  /** A summarizer worker session, updated after every other session. */
+  const worker = (id: string): ReturnType<typeof session> =>
+    session(id, "[recall-summarizer] worker", PROJECT_DIR, Date.now() + 60_000);
+
+  /** Session `id` updated now: newer `time.updated`, first in the listing. */
+  function touch(h: Harness, id: string): void {
+    const index = h.sessions.findIndex((s) => s.id === id);
+    const [moved] = h.sessions.splice(index, 1);
+    h.sessions.unshift({ ...moved!, time: { ...moved!.time, updated: Date.now() + 60_000 } });
+  }
+
+  /** Every page of a listing, following `nextCursor` to the end. `between`
+   *  runs before each page after the first. */
+  async function walk(
+    tool: ReturnType<typeof sessionsTool>,
+    args: Record<string, unknown>,
+    between?: (step: number) => void,
+  ): Promise<Page[]> {
+    const pages: Page[] = [];
+    let cursor: string | undefined;
+    for (let step = 0; step < 50; step++) {
+      const out = await runTool<Page>(tool, { ...args, ...(cursor && { cursor }) });
+      expect(out.ok, out.error).toBe(true);
+      pages.push(out);
+      cursor = out.nextCursor;
+      if (!cursor) return pages;
+      between?.(step);
+    }
+    throw new Error("pages did not end");
+  }
+
+  const idsOf = (pages: Page[]): string[] => pages.flatMap((p) => p.sessions.map((s) => s.id));
+  /** `truncated` as every page but the last of `count` shows it. */
+  const truncatedUntilLast = (count: number): Array<true | undefined> =>
+    Array.from({ length: count }, (_, i) => (i < count - 1 ? true : undefined));
+
+  it("pages a live listing by recency, limit sessions at a time, each once and in order", async () => {
+    // 27 sessions: pages of 9 end on a full page, pages of 10 on a short one.
+    for (const [limit, sizes] of [
+      [9, [9, 9, 9]],
+      [10, [10, 10, 7]],
+    ] as const) {
+      const h = listing(25);
+      const pages = await walk(sessionsTool(h.source, true, TEST_LIMITS), { limit });
+      expect(pages.map((p) => p.returned)).toEqual(sizes);
+      expect(pages.map((p) => p.truncated)).toEqual(truncatedUntilLast(sizes.length));
+      expect(pages.every((p) => p.continuation === undefined && p.trimmed === undefined)).toBe(
+        true,
+      );
+      expect(idsOf(pages)).toEqual(h.sessions.map((s) => s.id));
+      // Each call reads from the top through the session after its page (the
+      // source asks for one row more, to decide its own `truncated`).
+      expect(h.calls.projectList.map((c) => c.limit)).toEqual(
+        sizes.map((_, k) => (k + 1) * limit + 2),
+      );
+    }
+  });
+
+  it("ends a live listing that fits in one page without truncated or nextCursor", async () => {
+    const h = listing(3);
+    const out = await runTool<Page>(sessionsTool(h.source, true, TEST_LIMITS), { limit: 5 });
+    expect(out.returned).toBe(5);
+    expect(out.truncated).toBeUndefined();
+    expect(out.nextCursor).toBeUndefined();
+  });
+
+  it("refuses the next live page when a session not yet shown moved ahead of it", async () => {
+    const h = listing(25);
+    const tool = sessionsTool(h.source, true, TEST_LIMITS);
+    const first = await runTool<Page>(tool, { limit: 10 });
+    expect(first.nextCursor).toEqual(expect.any(String));
+    // A session from the third page is updated, so it moves to the top,
+    // ahead of the sessions already shown.
+    touch(h, h.sessions[22]!.id);
+    expect(await runTool<Page>(tool, { limit: 10, cursor: first.nextCursor })).toMatchObject({
+      ok: false,
+      error: expect.stringContaining("This listing changed"),
+    });
+  });
+
+  it("keeps paging a live listing without a gap when a summarizer worker arrives between pages", async () => {
+    const h = listing(25);
+    const expected = h.sessions.map((s) => s.id);
+    const pages = await walk(sessionsTool(h.source, true, TEST_LIMITS), { limit: 9 }, (step) => {
+      h.sessions.unshift(worker(`s-worker-${step}`));
+    });
+    expect(pages.map((p) => p.returned)).toEqual([9, 9, 9]);
+    expect(idsOf(pages)).toEqual(expected);
+    expect(pages.every((p) => p.note === undefined)).toBe(true);
+  });
+
+  it("reads past summarizer workers that leave a read short, to fill the page and reach the next", async () => {
+    const h = listing(10);
+    const expected = h.sessions.map((s) => s.id);
+    for (let i = 0; i < 5; i++) h.sessions.unshift(worker(`s-worker-${i}`));
+    const tool = sessionsTool(h.source, true, TEST_LIMITS);
+
+    const first = await runTool<Page>(tool, { limit: 3 });
+    expect(first.sessions.map((s) => s.id)).toEqual(expected.slice(0, 3));
+    expect(first).toMatchObject({ truncated: true, nextCursor: expect.any(String) });
+    expect(first.note).toBeUndefined();
+    // More than one read, at most three, each longer than the one before.
+    const reads = h.calls.projectList.map((c) => c.limit!);
+    expect(reads.length).toBeGreaterThan(1);
+    expect(reads.length).toBeLessThanOrEqual(3);
+    reads.slice(1).forEach((rows, i) => expect(rows).toBeGreaterThan(reads[i]!));
+
+    const second = await runTool<Page>(tool, { limit: 3, cursor: first.nextCursor });
+    expect(second.sessions.map((s) => s.id)).toEqual(expected.slice(3, 6));
+  });
+
+  it("makes at most three reads when summarizer workers fill them, and says why the page is short", async () => {
+    const h = listing(10);
+    for (let i = 0; i < 40; i++) h.sessions.unshift(worker(`s-worker-${i}`));
+    const out = await runTool<Page>(sessionsTool(h.source, true, TEST_LIMITS), { limit: 3 });
+    expect(h.calls.projectList).toHaveLength(3);
+    // More sessions exist, but this call reached none to continue from.
+    expect(out).toMatchObject({
+      ok: true,
+      returned: 0,
+      truncated: true,
+      note: expect.stringContaining("summarizer worker"),
+    });
+    expect(out.nextCursor).toBeUndefined();
+  });
+
+  it("keeps a time-bounded live listing to one page of the newest limit sessions", async () => {
+    // Without a card store, and on the staleness fallback (a card store with
+    // nothing newer than `since`).
+    for (const enrichment of [undefined, { cards: () => [] }]) {
+      const h = listing(25);
+      const out = await runTool<Page>(sessionsTool(h.source, true, TEST_LIMITS, enrichment), {
+        since: "1h",
+        limit: 5,
+      });
+      expect(out.sessions.map((s) => s.id)).toEqual(h.sessions.slice(0, 5).map((s) => s.id));
+      expect(out.truncated).toBeUndefined();
+      expect(out.nextCursor).toBeUndefined();
+      expect(out.note).toMatch(/newest 5\b/);
+    }
+  });
+
+  it("pages a listing selected from the cards, with no live read", async () => {
+    // With `since` over a card store, and from the cards alone while the
+    // history source is unavailable.
+    for (const mode of ["since", "unavailable"] as const) {
+      const h = makeFakeHarness();
+      const known = carded(25);
+      const source =
+        mode === "since" ? h.source : createUnavailableSource("v2-sqlite", "cannot open db");
+      const tool = sessionsTool(source, true, TEST_LIMITS, {
+        cards: () => cardsLiteFromSessions(known),
+      });
+      const pages = await walk(tool, { limit: 10, ...(mode === "since" && { since: "7d" }) });
+      expect(
+        pages.map((p) => p.returned),
+        mode,
+      ).toEqual([10, 10, 5]);
+      expect(
+        pages.map((p) => p.truncated),
+        mode,
+      ).toEqual(truncatedUntilLast(3));
+      expect(idsOf(pages), mode).toEqual(known.map((s) => s.id));
+      expect(h.calls.projectList, mode).toEqual([]);
+    }
+  });
+
+  it("refuses the next page of a card listing when a session after the page left it", async () => {
+    const h = makeFakeHarness();
+    const known = carded(25);
+    const tool = sessionsTool(h.source, true, TEST_LIMITS, {
+      cards: () => cardsLiteFromSessions(known),
+    });
+    const first = await runTool<Page>(tool, { since: "7d", limit: 10 });
+    expect(first.nextCursor).toEqual(expect.any(String));
+    // The oldest session, on the last page, is gone from the cards.
+    known.pop();
+    expect(
+      await runTool<Page>(tool, { since: "7d", limit: 10, cursor: first.nextCursor }),
+    ).toMatchObject({ ok: false, error: expect.stringContaining("This listing changed") });
+  });
+
+  it("reports archived from the card on listings served from the cards", async () => {
+    const h = makeFakeHarness();
+    const now = Date.now();
+    const [archived, cleared, never] = cardsLiteFromSessions([
+      session("s-archived", "Archived", PROJECT_DIR, now - 1_000),
+      session("s-cleared", "Unarchived", PROJECT_DIR, now - 2_000),
+      session("s-never", "Never archived", PROJECT_DIR, now - 3_000),
+    ]);
+    const cards = [
+      { ...archived!, timeArchived: now - 500 },
+      { ...cleared!, timeArchived: null },
+      never!,
+    ];
+    for (const [source, args] of [
+      [h.source, { since: "7d" }],
+      [createUnavailableSource("v2-sqlite", "cannot open db"), {}],
+    ] as const) {
+      const out = await runTool<Page>(
+        sessionsTool(source, true, TEST_LIMITS, { cards: () => cards }),
+        args,
+      );
+      expect(out.sessions.map((s) => [s.id, s.archived])).toEqual([
+        ["s-archived", true],
+        ["s-cleared", false],
+        ["s-never", false],
+      ]);
+    }
   });
 });
 
