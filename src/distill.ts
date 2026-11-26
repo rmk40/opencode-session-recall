@@ -438,10 +438,11 @@ export type DistillSync = {
    *  no longer has ({@link DistillSync.missing}); the cold pass does it too. */
   readonly reconcileEveryMs: number;
   /**
-   * A session's rows after `afterSeq`, ascending by `seq`, at most `limit`
-   * (capped by the host), each with the state of its part rows. The range
-   * hashes and the range check are built from these. Absent: the host keeps
-   * no range hashes.
+   * A session's rows after `afterSeq`, ascending by `seq`, at most `limit`,
+   * each with the state of its part rows. Fewer than `limit` rows means the
+   * session ends there, so a caller never asks for more than the host's cap
+   * (500 on v2). The range hashes and the range check are built from these.
+   * Absent: the host keeps no range hashes.
    */
   rangeDigest?(sessionID: string, afterSeq: number, limit: number): Promise<RangeRow[]>;
   /** Of `sessionIDs`, those with part rows. */
