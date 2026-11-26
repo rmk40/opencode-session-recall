@@ -484,6 +484,16 @@ inline content, so it may pass the ceiling by at most `CONTINUATION_METADATA_MAX
 (16 KiB) and always moves forward. v1 has no part ordinals and answers a
 `partOrdinal` with `unsupported`.
 
+The ceiling covers message bodies and part rows only. The lookups that attribute each
+user row to an agent and a model (`identities` in `src/history/v2.ts`) run after those
+reads and are not charged to it, because which rows they need depends on which rows the
+reads kept. Per switch type a page reads one switch row for its oldest user row, at
+most `SWITCH_SCAN_LIMIT + 1` (65) between its oldest and newest user row and, when
+there are more, one per remaining user row. It also reads the agent and model fields
+of one assistant row. A switch row holds the agent or model chosen, the previous one,
+event metadata and a timestamp. Paging a real 26,000-message session, they added at
+most 256 bytes to any page, but the reader does not cap a switch row's size.
+
 ## What the v2 reader relies on in opencode 2.4
 
 The v2 reader was written against opencode 2.4.1's stored layout (the full

@@ -57,9 +57,11 @@ import {
  *   drill, deep and the distiller keep moving past it, and the placeholder
  *   text is what gets indexed. The body statements re-read every size, since
  *   rows can grow between statements, and cut where a running total would
- *   pass what is left of the ceiling, so the bytes a page loads never exceed
- *   it. A first message whose parts do not fit loads them in ordinal order up
- *   to the cut (possibly none) and is marked `partial` (see
+ *   pass what is left of the ceiling, so the body and part bytes a page loads
+ *   never exceed it. The lookups that attribute user rows to an agent and a
+ *   model run after those reads and are not charged to it (see `identities`
+ *   for their bound). A first message whose parts do not fit loads them in
+ *   ordinal order up to the cut (possibly none) and is marked `partial` (see
  *   {@link MessageParts}); `getMessage` continues it from a part ordinal,
  *   charging the envelope's metadata rather than its inline content, and a
  *   continuation may pass the ceiling by at most that metadata
@@ -415,6 +417,9 @@ export type V2SourceOptions = {
   drift?: HistoryDriftState;
 };
 
+/** The default {@link V2SourceOptions.pageByteCeiling}. It covers message
+ *  bodies and part rows; the lookups that attribute user rows are read
+ *  outside it (see `identities` for their bound). */
 const DEFAULT_PAGE_BYTE_CEILING = 4 * 1024 * 1024;
 const DEFAULT_PAGE_PART_ROWS = 2_000;
 /** Children per page when the caller gives no limit. */
@@ -1211,6 +1216,16 @@ export function createV2HistorySource(db: ReadOnlyDb, opts: V2SourceOptions = {}
    * The switch lookups are per user and independent of page size, so a page
    * and `getMessage` attribute the same row the same way. Every statement is
    * LIMIT-bound; none runs unless the rows include a user.
+   *
+   * These reads come after a page's body and part reads and are not charged
+   * to its byte ceiling, because which rows they need depends on which rows
+   * those reads kept. Their bound, per switch type: one switch row for the
+   * oldest user row, at most {@link SWITCH_SCAN_LIMIT} + 1 from the range
+   * read and, when the range holds more, one per remaining user row; plus
+   * the agent and model fields of one assistant row. opencode writes a
+   * switch row as the agent or model chosen, the previous one, event
+   * metadata and a timestamp, so each is small, but nothing here caps its
+   * size.
    */
   async function identities(
     decoded: Array<Extract<DecodedRow, { ok: true }>>,
