@@ -13,6 +13,7 @@ import {
 } from "../src/types.js";
 import {
   createHistoryDriftState,
+  createUnavailableSource,
   emptyReadCounts,
   type HistoryDrift,
 } from "../src/history/source.js";
@@ -1908,29 +1909,29 @@ describe("recall", () => {
       return h;
     }
 
-    it("excludes the whole delegation tree when searching from the root", async () => {
+    it("excludes the whole delegation tree from the root with excludeFamily", async () => {
       const h = familyHarness();
       const out = await runTool<SearchOutput>(
         await recallTool(h),
-        { query: "family lineage evidence" },
+        { query: "family lineage evidence", excludeFamily: true },
         makeContext({ sessionID: "s-root" }).ctx,
       );
       expect(out.results).toEqual([]);
       expect(out.coverage?.skippedByReason?.excludedSession).toBe(4);
     });
 
-    it("excludes ancestors and siblings when searching from a subagent child", async () => {
+    it("excludes ancestors and siblings from a subagent child with excludeFamily", async () => {
       const h = familyHarness();
       const out = await runTool<SearchOutput>(
         await recallTool(h),
-        { query: "family lineage evidence" },
+        { query: "family lineage evidence", excludeFamily: true },
         makeContext({ sessionID: "s-grandchild" }).ctx,
       );
       expect(out.results).toEqual([]);
       expect(out.coverage?.skippedByReason?.excludedSession).toBe(4);
     });
 
-    it("keeps unrelated sessions and restores the family on explicit opt-in", async () => {
+    it("keeps the family by default and unrelated sessions under excludeFamily", async () => {
       const h = familyHarness();
       const outsider = session("s-outsider", "Unrelated", PROJECT_DIR, Date.now() - 1_000);
       h.globalSessions.push(globalSessionFrom(outsider));
@@ -1939,20 +1940,54 @@ describe("recall", () => {
           textPart("p-outsider", outsider.id, "m-outsider", "family lineage evidence marker too"),
         ]),
       ];
+      const tool = await recallTool(h);
+      const rootCtx = makeContext({ sessionID: "s-root" }).ctx;
 
-      const excluded = await runTool<SearchOutput>(
-        await recallTool(h),
+      const byDefault = await runTool<SearchOutput>(
+        tool,
         { query: "family lineage evidence" },
-        makeContext({ sessionID: "s-root" }).ctx,
+        rootCtx,
       );
-      expect(excluded.results.map((r) => r.sessionID)).toEqual(["s-outsider"]);
+      expect(new Set(byDefault.results.map((r) => r.sessionID))).toEqual(
+        new Set(["s-child", "s-grandchild", "s-sibling", "s-outsider"]),
+      );
+      expect(byDefault.coverage?.skippedByReason?.excludedSession).toBe(1);
+
+      const family = await runTool<SearchOutput>(
+        tool,
+        { query: "family lineage evidence", excludeFamily: true },
+        rootCtx,
+      );
+      expect(family.results.map((r) => r.sessionID)).toEqual(["s-outsider"]);
 
       const optIn = await runTool<SearchOutput>(
-        await recallTool(h),
+        tool,
         { query: "family lineage evidence", excludeCurrentSession: false },
-        makeContext({ sessionID: "s-root" }).ctx,
+        rootCtx,
       );
       expect(new Set(optIn.results.map((r) => r.sessionID)).size).toBe(5);
+    });
+
+    it("reads excludeFamily as unset unless it is true when hosts bypass Zod parsing", async () => {
+      const tool = await recallTool(familyHarness());
+      const { ctx } = makeContext({ sessionID: "s-root" });
+      const query = "family lineage evidence";
+
+      for (const excludeFamily of [undefined, "yes", 1, null]) {
+        const out = await runToolRaw<SearchOutput>(
+          tool,
+          { query, ...(excludeFamily !== undefined && { excludeFamily }) },
+          ctx,
+        );
+        expect(out.ok, String(excludeFamily)).toBe(true);
+        expect(out.results.length, String(excludeFamily)).toBeGreaterThan(0);
+        expect(out.coverage?.skippedByReason?.excludedSession, String(excludeFamily)).toBe(1);
+      }
+
+      const on = await runToolRaw<SearchOutput>(tool, { query, excludeFamily: true }, ctx);
+      expect(on.ok).toBe(true);
+      expect(on.results).toEqual([]);
+      expect(on.coverage?.skippedByReason?.excludedSession).toBe(4);
     });
 
     it("survives a parentID cycle without hanging", async () => {
@@ -1968,13 +2003,20 @@ describe("recall", () => {
           ]),
         ];
       }
-      const out = await runTool<SearchOutput>(
-        await recallTool(h),
-        { query: "cycle marker" },
-        makeContext({ sessionID: "s-cyc-a" }).ctx,
+      const tool = await recallTool(h);
+      const { ctx } = makeContext({ sessionID: "s-cyc-a" });
+      const family = await runTool<SearchOutput>(
+        tool,
+        { query: "cycle marker", excludeFamily: true },
+        ctx,
       );
-      expect(out.ok).toBe(true);
-      expect(out.results).toEqual([]);
+      expect(family.ok).toBe(true);
+      expect(family.results).toEqual([]);
+
+      // The default walks the same family to order the relatives it keeps.
+      const byDefault = await runTool<SearchOutput>(tool, { query: "cycle marker" }, ctx);
+      expect(byDefault.ok).toBe(true);
+      expect(byDefault.results.map((r) => r.sessionID)).toEqual(["s-cyc-b"]);
     });
   });
 
@@ -2122,6 +2164,111 @@ describe("recall", () => {
         s.reason.startsWith("Most top hits are from this conversation"),
       );
       expect(dominance).toBeDefined();
+    });
+  });
+
+  describe("an orchestrator searching its own subagents", () => {
+    const MINUTE = 60_000;
+
+    /** A root session (the caller) with two subagents, one of which holds
+     *  the only mention of "kestrelvane", plus a recent outsider that shares
+     *  the query's other term. All inside the last four hours. */
+    function orchestratorHarness(): FakeHarness {
+      const h = makeFakeHarness();
+      const now = Date.now();
+      const root = session("s-orch", "Gateway work", PROJECT_DIR, now - 30 * MINUTE);
+      const finder = session(
+        "s-orch-a",
+        "Gateway config lookup",
+        PROJECT_DIR,
+        now - 20 * MINUTE,
+        undefined,
+        "s-orch",
+      );
+      const other = session(
+        "s-orch-b",
+        "Release notes",
+        PROJECT_DIR,
+        now - 10 * MINUTE,
+        undefined,
+        "s-orch",
+      );
+      const outsider = session("s-outsider", "Upload fixes", PROJECT_DIR, now - 5 * MINUTE);
+      for (const sess of [root, finder, other, outsider]) {
+        h.globalSessions.push(globalSessionFrom(sess));
+      }
+      h.messagesBySession[root.id] = [
+        bundle(userMessage("m-orch-1", root.id, now - 31 * MINUTE), [
+          textPart("p-orch-1", root.id, "m-orch-1", "Split the gateway work across subagents."),
+        ]),
+      ];
+      h.messagesBySession[finder.id] = [
+        bundle(userMessage("m-orch-a1", finder.id, now - 21 * MINUTE), [
+          textPart(
+            "p-orch-a1",
+            finder.id,
+            "m-orch-a1",
+            "Find where the kestrelvane gateway timeout is configured.",
+          ),
+        ]),
+        bundle(assistantMessage("m-orch-a2", finder.id, now - 20 * MINUTE), [
+          textPart(
+            "p-orch-a2",
+            finder.id,
+            "m-orch-a2",
+            "The kestrelvane timeout lives in deploy/gateway.yaml; I raised it to 30s.",
+          ),
+        ]),
+      ];
+      h.messagesBySession[other.id] = [
+        bundle(userMessage("m-orch-b1", other.id, now - 11 * MINUTE), [
+          textPart("p-orch-b1", other.id, "m-orch-b1", "Summarize the release notes."),
+        ]),
+      ];
+      h.messagesBySession[outsider.id] = [
+        bundle(userMessage("m-outsider-1", outsider.id, now - 6 * MINUTE), [
+          textPart(
+            "p-outsider-1",
+            outsider.id,
+            "m-outsider-1",
+            "Bump the timeout on the flaky upload.",
+          ),
+        ]),
+      ];
+      return h;
+    }
+
+    const query = { query: "kestrelvane timeout", match: "smart", last: "4h" };
+
+    it("finds the subagent first on the drilled path", async () => {
+      const tool = await recallTool(orchestratorHarness());
+      const { ctx } = makeContext({ sessionID: "s-orch" });
+      for (const group of ["part", "session"]) {
+        const out = await runTool<SearchOutput>(tool, { ...query, group }, ctx);
+        expect(out.ok, group).toBe(true);
+        expect(out.results[0]?.sessionID, group).toBe("s-orch-a");
+        expect(
+          out.results.some((r) => r.sessionID === "s-orch"),
+          group,
+        ).toBe(false);
+      }
+    });
+
+    it("finds the subagent first on the card tier", async () => {
+      const h = orchestratorHarness();
+      const { deps, cleanup } = await makeRecallDeps(h, TEST_LIMITS);
+      cleanups.push(cleanup);
+      const source = createUnavailableSource("v2-sqlite", "cannot open opencode.db");
+      const drill = createDrill({ source, gate: deps.gate, limits: TEST_LIMITS });
+      const tool = search(source, true, TEST_LIMITS, { ...deps, drill });
+      const { ctx } = makeContext({ sessionID: "s-orch" });
+      for (const group of ["part", "session"]) {
+        const out = await runTool<SearchOutput>(tool, { ...query, group }, ctx);
+        expect(out.ok, group).toBe(true);
+        expect(out.coverage?.source?.available, group).toBe(false);
+        expect(out.results[0]?.sessionID, group).toBe("s-orch-a");
+        expect(out.results[0]?.partID, group).toMatch(/:card:|:title$/);
+      }
     });
   });
 });

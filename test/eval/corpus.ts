@@ -12,6 +12,9 @@
  *  - exact-phrase preference
  *  - cross-session / cross-project recall
  *  - old-but-strong vs. recent-but-weak
+ *  - the current session's subagents: one holding the answer outranks a weak
+ *    outsider, one whose prompt echoes the query ranks below the real answer,
+ *    and one whose reply echoes it stays out under excludeFamily
  *
  * The corpus is intentionally separate from `makeFixture` in helpers.ts so
  * eval cases stay stable even if the unit-test fixture changes.
@@ -98,6 +101,40 @@ export function makeEvalCorpus(now = Date.now()): EvalCorpus {
   // e-tui: unrelated recent TUI session in another directory.
   const sTui = session("e-tui", "Terminal UI spike", OTHER_DIR, now - 8_000);
 
+  // ── Subagent answer: the only session holding the answer is a child of the
+  //    session searching for it ──
+  // e-orch: the orchestrator (the current session in that case). It delegated
+  // the investigation without naming what was found.
+  const sOrch = session("e-orch", "Release notes cleanup", PROJECT_DIR, now - 36_000);
+  // e-orch-sub: its subagent, whose reply holds the answer.
+  const sOrchSub = session(
+    "e-orch-sub",
+    "Investigate nightly export stall",
+    PROJECT_DIR,
+    now - 35_000,
+    undefined,
+    "e-orch",
+  );
+  // e-weak: an unrelated, more recent session sharing one query term.
+  const sWeak = session("e-weak", "Dashboard polish", PROJECT_DIR, now - 4_000);
+
+  // ── A model-written echo in a relative's reply ──
+  // e-hub: the current session in that case; it parrots its own query.
+  const sHub = session("e-hub", "Uploader hardening", PROJECT_DIR, now - 45_000);
+  // e-hub-echo: its subagent, whose reply (not its prompt) restates the
+  // query with no evidence. Family diversity does not demote a reply, so it
+  // outranks the real session unless excludeFamily removes it.
+  const sHubEcho = session(
+    "e-hub-echo",
+    "Summarize earlier uploader work",
+    PROJECT_DIR,
+    now - 44_000,
+    undefined,
+    "e-hub",
+  );
+  // e-harbor: the earlier session that did the work.
+  const sHarbor = session("e-harbor", "Upload client changes", PROJECT_DIR, now - 70_000);
+
   // ── Distill-then-search tier probes (round-4) ────────────────────────
   const HOUR = 60 * 60 * 1000;
   const DAY = 24 * HOUR;
@@ -106,9 +143,9 @@ export function makeEvalCorpus(now = Date.now()): EvalCorpus {
   // card inventory (and the FTS index). A smart query on it is answered by the
   // tier-1 card ranker alone. Recent, so it is never a near-miss casualty.
   const sInv = session("e-inv", "Release deploy tuning", PROJECT_DIR, now - 6_000);
-  // The three OLDEST sessions below are, by construction, the three the tier-1
-  // recency near-miss fallback drops (the corpus has exactly 12 newer sessions,
-  // and the fallback keeps only the newest 12). That is load-bearing:
+  // The three OLDEST sessions below are, by construction, among those the
+  // tier-1 recency near-miss fallback drops (the corpus has more than 12 newer
+  // sessions, and the fallback keeps only the newest 12). That is load-bearing:
   //   • e-fts reaches the shortlist ONLY through the tier-1.5 FTS tier, proving
   //     the FTS needle path (its card carries nothing the query matches).
   //   • e-out is never drilled by a non-deep query, so its output-only needle is
@@ -266,15 +303,25 @@ export function makeEvalCorpus(now = Date.now()): EvalCorpus {
     ],
 
     // ── e-cur-sub: delegation-tree echo of the current conversation ─────
+    // Its prompt is the orchestrator's own wording of the query, which is its
+    // best match; its reply restates the query with no workflow evidence.
     [sCurSub.id]: [
+      bundle(userMessage("ecs-0", sCurSub.id, now - 1_450), [
+        textPart(
+          "ecs-0p",
+          sCurSub.id,
+          "ecs-0",
+          "Evaluate recall search results for the query: " +
+            "ghostauth tuistory test opencode plugin auth login debug workflow.",
+        ),
+      ]),
       bundle(assistantMessage("ecs-1", sCurSub.id, now - 1_400), [
         textPart(
           "ecs-1p",
           sCurSub.id,
           "ecs-1",
           "Findings: the ghostauth tuistory test workflow for the opencode plugin " +
-            "auth login debug involved launching the TUI. Query terms repeated: " +
-            "ghostauth tuistory test opencode plugin auth login debug workflow.",
+            "auth login debug involved launching the TUI.",
         ),
       ]),
     ],
@@ -427,6 +474,89 @@ export function makeEvalCorpus(now = Date.now()): EvalCorpus {
       ]),
     ],
 
+    // ── e-orch / e-orch-sub / e-weak: the answer lives in a subagent ───────
+    [sOrch.id]: [
+      bundle(userMessage("eor-1", sOrch.id, now - 37_000), [
+        textPart(
+          "eor-1p",
+          sOrch.id,
+          "eor-1",
+          "Ask a subagent to find out why the nightly export job stalls.",
+        ),
+      ]),
+    ],
+    [sOrchSub.id]: [
+      bundle(userMessage("eos-1", sOrchSub.id, now - 36_500), [
+        textPart(
+          "eos-1p",
+          sOrchSub.id,
+          "eos-1",
+          "Find out why the nightly export job stalls and report the cause.",
+        ),
+      ]),
+      bundle(assistantMessage("eos-2", sOrchSub.id, now - 35_500), [
+        textPart(
+          "eos-2p",
+          sOrchSub.id,
+          "eos-2",
+          "Cause found: the zephyrmarble exporter keeps a stale lock after a clock drift; " +
+            "clearing the lock on startup ends the stall.",
+        ),
+      ]),
+    ],
+    [sWeak.id]: [
+      bundle(userMessage("ewk-1", sWeak.id, now - 4_500), [
+        textPart(
+          "ewk-1p",
+          sWeak.id,
+          "ewk-1",
+          "Make the wall clock widget on the dashboard show seconds.",
+        ),
+      ]),
+    ],
+
+    // ── e-hub / e-hub-echo / e-harbor: an echo only excludeFamily removes ──
+    [sHub.id]: [
+      bundle(userMessage("ehb-1", sHub.id, now - 46_000), [
+        textPart(
+          "ehb-1p",
+          sHub.id,
+          "ehb-1",
+          "How did we add harborlight retry backoff with jitter before? Check recall.",
+        ),
+      ]),
+    ],
+    [sHubEcho.id]: [
+      bundle(assistantMessage("ehe-1", sHubEcho.id, now - 44_500), [
+        textPart(
+          "ehe-1p",
+          sHubEcho.id,
+          "ehe-1",
+          "Findings: harborlight retry backoff jitter came up in an earlier session. " +
+            "Query terms repeated: harborlight retry backoff jitter.",
+        ),
+      ]),
+    ],
+    [sHarbor.id]: [
+      bundle(userMessage("ehr-1", sHarbor.id, now - 72_000), [
+        textPart(
+          "ehr-1p",
+          sHarbor.id,
+          "ehr-1",
+          "Give the harborlight uploader retries with exponential backoff and jitter.",
+        ),
+      ]),
+      bundle(assistantMessage("ehr-2", sHarbor.id, now - 71_000), [
+        textPart(
+          "ehr-2p",
+          sHarbor.id,
+          "ehr-2",
+          "Wrapped the harborlight upload call in exponential backoff with full jitter; " +
+            "it gives up after five tries.",
+        ),
+      ]),
+    ],
+
     // ── e-inv: card-inventory needle (distinctive token in a tool INPUT) ──
     [sInv.id]: [
       bundle(userMessage("ei-1", sInv.id, now - 7_000), [
@@ -502,7 +632,25 @@ export function makeEvalCorpus(now = Date.now()): EvalCorpus {
     ],
   };
 
-  const sessions = [sAuth, sRate, sDb, sNoise, sCur, sCurSub, sInv, sFts, sOut, sTempOld, sTempNew];
+  const sessions = [
+    sAuth,
+    sRate,
+    sDb,
+    sNoise,
+    sCur,
+    sCurSub,
+    sOrch,
+    sOrchSub,
+    sWeak,
+    sHub,
+    sHubEcho,
+    sHarbor,
+    sInv,
+    sFts,
+    sOut,
+    sTempOld,
+    sTempNew,
+  ];
   const globalSessions = [
     sAuth,
     sRate,
@@ -514,6 +662,12 @@ export function makeEvalCorpus(now = Date.now()): EvalCorpus {
     sFlow,
     sDocs,
     sTui,
+    sOrch,
+    sOrchSub,
+    sWeak,
+    sHub,
+    sHubEcho,
+    sHarbor,
     sInv,
     sFts,
     sOut,

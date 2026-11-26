@@ -130,6 +130,18 @@ describe("recall relevance eval", () => {
         ).not.toContain(banned);
       }
 
+      for (const { session, below } of c.expect.rankedBelow ?? []) {
+        const upper = result.returnedSessionIDs.indexOf(below);
+        const lower = result.returnedSessionIDs.indexOf(session);
+        expect(upper, `${c.name}: session ${below} must appear in results`).toBeGreaterThanOrEqual(
+          0,
+        );
+        expect(
+          lower,
+          `${c.name}: session ${session} must appear below ${below}, got [${result.returnedSessionIDs.join(", ")}]`,
+        ).toBeGreaterThan(upper);
+      }
+
       if (c.expect.classInTop3) {
         const top3 = result.topClasses.slice(0, 3);
         expect(

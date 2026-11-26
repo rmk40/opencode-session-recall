@@ -92,10 +92,12 @@ export const EVAL_CASES: EvalCase[] = [
   },
   {
     // Field report: historical-workflow discovery. The current conversation
-    // (e-cur) parrots the whole query; default current-session exclusion must
-    // keep it out so the real workflow session (e-flow, misleading title in
-    // the ghostauth directory) can surface.
-    name: "field-report: prior ghostauth/tuistory workflow excludes current session",
+    // (e-cur) parrots the whole query and is excluded by default. Its
+    // subagent (e-cur-sub) stays searchable, but its best match is the prompt
+    // e-cur wrote it, an echo of the query, so family diversity demotes it
+    // and the real workflow session (e-flow, misleading title in the
+    // ghostauth directory) must rank above it.
+    name: "field-report: prior ghostauth/tuistory workflow outranks the current session's subagent echo",
     args: {
       query: "ghostauth tuistory test opencode plugin auth login debug workflow",
       match: "smart",
@@ -105,11 +107,52 @@ export const EVAL_CASES: EvalCase[] = [
     ctxSessionID: "e-cur",
     relevantSessionIDs: ["e-flow"],
     expect: {
-      notInResults: ["e-cur", "e-cur-sub"],
+      notInResults: ["e-cur"],
+      rankedBelow: [{ session: "e-cur-sub", below: "e-flow" }],
       // The grouped representative must be conversational or action evidence,
       // never the skill payload that happens to score well lexically.
       classInTop3: ["human-text", "tool-input"],
       maxClassInTop5: { "skill-definition": 0 },
+    },
+  },
+  {
+    // A relative whose reply (not its prompt) parrots the query. Family
+    // diversity demotes only a delegated-prompt echo, so a reply echo stays
+    // out only under excludeFamily:true, which lets the real session
+    // (e-harbor) rank first.
+    name: "excludeFamily: a subagent's reply echoing the query stays out",
+    args: {
+      query: "harborlight retry backoff jitter",
+      match: "smart",
+      group: "session",
+      scope: "global",
+      excludeFamily: true,
+    },
+    ctxSessionID: "e-hub",
+    relevantSessionIDs: ["e-harbor"],
+    expect: {
+      notInResults: ["e-hub", "e-hub-echo"],
+      classInTop3: ["human-text", "tool-input"],
+      maxClassInTop5: { "skill-definition": 0 },
+    },
+  },
+  {
+    // The only session holding the answer is a subagent of the session
+    // searching for it (e-orch); a more recent outsider (e-weak) shares one
+    // query term. The subagent's best match is its own reply, not its
+    // prompt, so it must rank first.
+    name: "subagent answer: the current session's child outranks a weak outsider",
+    args: {
+      query: "zephyrmarble lock clock drift",
+      match: "smart",
+      group: "session",
+      scope: "global",
+    },
+    ctxSessionID: "e-orch",
+    relevantSessionIDs: ["e-orch-sub"],
+    expect: {
+      notInResults: ["e-orch"],
+      rankedBelow: [{ session: "e-weak", below: "e-orch-sub" }],
     },
   },
   {

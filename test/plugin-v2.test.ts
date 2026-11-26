@@ -531,7 +531,7 @@ describe("v2 tools and hooks", () => {
     const runtime = await runtimeOf(h);
     expect(runtime.store).toBeNull();
     await waitUntil(() => runtime.cards.coverage().totalCards === 2);
-    // Called from another session: recall excludes the caller's own family.
+    // Called from another session: recall excludes only the caller's own session.
     const out = await call(h, "recall", { query: "orchidneedle", scope: "project" }, "ses_new");
     expect(out.ok).toBe(true);
     expect((out.coverage as { mode?: string }).mode).toBe("ephemeral");

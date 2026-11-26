@@ -438,6 +438,70 @@ describe("deep finds output-only needles that non-deep honestly misses", () => {
   });
 });
 
+// ── The scoped listing and the current session's family ──────────────────────
+
+describe("deep sweep of a scoped listing", () => {
+  it("leaves out only the current session by default, and its whole family with excludeFamily", async () => {
+    const h = makeFakeHarness();
+    // The caller (s-dl-kid) is a subagent of s-dl-root with a subagent of its
+    // own, and has a sibling with a subagent; s-dl-out is unrelated. Each
+    // holds the needle in a tool output, which only a deep sweep reads.
+    const family: Array<[string, string | undefined]> = [
+      ["s-dl-root", undefined],
+      ["s-dl-kid", "s-dl-root"],
+      ["s-dl-kidsub", "s-dl-kid"],
+      ["s-dl-sib", "s-dl-root"],
+      ["s-dl-grand", "s-dl-sib"],
+      ["s-dl-out", undefined],
+    ];
+    for (const [i, [id, parent]] of family.entries()) {
+      const at = NOW - 10_000 - i * 1_000;
+      addSession(h, session(id, `Listing ${id}`, PROJECT_DIR, at, undefined, parent), [
+        bundle(assistantMessage(`m-${id}`, id, at), [
+          completedToolPart(
+            `p-${id}`,
+            id,
+            `m-${id}`,
+            "bash",
+            { command: "run" },
+            "spindlewort found",
+          ),
+        ]),
+      ]);
+    }
+    const { deps, cleanup } = await makeRecallDeps(h);
+    try {
+      const recall = search(h.source, true, TEST_LIMITS, deps);
+      const { ctx } = makeContext({ sessionID: "s-dl-kid" });
+      const args = { query: "spindlewort", deep: true, since: "30d", project: true };
+      const swept = async (extra: Record<string, unknown>): Promise<string[]> => {
+        const out = await runTool<SearchOutput>(recall, { ...args, ...extra }, ctx);
+        expect(out.ok).toBe(true);
+        return [...new Set(out.results.map((r) => r.sessionID))].sort();
+      };
+
+      expect(await swept({})).toEqual([
+        "s-dl-grand",
+        "s-dl-kidsub",
+        "s-dl-out",
+        "s-dl-root",
+        "s-dl-sib",
+      ]);
+      expect(await swept({ excludeFamily: true })).toEqual(["s-dl-out"]);
+      expect(await swept({ excludeCurrentSession: false })).toEqual([
+        "s-dl-grand",
+        "s-dl-kid",
+        "s-dl-kidsub",
+        "s-dl-out",
+        "s-dl-root",
+        "s-dl-sib",
+      ]);
+    } finally {
+      cleanup();
+    }
+  });
+});
+
 // ── Budget stop + cursor continuation ────────────────────────────────────────
 
 describe("deep budget stop and cursor continuation", () => {
