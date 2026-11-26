@@ -484,6 +484,16 @@ checkpoint still compares as `tail`, since the card's rows past the boundary are
 read again on the next poll. It is never taken as proof that nothing changed,
 because the card may hold rows newer than it describes.
 
+## Metadata patches during a distill
+
+A metadata patch (a rename, a move, an archive or unarchive) is applied to the card
+at once. If a re-distill or sweep of the session is running, or a cold pass that has
+not written the session yet, that writer read the session's metadata earlier and
+writes it over the patch. So the distiller notes the session and reads its metadata
+from the host again once the last such writer has finished. A cold pass follows up
+the sessions it never wrote when it ends. A failed read keeps the follow-up and
+retries it after a delay that doubles each time, up to five times.
+
 ## The summarizer only runs while holding the distill lease
 
 Path B summaries (`summarize.ts`) are not an independent loop. The distiller drives
