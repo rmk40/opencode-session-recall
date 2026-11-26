@@ -190,6 +190,10 @@ export type RankStats = {
    *  of which cards would have taken a shortlist slot; that estimate is
    *  explicitly approximate (see the counterfactual merge in `search.ts`). */
   rootOnlySkipped: Array<{ card: Card; score: number }>;
+  /** Cards that passed every filter but were left out unscored because the
+   *  index had yet to take their current content (an index update was still
+   *  running). Set by every `rank` call given this object. */
+  pending?: number;
 };
 
 export type CardsCoverage = {
@@ -1388,7 +1392,14 @@ export function createCardsRuntime(deps: CardsRuntimeDeps): CardsRuntime {
 
       const hits: CardHit[] = [];
       const skipped: Array<{ card: Card; score: number }> = [];
+      let pending = 0;
       for (const card of cards) {
+        if (dirty.has(card.sessionId)) {
+          // Unscored (see lexicalHits); counted only when a filter would
+          // have let it compete.
+          if (passesFilters(card, filters, excluded)) pending++;
+          continue;
+        }
         if (!passesFilters(card, filters, excluded)) {
           // Count only cards the restriction ALONE removed and that would have
           // become hits: the contention set every other skippedByReason key is
@@ -1426,6 +1437,7 @@ export function createCardsRuntime(deps: CardsRuntimeDeps): CardsRuntime {
         skipped.sort((a, b) => byRecency(a.card, b.card));
         stats.rootOnlySkipped.push(...skipped);
       }
+      if (stats) stats.pending = pending;
       hits.sort(
         (a, b) =>
           b.score - a.score ||

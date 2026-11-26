@@ -2701,6 +2701,9 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
         // score, and the sessions the reserved-slot band pulled into the drill.
         const semanticBySession = new Map<string, number>();
         let semanticReserved: string[] = [];
+        /** Cards tier-1 ranking left out because the index had yet to take
+         *  their latest content (reported as `coverage.cards.pending`). */
+        let cardsPending = 0;
         /** Sessions the authorship root-only restriction removed from selection,
          *  across BOTH selection paths (card ranking and the FTS admission
          *  chain). Kept as ids so the two paths cannot double-count the same
@@ -3142,14 +3145,12 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
           // Coverage for that restriction comes back from the ranking pass
           // itself, which already knows which cards it discarded and whether
           // they had any signal. The directory/scope bucketing below is applied
-          // to them here, since `rank` never sees it.
+          // to them here, since `rank` never sees it. The same pass counts the
+          // cards it left out because the index had yet to take them.
           const rankStats: RankStats = { rootOnlySkipped: [] };
           await cards.ready({ index: true });
-          let cardHits: CardHit[] = cards.rank(
-            queryMeta,
-            cardFilters,
-            humanOnly ? rankStats : undefined,
-          );
+          let cardHits: CardHit[] = cards.rank(queryMeta, cardFilters, rankStats);
+          cardsPending = rankStats.pending ?? 0;
 
           // Hoisted so the authorship skip accounting below applies the exact
           // same title predicate `eligible` did, instead of over-counting a
@@ -3638,6 +3639,7 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
               full: cardsCoverage.fullCards,
               storeRecency: cardsCoverage.storeRecency,
               degraded: cardsCoverage.degraded,
+              ...(cardsPending > 0 && { pending: cardsPending }),
               ...(indexing && { indexing }),
             },
             ...(semanticStatus && { semantic: { ...semanticStatus, contributed: 0 } }),

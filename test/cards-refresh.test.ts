@@ -805,6 +805,41 @@ describe("vectors behind a card's content", () => {
   });
 });
 
+describe("cards left out of a ranking", () => {
+  it("counts the cards a running index update has yet to take", async () => {
+    const store = await freshStore();
+    put(store, "anchor", { inventory: "omega anchor", directory: "/p" });
+    for (let i = 0; i < 140; i++) {
+      put(store, cardId(i), { inventory: "alpha shared", directory: i < 10 ? "/q" : "/p" });
+    }
+    const slices = gate();
+    const runtime = createCardsRuntime({
+      source: storeCardSource(store),
+      refreshIntervalMs: 0,
+      yieldBetween: slices.yieldBetween,
+    });
+    runtime.rank(parseQuery("alpha"), {});
+    for (let i = 0; i < 65; i++) {
+      put(store, cardId(i), { inventory: "omega shared", directory: i < 10 ? "/q" : "/p" });
+    }
+    slowSlices();
+
+    const all: RankStats = { rootOnlySkipped: [] };
+    runtime.rank(parseQuery("alpha"), {}, all);
+    expect(all.pending).toBe(65);
+    // Only the pending cards a filter would have let compete count.
+    const scoped: RankStats = { rootOnlySkipped: [] };
+    runtime.rank(parseQuery("alpha"), { directoryFilter: "/q" }, scoped);
+    expect(scoped.pending).toBe(10);
+
+    slices.open();
+    await runtime.ready({ index: true });
+    const done: RankStats = { rootOnlySkipped: [] };
+    runtime.rank(parseQuery("alpha"), {}, done);
+    expect(done.pending).toBe(0);
+  });
+});
+
 describe("cards-lite source", () => {
   it("keeps its cards past the refresh interval until invalidate(), then reloads before any access", () => {
     let liteCards = [makeCard("a", { title: "first widget" })];

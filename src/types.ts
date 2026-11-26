@@ -282,6 +282,10 @@ export type SearchCoverage = {
     full: number;
     storeRecency: number;
     degraded: boolean;
+    /** Present when ranking left out cards whose latest content the search
+     *  index had yet to take (its update was still running when the search
+     *  stopped waiting): how many would otherwise have competed. */
+    pending?: number;
     /** Present while the store is not complete yet (no cold pass has
      *  indexed every session, and it has fewer cards than sessions): how many
      *  of the `known` sessions have a card (`indexed`) and how many the

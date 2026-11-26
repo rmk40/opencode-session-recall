@@ -2773,6 +2773,30 @@ describe("recall card index use", () => {
     expect(embed).toHaveBeenCalled();
     expect(cards.semanticStatus()?.cardsWithVectors).toBeGreaterThan(0);
   });
+
+  it("reports how many cards a ranking left out because the index was still updating", async () => {
+    const h = makeFakeHarness();
+    const { deps, cleanup } = await makeRecallDeps(h, TEST_LIMITS);
+    cleanups.push(cleanup);
+    const recallWith = (pending: number): ToolDefinition =>
+      search(h.source, true, TEST_LIMITS, {
+        ...deps,
+        cards: {
+          ...deps.cards,
+          // As when the search stopped waiting while an index update ran.
+          rank: (query, filters, stats) => {
+            const hits = deps.cards.rank(query, filters, stats);
+            if (stats) stats.pending = pending;
+            return hits;
+          },
+        },
+      });
+
+    const left = await runTool<SearchOutput>(recallWith(3), { query: "walkthrough" });
+    expect(left.coverage?.cards?.pending).toBe(3);
+    const none = await runTool<SearchOutput>(recallWith(0), { query: "walkthrough" });
+    expect(none.coverage?.cards).not.toHaveProperty("pending");
+  });
 });
 
 // ── History drift, card repair and cut messages ──────────────────────────────
