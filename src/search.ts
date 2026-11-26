@@ -2762,7 +2762,7 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
          *  `time.updated` alone still drops cached pages at once, even before
          *  the snapshot reloads. Undefined without a store, a card or a
          *  stamped write. */
-        const liveWriteRev = (id: string): number | undefined => store?.getCard(id)?.writeRev;
+        const liveWriteRev = (id: string): number | undefined => store?.cardWriteRev(id);
 
         /** The explicitly named ids to treat as UNCARDED. Uncarded-ness is
          *  decided from the SAME facade snapshot the carded filter reads
