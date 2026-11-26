@@ -757,30 +757,30 @@ export function decodeMessagesCursor(cursor: string): Decoded<MessagesCursor> {
 }
 
 /**
- * A `recall_sessions` position: the first session not shown (`anchor`), the
- * `updated` time it was listed with, and the sessions listed before it, as
- * their count (`shown`) and a fingerprint of their ids (`ids`). The same
- * listing resumes at the anchor only while all of these still hold, so a
- * session that moved past the anchor between calls is never skipped and an
- * anchor that moved is never shown twice. Token fields: `anchorId`,
- * `updated`, `n`, `h`.
+ * A `recall_sessions` position in the listing it was made from: the first
+ * session not shown (`anchor`), the sessions listed before it as their
+ * count (`shown`) and a fingerprint of their ids in any order (`ids`), and a
+ * fingerprint of the rest of the listing from the anchor on (`rest`). The
+ * same listing resumes at the anchor only while all of these still hold, so
+ * no session is skipped or shown twice. Token fields: `anchorId`, `n`, `h`,
+ * `t`.
  */
-export type SessionsCursor = { anchor: string; updated: number; shown: number; ids: string };
+export type SessionsCursor = { anchor: string; shown: number; ids: string; rest: string };
 
 export function encodeSessionsCursor(c: SessionsCursor): string {
   return encodeContinuation("recall_sessions", {
     anchorId: c.anchor,
-    updated: c.updated,
     n: c.shown,
     h: c.ids,
+    t: c.rest,
   });
 }
 
 export function decodeSessionsCursor(cursor: string): Decoded<SessionsCursor> {
   return decodeWith("recall_sessions", cursor, (fields) => {
-    const { anchorId: anchor, updated, n: shown, h: ids } = fields;
-    if (!nonEmptyString(anchor) || !nonEmptyString(ids)) return null;
-    if (typeof updated !== "number" || !Number.isFinite(updated) || !isOffset(shown)) return null;
-    return { anchor, updated, shown, ids };
+    const { anchorId: anchor, n: shown, h: ids, t: rest } = fields;
+    if (!nonEmptyString(anchor) || !nonEmptyString(ids) || !nonEmptyString(rest)) return null;
+    if (!isOffset(shown)) return null;
+    return { anchor, shown, ids, rest };
   });
 }

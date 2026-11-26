@@ -52,6 +52,13 @@ function idsFingerprint(items: readonly SessionItem[]): string {
   return cyrb53(JSON.stringify(items.map((item) => item.id).sort()));
 }
 
+/** A fingerprint of a run of sessions: each one's id and `updated` time in
+ *  listing order, hashed, so any session added, removed, updated or moved
+ *  changes it. */
+function runFingerprint(items: readonly SessionItem[]): string {
+  return cyrb53(JSON.stringify(items.map((item) => [item.id, item.time.updated])));
+}
+
 /** Every child of `parentID`, paged in id order so a child updated during the
  *  walk is neither skipped nor listed twice, up to
  *  `CHILDREN_PAGE * CHILDREN_PAGES_MAX` of them. */
@@ -128,11 +135,13 @@ export function sessions(
   /**
    * The listing as output: from the cursor's session on when there is one,
    * trimmed to the budget with a continuation at the first session not shown.
-   * The listing is in recency order and rebuilt on every call, so a cursor
-   * resumes only when its anchor kept its `updated` time and the sessions
-   * before it are exactly the ones already shown; a session that changed
-   * between calls would otherwise be skipped (it moved ahead of the anchor)
-   * or shown twice (the anchor moved).
+   * The listing is rebuilt on every call, so a cursor resumes only when the
+   * sessions before its anchor are exactly the ones already shown (in any
+   * order: a shown session that was updated may have moved to the top) and
+   * the listing from the anchor on is unchanged, session for session. A
+   * change in between could otherwise skip a session (one moved ahead of the
+   * anchor, or a new or filtered-out session pushed the last one out of the
+   * `limit` window) or show one twice (the anchor moved).
    */
   const respond = (out: SessionsOutput, cursor: SessionsCursor | undefined): string => {
     const listed = out.sessions;
@@ -149,12 +158,12 @@ export function sessions(
         );
       }
       if (
-        listed[start]!.time.updated !== cursor.updated ||
         start !== cursor.shown ||
-        idsFingerprint(listed.slice(0, start)) !== cursor.ids
+        idsFingerprint(listed.slice(0, start)) !== cursor.ids ||
+        runFingerprint(listed.slice(start)) !== cursor.rest
       ) {
         return writeError(
-          `This listing changed since the cursor was made (session ${cursor.anchor} or one listed before it was updated, added or removed); list again without cursor`,
+          `This listing changed since the cursor was made (a session not yet shown was updated, added or removed); list again without cursor`,
         );
       }
     }
@@ -167,9 +176,9 @@ export function sessions(
           ...(next !== undefined && {
             continuation: encodeSessionsCursor({
               anchor: listed[next]!.id,
-              updated: listed[next]!.time.updated,
               shown: next,
               ids: idsFingerprint(listed.slice(0, next)),
+              rest: runFingerprint(listed.slice(next)),
             }),
           }),
           fields: { ...rest, returned: counts.sessions ?? 0 },

@@ -589,6 +589,37 @@ describe("recall_sessions continuations across listing changes", () => {
     expect(out).toMatchObject({ ok: false, error: expect.stringContaining("list again") });
   });
 
+  it("rejects the continuation when a session filtered out of the listing took a slot in between", async () => {
+    // A summarizer worker is dropped after the source listing, so it leaves
+    // the anchor and the sessions before it alone but pushes the window's
+    // last session out of the `limit` the source returns.
+    const h = harness();
+    const first = await run(h);
+    h.sessions.unshift(
+      session("s-walk-worker", "[recall-summarizer] worker", PROJECT_DIR, Date.now() + 60_000),
+    );
+    const out = await run(h, first.continuation);
+    expect(out).toMatchObject({ ok: false, error: expect.stringContaining("list again") });
+  });
+
+  it("rejects the continuation when a session was inserted below the anchor in between", async () => {
+    // The card index's initial pass can add a card with an old update time,
+    // which sorts below the anchor on the card path (`since`/`until`).
+    const h = harness();
+    const cards = h.sessions.filter((s) => s.directory === PROJECT_DIR).slice(0, 100);
+    const tool = sessionsTool(h.source, true, TEST_LIMITS, {
+      cards: () => cardsLiteFromSessions(cards),
+    });
+    const call = (cursor?: string): Promise<Listed> =>
+      runTool<Listed>(tool, { limit: 100, since: "7d", ...(cursor && { cursor }) });
+    const first = await call();
+    expect(first.continuation).toBeDefined();
+    const anchorUpdated = cards[first.sessions.length]!.time.updated;
+    cards.push(session("s-walk-late", "Late card", PROJECT_DIR, anchorUpdated - 1));
+    const out = await call(first.continuation);
+    expect(out).toMatchObject({ ok: false, error: expect.stringContaining("list again") });
+  });
+
   it("resumes when a session already shown was updated in between, without repeating it", async () => {
     const h = harness();
     const first = await run(h);
