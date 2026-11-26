@@ -24,6 +24,7 @@ import {
   identityOf,
   isUserRoleType,
   PART_TYPES,
+  partId,
   projectMessage,
   projectSession,
   resolveIdentity,
@@ -365,19 +366,19 @@ export async function openOpencodeDb(path: string): Promise<OpencodeDbOpen> {
 
 // ── Cursors ──────────────────────────────────────────────────────────────────
 
+/** Prefix of a newest-first page cursor. */
 const CURSOR_PREFIX = "v2:";
+/** Prefix of an oldest-first page cursor, so neither walk takes the other's. */
+const ASCENDING_CURSOR_PREFIX = "v2a:";
 
-/** Opaque page cursor: `base64url("v2:" + seq)`. `seq` is a non-negative
- *  safe integer (up to 16 digits), the same range the decoder accepts. */
-export function encodeV2Cursor(seq: number): string {
+function encodeCursor(prefix: string, seq: number): string {
   if (!Number.isSafeInteger(seq) || seq < 0) {
     throw new Error(`cursor seq must be a non-negative safe integer, got ${String(seq)}`);
   }
-  return btoa(`${CURSOR_PREFIX}${seq}`).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  return btoa(`${prefix}${seq}`).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 }
 
-/** Decode a cursor; anything that is not one of ours rejects. */
-export function decodeV2Cursor(cursor: string): number {
+function decodeCursor(prefix: string, cursor: string): number {
   const invalid = new Error(`Invalid message cursor: ${cursor.slice(0, 64)}`);
   if (!/^[A-Za-z0-9_-]+$/.test(cursor)) throw invalid;
   let decoded: string;
@@ -386,11 +387,37 @@ export function decodeV2Cursor(cursor: string): number {
   } catch {
     throw invalid;
   }
-  const match = /^v2:(\d{1,16})$/.exec(decoded);
+  if (!decoded.startsWith(prefix)) throw invalid;
+  const match = /^(\d{1,16})$/.exec(decoded.slice(prefix.length));
   if (!match) throw invalid;
   const seq = Number(match[1]);
   if (!Number.isSafeInteger(seq)) throw invalid;
   return seq;
+}
+
+/** Opaque newest-first page cursor: `base64url("v2:" + seq)`, read as "rows
+ *  below `seq`". `seq` is a non-negative safe integer (up to 16 digits), the
+ *  same range the decoder accepts. */
+export function encodeV2Cursor(seq: number): string {
+  return encodeCursor(CURSOR_PREFIX, seq);
+}
+
+/** Decode a newest-first cursor; anything that is not one (an oldest-first
+ *  cursor included) rejects. */
+export function decodeV2Cursor(cursor: string): number {
+  return decodeCursor(CURSOR_PREFIX, cursor);
+}
+
+/** Opaque oldest-first page cursor: `base64url("v2a:" + seq)`, read as "rows
+ *  above `seq`", with the same `seq` range as {@link encodeV2Cursor}. */
+export function encodeV2AscendingCursor(seq: number): string {
+  return encodeCursor(ASCENDING_CURSOR_PREFIX, seq);
+}
+
+/** Decode an oldest-first cursor; anything that is not one (a newest-first
+ *  cursor included) rejects. */
+export function decodeV2AscendingCursor(cursor: string): number {
+  return decodeCursor(ASCENDING_CURSOR_PREFIX, cursor);
 }
 
 // ── Source ───────────────────────────────────────────────────────────────────
@@ -460,6 +487,34 @@ const NO_CURSOR_SEQ = Number.MAX_SAFE_INTEGER;
 /** Page plans retried when a whole planned range turns ineligible between the
  *  size read and the body read. */
 const PAGE_ATTEMPTS = 3;
+
+/** Which way a page walks a session's rows by `seq`. */
+type PageOrder = {
+  /** How a row's seq compares with the cursor's to be past it. */
+  past: "<" | ">";
+  /** The SQL sort that puts a page's first row first. */
+  sort: "DESC" | "ASC";
+  /** The cursor seq of a walk's first page. */
+  start: number;
+  encode: (seq: number) => string;
+  decode: (cursor: string) => number;
+};
+
+const NEWEST_FIRST: PageOrder = {
+  past: "<",
+  sort: "DESC",
+  start: NO_CURSOR_SEQ,
+  encode: encodeV2Cursor,
+  decode: decodeV2Cursor,
+};
+
+const OLDEST_FIRST: PageOrder = {
+  past: ">",
+  sort: "ASC",
+  start: Number.MIN_SAFE_INTEGER,
+  encode: encodeV2AscendingCursor,
+  decode: decodeV2AscendingCursor,
+};
 
 const macrotask = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0));
 
@@ -1323,7 +1378,8 @@ export function createV2HistorySource(db: ReadOnlyDb, opts: V2SourceOptions = {}
    * from `parts` (keyed by message id). A part row that does not decode
    * rejects under `strict` and becomes a placeholder otherwise. Yields every
    * {@link ROWS_PER_YIELD} rows. Adds what it could not project faithfully to
-   * `counts`.
+   * `counts`, a `partial` message among them unless `countPartial` is false
+   * (for a read the caller capped below the ceiling, whose cut it asked for).
    */
   async function project(
     decoded: Decoded[],
@@ -1332,6 +1388,7 @@ export function createV2HistorySource(db: ReadOnlyDb, opts: V2SourceOptions = {}
     parts: Map<string, PartLoad>,
     counts: HistoryReadCounts,
     unknownTypes: Set<string>,
+    countPartial = true,
   ): Promise<HistoryMessage[]> {
     const who = await identities(decoded, session.id, session);
     const fallback = resolveIdentity([], session);
@@ -1359,7 +1416,7 @@ export function createV2HistorySource(db: ReadOnlyDb, opts: V2SourceOptions = {}
       }
       const message = projectMessage(d, session, who.get(d.row.id) ?? fallback, messageParts);
       if (!message) continue;
-      if (message.partial) counts.partialMessages++;
+      if (message.partial && countPartial) counts.partialMessages++;
       if (load && load.rows.length > 0 && message.parts.length === 0 && completedRow(d.data)) {
         counts.emptyWithParts++;
       }
@@ -1379,7 +1436,8 @@ export function createV2HistorySource(db: ReadOnlyDb, opts: V2SourceOptions = {}
   }
 
   /** Project one point read and record it; the result carries the read's
-   *  counts when any is non-zero. */
+   *  counts when any is non-zero, and the ordinals of the part rows it
+   *  loaded. `countPartial` as in {@link project}. */
   async function finishPoint(
     decoded: Decoded,
     session: SessionContext,
@@ -1387,14 +1445,41 @@ export function createV2HistorySource(db: ReadOnlyDb, opts: V2SourceOptions = {}
     counts: HistoryReadCounts,
     unknownTypes: Set<string>,
     strict: boolean,
+    countPartial = true,
   ): Promise<Lookup<HistoryMessage>> {
     const id = decoded.row.id;
     const loads = new Map<string, PartLoad>(load ? [[id, load]] : []);
-    const [message] = await project([decoded], session, strict, loads, counts, unknownTypes);
+    const [message] = await project(
+      [decoded],
+      session,
+      strict,
+      loads,
+      counts,
+      unknownTypes,
+      countPartial,
+    );
     const readCounts = recordRead(counts, unknownTypes);
-    return message
-      ? { ok: true, value: message, ...(readCounts && { counts: readCounts }) }
-      : { ok: false, reason: "not-found", error: `Message not found: ${id}` };
+    if (!message) return { ok: false, reason: "not-found", error: `Message not found: ${id}` };
+    const ordinals = load ? loadedOrdinals(id, load) : undefined;
+    return {
+      ok: true,
+      value: message,
+      ...(readCounts && { counts: readCounts }),
+      ...(ordinals && { partOrdinals: ordinals }),
+    };
+  }
+
+  /** The part ids a load's part rows project to (their merged positions from
+   *  `load.start`, placeholders included), each with its row's ordinal;
+   *  undefined when the load holds no part row. */
+  function loadedOrdinals(messageID: string, load: PartLoad): Map<string, number> | undefined {
+    if (load.rows.length === 0) return undefined;
+    const ordinals = new Map<string, number>();
+    load.rows.forEach((row, i) => {
+      const ordinal = asNumber(row.ordinal);
+      if (ordinal !== null) ordinals.set(partId(messageID, load.start + i), ordinal);
+    });
+    return ordinals;
   }
 
   /**
@@ -1445,6 +1530,13 @@ export function createV2HistorySource(db: ReadOnlyDb, opts: V2SourceOptions = {}
    * so the whole call stays under the same bound. Each call moves past at
    * least one part row, so every part row within the ceiling is returned
    * with its data by some continuation.
+   *
+   * `cap` (at most the ceiling) narrows what the call reads ahead: the part
+   * rows and the inline content fit under it beside the metadata, the forced
+   * first part row aside, and inline content that does not fit beside them
+   * is left for the next call, which reads it alone. A cut below the ceiling
+   * is one the caller asked for, so it is not counted as drift. Retries are
+   * still decided against the ceiling.
    */
   async function continueMessage(
     sessionID: string,
@@ -1452,7 +1544,9 @@ export function createV2HistorySource(db: ReadOnlyDb, opts: V2SourceOptions = {}
     from: number,
     fork: SqlValue[],
     strict: boolean,
+    cap: number,
   ): Promise<Lookup<HistoryMessage>> {
+    const capped = cap < byteCeiling;
     // Body bytes this call has loaded, discarded attempts included, and the
     // read to fall back on when a discarded attempt is not read again.
     let spent = 0;
@@ -1462,9 +1556,18 @@ export function createV2HistorySource(db: ReadOnlyDb, opts: V2SourceOptions = {}
       if (attempt > 0) await pause();
       const retry = settle !== undefined;
       const budget = byteCeiling - spent;
+      // What this attempt reads ahead at most.
+      const window = Math.min(budget, cap);
       const metaCap = retry
         ? Math.max(0, Math.min(CONTINUATION_METADATA_MAX, budget))
         : CONTINUATION_METADATA_MAX;
+      // A retry also measures the metadata, to tell a block left out for
+      // being over CONTINUATION_METADATA_MAX (which a first read leaves out
+      // too) from one that no longer fits what is left of the ceiling. A
+      // first read does not need it: its only cap is the maximum.
+      const metaSize = retry
+        ? `, ${ifValid(`${BYTES} - coalesce(${INLINE_BYTES}, 0)`)} AS meta_bytes`
+        : "";
       // The metadata is measured as the row less its inline content, a few
       // bytes over what `json_remove` returns, so the row is split once.
       const head = read("message head", () =>
@@ -1478,10 +1581,20 @@ export function createV2HistorySource(db: ReadOnlyDb, opts: V2SourceOptions = {}
              ${ifValid(
                `CASE WHEN ${BYTES} - coalesce(${INLINE_BYTES}, 0) <= ?
                   THEN json_remove(data, '$.content') END`,
-             )} AS meta
+             )} AS meta${metaSize}
            FROM session_message
            WHERE id = ? AND session_id = ? AND ${CONTENT_FILTER} AND ${FORK_FILTER} LIMIT ?`,
-          [byteCeiling, byteCeiling, byteCeiling, metaCap, messageID, sessionID, ...fork, 1],
+          [
+            byteCeiling,
+            byteCeiling,
+            byteCeiling,
+            metaCap,
+            ...(retry ? [byteCeiling] : []),
+            messageID,
+            sessionID,
+            ...fork,
+            1,
+          ],
         ),
       );
       if (!head)
@@ -1519,8 +1632,13 @@ export function createV2HistorySource(db: ReadOnlyDb, opts: V2SourceOptions = {}
         inlineCount = asNumber(head.inline_count) ?? 0;
         let data: Record<string, unknown> = {};
         const meta = asString(head.meta);
-        // A retry whose metadata no longer fits keeps the earlier read.
-        if (retry && meta === null) return settle!();
+        if (retry && meta === null) {
+          // Metadata over the maximum is left out, as a first read leaves it
+          // out, and the retry goes on. A retry whose metadata no longer
+          // fits what is left of the ceiling keeps the earlier read.
+          const metaBytes = asNumber(head.meta_bytes);
+          if (metaBytes === null || metaBytes <= CONTINUATION_METADATA_MAX) return settle!();
+        }
         if (meta !== null) {
           charge = utf8Length(meta);
           const parsed = decodeRow({ ...message, data: meta });
@@ -1535,13 +1653,17 @@ export function createV2HistorySource(db: ReadOnlyDb, opts: V2SourceOptions = {}
       const inlinePending = inlineCount > 0;
 
       const start = (await partSizes(sessionID, [messageID], from)).get(messageID)?.skipped ?? 0;
+      // Room is kept for the inline content beside the part rows, except
+      // under a cap it does not fit beside the metadata: then the part rows
+      // take the window and the inline content waits for the next call.
+      const inlineRoom = capped && inlineBytes > window - charge ? 0 : inlineBytes;
       // A first read forces its first part row in; a retry only takes what
       // is left of the ceiling.
       const got = await readParts(
         sessionID,
         [{ id: messageID, pos: 0 }],
         from,
-        budget - charge - inlineBytes,
+        window - charge - inlineRoom,
         !retry,
       );
       const partBytes = loadedBytes(got.loaded);
@@ -1550,14 +1672,15 @@ export function createV2HistorySource(db: ReadOnlyDb, opts: V2SourceOptions = {}
       const unknownTypes = new Set<string>();
       const load: PartLoad = { rows: got.loaded, start };
       if (inlinePending) load.inlineCount = inlineCount;
-      const finish = () => finishPoint(decoded, session, load, counts, unknownTypes, strict);
+      const finish = () =>
+        finishPoint(decoded, session, load, counts, unknownTypes, strict, !capped);
       if (got.cut) {
         load.cut = await cutAt(sessionID, messageID, got.cut.ordinal);
         if (retry && got.loaded.length === 0) return settle!();
       } else if (inlinePending) {
         // With no part row loaded on a first read, the metadata and the
         // inline content are the envelope's own size, within the ceiling.
-        const room = got.loaded.length > 0 || retry ? budget - charge - partBytes : byteCeiling;
+        const room = got.loaded.length > 0 || retry ? window - charge - partBytes : byteCeiling;
         await pause();
         const tail = read("message inline content", () =>
           db.get(
@@ -1597,6 +1720,250 @@ export function createV2HistorySource(db: ReadOnlyDb, opts: V2SourceOptions = {}
       }
       return finish();
     }
+  }
+
+  /**
+   * One bounded page of a session's messages in `order`, from past `cursor`
+   * (a cursor of the same order; the session's first page without one). See
+   * `HistorySource.messagePage` and `messagePageAscending`.
+   */
+  async function readPage(
+    o: { sessionID: string; limit: number; strict?: boolean },
+    cursor: string | undefined,
+    order: PageOrder,
+  ): Promise<MessagePage> {
+    assertBoundedLimit(o.limit);
+    let bound = cursor === undefined ? order.start : order.decode(cursor);
+    const fork = forkBinds(o.sessionID);
+    if (!fork) throw new Error(`Session not found: ${o.sessionID}`);
+    const notFound = new Error(`Session not found: ${o.sessionID}`);
+
+    const strict = o.strict === true;
+    const limit = Math.min(o.limit, PAGE_MESSAGES_MAX);
+
+    // Body bytes this call has loaded, discarded attempts included, and the
+    // page to fall back on when a discarded attempt is not read again.
+    let spent = 0;
+    let settle: (() => Promise<MessagePage>) | undefined;
+
+    // Each attempt plans a page from sizes, then reads its bodies. Rows can
+    // change eligibility between the two statements (a compaction completing,
+    // a row growing), so the cursor comes from the rows actually returned.
+    // A planned range that emptied entirely retries, bounded, as does a page
+    // whose message was rewritten under its part read (see
+    // `movedDuringRead`). A retry after bodies were loaded gets only what
+    // is left of the ceiling and keeps its first message only when that
+    // fits, so one call never loads more than the ceiling.
+    for (let attempt = 0; attempt < PAGE_ATTEMPTS; attempt++) {
+      const retry = settle !== undefined;
+      const budget = byteCeiling - spent;
+      // Sizes first: pick the page without loading a row body.
+      await pause();
+      const sizes = read("page sizes", () =>
+        db.all(
+          `SELECT id, type, seq, ${BYTES} AS bytes FROM session_message
+           WHERE session_id = ? AND seq ${order.past} ? AND ${CONTENT_FILTER} AND ${FORK_FILTER}
+           ORDER BY seq ${order.sort} LIMIT ?`,
+          [o.sessionID, bound, ...fork, limit + 1],
+        ),
+      );
+      if (sizes.length === 0) return settle ? settle() : { items: [], nextCursor: null };
+      const planned = await partSizes(
+        o.sessionID,
+        sizes.map((size) => asString(size.id) ?? ""),
+        FIRST_ORDINAL,
+      );
+      // Each message costs its envelope plus, for an assistant, its part
+      // rows' bytes and count. The first message is always taken (on a
+      // retry, when its envelope fits); its parts are cut to fit if they do
+      // not.
+      let take = 0;
+      let bytes = 0;
+      let partRows = 0;
+      const extra: SqlValue[] = [];
+      for (const size of sizes) {
+        if (take >= limit) break;
+        const rowBytes = asNumber(size.bytes) ?? 0;
+        // An oversized row is never loaded, so it costs the page nothing.
+        const envelope = rowBytes > byteCeiling ? 0 : rowBytes;
+        const id = asString(size.id) ?? "";
+        const own = size.type === "assistant" ? planned.get(id) : undefined;
+        const cost = envelope + (own?.bytes ?? 0);
+        const rowsCost = own?.rows ?? 0;
+        if (take === 0 && retry && envelope > budget) break;
+        if (take > 0 && (bytes + cost > budget || partRows + rowsCost > partRowCap)) break;
+        bytes += cost;
+        partRows += rowsCost;
+        take++;
+        if (own && own.bytes > 0) extra.push(id, own.bytes);
+      }
+      if (take === 0) return settle!();
+      // The planned range, from the page's first row to its last in `order`.
+      const first = asNumber(sizes[0]!.seq) ?? 0;
+      const last = asNumber(sizes[take - 1]!.seq) ?? 0;
+      const plannedMore = sizes.length > take;
+
+      // Bodies, under the cumulative budget: envelope sizes are re-read in
+      // the same statement (rows may have grown since the size read), each
+      // row's planned part bytes are added to it, a running total in `order`
+      // cuts the page where it would pass the ceiling, and only rows inside
+      // the cut load `data`. The first row is always kept (on a retry, when
+      // its envelope fits); its parts are cut by the part read when they no
+      // longer fit. The CTEs hold only ids, seqs and sizes; bodies are read
+      // by the final join.
+      const firstCap = retry ? budget : byteCeiling;
+      await pause();
+      const rows = read("page rows", () =>
+        db.all(
+          `WITH sized AS (
+             SELECT id, seq, ${BYTES} AS bytes FROM session_message
+             WHERE session_id = ? AND seq <= ? AND seq >= ? AND ${CONTENT_FILTER} AND ${FORK_FILTER}
+             ORDER BY seq ${order.sort} LIMIT ?
+           ), extra(id, bytes) AS (
+             VALUES (NULL, 0)${", (?, ?)".repeat(extra.length / 2)}
+           ), budget AS (
+             SELECT s.seq AS seq, s.bytes AS bytes,
+               sum(CASE WHEN s.bytes <= ? THEN s.bytes ELSE 0 END + coalesce(e.bytes, 0))
+                 OVER (ORDER BY s.seq ${order.sort} ROWS UNBOUNDED PRECEDING) AS running,
+               row_number() OVER (ORDER BY s.seq ${order.sort}) AS rn
+             FROM sized s LEFT JOIN extra e ON e.id = s.id
+           )
+           SELECT ${PAGE_BODY_COLUMNS}
+           FROM budget b JOIN session_message m ON m.session_id = ? AND m.seq = b.seq
+           WHERE b.running <= ?
+             OR (b.rn = 1 AND CASE WHEN b.bytes <= ? THEN b.bytes ELSE 0 END <= ?)
+           ORDER BY m.seq ${order.sort} LIMIT ?`,
+          [
+            o.sessionID,
+            Math.max(first, last),
+            Math.min(first, last),
+            ...fork,
+            take,
+            ...extra,
+            byteCeiling,
+            byteCeiling,
+            o.sessionID,
+            budget,
+            byteCeiling,
+            firstCap,
+            take,
+          ],
+        ),
+      );
+      if (rows.length === 0) {
+        if (settle) return settle();
+        // The whole planned range became ineligible: continue past it.
+        if (!plannedMore) return { items: [], nextCursor: null };
+        bound = last;
+        continue;
+      }
+      let envelopes = 0;
+      for (const row of rows) if (row.data != null) envelopes += asNumber(row.bytes) ?? 0;
+      spent += envelopes;
+
+      const decoded = await decodeRows(rows, strict);
+
+      // Parts of the page's assistant rows, under what the envelopes left
+      // of the ceiling. A cut in the first message makes it partial and
+      // ends the page with it (holding no part row at all when its first
+      // one does not fit beside the envelope; a continuation reads it); a
+      // cut in a later message ends the page before that message, which
+      // leads the next page instead.
+      const counts = emptyReadCounts();
+      const unknownTypes = new Set<string>();
+      const loads = new Map<string, PartLoad>();
+      let keep = rows.length;
+      const assistants = rows.flatMap((row, pos) =>
+        row.type === "assistant" ? [{ id: asString(row.id) ?? "", pos }] : [],
+      );
+      const finish = async (): Promise<MessagePage> => {
+        const kept = rows.slice(0, keep);
+        for (const row of kept) {
+          if (row.type === "assistant") continue;
+          const stray = planned.get(asString(row.id) ?? "");
+          if (stray) counts.strayParts += stray.rows + stray.skipped;
+        }
+        // If a row became eligible mid-range, LIMIT cut the page before the
+        // planned last row; resuming from the last returned row keeps every
+        // row past it for the next page.
+        const returnedLast = asNumber(kept[kept.length - 1]!.seq) ?? last;
+        const more = plannedMore || returnedLast !== last || keep < rows.length;
+        const session = contextOf(o.sessionID);
+        if (!session) throw notFound;
+        const items = await project(
+          decoded.slice(0, keep),
+          session,
+          strict,
+          loads,
+          counts,
+          unknownTypes,
+        );
+        const pageCounts = recordRead(counts, unknownTypes);
+        return {
+          items,
+          nextCursor: more ? order.encode(returnedLast) : null,
+          ...(pageCounts && { counts: pageCounts }),
+        };
+      };
+      if (partsOn && assistants.length > 0) {
+        const got = await readParts(
+          o.sessionID,
+          assistants,
+          FIRST_ORDINAL,
+          budget - envelopes,
+          false,
+        );
+        const partBytes = loadedBytes(got.loaded);
+        spent += partBytes;
+        if (got.cut) keep = Math.max(1, got.cut.pos);
+        for (const { id, pos } of assistants) {
+          if (pos >= keep) break;
+          loads.set(id, {
+            rows: got.loaded.filter((part) => asNumber(part.pos) === pos),
+            start: 0,
+          });
+        }
+        if (got.cut?.pos === 0) {
+          // Only an assistant row has part rows, so position 0 is one.
+          const firstID = asString(rows[0]!.id) ?? "";
+          const load = loads.get(firstID);
+          if (load) load.cut = await cutAt(o.sessionID, firstID, got.cut.ordinal);
+        }
+        const moved = await movedDuringRead(o.sessionID, rows, decoded, loads, keep);
+        if (moved.size > 0) {
+          // This page, settled: the first message leaves its inline
+          // content for the continuation and a later one leads the next
+          // page.
+          const settled = (): Promise<MessagePage> => {
+            for (const [id, pos] of moved) {
+              if (pos > 0) {
+                keep = Math.min(keep, pos);
+                continue;
+              }
+              leaveInline(loads.get(id)!, FIRST_ORDINAL, counts);
+              keep = 1;
+            }
+            return finish();
+          };
+          // Read the page again only while what is left of the ceiling
+          // holds another read of the same size.
+          if (attempt < PAGE_ATTEMPTS - 1 && byteCeiling - spent >= envelopes + partBytes) {
+            settle = settled;
+            continue;
+          }
+          return settled();
+        }
+      }
+      return finish();
+    }
+    if (settle) return settle();
+    // Every attempt's planned range emptied between the size read and the
+    // body read. This empty page with a cursor is the one case that can end
+    // a drill early (a reader may stop on an empty page); it takes
+    // PAGE_ATTEMPTS consecutive whole-range invalidations, which only a
+    // concurrent writer rewriting the tail on every read could cause. Each
+    // of them moved `bound` to a row's seq, so it encodes.
+    return { items: [], nextCursor: order.encode(bound) };
   }
 
   return {
@@ -1653,237 +2020,12 @@ export function createV2HistorySource(db: ReadOnlyDb, opts: V2SourceOptions = {}
       return listing(where, [parentID], { limit, order, after: o.after });
     },
 
-    async messagePage(o): Promise<MessagePage> {
-      assertBoundedLimit(o.limit);
-      let below = o.before === undefined ? NO_CURSOR_SEQ : decodeV2Cursor(o.before);
-      const fork = forkBinds(o.sessionID);
-      if (!fork) throw new Error(`Session not found: ${o.sessionID}`);
-      const notFound = new Error(`Session not found: ${o.sessionID}`);
+    messagePage(o): Promise<MessagePage> {
+      return readPage(o, o.before, NEWEST_FIRST);
+    },
 
-      const strict = o.strict === true;
-      const limit = Math.min(o.limit, PAGE_MESSAGES_MAX);
-
-      // Body bytes this call has loaded, discarded attempts included, and the
-      // page to fall back on when a discarded attempt is not read again.
-      let spent = 0;
-      let settle: (() => Promise<MessagePage>) | undefined;
-
-      // Each attempt plans a page from sizes, then reads its bodies. Rows can
-      // change eligibility between the two statements (a compaction completing,
-      // a row growing), so the cursor comes from the rows actually returned.
-      // A planned range that emptied entirely retries, bounded, as does a page
-      // whose message was rewritten under its part read (see
-      // `movedDuringRead`). A retry after bodies were loaded gets only what
-      // is left of the ceiling and keeps its first message only when that
-      // fits, so one call never loads more than the ceiling.
-      for (let attempt = 0; attempt < PAGE_ATTEMPTS; attempt++) {
-        const retry = settle !== undefined;
-        const budget = byteCeiling - spent;
-        // Sizes first: pick the page without loading a row body.
-        await pause();
-        const sizes = read("page sizes", () =>
-          db.all(
-            `SELECT id, type, seq, ${BYTES} AS bytes FROM session_message
-             WHERE session_id = ? AND seq < ? AND ${CONTENT_FILTER} AND ${FORK_FILTER}
-             ORDER BY seq DESC LIMIT ?`,
-            [o.sessionID, below, ...fork, limit + 1],
-          ),
-        );
-        if (sizes.length === 0) return settle ? settle() : { items: [], nextCursor: null };
-        const planned = await partSizes(
-          o.sessionID,
-          sizes.map((size) => asString(size.id) ?? ""),
-          FIRST_ORDINAL,
-        );
-        // Each message costs its envelope plus, for an assistant, its part
-        // rows' bytes and count. The first message is always taken (on a
-        // retry, when its envelope fits); its parts are cut to fit if they do
-        // not.
-        let take = 0;
-        let bytes = 0;
-        let partRows = 0;
-        const extra: SqlValue[] = [];
-        for (const size of sizes) {
-          if (take >= limit) break;
-          const rowBytes = asNumber(size.bytes) ?? 0;
-          // An oversized row is never loaded, so it costs the page nothing.
-          const envelope = rowBytes > byteCeiling ? 0 : rowBytes;
-          const id = asString(size.id) ?? "";
-          const own = size.type === "assistant" ? planned.get(id) : undefined;
-          const cost = envelope + (own?.bytes ?? 0);
-          const rowsCost = own?.rows ?? 0;
-          if (take === 0 && retry && envelope > budget) break;
-          if (take > 0 && (bytes + cost > budget || partRows + rowsCost > partRowCap)) break;
-          bytes += cost;
-          partRows += rowsCost;
-          take++;
-          if (own && own.bytes > 0) extra.push(id, own.bytes);
-        }
-        if (take === 0) return settle!();
-        const newest = asNumber(sizes[0]!.seq) ?? 0;
-        const oldest = asNumber(sizes[take - 1]!.seq) ?? 0;
-        const plannedMore = sizes.length > take;
-
-        // Bodies, under the cumulative budget: envelope sizes are re-read in
-        // the same statement (rows may have grown since the size read), each row's
-        // planned part bytes are added to it, a running total cuts the page
-        // where it would pass the ceiling, and only rows inside the cut load
-        // `data`. The first row is always kept (on a retry, when its envelope
-        // fits); its parts are cut by the part read when they no longer fit.
-        // The CTEs hold only ids, seqs and sizes; bodies are read by the
-        // final join.
-        const firstCap = retry ? budget : byteCeiling;
-        await pause();
-        const rows = read("page rows", () =>
-          db.all(
-            `WITH sized AS (
-               SELECT id, seq, ${BYTES} AS bytes FROM session_message
-               WHERE session_id = ? AND seq <= ? AND seq >= ? AND ${CONTENT_FILTER} AND ${FORK_FILTER}
-               ORDER BY seq DESC LIMIT ?
-             ), extra(id, bytes) AS (
-               VALUES (NULL, 0)${", (?, ?)".repeat(extra.length / 2)}
-             ), budget AS (
-               SELECT s.seq AS seq, s.bytes AS bytes,
-                 sum(CASE WHEN s.bytes <= ? THEN s.bytes ELSE 0 END + coalesce(e.bytes, 0))
-                   OVER (ORDER BY s.seq DESC ROWS UNBOUNDED PRECEDING) AS running,
-                 row_number() OVER (ORDER BY s.seq DESC) AS rn
-               FROM sized s LEFT JOIN extra e ON e.id = s.id
-             )
-             SELECT ${PAGE_BODY_COLUMNS}
-             FROM budget b JOIN session_message m ON m.session_id = ? AND m.seq = b.seq
-             WHERE b.running <= ?
-               OR (b.rn = 1 AND CASE WHEN b.bytes <= ? THEN b.bytes ELSE 0 END <= ?)
-             ORDER BY m.seq DESC LIMIT ?`,
-            [
-              o.sessionID,
-              newest,
-              oldest,
-              ...fork,
-              take,
-              ...extra,
-              byteCeiling,
-              byteCeiling,
-              o.sessionID,
-              budget,
-              byteCeiling,
-              firstCap,
-              take,
-            ],
-          ),
-        );
-        if (rows.length === 0) {
-          if (settle) return settle();
-          // The whole planned range became ineligible: continue below it.
-          if (!plannedMore) return { items: [], nextCursor: null };
-          below = oldest;
-          continue;
-        }
-        let envelopes = 0;
-        for (const row of rows) if (row.data != null) envelopes += asNumber(row.bytes) ?? 0;
-        spent += envelopes;
-
-        const decoded = await decodeRows(rows, strict);
-
-        // Parts of the page's assistant rows, under what the envelopes left
-        // of the ceiling. A cut in the first message makes it partial and
-        // ends the page with it (holding no part row at all when its first
-        // one does not fit beside the envelope; a continuation reads it); a
-        // cut in a later message ends the page before that message, which
-        // leads the next page instead.
-        const counts = emptyReadCounts();
-        const unknownTypes = new Set<string>();
-        const loads = new Map<string, PartLoad>();
-        let keep = rows.length;
-        const assistants = rows.flatMap((row, pos) =>
-          row.type === "assistant" ? [{ id: asString(row.id) ?? "", pos }] : [],
-        );
-        const finish = async (): Promise<MessagePage> => {
-          const kept = rows.slice(0, keep);
-          for (const row of kept) {
-            if (row.type === "assistant") continue;
-            const stray = planned.get(asString(row.id) ?? "");
-            if (stray) counts.strayParts += stray.rows + stray.skipped;
-          }
-          // If a row became eligible mid-range, LIMIT cut the page above the
-          // planned oldest row; resuming from the oldest returned row keeps
-          // every row below it for the next page.
-          const returnedOldest = asNumber(kept[kept.length - 1]!.seq) ?? oldest;
-          const more = plannedMore || returnedOldest > oldest || keep < rows.length;
-          const session = contextOf(o.sessionID);
-          if (!session) throw notFound;
-          const items = await project(
-            decoded.slice(0, keep),
-            session,
-            strict,
-            loads,
-            counts,
-            unknownTypes,
-          );
-          const pageCounts = recordRead(counts, unknownTypes);
-          return {
-            items,
-            nextCursor: more ? encodeV2Cursor(returnedOldest) : null,
-            ...(pageCounts && { counts: pageCounts }),
-          };
-        };
-        if (partsOn && assistants.length > 0) {
-          const got = await readParts(
-            o.sessionID,
-            assistants,
-            FIRST_ORDINAL,
-            budget - envelopes,
-            false,
-          );
-          const partBytes = loadedBytes(got.loaded);
-          spent += partBytes;
-          if (got.cut) keep = Math.max(1, got.cut.pos);
-          for (const { id, pos } of assistants) {
-            if (pos >= keep) break;
-            loads.set(id, {
-              rows: got.loaded.filter((part) => asNumber(part.pos) === pos),
-              start: 0,
-            });
-          }
-          if (got.cut?.pos === 0) {
-            // Only an assistant row has part rows, so position 0 is one.
-            const firstID = asString(rows[0]!.id) ?? "";
-            const load = loads.get(firstID);
-            if (load) load.cut = await cutAt(o.sessionID, firstID, got.cut.ordinal);
-          }
-          const moved = await movedDuringRead(o.sessionID, rows, decoded, loads, keep);
-          if (moved.size > 0) {
-            // This page, settled: the first message leaves its inline
-            // content for the continuation and a later one leads the next
-            // page.
-            const settled = (): Promise<MessagePage> => {
-              for (const [id, pos] of moved) {
-                if (pos > 0) {
-                  keep = Math.min(keep, pos);
-                  continue;
-                }
-                leaveInline(loads.get(id)!, FIRST_ORDINAL, counts);
-                keep = 1;
-              }
-              return finish();
-            };
-            // Read the page again only while what is left of the ceiling
-            // holds another read of the same size.
-            if (attempt < PAGE_ATTEMPTS - 1 && byteCeiling - spent >= envelopes + partBytes) {
-              settle = settled;
-              continue;
-            }
-            return settled();
-          }
-        }
-        return finish();
-      }
-      if (settle) return settle();
-      // Every attempt's planned range emptied between the size read and the
-      // body read. This empty page with a cursor is the one case that can end
-      // a drill early (a reader may stop on an empty page); it takes
-      // PAGE_ATTEMPTS consecutive whole-range invalidations, which only a
-      // concurrent writer rewriting the tail on every read could cause.
-      return { items: [], nextCursor: encodeV2Cursor(below) };
+    messagePageAscending(o): Promise<MessagePage> {
+      return readPage(o, o.after, OLDEST_FIRST);
     },
 
     async getMessage(sessionID, messageID, o = {}): Promise<Lookup<HistoryMessage>> {
@@ -1913,7 +2055,12 @@ export function createV2HistorySource(db: ReadOnlyDb, opts: V2SourceOptions = {}
       }
       const strict = o.strict === true;
       if (partOrdinal !== undefined) {
-        return continueMessage(sessionID, messageID, partOrdinal, fork, strict);
+        // A cap that is not a positive number leaves the ceiling in force.
+        const cap =
+          typeof o.maxBytes === "number" && Number.isFinite(o.maxBytes) && o.maxBytes >= 1
+            ? Math.min(byteCeiling, Math.floor(o.maxBytes))
+            : byteCeiling;
+        return continueMessage(sessionID, messageID, partOrdinal, fork, strict, cap);
       }
 
       // Body bytes this call has loaded, discarded attempts included, and the

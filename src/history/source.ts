@@ -39,18 +39,29 @@ export type Listing<T> =
  * there was one, so callers can keep their own wording for the empty case.
  * `counts` is what a message read could not project faithfully (v2
  * `getMessage` only), present only when some count is non-zero.
+ * `partOrdinals` maps the id of each returned part that came from a part row
+ * to that row's ordinal, so `getMessage` with that `partOrdinal` reads the
+ * message from that part on (v2 `getMessage` of an assistant message with
+ * part rows only). A part id is a position in the message, not an ordinal.
  */
 export type Lookup<T> =
-  | { ok: true; value: T; counts?: HistoryReadCounts }
+  | {
+      ok: true;
+      value: T;
+      counts?: HistoryReadCounts;
+      partOrdinals?: ReadonlyMap<string, number>;
+    }
   | { ok: false; reason: "not-found"; error?: string }
   | { ok: false; reason: "error"; error: string }
   | { ok: false; reason: "malformed"; error: string }
   | { ok: false; reason: "unsupported"; error: string };
 
 /**
- * One newest-first page of a session's messages. `nextCursor` is opaque and
- * null at the end of the session. `counts` is what this read could not
- * project faithfully, present only when some count is non-zero (v1 never
+ * One page of a session's messages, in the order of the reader that returned
+ * it (newest first from `messagePage`, oldest first from
+ * `messagePageAscending`). `nextCursor` is opaque, continues the same reader
+ * and is null at that end of the session. `counts` is what this read could
+ * not project faithfully, present only when some count is non-zero (v1 never
  * sets it).
  */
 export type MessagePage = {
@@ -265,6 +276,20 @@ export interface HistorySource {
     strict?: boolean;
   }): Promise<MessagePage>;
   /**
+   * One bounded page, oldest first: the messages after `after` (a previous
+   * page's `nextCursor` from this method), or from the session's first
+   * message without it. Otherwise it reads as {@link messagePage} does: the
+   * same runtime-checked `limit`, byte ceiling, part merge, `partial`
+   * messages and `strict`. Each method rejects the other's cursors. Unset on
+   * a host that pages newest first only (v1).
+   */
+  messagePageAscending?(o: {
+    sessionID: string;
+    limit: number;
+    after?: string;
+    strict?: boolean;
+  }): Promise<MessagePage>;
+  /**
    * One message. `partOrdinal` continues a message a read cut short (its
    * `partial.nextOrdinal`): the result holds the part rows from that ordinal
    * on, then the message's inline content, with the same part ids a whole
@@ -272,14 +297,18 @@ export interface HistorySource {
    * fit. Following `partial.nextOrdinal` until a read is not `partial`
    * returns every part. Only an assistant message has part ordinals: v1, a
    * v2 database without part rows and a v2 message of any other type answer
-   * a `partOrdinal` with `unsupported`. `strict` rejects a message or part
-   * whose data does not decode with a {@link MalformedSessionError} instead
-   * of projecting a placeholder, as `messagePage` does (v1 ignores it).
+   * a `partOrdinal` with `unsupported`. `maxBytes` lowers the body bytes such
+   * a continuation loads below the source's own ceiling. It still loads its
+   * first part row whole, so it always moves on, and it ends `partial` where
+   * it stops; that cut is not counted as drift. Without `partOrdinal` it is
+   * ignored. `strict` rejects a message or part whose data does not decode
+   * with a {@link MalformedSessionError} instead of projecting a placeholder,
+   * as `messagePage` does (v1 ignores it).
    */
   getMessage(
     sessionID: string,
     messageID: string,
-    o?: { partOrdinal?: number; strict?: boolean },
+    o?: { partOrdinal?: number; strict?: boolean; maxBytes?: number },
   ): Promise<Lookup<HistoryMessage>>;
   /**
    * How the host database differs from what this build reads (see
@@ -330,6 +359,9 @@ export function createUnavailableSource(
   reason: string,
 ): HistorySource {
   const error = unavailableHistoryError(reason);
+  const reject = async (): Promise<MessagePage> => {
+    throw new Error(error);
+  };
   return {
     kind,
     scopedLookup: false,
@@ -337,9 +369,10 @@ export function createUnavailableSource(
     listSessions: async () => ({ ok: false, error }),
     getSession: async () => ({ ok: false, reason: "error", error }),
     listChildren: async () => ({ ok: false, error }),
-    messagePage: async () => {
-      throw new Error(error);
-    },
+    messagePage: reject,
+    // A v2 source pages oldest first too, so its reads report the outage
+    // rather than a missing capability.
+    ...(kind === "v2-sqlite" && { messagePageAscending: reject }),
     getMessage: async () => ({ ok: false, reason: "error", error }),
   };
 }
