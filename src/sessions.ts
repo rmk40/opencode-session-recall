@@ -45,6 +45,12 @@ const MAX_TOOLS = 5;
  *  `truncated`. */
 const CHILDREN_PAGE = 1_000;
 const CHILDREN_PAGES_MAX = 10;
+/** Reads one call makes of a live listing at most, each one longer by the
+ *  rows the filters dropped from the one before. */
+const LIVE_READS_MAX = 3;
+
+/** A listing's output fields other than its sessions, which a page sets. */
+type ListingFields = Omit<SessionsOutput, "ok" | "sessions" | "returned">;
 
 /** A fingerprint of a set of sessions: their ids in id order, hashed, so a
  *  session that moves within the set leaves it unchanged. */
@@ -126,29 +132,44 @@ export function sessions(
   /** A listing selected from the cards while the index is still being built
    *  may be missing sessions: say so, with the pass's progress. Only the
    *  card-selected paths use it; a live listing is complete as it is. */
-  const withIndexing = (out: SessionsOutput): SessionsOutput => {
+  const withIndexing = (out: ListingFields): ListingFields => {
     const progress = enrichment?.indexing?.();
     if (!progress) return out;
     const warning = indexingWarning(progress);
     return { ...out, indexing: progress, note: out.note ? `${out.note} ${warning}` : warning };
   };
   /**
-   * The listing as output: from the cursor's session on when there is one,
-   * trimmed to the budget with a continuation at the first session not shown.
+   * One page of a listing as output. `listed` is the whole listing this call
+   * holds, in order and without card enrichment; the page is the `limit`
+   * sessions from the cursor's session on (from the start without one, and
+   * the rest of the page for a cursor into a trimmed one), passed through
+   * `decorate` and trimmed to the budget. A trimmed page carries a
+   * `continuation` at the first session not shown, and `nextCursor` names
+   * that session whether the budget or the end of the page stopped the
+   * output. `truncated` says more sessions match than the page holds: the
+   * listing goes on past it, the source holds rows past those this call read
+   * (`more`), or `fields` says so already. When `more` is set but the call
+   * holds no session past the page to continue from, its note says why.
+   *
    * The listing is rebuilt on every call, so a cursor resumes only when the
    * sessions before its anchor are exactly the ones already shown (in any
    * order: a shown session that was updated may have moved to the top) and
-   * the listing from the anchor on is unchanged, session for session. A
-   * change in between could otherwise skip a session (one moved ahead of the
-   * anchor, or a new or filtered-out session pushed the last one out of the
-   * `limit` window) or show one twice (the anchor moved).
+   * the listing from the anchor on is unchanged, session for session, as far
+   * as the call that made the cursor held it. A change in between could
+   * otherwise skip a session (one moved ahead of the anchor) or show one
+   * twice (the anchor moved).
    */
-  const respond = (out: SessionsOutput, cursor: SessionsCursor | undefined): string => {
-    const listed = out.sessions;
-    const rest: Record<string, unknown> = {};
-    for (const [key, value] of Object.entries(out)) {
-      if (key !== "ok" && key !== "sessions") rest[key] = value;
-    }
+  const respond = (
+    fields: ListingFields,
+    listed: readonly SessionItem[],
+    page: {
+      cursor: SessionsCursor | undefined;
+      limit: number;
+      decorate?: (item: SessionItem) => SessionItem;
+      more?: { note: string };
+    },
+  ): string => {
+    const { cursor, limit } = page;
     let start = 0;
     if (cursor) {
       start = listed.findIndex((item) => item.id === cursor.anchor);
@@ -157,37 +178,59 @@ export function sessions(
           `This cursor's session ${cursor.anchor} is no longer in this listing; list again without cursor`,
         );
       }
+      const restEnd = start + cursor.restCount;
       if (
         start !== cursor.shown ||
+        restEnd > listed.length ||
         idsFingerprint(listed.slice(0, start)) !== cursor.ids ||
-        runFingerprint(listed.slice(start)) !== cursor.rest
+        runFingerprint(listed.slice(start, restEnd)) !== cursor.rest
       ) {
         return writeError(
           `This listing changed since the cursor was made (sessions were updated, added or removed); list again without cursor`,
         );
       }
     }
-    const shown = listed.slice(start);
+    // A cursor into a trimmed page shows the rest of that page; any other
+    // cursor, or none, starts a page of `limit`.
+    const end = Math.min(listed.length, start + Math.min(limit, cursor?.left ?? limit));
+    const shown = listed.slice(start, end);
+    const records = page.decorate ? shown.map(page.decorate) : shown;
+    const truncated = fields.truncated === true || end < listed.length || page.more !== undefined;
+    const rest: Record<string, unknown> = { ...fields };
+    delete rest.truncated;
+    if (page.more && end === listed.length) {
+      rest.note = fields.note ? `${fields.note} ${page.more.note}` : page.more.note;
+    }
+    /** A cursor at `next`; `pageEnd` makes it resume a trimmed page that
+     *  ends there. */
+    const cursorAt = (next: number, pageEnd?: number): string =>
+      encodeSessionsCursor({
+        anchor: listed[next]!.id,
+        shown: next,
+        ids: idsFingerprint(listed.slice(0, next)),
+        rest: runFingerprint(listed.slice(next)),
+        restCount: listed.length - next,
+        ...(pageEnd !== undefined && { left: pageEnd - next }),
+      });
     return writeOutput({
-      sections: [section("sessions", shown)],
+      sections: [section("sessions", records)],
       head: (stop, counts) => {
-        const next = stop && start + stop.index;
+        const continuation = stop ? cursorAt(start + stop.index, end) : undefined;
+        const nextCursor = continuation ?? (end < listed.length ? cursorAt(end) : undefined);
         return {
-          ...(next !== undefined && {
-            continuation: encodeSessionsCursor({
-              anchor: listed[next]!.id,
-              shown: next,
-              ids: idsFingerprint(listed.slice(0, next)),
-              rest: runFingerprint(listed.slice(next)),
-            }),
-          }),
-          fields: { ...rest, returned: counts.sessions ?? 0 },
+          ...(continuation && { continuation }),
+          fields: {
+            returned: counts.sessions ?? 0,
+            ...rest,
+            ...(truncated && { truncated: true }),
+            ...(nextCursor && { nextCursor }),
+          },
         };
       },
     }).text;
   };
   return tool({
-    description: `List session metadata: titles, directories, timestamps, archival state, plus (when a distilled card exists) a content digest, top files/tools, and a family rollup for roots. Use only for recent-session browsing, finding a session ID/title/timeframe, or recency checks. Not content search; for topical discovery use recall. To recover cancelled or interrupted subagents (Task tool returned "Task cancelled" with no task_id), call this with parentID:"current" — the listing is live and does not depend on the search index. A trimmed result continues with cursor: continuation (same arguments).`,
+    description: `List session metadata: titles, directories, timestamps, archival state, plus (when a distilled card exists) a content digest, top files/tools, and a family rollup for roots. Use only for recent-session browsing, finding a session ID/title/timeframe, or recency checks. Not content search; for topical discovery use recall. To recover cancelled or interrupted subagents (Task tool returned "Task cancelled" with no task_id), call this with parentID:"current" — the listing is live and does not depend on the search index. To read on, pass cursor: nextCursor (same arguments): it resumes a trimmed result, then pages past limit while truncated.`,
     args: {
       scope: tool.schema
         .enum(["project", "global"])
@@ -213,11 +256,11 @@ export function sessions(
         .min(1)
         .max(limits.maxSessionList)
         .default(Math.min(20, limits.maxSessionList))
-        .describe("Max sessions returned"),
+        .describe("Max sessions returned per page"),
       cursor: tool.schema
         .string()
         .optional()
-        .describe("continuation from a trimmed result; omit for the start"),
+        .describe("nextCursor (or continuation) from a prior result; omit for the start"),
     },
     async execute(args, ctx: ToolContext): Promise<string> {
       const search = optionalString(args.search);
@@ -308,6 +351,15 @@ export function sessions(
         };
       };
 
+      /** A card as a listed session, for the paths that list from cards. */
+      const cardItem = (card: Card): SessionItem => ({
+        id: card.sessionId,
+        title: card.title,
+        directory: card.directory,
+        time: { created: card.timeCreated, updated: card.timeUpdated },
+        archived: card.timeArchived != null,
+      });
+
       try {
         // ── Unreadable history source: serve from the card index ──
         // v2 with opencode.db unavailable: no listing can be read live, but a
@@ -346,24 +398,16 @@ export function sessions(
             .sort(
               (a, b) => b.timeUpdated - a.timeUpdated || a.sessionId.localeCompare(b.sessionId),
             );
-          const items = selected.slice(0, limit).map((card) =>
-            enrich({
-              id: card.sessionId,
-              title: card.title,
-              directory: card.directory,
-              time: { created: card.timeCreated, updated: card.timeUpdated },
-              archived: false,
-            }),
-          );
-          const out: SessionsOutput = {
-            ok: true,
-            sessions: items,
-            returned: items.length,
+          const fields: ListingFields = {
             scope: resolvedParent ? "children" : scope,
             ...(resolvedParent && { parentID: resolvedParent, childCount: selected.length }),
             note: `${unavailable}. This listing comes from the card index, which may lag the live history.`,
           };
-          return respond(withIndexing(out), resume);
+          return respond(withIndexing(fields), selected.map(cardItem), {
+            cursor: resume,
+            limit,
+            decorate: enrich,
+          });
         }
 
         // ── Children branch: live parent/child lookup, index-free ──
@@ -406,20 +450,19 @@ export function sessions(
               return true;
             })
             .sort((a, b) => b.time.updated - a.time.updated || a.id.localeCompare(b.id));
-          // Post-filter, pre-slice: childCount > returned means `limit` truncated.
+          // Post-filter, across every page: childCount > returned means more
+          // pages follow (or the output was trimmed).
           const childCount = selected.length;
-          const items = selected.slice(0, limit).map((s) =>
-            markUndistilled(
-              enrich({
-                id: s.id,
-                title: s.title,
-                directory: s.directory,
-                time: { created: s.time.created, updated: s.time.updated },
-                archived: s.time.archived != null,
-              }),
-            ),
+          const listed = selected.map(
+            (s): SessionItem => ({
+              id: s.id,
+              title: s.title,
+              directory: s.directory,
+              time: { created: s.time.created, updated: s.time.updated },
+              archived: s.time.archived != null,
+            }),
           );
-          ctx.metadata({ title: `Found ${items.length} children of ${resolvedParent}` });
+          ctx.metadata({ title: `Found ${childCount} children of ${resolvedParent}` });
           const notes = [
             ...(withheld > 0
               ? [
@@ -432,17 +475,18 @@ export function sessions(
                 ]
               : []),
           ];
-          const out: SessionsOutput = {
-            ok: true,
-            sessions: items,
-            returned: items.length,
+          const fields: ListingFields = {
             scope: "children",
             parentID: resolvedParent,
             childCount,
             ...(result.truncated && { truncated: true as const }),
             ...(notes.length > 0 && { note: notes.join(" ") }),
           };
-          return respond(out, resume);
+          return respond(fields, listed, {
+            cursor: resume,
+            limit,
+            decorate: (item) => markUndistilled(enrich(item)),
+          });
         }
 
         // ── Card-authoritative time filtering ──
@@ -469,17 +513,7 @@ export function sessions(
                 (!searchLower || card.title.toLowerCase().includes(searchLower)),
             )
             .sort((a, b) => b.timeUpdated - a.timeUpdated || a.sessionId.localeCompare(b.sessionId))
-            .slice(0, limit)
-            .map((card) =>
-              enrich({
-                id: card.sessionId,
-                title: card.title,
-                directory: card.directory,
-                time: { created: card.timeCreated, updated: card.timeUpdated },
-                // archived is not carried on cards; the fetch-free path omits it.
-                archived: false,
-              }),
-            );
+            .map(cardItem);
           // Staleness watermark: newest in-scope card, counting ALL cards
           // regardless of distillState (a metadata card is sufficient coverage
           // for a metadata listing; a full-only watermark would collapse in
@@ -500,81 +534,56 @@ export function sessions(
             ctx.metadata({
               title: `Found ${selected.length} ${scope} sessions${search ? ` matching "${search}"` : ""}`,
             });
-            const out: SessionsOutput = {
-              ok: true,
-              sessions: selected,
-              returned: selected.length,
-              scope,
-            };
-            return respond(withIndexing(out), resume);
+            return respond(withIndexing({ scope }), selected, {
+              cursor: resume,
+              limit,
+              decorate: enrich,
+            });
           }
         }
 
-        const items: SessionItem[] = [];
-
-        if (scope === "global") {
-          const result = await source.listSessions({
-            scope: "global",
-            search,
-            limit,
-            strict: true,
-          });
-          if (!result.ok) return writeError(`Failed to list sessions: ${result.error}`);
-          for (const s of result.items) {
-            if (isSummarizerTitle(s.title)) continue;
-            if (!passesTime(s.time.updated)) continue;
-            items.push(
-              enrich({
-                id: s.id,
-                title: s.title,
-                directory: s.directory,
-                project: s.project
-                  ? { name: s.project.name, worktree: s.project.worktree }
-                  : undefined,
-                time: { created: s.time.created, updated: s.time.updated },
-                archived: s.time.archived != null,
-              }),
-            );
-          }
-        } else {
-          const result = await source.listSessions({
-            scope: "project",
-            search,
-            limit,
-            strict: true,
-          });
-          if (!result.ok) return writeError(`Failed to list sessions: ${result.error}`);
-          for (const s of result.items) {
-            if (isSummarizerTitle(s.title)) continue;
-            if (!passesTime(s.time.updated)) continue;
-            items.push(
-              enrich({
-                id: s.id,
-                title: s.title,
-                directory: s.directory,
-                time: { created: s.time.created, updated: s.time.updated },
-                archived: s.time.archived != null,
-              }),
-            );
-          }
-        }
-
-        ctx.metadata({
-          title: `Found ${items.length} ${scope} sessions${search ? ` matching "${search}"` : ""}`,
+        // ── Live listing ──
+        // A time-bounded live listing (no card store, or the staleness
+        // fallback) covers the newest `limit` sessions only, as its note says,
+        // so it is one page. Any other live listing pages on. A listing by
+        // recency cannot resume from a key, so each call reads it from the top
+        // through the session after its page and every session its cursor's
+        // rest covers.
+        const pages = !hasTimeFilter;
+        const start = resume?.shown ?? 0;
+        const want = pages ? start + Math.max(limit + 1, resume?.restCount ?? 0) : limit;
+        const toItem = (s: HistorySession): SessionItem => ({
+          id: s.id,
+          title: s.title,
+          directory: s.directory,
+          ...(scope === "global" && {
+            project: s.project ? { name: s.project.name, worktree: s.project.worktree } : undefined,
+          }),
+          time: { created: s.time.created, updated: s.time.updated },
+          archived: s.time.archived != null,
         });
-
-        // On the staleness fallback, rows without a full card are marked
-        // distilled:false at this call site (never inside enrich()).
-        const finalItems = staleFallback ? items.map(markUndistilled) : items;
+        let listed: SessionItem[] = [];
+        let more = false;
+        for (let reads = 1, rows = want; ; reads++) {
+          const result = await source.listSessions({ scope, search, limit: rows, strict: true });
+          if (!result.ok) return writeError(`Failed to list sessions: ${result.error}`);
+          listed = result.items
+            .filter((s) => !isSummarizerTitle(s.title) && passesTime(s.time.updated))
+            .map(toItem);
+          more = pages && result.truncated;
+          if (!more || listed.length >= want || reads >= LIVE_READS_MAX) break;
+          // Summarizer workers left this read short of `want`: read past them.
+          rows += want - listed.length;
+        }
+        ctx.metadata({
+          title: `Found ${Math.max(0, Math.min(limit, listed.length - start))} ${scope} sessions${search ? ` matching "${search}"` : ""}`,
+        });
 
         // The fallback consulted the newest `limit` live sessions — newest
         // `limit` MATCHING sessions when a title search narrowed the list call.
         const liveBound = `the newest ${limit}${search ? " matching" : ""} live sessions`;
 
-        const out: SessionsOutput = {
-          ok: true,
-          sessions: finalItems,
-          returned: finalItems.length,
+        const fields: ListingFields = {
           scope: scope,
           // The two note producers below cannot co-occur: the fallback requires
           // a card store (allCards), the degraded note requires its absence.
@@ -584,7 +593,7 @@ export function sessions(
           ...(staleFallback
             ? {
                 note:
-                  finalItems.length > 0
+                  listed.length > 0
                     ? `The card index had not caught up to this time window (its newest session predates \`since\`), so ${liveBound} were consulted instead. This listing is bounded by that window and may itself be incomplete.`
                     : `No indexed session in scope is newer than \`since\`, so ${liveBound} were checked; none fell in the window either.`,
               }
@@ -599,7 +608,19 @@ export function sessions(
             : {}),
         };
         // A live listing does not depend on the card index: no indexing note.
-        return respond(out, resume);
+        // On the staleness fallback, rows without a full card are marked
+        // distilled:false here (never inside enrich()). Only summarizer
+        // workers can keep the reads from reaching a session past the page.
+        return respond(fields, listed, {
+          cursor: resume,
+          limit,
+          decorate: staleFallback ? (item) => markUndistilled(enrich(item)) : enrich,
+          ...(more && {
+            more: {
+              note: "More sessions exist past these, but too many summarizer worker sessions (never listed) came first for this call to reach them; narrow the listing with search.",
+            },
+          }),
+        });
       } catch (e) {
         return writeError(errmsg(e));
       }

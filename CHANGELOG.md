@@ -8,8 +8,8 @@ All notable changes to this project are documented here. This project follows
 
 ### Added
 
-- **opencode v2 support.** The same package now runs on opencode 2.0.x
-  (checked against 2.0.18) as well as opencode v1 (1.3.4 and later). One
+- **opencode v2 support.** The same package now runs on opencode 2.0 through
+  2.4 (checked against 2.4.1) as well as opencode v1 (1.3.4 and later). One
   default export serves both: v1 calls `server()`, v2 calls `setup()`,
   and `setup` stays inert under v1. On v2:
   - The five tools, `nudge` and `primary` work as on v1. `primary` hides
@@ -183,6 +183,15 @@ All notable changes to this project are documented here. This project follows
   resumes inside that page. Otherwise it reads the next one. A raw page
   cursor from an earlier version is still accepted and reads that page from
   its start.
+- **`recall_sessions` pages past `limit`.** A listing with more matching
+  sessions than `limit` carries `truncated: true` and a `nextCursor`, in
+  every listing mode (live, children or selected from the cards). Passed
+  back as `cursor` with the same arguments, `nextCursor` returns the next
+  `limit` sessions. On a trimmed page it equals the `continuation` and
+  returns the rest of that page first. A listing bounded to the newest
+  `limit` live sessions (the staleness fallback, or `since`/`until` without
+  a card store) stays one page. Listings served from the cards now report
+  `archived` from the card instead of always `false`.
 - On opencode v1 a tool whose `execute` rejects now returns a bounded
   `{ ok: false, error }` result instead of passing the rejection to the
   host.

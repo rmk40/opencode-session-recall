@@ -61,8 +61,9 @@ describe("recall_sessions", () => {
 
     expect(out).toMatchObject({ ok: true, returned: 2, scope: "project" });
     expect(out.sessions.map((s) => s.id)).toEqual(["s-current", "s-project-2"]);
-    // One row past the limit decides the listing's `truncated`.
-    expect(h.calls.projectList).toEqual([{ search: undefined, limit: 21 }]);
+    // The tool reads one session past its page, to start the next page's
+    // cursor there, and the source one row past that to decide `truncated`.
+    expect(h.calls.projectList).toEqual([{ search: undefined, limit: 22 }]);
   });
 
   it("pins the fake's deliberate divergence: its global listing includes an archived session", async () => {
@@ -84,7 +85,7 @@ describe("recall_sessions", () => {
       search: "   ",
     });
 
-    expect(h.calls.globalList).toEqual([{ search: undefined, limit: 21 }]);
+    expect(h.calls.globalList).toEqual([{ search: undefined, limit: 22 }]);
     expect(out.sessions.map((s) => s.id)).toEqual(["s-other", "s-current", "s-project-2"]);
     expect(out.sessions.find((s) => s.id === "s-project-2")?.archived).toBe(true);
     expect(out.sessions.find((s) => s.id === "s-other")?.project?.name).toBe("other");
@@ -589,17 +590,25 @@ describe("recall_sessions continuations across listing changes", () => {
     expect(out).toMatchObject({ ok: false, error: expect.stringContaining("list again") });
   });
 
-  it("rejects the continuation when a session filtered out of the listing took a slot in between", async () => {
-    // A summarizer worker is dropped after the source listing, so it leaves
-    // the anchor and the sessions before it alone but pushes the window's
-    // last session out of the `limit` the source returns.
+  it("resumes when a session filtered out of the listing arrived in between, skipping nothing", async () => {
+    // A summarizer worker is dropped after the source listing. The listing
+    // reads past it, so the sessions the page still owes keep their places.
     const h = harness();
+    const expected = h.sessions.filter((s) => s.directory === PROJECT_DIR).slice(0, 100);
     const first = await run(h);
     h.sessions.unshift(
       session("s-walk-worker", "[recall-summarizer] worker", PROJECT_DIR, Date.now() + 60_000),
     );
-    const out = await run(h, first.continuation);
-    expect(out).toMatchObject({ ok: false, error: expect.stringContaining("list again") });
+    const ids = first.sessions.map((s) => s.id);
+    let out = await run(h, first.continuation);
+    for (let calls = 1; ; calls++) {
+      expect(out.ok).toBe(true);
+      ids.push(...out.sessions.map((s) => s.id));
+      if (!out.continuation) break;
+      expect(calls).toBeLessThan(20);
+      out = await run(h, out.continuation);
+    }
+    expect(ids).toEqual(expected.map((s) => s.id));
   });
 
   it("rejects the continuation when a session was inserted below the anchor in between", async () => {
