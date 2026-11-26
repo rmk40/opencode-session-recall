@@ -319,6 +319,20 @@ describe("recall_get", () => {
     expect(ok.context.directory).toBeUndefined();
   });
 
+  it("survives a raw non-string or blank cursor (host path): reads the whole message", async () => {
+    const h = makeFakeHarness();
+    for (const cursor of [123, {}, "   "]) {
+      const out = await runToolRaw<MessageOutput>(getTool(h.source, gate), {
+        sessionID: "s-current",
+        messageID: "m-current-3",
+        cursor,
+      });
+      expect(out.ok).toBe(true);
+      expect(out.trimmed).toBeUndefined();
+      expect(out.parts[0]).toMatchObject({ type: "tool", toolName: "bash" });
+    }
+  });
+
   it("routes its fetches through the shared gate", async () => {
     const h = makeFakeHarness();
     const { gate: spy, queries } = makeSpyGate();
@@ -425,6 +439,25 @@ describe("recall_context", () => {
     expect(out.messages.some((m) => m.center)).toBe(true);
   });
 
+  it("survives a raw non-string or blank cursor (host path): returns the window from its start", async () => {
+    const h = makeFakeHarness();
+    for (const cursor of [42, { anchorId: "m-current-4" }, ""]) {
+      const out = await runToolRaw<ContextOutput>(contextTool(h.source, gate, TEST_LIMITS), {
+        sessionID: "s-current",
+        messageID: "m-current-3",
+        window: 1,
+        cursor,
+      });
+      expect(out.ok).toBe(true);
+      expect(out.trimmed).toBeUndefined();
+      expect(out.messages.map((m) => m.message.id)).toEqual([
+        "m-current-2",
+        "m-current-3",
+        "m-current-4",
+      ]);
+    }
+  });
+
   it("fetches only bounded pages, never the whole session", async () => {
     // A 60-message session: a small window around a recent message must be
     // served by bounded newest-first pages, never an unpaginated whole-session
@@ -487,6 +520,18 @@ describe("recall_sessions defensive args", () => {
     expect(out.ok).toBe(true);
     // Non-string bounds were ignored, so every listed session came through.
     expect(out.sessions.length).toBeGreaterThan(0);
+  });
+
+  it("survives a raw non-string or blank cursor (host path): lists from the start", async () => {
+    const h = makeFakeHarness();
+    for (const cursor of [7, ["s-project-2"], "  "]) {
+      const out = await runToolRaw<SessionsOutput>(sessionsTool(h.source, true, TEST_LIMITS), {
+        cursor,
+      });
+      expect(out.ok).toBe(true);
+      expect(out.trimmed).toBeUndefined();
+      expect(out.sessions.map((s) => s.id)).toEqual(["s-current", "s-project-2"]);
+    }
   });
 });
 

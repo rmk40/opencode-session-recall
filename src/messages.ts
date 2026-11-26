@@ -6,13 +6,30 @@ import {
   optionalString,
   coerceEnum,
   coerceInt,
-  type MessagesOutput,
-  type ErrorOutput,
   type Limits,
+  type MessageItem,
 } from "./types.js";
-import { formatMsg, searchable, matches } from "./extract.js";
-import type { HistorySource } from "./history/source.js";
+import { searchable, matches } from "./extract.js";
+import type { HistorySource, MessagePage } from "./history/source.js";
 import type { FetchGate } from "./fetch-gate.js";
+import {
+  decodeMessagesCursor,
+  encodeMessagesCursor,
+  fitMessage,
+  isContinuation,
+  messageItem,
+  resumeMessage,
+  section,
+  writeError,
+  writeOutput,
+  type MessagePosition,
+  type PartPosition,
+} from "./output.js";
+
+/** Pages a continuation reads, its own page included, to find the message it
+ *  resumes at. The newest page shifts as messages arrive between calls, so
+ *  the message can move onto the page after it. */
+const RESUME_PAGES = 3;
 
 function msgMatches(msg: { parts: Array<Part> }, query: string): boolean {
   for (const part of msg.parts) {
@@ -57,12 +74,22 @@ export function messages(source: HistorySource, gate: FetchGate, limits: Limits)
       const role = coerceEnum(args.role, ["user", "assistant", "all"] as const, "all");
       const limit = coerceInt(args.limit, Math.min(10, limits.maxMessages), 1, limits.maxMessages);
       const cursor = optionalString(args.cursor);
-      if (!sid) {
-        const err: ErrorOutput = {
-          ok: false,
-          error: "No sessionID provided and no current session available",
-        };
-        return JSON.stringify(err);
+      if (!sid) return writeError("No sessionID provided and no current session available");
+
+      // The cursor is this tool's own continuation, or a history source page
+      // cursor a caller may still hold, which reads that page from its start.
+      let before = cursor;
+      let resume: MessagePosition | undefined;
+      if (cursor && isContinuation(cursor)) {
+        const decoded = decodeMessagesCursor(cursor);
+        if (!decoded.ok) return writeError(decoded.error);
+        if (decoded.value.session !== sid) {
+          return writeError(
+            `This cursor continues session ${decoded.value.session}, not ${sid}; pass that sessionID`,
+          );
+        }
+        before = decoded.value.page ?? undefined;
+        resume = decoded.value.at;
       }
 
       ctx.metadata({ title: "Browsing messages..." });
@@ -70,14 +97,41 @@ export function messages(source: HistorySource, gate: FetchGate, limits: Limits)
       try {
         // Always a bounded page (limit + cursor), through the shared gate —
         // never an unpaginated fetch and never outside the concurrency budget.
-        const page = await gate.runQuery(() =>
-          source.messagePage({ sessionID: sid, limit, before: cursor }),
-        );
+        const read = (page: string | undefined): Promise<MessagePage> =>
+          gate.runQuery(() => source.messagePage({ sessionID: sid, limit, before: page }));
+        let page = await read(before);
+        let start = 0;
+        if (resume) {
+          const anchor = resume.message;
+          for (let pages = 1; ; pages++) {
+            start = page.items.findIndex((m) => m.info.id === anchor);
+            if (start !== -1) break;
+            if (pages >= RESUME_PAGES || page.nextCursor == null) {
+              return writeError(
+                `This cursor's message ${anchor} is no longer where it was; browse again without cursor`,
+              );
+            }
+            before = page.nextCursor;
+            page = await read(before);
+          }
+        }
 
-        let items = page.items; // newest-first
+        let items = page.items.slice(start); // newest-first
         if (role !== "all") items = items.filter((m) => m.info.role === role);
         if (query) items = items.filter((m) => msgMatches(m, query));
-        const formatted = items.map(formatMsg);
+        const formatted: MessageItem[] = items.map(messageItem);
+        // Resume inside the anchor message only while the filters keep it.
+        const resumeAt = resume?.at;
+        const anchorItem = formatted[0];
+        if (resumeAt && anchorItem && anchorItem.message.id === resume?.message) {
+          const resumed = resumeMessage(anchorItem, resumeAt);
+          if (!resumed) {
+            return writeError(
+              `This cursor's part ${resumeAt.part} is no longer in message ${resume?.message}; browse again without cursor`,
+            );
+          }
+          formatted[0] = resumed;
+        }
 
         let title: string | undefined;
         let directory: string | undefined;
@@ -95,21 +149,43 @@ export function messages(source: HistorySource, gate: FetchGate, limits: Limits)
           title: `Showing ${formatted.length} messages${title ? ` from "${title}"` : ""}${page.nextCursor ? " (more available)" : ""}`,
         });
 
-        const out: MessagesOutput = {
-          ok: true,
-          messages: formatted,
-          context: { sessionTitle: title, directory },
-          pagination: {
-            limit,
-            returned: formatted.length,
-            hasMore: page.nextCursor != null,
-            ...(page.nextCursor != null ? { nextCursor: page.nextCursor } : {}),
+        const pageCursor = before ?? null;
+        const nextPage =
+          page.nextCursor != null
+            ? encodeMessagesCursor({ session: sid, page: page.nextCursor })
+            : undefined;
+        return writeOutput<PartPosition>({
+          sections: [section("messages", formatted, fitMessage)],
+          head: (stop, shown) => {
+            // A trimmed output continues at the message it stopped at, on the
+            // page it read; otherwise the next page follows.
+            const continuation = stop
+              ? encodeMessagesCursor({
+                  session: sid,
+                  page: pageCursor,
+                  at: {
+                    message: formatted[stop.index]!.message.id,
+                    ...(stop.rest && { at: stop.rest }),
+                  },
+                })
+              : undefined;
+            const nextCursor = continuation ?? nextPage;
+            return {
+              ...(continuation && { continuation }),
+              fields: {
+                context: { sessionTitle: title, directory },
+                pagination: {
+                  limit,
+                  returned: shown.messages ?? 0,
+                  hasMore: nextCursor !== undefined,
+                  ...(nextCursor !== undefined && { nextCursor }),
+                },
+              },
+            };
           },
-        };
-        return JSON.stringify(out);
+        }).text;
       } catch (e) {
-        const err: ErrorOutput = { ok: false, error: errmsg(e) };
-        return JSON.stringify(err);
+        return writeError(errmsg(e));
       }
     },
   });

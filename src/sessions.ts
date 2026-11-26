@@ -7,7 +7,6 @@ import {
   coerceInt,
   type SessionItem,
   type SessionsOutput,
-  type ErrorOutput,
   type Limits,
   type IndexingStatus,
   indexingWarning,
@@ -15,6 +14,14 @@ import {
 import type { Card } from "./store.js";
 import { isSummarizerTitle } from "./extract.js";
 import { unavailableHistoryError, type HistorySource } from "./history/source.js";
+import type { HistorySession } from "./history/model.js";
+import {
+  decodeSessionsCursor,
+  encodeSessionsCursor,
+  section,
+  writeError,
+  writeOutput,
+} from "./output.js";
 
 /** Card-backed enrichment for the sessions browser: a snapshot of all cards the
  *  distiller has built. `session.list` stays the authoritative listing; when a
@@ -31,6 +38,38 @@ export type SessionEnrichment = {
 const SESSION_DIGEST_CHARS = 160;
 const MAX_FILES = 5;
 const MAX_TOOLS = 5;
+/** Children read per listing call, and the most calls one children listing
+ *  makes. A parent with more children than these read is reported
+ *  `truncated`. */
+const CHILDREN_PAGE = 1_000;
+const CHILDREN_PAGES_MAX = 10;
+
+/** Every child of `parentID`, paged in id order so a child updated during the
+ *  walk is neither skipped nor listed twice, up to
+ *  `CHILDREN_PAGE * CHILDREN_PAGES_MAX` of them. */
+async function listAllChildren(
+  source: HistorySource,
+  parentID: string,
+): Promise<
+  { ok: true; items: HistorySession[]; truncated: boolean } | { ok: false; error: string }
+> {
+  const items: HistorySession[] = [];
+  let after: string | undefined;
+  for (let pages = 1; ; pages++) {
+    const result = await source.listChildren(parentID, {
+      order: "id",
+      limit: CHILDREN_PAGE,
+      ...(after !== undefined && { after }),
+    });
+    if (!result.ok) return result;
+    items.push(...result.items);
+    if (!result.truncated) return { ok: true, items, truncated: false };
+    if (pages >= CHILDREN_PAGES_MAX || result.nextCursor === undefined) {
+      return { ok: true, items, truncated: true };
+    }
+    after = result.nextCursor;
+  }
+}
 
 /** Parse a `since`/`until` bound: a relative duration (`2h`/`7d`/`3w`), an ISO
  *  date, or a ms-epoch number. Returns undefined for anything unparseable. */
@@ -78,8 +117,35 @@ export function sessions(
     const warning = indexingWarning(progress);
     return { ...out, indexing: progress, note: out.note ? `${out.note} ${warning}` : warning };
   };
+  /** The listing as output: from the cursor's session on when there is one,
+   *  trimmed to the budget with a continuation at the first session not
+   *  shown. */
+  const respond = (out: SessionsOutput, anchor: string | undefined): string => {
+    const listed = out.sessions;
+    const rest: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(out)) {
+      if (key !== "ok" && key !== "sessions") rest[key] = value;
+    }
+    let shown = listed;
+    if (anchor !== undefined) {
+      const index = listed.findIndex((item) => item.id === anchor);
+      if (index === -1) {
+        return writeError(
+          `This cursor's session ${anchor} is no longer in this listing; list again without cursor`,
+        );
+      }
+      shown = listed.slice(index);
+    }
+    return writeOutput({
+      sections: [section("sessions", shown)],
+      head: (stop, counts) => ({
+        ...(stop && { continuation: encodeSessionsCursor({ anchor: shown[stop.index]!.id }) }),
+        fields: { ...rest, returned: counts.sessions ?? 0 },
+      }),
+    }).text;
+  };
   return tool({
-    description: `List session metadata: titles, directories, timestamps, archival state, plus (when a distilled card exists) a content digest, top files/tools, and a family rollup for roots. Use only for recent-session browsing, finding a session ID/title/timeframe, or recency checks. Not content search; for topical discovery use recall. To recover cancelled or interrupted subagents (Task tool returned "Task cancelled" with no task_id), call this with parentID:"current" — the listing is live and does not depend on the search index.`,
+    description: `List session metadata: titles, directories, timestamps, archival state, plus (when a distilled card exists) a content digest, top files/tools, and a family rollup for roots. Use only for recent-session browsing, finding a session ID/title/timeframe, or recency checks. Not content search; for topical discovery use recall. To recover cancelled or interrupted subagents (Task tool returned "Task cancelled" with no task_id), call this with parentID:"current" — the listing is live and does not depend on the search index. A trimmed result continues with cursor: continuation (same arguments).`,
     args: {
       scope: tool.schema
         .enum(["project", "global"])
@@ -106,11 +172,16 @@ export function sessions(
         .max(limits.maxSessionList)
         .default(Math.min(20, limits.maxSessionList))
         .describe("Max sessions returned"),
+      cursor: tool.schema
+        .string()
+        .optional()
+        .describe("continuation from a trimmed result; omit for the start"),
     },
     async execute(args, ctx: ToolContext): Promise<string> {
       const search = optionalString(args.search);
       // Defensive: live MCP host can bypass Zod defaults. A non-string parentID
-      // degrades to an ordinary listing (detectable: scope !== "children").
+      // degrades to an ordinary listing (detectable: scope !== "children"),
+      // and a non-string cursor reads as none.
       const parentID = optionalString(args.parentID);
       const scope = coerceEnum(args.scope, ["project", "global"] as const, "project");
       const limit = coerceInt(
@@ -122,6 +193,13 @@ export function sessions(
       const now = Date.now();
       const since = parseTimeBound(optionalString(args.since), now);
       const until = parseTimeBound(optionalString(args.until), now);
+      const cursor = optionalString(args.cursor);
+      let anchor: string | undefined;
+      if (cursor) {
+        const decoded = decodeSessionsCursor(cursor);
+        if (!decoded.ok) return writeError(decoded.error);
+        anchor = decoded.value.anchor;
+      }
 
       ctx.metadata({
         title: search
@@ -133,11 +211,7 @@ export function sessions(
       // return does not apply to it (its own scope policy is decision 2's
       // sameProject withholding for explicit foreign parents).
       if (scope === "global" && !global && !parentID) {
-        const err: ErrorOutput = {
-          ok: false,
-          error: "Global scope disabled via plugin option: global: false",
-        };
-        return JSON.stringify(err);
+        return writeError("Global scope disabled via plugin option: global: false");
       }
 
       // Build the enrichment lookups once (card by id, child count by root).
@@ -199,19 +273,14 @@ export function sessions(
         // cards there is nothing to list.
         if (source.unavailable !== undefined) {
           const unavailable = unavailableHistoryError(source.unavailable);
-          if (!allCards || allCards.length === 0) {
-            const err: ErrorOutput = { ok: false, error: unavailable };
-            return JSON.stringify(err);
-          }
+          if (!allCards || allCards.length === 0) return writeError(unavailable);
           const currentSessionID = optionalString(ctx.sessionID);
           const resolvedParent =
             parentID && parentID.toLowerCase() === "current" ? currentSessionID : parentID;
           if (parentID && !resolvedParent) {
-            const err: ErrorOutput = {
-              ok: false,
-              error: 'parentID:"current" requires a current session, but none is available',
-            };
-            return JSON.stringify(err);
+            return writeError(
+              'parentID:"current" requires a current session, but none is available',
+            );
           }
           const searchLower = search?.toLowerCase();
           const callerDir = normalizeDir(optionalString(ctx.directory));
@@ -252,7 +321,7 @@ export function sessions(
             ...(resolvedParent && { parentID: resolvedParent, childCount: selected.length }),
             note: `${unavailable}. This listing comes from the card index, which may lag the live history.`,
           };
-          return JSON.stringify(withIndexing(out));
+          return respond(withIndexing(out), anchor);
         }
 
         // ── Children branch: live parent/child lookup, index-free ──
@@ -263,20 +332,12 @@ export function sessions(
           // Case-insensitive sugar; no collision risk (real IDs are ses_*-prefixed).
           const resolvedParent = parentID.toLowerCase() === "current" ? currentSessionID : parentID;
           if (!resolvedParent) {
-            const err: ErrorOutput = {
-              ok: false,
-              error: 'parentID:"current" requires a current session, but none is available',
-            };
-            return JSON.stringify(err);
+            return writeError(
+              'parentID:"current" requires a current session, but none is available',
+            );
           }
-          const result = await source.listChildren(resolvedParent);
-          if (!result.ok) {
-            const err: ErrorOutput = {
-              ok: false,
-              error: `Failed to list children: ${result.error}`,
-            };
-            return JSON.stringify(err);
-          }
+          const result = await listAllChildren(source, resolvedParent);
+          if (!result.ok) return writeError(`Failed to list children: ${result.error}`);
           const searchLower = search?.toLowerCase();
           const callerDir = normalizeDir(optionalString(ctx.directory));
           // `global: false` withholds children in foreign projects — but only
@@ -317,6 +378,18 @@ export function sessions(
             ),
           );
           ctx.metadata({ title: `Found ${items.length} children of ${resolvedParent}` });
+          const notes = [
+            ...(withheld > 0
+              ? [
+                  `${withheld} child session${withheld === 1 ? "" : "s"} in other projects ${withheld === 1 ? "was" : "were"} withheld (plugin option global: false).`,
+                ]
+              : []),
+            ...(result.truncated
+              ? [
+                  `This parent has more than ${result.items.length} children; only the first ${result.items.length} by session id were read, so childCount and this listing cover those alone.`,
+                ]
+              : []),
+          ];
           const out: SessionsOutput = {
             ok: true,
             sessions: items,
@@ -324,13 +397,10 @@ export function sessions(
             scope: "children",
             parentID: resolvedParent,
             childCount,
-            ...(withheld > 0
-              ? {
-                  note: `${withheld} child session${withheld === 1 ? "" : "s"} in other projects ${withheld === 1 ? "was" : "were"} withheld (plugin option global: false).`,
-                }
-              : {}),
+            ...(result.truncated && { truncated: true as const }),
+            ...(notes.length > 0 && { note: notes.join(" ") }),
           };
-          return JSON.stringify(out);
+          return respond(out, anchor);
         }
 
         // ── Card-authoritative time filtering ──
@@ -394,7 +464,7 @@ export function sessions(
               returned: selected.length,
               scope,
             };
-            return JSON.stringify(withIndexing(out));
+            return respond(withIndexing(out), anchor);
           }
         }
 
@@ -407,13 +477,7 @@ export function sessions(
             limit,
             strict: true,
           });
-          if (!result.ok) {
-            const err: ErrorOutput = {
-              ok: false,
-              error: `Failed to list sessions: ${result.error}`,
-            };
-            return JSON.stringify(err);
-          }
+          if (!result.ok) return writeError(`Failed to list sessions: ${result.error}`);
           for (const s of result.items) {
             if (isSummarizerTitle(s.title)) continue;
             if (!passesTime(s.time.updated)) continue;
@@ -437,13 +501,7 @@ export function sessions(
             limit,
             strict: true,
           });
-          if (!result.ok) {
-            const err: ErrorOutput = {
-              ok: false,
-              error: `Failed to list sessions: ${result.error}`,
-            };
-            return JSON.stringify(err);
-          }
+          if (!result.ok) return writeError(`Failed to list sessions: ${result.error}`);
           for (const s of result.items) {
             if (isSummarizerTitle(s.title)) continue;
             if (!passesTime(s.time.updated)) continue;
@@ -499,10 +557,9 @@ export function sessions(
             : {}),
         };
         // A live listing does not depend on the card index: no indexing note.
-        return JSON.stringify(out);
+        return respond(out, anchor);
       } catch (e) {
-        const err: ErrorOutput = { ok: false, error: errmsg(e) };
-        return JSON.stringify(err);
+        return writeError(errmsg(e));
       }
     },
   });
