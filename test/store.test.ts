@@ -8,6 +8,7 @@ import {
   pluginBuild,
   type Card,
   type PartTextRow,
+  type RangeHash,
   type Store,
   type StoreIdentity,
   type StoreOptions,
@@ -308,9 +309,9 @@ async function buildV3Store(path: string): Promise<void> {
   db.close();
 }
 
-/** Create a fresh v4 store at `path` as `identity` and seed one card so a later
- *  rebuild would be visible. */
-async function buildV4Store(path: string, identity: StoreIdentity): Promise<void> {
+/** Create a fresh current-schema store at `path` as `identity` and seed one
+ *  card so a later rebuild would be visible. */
+async function buildCurrentStore(path: string, identity: StoreIdentity): Promise<void> {
   const db = await openSqlite(path);
   if (!db) throw new Error("open failed");
   const opened = openStore(db, identity);
@@ -319,10 +320,111 @@ async function buildV4Store(path: string, identity: StoreIdentity): Promise<void
   db.close();
 }
 
+/** The family rollup {@link buildV4Store} gives its root card. */
+const V4_ROLLUP = [{ sessionId: "C", messageId: "mC", snippet: "Child work" }];
+
+/** The checkpoint {@link buildV4Store} gives a v2-host root card. */
+const V4_CURSOR = '{"v":1,"seq":7}';
+
+/**
+ * Hand-build a populated schema-4 store (the v3 layout plus
+ * `card.distill_cursor`, with host stamps) for `identity`: a root card with a
+ * summary, a family rollup, a current-generation vector and, for the v2 host,
+ * a checkpoint; a child card; both sessions' slim-index and FTS rows; and the
+ * revision and vector counters.
+ */
+async function buildV4Store(path: string, identity: StoreIdentity): Promise<void> {
+  const db = await openSqlite(path);
+  if (!db) throw new Error("open failed");
+  db.exec("PRAGMA journal_mode=WAL;");
+  db.exec(`
+    CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL) WITHOUT ROWID;
+    CREATE TABLE card (
+      session_id TEXT PRIMARY KEY, parent_id TEXT, root_id TEXT NOT NULL,
+      title TEXT NOT NULL DEFAULT '', slug TEXT NOT NULL DEFAULT '',
+      directory TEXT NOT NULL DEFAULT '', project_id TEXT NOT NULL DEFAULT '',
+      agent TEXT, model TEXT,
+      time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL,
+      part_count INTEGER NOT NULL DEFAULT 0, retained_chars INTEGER NOT NULL DEFAULT 0,
+      summary_head TEXT NOT NULL DEFAULT '', outcome_head TEXT NOT NULL DEFAULT '',
+      inventory TEXT NOT NULL DEFAULT '',
+      files TEXT NOT NULL DEFAULT '[]', tools TEXT NOT NULL DEFAULT '[]',
+      errors TEXT NOT NULL DEFAULT '[]', family_rollup TEXT NOT NULL DEFAULT '[]',
+      distill_state TEXT NOT NULL DEFAULT 'metadata',
+      distilled_through TEXT,
+      embedding BLOB,
+      embedding_gen INTEGER,
+      nl_summary TEXT NOT NULL DEFAULT '',
+      summary_hash TEXT NOT NULL DEFAULT '',
+      distill_cursor TEXT
+    );
+    CREATE INDEX card_updated ON card(time_updated DESC);
+    CREATE INDEX card_root ON card(root_id);
+    CREATE INDEX card_project ON card(project_id);
+    CREATE TABLE part_text (
+      id INTEGER PRIMARY KEY, session_id TEXT NOT NULL, part_id TEXT NOT NULL,
+      message_id TEXT NOT NULL, prev_message_id TEXT, next_message_id TEXT,
+      class TEXT NOT NULL, time_created INTEGER NOT NULL,
+      raw TEXT NOT NULL, norm TEXT NOT NULL
+    );
+    CREATE INDEX part_text_session ON part_text(session_id);
+    CREATE UNIQUE INDEX part_text_part ON part_text(part_id);
+    CREATE VIRTUAL TABLE part_fts USING fts5(
+      raw, norm, content='part_text', content_rowid='id',
+      tokenize="unicode61 tokenchars '_-./'"
+    );
+  `);
+  const meta: Array<[string, string]> = [
+    ["schema_version", "4"],
+    ["store_host", identity.host],
+    ["semantic_model", "model-x:4"],
+    ["cards_rev", "11"],
+    ["vectors_rev", "5"],
+  ];
+  if (identity.host === "opencode-v2") meta.push(["source_db", identity.source]);
+  for (const [key, value] of meta) {
+    db.run("INSERT INTO meta(key, value) VALUES(?, ?)", [key, value]);
+  }
+  db.run(
+    "INSERT INTO card(session_id, root_id, title, time_created, time_updated, distill_state, distilled_through, inventory, family_rollup, embedding, embedding_gen, nl_summary, summary_hash, distill_cursor) VALUES(?, ?, ?, ?, ?, 'full', ?, ?, ?, ?, ?, ?, ?, ?)",
+    [
+      "R",
+      "R",
+      "V4 root",
+      1000,
+      3000,
+      "mR",
+      "gizmo planner",
+      JSON.stringify(V4_ROLLUP),
+      new Uint8Array([1, 2, 3, 4]),
+      4,
+      "Planned the gizmos.",
+      "h4",
+      identity.host === "opencode-v2" ? V4_CURSOR : null,
+    ],
+  );
+  db.run(
+    "INSERT INTO card(session_id, parent_id, root_id, title, time_created, time_updated, distill_state, distilled_through) VALUES(?, ?, ?, ?, ?, ?, 'full', ?)",
+    ["C", "R", "R", "V4 child", 1000, 2000, "mC"],
+  );
+  const parts: Array<[string, string, string, string]> = [
+    ["R", "pR", "mR", "gizmo planner wobblefrond"],
+    ["C", "pC", "mC", "child task snorkelwick"],
+  ];
+  parts.forEach(([sessionId, partId, messageId, text], i) => {
+    db.run(
+      "INSERT INTO part_text(id, session_id, part_id, message_id, class, time_created, raw, norm) VALUES(?, ?, ?, ?, 'human-text', 1000, ?, ?)",
+      [i + 1, sessionId, partId, messageId, text, text],
+    );
+    db.run("INSERT INTO part_fts(rowid, raw, norm) VALUES(?, ?, ?)", [i + 1, text, text]);
+  });
+  db.close();
+}
+
 describe("store migration", () => {
-  it("creates schema v4 on a fresh db, stamped for the v1 host with no source", async () => {
+  it("creates schema v5 on a fresh db, stamped for the v1 host with no source", async () => {
     const { db, store } = await fresh();
-    expect(store.getMeta("schema_version")).toBe("4");
+    expect(store.getMeta("schema_version")).toBe("5");
     expect(store.getMeta("store_host")).toBe("opencode-v1");
     expect(store.getMeta("source_db")).toBeUndefined();
     expect(columnNames(db, "card")).toContain("distill_cursor");
@@ -335,7 +437,7 @@ describe("store migration", () => {
     if (!db) throw new Error("open failed");
     const opened = openStore(db, v2("/data/opencode.db"));
     if (!opened.ok) throw new Error(opened.reason);
-    expect(opened.store.getMeta("schema_version")).toBe("4");
+    expect(opened.store.getMeta("schema_version")).toBe("5");
     expect(opened.store.getMeta("store_host")).toBe("opencode-v2");
     expect(opened.store.getMeta("source_db")).toBe("/data/opencode.db");
     db.close();
@@ -356,7 +458,7 @@ describe("store migration", () => {
     if (!db2) throw new Error("reopen failed");
     const store2 = openV1Store(db2);
     if (!store2) throw new Error("reopen store failed");
-    expect(store2.getMeta("schema_version")).toBe("4");
+    expect(store2.getMeta("schema_version")).toBe("5");
     expect(store2.getMeta("store_host")).toBe("opencode-v1");
     expect(store2.allCards()).toEqual([]);
     expect(db2.get("SELECT name FROM sqlite_master WHERE name='junk'")).toBeUndefined();
@@ -375,14 +477,14 @@ describe("store migration", () => {
     if (!db2) throw new Error("reopen failed");
     const opened = openStore(db2, v2("/data/opencode.db"));
     if (!opened.ok) throw new Error(opened.reason);
-    expect(opened.store.getMeta("schema_version")).toBe("4");
+    expect(opened.store.getMeta("schema_version")).toBe("5");
     expect(opened.store.getMeta("store_host")).toBe("opencode-v2");
     expect(opened.store.getMeta("source_db")).toBe("/data/opencode.db");
     expect(db2.get("SELECT name FROM sqlite_master WHERE name='foreign_thing'")).toBeUndefined();
     db2.close();
   });
 
-  it("chains a populated v1 store additively to v4, preserving cards/FTS/vectors/stamps", async () => {
+  it("chains a populated v1 store additively to v5, preserving cards/FTS/vectors/stamps", async () => {
     const path = freshDbPath();
     // Build a v1-shaped store by hand (the v1 card table has no summary columns),
     // populated with a card, its slim-index/FTS rows, a persisted vector, and the
@@ -445,14 +547,14 @@ describe("store migration", () => {
     ]);
     db1.close();
 
-    // Reopen with the current (v4) code: additive upgrade chaining
-    // v1->v2->v3->v4, no rebuild.
+    // Reopen with the current (v5) code: additive upgrade chaining
+    // v1->v2->v3->v4->v5, no rebuild.
     const db2 = await openSqlite(path);
     if (!db2) throw new Error("reopen failed");
     const store2 = openV1Store(db2);
     if (!store2) throw new Error("reopen store failed");
 
-    expect(store2.getMeta("schema_version")).toBe("4");
+    expect(store2.getMeta("schema_version")).toBe("5");
     expect(store2.getMeta("store_host")).toBe("opencode-v1");
     expect(columnNames(db2, "card")).toContain("distill_cursor");
     // Everything survived: card, its vector, the semantic stamp, cards_rev.
@@ -485,7 +587,7 @@ describe("store migration", () => {
     db2.close();
   });
 
-  it("chains a populated v2 store additively to v4, preserving cards/FTS/vectors/summaries", async () => {
+  it("chains a populated v2 store additively to v5, preserving cards/FTS/vectors/summaries", async () => {
     const path = freshDbPath();
     // Build a v2-shaped store by hand: the v2 card table HAS the summary columns
     // but NOT embedding_gen. Populate it as a real install would be.
@@ -559,13 +661,13 @@ describe("store migration", () => {
     ]);
     db1.close();
 
-    // Reopen with the current (v4) code: additive v2->v3->v4 steps.
+    // Reopen with the current (v5) code: additive v2->v3->v4->v5 steps.
     const db2 = await openSqlite(path);
     if (!db2) throw new Error("reopen failed");
     const store2 = openV1Store(db2);
     if (!store2) throw new Error("reopen store failed");
 
-    expect(store2.getMeta("schema_version")).toBe("4");
+    expect(store2.getMeta("schema_version")).toBe("5");
     expect(store2.getMeta("store_host")).toBe("opencode-v1");
     expect(columnNames(db2, "card")).toContain("distill_cursor");
     // Card, vector, summary, stamp, and cards_rev all survived.
@@ -583,7 +685,7 @@ describe("store migration", () => {
     db2.close();
   });
 
-  it("upgrades a populated v3 store additively to v4 for the v1 host, keeping every row and stamp", async () => {
+  it("upgrades a populated v3 store additively to v5 for the v1 host, keeping every row and stamp", async () => {
     const path = freshDbPath();
     await buildV3Store(path);
 
@@ -592,7 +694,7 @@ describe("store migration", () => {
     const store = openV1Store(db);
     if (!store) throw new Error("reopen store failed");
 
-    expect(store.getMeta("schema_version")).toBe("4");
+    expect(store.getMeta("schema_version")).toBe("5");
     expect(store.getMeta("store_host")).toBe("opencode-v1");
     expect(store.getMeta("source_db")).toBeUndefined();
     expect(columnNames(db, "card")).toContain("distill_cursor");
@@ -630,7 +732,7 @@ describe("store migration", () => {
 
   it("opens a migrated store with a warning when the WAL switch fails", async () => {
     // The migration commits before the WAL switch, so a failing switch must not
-    // turn a committed schema 4 store into an `error` refusal.
+    // turn a committed schema 5 store into an `error` refusal.
     const path = freshDbPath();
     await buildV3Store(path);
     const db = await openSqlite(path);
@@ -639,7 +741,7 @@ describe("store migration", () => {
     const opened = openStore(spy.db, V1);
     if (!opened.ok) throw new Error(opened.reason);
     expect(opened.warning).toContain("could not enable WAL");
-    expect(opened.store.getMeta("schema_version")).toBe("4");
+    expect(opened.store.getMeta("schema_version")).toBe("5");
     expect(opened.store.getCard("s-v3")?.title).toBe("V3 session");
     opened.store.upsertCard(makeCard("s-new"));
     expect(opened.store.getCard("s-new")).toBeDefined();
@@ -673,7 +775,7 @@ describe("store migration", () => {
       const retry = await openSqlite(path);
       const store = retry && openV1Store(retry);
       if (!retry || !store) throw new Error("retry open failed");
-      expect(store.getMeta("schema_version")).toBe("4");
+      expect(store.getMeta("schema_version")).toBe("5");
       expect(store.getCard("s-v3")?.nlSummary).toBe("Linked the sprockets.");
       retry.close();
     }
@@ -725,21 +827,21 @@ describe("store migration", () => {
     db.close();
   });
 
-  it("refuses a v4 store owned by the v1 host when the v2 host opens it", async () => {
+  it("refuses a current store owned by the v1 host when the v2 host opens it", async () => {
     const path = freshDbPath();
-    await buildV4Store(path, V1);
+    await buildCurrentStore(path, V1);
     await expectRefusal(path, v2("/data/opencode.db"), "host-mismatch");
   });
 
-  it("refuses a v4 store owned by the v2 host when the v1 host opens it", async () => {
+  it("refuses a current store owned by the v2 host when the v1 host opens it", async () => {
     const path = freshDbPath();
-    await buildV4Store(path, v2("/data/opencode.db"));
+    await buildCurrentStore(path, v2("/data/opencode.db"));
     await expectRefusal(path, V1, "host-mismatch");
   });
 
-  it("refuses a v4 store whose host stamp is missing instead of guessing an owner", async () => {
+  it("refuses a current store whose host stamp is missing instead of guessing an owner", async () => {
     const path = freshDbPath();
-    await buildV4Store(path, V1);
+    await buildCurrentStore(path, V1);
     const db = await openSqlite(path);
     if (!db) throw new Error("reopen failed");
     db.run("DELETE FROM meta WHERE key='store_host'");
@@ -749,7 +851,7 @@ describe("store migration", () => {
 
   it("refuses a v2-host store distilled from a different source database", async () => {
     const path = freshDbPath();
-    await buildV4Store(path, v2("/data/a/opencode.db"));
+    await buildCurrentStore(path, v2("/data/a/opencode.db"));
     await expectRefusal(path, v2("/data/b/opencode.db"), "source-mismatch");
   });
 
@@ -766,7 +868,7 @@ describe("store migration", () => {
     // without a source stamp only arises from a hand edit. It is refused, not
     // adopted by whichever source opens it next.
     const path = freshDbPath();
-    await buildV4Store(path, v2("/data/opencode.db"));
+    await buildCurrentStore(path, v2("/data/opencode.db"));
     const db = await openSqlite(path);
     if (!db) throw new Error("reopen failed");
     db.run("DELETE FROM meta WHERE key='source_db'");
@@ -776,7 +878,7 @@ describe("store migration", () => {
 
   it("opens a store whose host and source both match, keeping its data", async () => {
     const path = freshDbPath();
-    await buildV4Store(path, v2("/data/opencode.db"));
+    await buildCurrentStore(path, v2("/data/opencode.db"));
     const db = await openSqlite(path);
     if (!db) throw new Error("reopen failed");
     const opened = openStore(db, v2("/data/opencode.db"));
@@ -790,7 +892,7 @@ describe("store migration", () => {
 
   it("rolls the fence transaction back on a refusal instead of committing it", async () => {
     const path = freshDbPath();
-    await buildV4Store(path, v2("/data/opencode.db"));
+    await buildCurrentStore(path, v2("/data/opencode.db"));
     const db = await openSqlite(path);
     if (!db) throw new Error("reopen failed");
     const spy = instrument(db);
@@ -801,7 +903,7 @@ describe("store migration", () => {
 
   it("leaves a refused file's journal mode alone and switches an accepted one to WAL", async () => {
     const path = freshDbPath();
-    await buildV4Store(path, v2("/data/opencode.db"));
+    await buildCurrentStore(path, v2("/data/opencode.db"));
     const raw = await openSqlite(path);
     if (!raw) throw new Error("reopen failed");
     raw.exec("PRAGMA journal_mode=DELETE;");
@@ -823,10 +925,10 @@ describe("store migration", () => {
 
   it("refuses a store whose schema is newer than the code, for either host", async () => {
     const path = freshDbPath();
-    await buildV4Store(path, V1);
+    await buildCurrentStore(path, V1);
     const db = await openSqlite(path);
     if (!db) throw new Error("reopen failed");
-    db.run("UPDATE meta SET value='5' WHERE key='schema_version'");
+    db.run("UPDATE meta SET value='6' WHERE key='schema_version'");
     db.close();
     await expectRefusal(path, V1, "newer");
     // A foreign host stamp is checked before the schema stamp, so the other
@@ -842,7 +944,7 @@ describe("store migration", () => {
       "UPDATE meta SET value='not-a-number' WHERE key='schema_version'",
     ]) {
       const path = freshDbPath();
-      await buildV4Store(path, v2("/data/opencode.db"));
+      await buildCurrentStore(path, v2("/data/opencode.db"));
       const db = await openSqlite(path);
       if (!db) throw new Error("reopen failed");
       db.run(damage);
@@ -887,12 +989,126 @@ describe("store migration", () => {
     expect(sessions(store2.ftsSearch({ strong: ["durable_marker"], weak: [] }))).toEqual(["s1"]);
     db2.close();
   });
+
+  it.each([
+    { name: "v1", identity: V1 },
+    { name: "v2", identity: v2("/data/opencode.db") },
+  ])(
+    "upgrades a populated v4 store for the $name host additively to v5, keeping cards, rollups, FTS rows and counters",
+    async ({ identity }) => {
+      const path = freshDbPath();
+      await buildV4Store(path, identity);
+
+      const db = await openSqlite(path);
+      if (!db) throw new Error("reopen failed");
+      const opened = openStore(db, identity);
+      if (!opened.ok) throw new Error(opened.reason);
+      const store = opened.store;
+
+      expect(store.getMeta("schema_version")).toBe("5");
+      expect(store.getMeta("store_host")).toBe(identity.host);
+      expect(store.getMeta("source_db")).toBe(
+        identity.host === "opencode-v2" ? identity.source : undefined,
+      );
+      expect(store.getMeta("semantic_model")).toBe("model-x:4");
+      expect(store.getCard("R")).toEqual(
+        makeCard("R", {
+          title: "V4 root",
+          timeUpdated: 3000,
+          inventory: "gizmo planner",
+          familyRollup: V4_ROLLUP,
+          distillState: "full",
+          distilledThrough: "mR",
+          embedding: new Uint8Array([1, 2, 3, 4]),
+          embeddingGen: 4,
+          nlSummary: "Planned the gizmos.",
+          summaryHash: "h4",
+          ...(identity.host === "opencode-v2" && { distillCursor: V4_CURSOR }),
+        }),
+      );
+      expect(store.getCard("C")).toMatchObject({ parentId: "R", rootId: "R", title: "V4 child" });
+      expect(sessions(store.ftsSearch({ strong: ["wobblefrond"], weak: [] }))).toEqual(["R"]);
+      expect(sessions(store.ftsSearch({ strong: ["snorkelwick"], weak: [] }))).toEqual(["C"]);
+      // The counters carry over; nothing this build stamps has been written yet.
+      expect(store.cardStats()).toEqual({
+        cards: 2,
+        fullCards: 2,
+        repairPending: 0,
+        cardsRev: 11,
+        cardsStamped: 0,
+        cardsDeleted: 0,
+        vectorsRev: 5,
+      });
+      // Migrated cards carry no generation and no stamped revision, and the
+      // range-hash table exists, empty.
+      expect(store.staleCards(1).map((c) => c.sessionId)).toEqual(["R", "C"]);
+      expect(store.cardsSince(0, 10)).toEqual([]);
+      expect(store.getRangeHashes("R")).toEqual([]);
+
+      // The first stamped write takes the revision after the migrated counter.
+      expect(store.patchCardMeta("C", { title: "Renamed child" })).toEqual({ changed: true });
+      expect(store.getCard("C")?.writeRev).toBe(12);
+      expect(store.cardStats()).toMatchObject({ cardsRev: 12, cardsStamped: 1 });
+      db.close();
+    },
+  );
+
+  it("existingOnly refuses a v4 store as needing migration, without writing", async () => {
+    const path = freshDbPath();
+    await buildV4Store(path, v2("/data/opencode.db"));
+    await expectRefusal(path, v2("/data/opencode.db"), "needs-migration", { existingOnly: true });
+  });
+
+  it("refuses a v4 store with no host stamp instead of treating it as pre-fence", async () => {
+    // Schema 4 is past the fence: its owner must be stamped, never implied.
+    const path = freshDbPath();
+    await buildV4Store(path, V1);
+    const db = await openSqlite(path);
+    if (!db) throw new Error("reopen failed");
+    db.run("DELETE FROM meta WHERE key='store_host'");
+    db.close();
+    await expectRefusal(path, V1, "host-mismatch");
+  });
+
+  it("refuses as `error` and keeps a v4 store intact when its migration throws midway", async () => {
+    // The range-hash table is created after the card columns are added, so
+    // failing there proves the earlier ALTERs roll back with it.
+    const path = freshDbPath();
+    await buildV4Store(path, V1);
+    const db = await openSqlite(path);
+    if (!db) throw new Error("reopen failed");
+    const spy = instrument(db, { exec: /CREATE TABLE range_hash/ });
+    expect(openStore(spy.db, V1)).toEqual({ ok: false, reason: "error" });
+    expect(spy.txOutcomes).toEqual(["rolled-back"]);
+    db.close();
+
+    const clean = await openSqlite(path);
+    if (!clean) throw new Error("reopen failed");
+    expect(rawMeta(clean, "schema_version")).toBe("4");
+    expect(columnNames(clean, "card")).not.toContain("projector_gen");
+    expect(columnNames(clean, "card")).not.toContain("write_rev");
+    expect(clean.get("SELECT name FROM sqlite_master WHERE name='range_hash'")).toBeUndefined();
+    expect(clean.get("SELECT COUNT(*) AS n FROM card")?.n).toBe(2);
+    clean.close();
+
+    const retry = await openSqlite(path);
+    const store = retry && openV1Store(retry);
+    if (!retry || !store) throw new Error("retry open failed");
+    expect(store.getMeta("schema_version")).toBe("5");
+    expect(store.getCard("R")?.familyRollup).toEqual(V4_ROLLUP);
+    retry.close();
+  });
 });
 
 describe("pluginBuild", () => {
   it("tags the schema, representation generation and host", () => {
-    expect(pluginBuild("opencode-v1")).toBe("schema4.gen4.opencode-v1");
-    expect(pluginBuild("opencode-v2")).toBe("schema4.gen4.opencode-v2");
+    expect(pluginBuild("opencode-v1")).toBe("schema5.gen4.opencode-v1");
+    expect(pluginBuild("opencode-v2")).toBe("schema5.gen4.opencode-v2");
+  });
+
+  it("adds the projector generation when the host stamps one", () => {
+    expect(pluginBuild("opencode-v2", 3)).toBe("schema5.gen4.proj3.opencode-v2");
+    expect(pluginBuild("opencode-v2", 0)).toBe("schema5.gen4.proj0.opencode-v2");
   });
 });
 
@@ -1275,30 +1491,30 @@ describe("meta and lease", () => {
 
     // Fresh acquire, and idempotent re-acquire by the same holder. The build tag
     // and generation ride the lease value for cross-process diagnosis.
-    expect(store.acquireLease("A", ttl, "schema4.gen4.opencode-v1", 4)).toBe(true);
-    expect(store.acquireLease("A", ttl, "schema4.gen4.opencode-v1", 4)).toBe(true);
+    expect(store.acquireLease("A", ttl, "schema5.gen4.opencode-v1", 4)).toBe(true);
+    expect(store.acquireLease("A", ttl, "schema5.gen4.opencode-v1", 4)).toBe(true);
     expect(store.leaseStatus()).toMatchObject({
       holder: "A",
-      build: "schema4.gen4.opencode-v1",
+      build: "schema5.gen4.opencode-v1",
       gen: 4,
     });
 
     // A second holder is refused while A's lease is fresh.
     clock = 1_000_100;
-    expect(store.acquireLease("B", ttl, "schema4.gen4.opencode-v1", 4)).toBe(false);
+    expect(store.acquireLease("B", ttl, "schema5.gen4.opencode-v1", 4)).toBe(false);
 
     // A heartbeat (only the holder's own) extends the lease and preserves build/gen.
     expect(store.heartbeatLease("A")).toBe(true);
     expect(store.heartbeatLease("B")).toBe(false);
     expect(store.leaseStatus()).toMatchObject({
       holder: "A",
-      build: "schema4.gen4.opencode-v1",
+      build: "schema5.gen4.opencode-v1",
       gen: 4,
     });
 
     // Past the ORIGINAL acquire + ttl but within heartbeat + ttl: still A's.
     clock = 1_005_050;
-    expect(store.acquireLease("B", ttl, "schema4.gen4.opencode-v1", 4)).toBe(false);
+    expect(store.acquireLease("B", ttl, "schema5.gen4.opencode-v1", 4)).toBe(false);
 
     // Past heartbeat + ttl: B, a DIFFERENT build, takes over the expired lease —
     // and leaseStatus now names it (the mixed-version diagnosis path).
@@ -1314,7 +1530,7 @@ describe("meta and lease", () => {
 
     // A released lease is immediately acquirable by anyone.
     clock = 1_005_102;
-    expect(store.acquireLease("A", ttl, "schema4.gen4.opencode-v1", 4)).toBe(true);
+    expect(store.acquireLease("A", ttl, "schema5.gen4.opencode-v1", 4)).toBe(true);
     db.close();
   });
 
@@ -1337,5 +1553,759 @@ describe("meta and lease", () => {
     expect(loser.store.acquireLease(loser.id, 30_000, "buildX", 4)).toBe(false);
     dbA.close();
     dbB.close();
+  });
+});
+
+// ── Revision accounting and write suppression ────────────────────────────────
+
+/** A range-hash fixture over the ~500 rows starting at `startSeq`. */
+function rangeHash(startSeq: number, hash = `h${startSeq}`): RangeHash {
+  return { startSeq, endSeq: startSeq + 499, rowCount: 500, hash, sweepGen: 1 };
+}
+
+/** Run `write` and report its result and how far each revision counter moved. */
+function counterMoves<T>(
+  store: Store,
+  write: () => T,
+): { result: T; rev: number; stamped: number; deleted: number; vectors: number } {
+  const before = store.cardStats();
+  const result = write();
+  const after = store.cardStats();
+  return {
+    result,
+    rev: after.cardsRev - before.cardsRev,
+    stamped: after.cardsStamped - before.cardsStamped,
+    deleted: after.cardsDeleted - before.cardsDeleted,
+    vectors: after.vectorsRev - before.vectorsRev,
+  };
+}
+
+const VECTOR = new Uint8Array([1, 2, 3, 4]);
+
+/** Persist {@link VECTOR} on a card, under the summary hash it currently holds. */
+function embed(store: Store, sessionId: string): void {
+  store.writeCardEmbeddings("model-x:4", 4, [
+    {
+      sessionId,
+      embedding: VECTOR,
+      expectedSummaryHash: store.getCard(sessionId)?.summaryHash ?? "",
+    },
+  ]);
+}
+
+describe("revision accounting", () => {
+  it("moves cards_rev and cards_stamped together: one per changing write, none otherwise", async () => {
+    const { db, store } = await fresh();
+    const card = makeCard("s1", { distillState: "full", distilledThrough: "m-p1" });
+    const rows = [makePart("p1", "alpha")];
+    const meta = { title: "", directory: "", projectId: "prj", timeUpdated: 2000 };
+    const rollup = [{ sessionId: "c1", messageId: "m1" }];
+    const steps: Array<{
+      name: string;
+      write: () => { changed: boolean };
+      changed: boolean;
+      revs: number;
+    }> = [
+      {
+        name: "first replace",
+        write: () => store.replaceSessionParts("s1", rows, card),
+        changed: true,
+        revs: 1,
+      },
+      {
+        name: "identical replace",
+        write: () => store.replaceSessionParts("s1", rows, card),
+        changed: false,
+        revs: 0,
+      },
+      {
+        name: "append of a row",
+        write: () =>
+          store.appendSessionParts(
+            "s1",
+            [makePart("p2", "beta")],
+            0,
+            { checkpointMessageId: "m-p1", firstNewMessageId: "m-p2" },
+            (all) => ({ ...card, partCount: all.length }),
+          ),
+        changed: true,
+        revs: 1,
+      },
+      {
+        name: "project patch",
+        write: () => store.patchCardMeta("s1", { projectId: "prj" }),
+        changed: true,
+        revs: 1,
+      },
+      {
+        name: "same project patch",
+        write: () => store.patchCardMeta("s1", { projectId: "prj" }),
+        changed: false,
+        revs: 0,
+      },
+      {
+        name: "metadata refresh",
+        write: () => store.refreshCardMeta("s1", meta, null),
+        changed: true,
+        revs: 1,
+      },
+      {
+        name: "same metadata refresh",
+        write: () => store.refreshCardMeta("s1", meta, null),
+        changed: false,
+        revs: 0,
+      },
+      {
+        name: "rollup",
+        write: () => store.setFamilyRollup("s1", rollup),
+        changed: true,
+        revs: 1,
+      },
+      {
+        name: "same rollup",
+        write: () => store.setFamilyRollup("s1", rollup),
+        changed: false,
+        revs: 0,
+      },
+      {
+        name: "summary",
+        write: () => store.writeSummary("s1", "Summary.", "h1"),
+        changed: true,
+        revs: 1,
+      },
+      {
+        name: "same summary",
+        write: () => store.writeSummary("s1", "Summary.", "h1"),
+        changed: false,
+        revs: 0,
+      },
+      // Readers never see a repair reason, so recording one allocates nothing.
+      {
+        name: "repair mark",
+        write: () => store.markRepairPending("s1", "malformed"),
+        changed: true,
+        revs: 0,
+      },
+      { name: "delete", write: () => store.deleteSession("s1"), changed: true, revs: 1 },
+      { name: "repeated delete", write: () => store.deleteSession("s1"), changed: false, revs: 0 },
+    ];
+    for (const step of steps) {
+      const moved = counterMoves(store, step.write);
+      expect(moved.result.changed, step.name).toBe(step.changed);
+      expect(moved.rev, step.name).toBe(step.revs);
+      expect(moved.stamped, step.name).toBe(step.revs);
+      const stored = store.getCard("s1");
+      if (stored && step.revs > 0) {
+        expect(stored.writeRev, step.name).toBe(store.cardStats().cardsRev);
+      }
+    }
+    expect(store.cardStats()).toMatchObject({ cardsRev: 7, cardsStamped: 7, cardsDeleted: 1 });
+    db.close();
+  });
+
+  it("moves only vectors_rev on a vector write, leaving the card's stamped revision", async () => {
+    const { db, store } = await fresh();
+    store.replaceSessionParts("s1", [], makeCard("s1"));
+    const moved = counterMoves(store, () => embed(store, "s1"));
+    expect(moved).toMatchObject({ rev: 0, stamped: 0, deleted: 0, vectors: 1 });
+    expect(store.getCard("s1")?.writeRev).toBe(1);
+    db.close();
+  });
+
+  it("deleteSession removes the session's range hashes with its card and counts the deletion", async () => {
+    const { db, store } = await fresh();
+    store.replaceSessionParts("s1", [makePart("p1", "doomed_marker")], makeCard("s1"), {
+      rangeHashes: [rangeHash(0)],
+    });
+    store.putRangeHashes("s2", [rangeHash(0)]);
+    const moved = counterMoves(store, () => store.deleteSession("s1"));
+    expect(moved).toMatchObject({ result: { changed: true }, rev: 1, stamped: 1, deleted: 1 });
+    expect(store.getCard("s1")).toBeUndefined();
+    expect(store.ftsSearch({ strong: ["doomed_marker"], weak: [] })).toEqual([]);
+    expect(store.getRangeHashes("s1")).toEqual([]);
+    expect(store.getRangeHashes("s2")).toEqual([rangeHash(0)]);
+    db.close();
+  });
+
+  it("upsertCard writes outside the accounting, keeping the stamped revision, repair reason and store-owned columns", async () => {
+    const { db, store } = await fresh();
+    const rollup = [{ sessionId: "c1", messageId: "m1" }];
+    store.replaceSessionParts("s1", [], makeCard("s1"));
+    store.setFamilyRollup("s1", rollup);
+    store.writeSummary("s1", "Summary.", "h1");
+    store.markRepairPending("s1", "malformed");
+    const moved = counterMoves(store, () =>
+      store.upsertCard(makeCard("s1", { title: "Upserted" })),
+    );
+    expect(moved).toMatchObject({ rev: 0, stamped: 0 });
+    expect(store.getCard("s1")).toMatchObject({
+      title: "Upserted",
+      familyRollup: rollup,
+      nlSummary: "Summary.",
+      summaryHash: "h1",
+      writeRev: 3,
+      repairReason: "malformed",
+    });
+    db.close();
+  });
+});
+
+describe("replace suppression", () => {
+  it("writes only the checkpoint, generation and range hashes for an identical replace, keeping the vector", async () => {
+    const { db, store } = await fresh();
+    const rows = [makePart("p1", "alpha"), makePart("p2", "beta", { prevMessageId: "m-p1" })];
+    const card = makeCard("s1", {
+      distillState: "full",
+      distillCursor: "cursor-1",
+      projectorGen: 1,
+    });
+    store.replaceSessionParts("s1", rows, card);
+    embed(store, "s1");
+    const before = store.getCard("s1")!;
+
+    // The incoming card carries no vector, as a re-derived card never does.
+    const moved = counterMoves(store, () =>
+      store.replaceSessionParts(
+        "s1",
+        rows,
+        { ...card, distillCursor: "cursor-2", projectorGen: 2 },
+        { rangeHashes: [rangeHash(0)] },
+      ),
+    );
+    expect(moved).toMatchObject({ result: { changed: false }, rev: 0, stamped: 0 });
+    expect(store.getCard("s1")).toEqual({ ...before, distillCursor: "cursor-2", projectorGen: 2 });
+    expect(store.getRangeHashes("s1")).toEqual([rangeHash(0)]);
+    expect(sessions(store.ftsSearch({ strong: ["beta"], weak: [] }))).toEqual(["s1"]);
+    db.close();
+  });
+
+  it("neither compares nor overwrites the stored summary and family rollup", async () => {
+    const { db, store } = await fresh();
+    const rows = [makePart("p1", "alpha")];
+    const rollup = [{ sessionId: "c1", messageId: "m1", snippet: "child" }];
+    store.replaceSessionParts("s1", rows, makeCard("s1"));
+    store.writeSummary("s1", "Summary.", "h1");
+    store.setFamilyRollup("s1", rollup);
+
+    // A re-derived card carries an empty summary and rollup.
+    expect(store.replaceSessionParts("s1", rows, makeCard("s1"))).toEqual({ changed: false });
+    expect(
+      store.replaceSessionParts("s1", rows, makeCard("s1", { title: "Renamed" })),
+    ).toMatchObject({ changed: true });
+    expect(store.getCard("s1")).toMatchObject({
+      title: "Renamed",
+      nlSummary: "Summary.",
+      summaryHash: "h1",
+      familyRollup: rollup,
+    });
+
+    // A first write takes the card's rollup.
+    store.replaceSessionParts("s2", [], makeCard("s2", { familyRollup: rollup }));
+    expect(store.getCard("s2")?.familyRollup).toEqual(rollup);
+    db.close();
+  });
+
+  it.each<{ name: string; card?: Partial<Card>; rows?: (rows: PartTextRow[]) => PartTextRow[] }>([
+    { name: "a card title", card: { title: "Renamed" } },
+    { name: "a card list field", card: { files: ["src/a.ts"] } },
+    { name: "the card's archive time", card: { timeArchived: 5000 } },
+    { name: "the card's distilled-through message", card: { distilledThrough: "m-p9" } },
+    { name: "a row's text", rows: (r) => [r[0]!, { ...r[1]!, raw: "gamma" }] },
+    { name: "a row's next pointer", rows: (r) => [{ ...r[0]!, nextMessageId: "m-p2" }, r[1]!] },
+    { name: "the row order", rows: (r) => [r[1]!, r[0]!] },
+    { name: "the row count", rows: (r) => [r[0]!] },
+  ])("rewrites with a revision when $name differs", async ({ card, rows: change }) => {
+    const { db, store } = await fresh();
+    const rows = [makePart("p1", "alpha"), makePart("p2", "beta")];
+    store.replaceSessionParts("s1", rows, makeCard("s1"));
+    const moved = counterMoves(store, () =>
+      store.replaceSessionParts("s1", change ? change(rows) : rows, makeCard("s1", card)),
+    );
+    expect(moved).toMatchObject({ result: { changed: true }, rev: 1, stamped: 1 });
+    expect(store.getCard("s1")?.writeRev).toBe(2);
+    db.close();
+  });
+});
+
+describe("append suppression", () => {
+  /** A session whose stored checkpoint row (`m-p2`) already points at `next`. */
+  async function seeded(next: string | null) {
+    const ctx = await fresh();
+    const card = makeCard("s1", {
+      distillState: "full",
+      distilledThrough: "m-p2",
+      partCount: 2,
+      distillCursor: "cursor-1",
+    });
+    ctx.store.replaceSessionParts(
+      "s1",
+      [makePart("p1", "alpha"), makePart("p2", "beta", { nextMessageId: next })],
+      card,
+    );
+    return { ...ctx, card };
+  }
+  const boundary = { checkpointMessageId: "m-p2", firstNewMessageId: "m-p3" };
+
+  it("writes only the checkpoint and range hashes when nothing is added, evicted or repointed and the card matches", async () => {
+    const { db, store, card } = await seeded("m-p3");
+    embed(store, "s1");
+    const before = store.getCard("s1")!;
+    const moved = counterMoves(store, () =>
+      store.appendSessionParts("s1", [], 0, boundary, () => ({ ...card, distillCursor: "c-2" }), {
+        rangeHashes: [rangeHash(0)],
+      }),
+    );
+    expect(moved).toMatchObject({ result: { changed: false }, rev: 0, stamped: 0 });
+    expect(store.getCard("s1")).toEqual({ ...before, distillCursor: "c-2" });
+    expect(store.getRangeHashes("s1")).toEqual([rangeHash(0)]);
+    db.close();
+  });
+
+  it.each([
+    { name: "adds a row", rows: [makePart("p3", "gamma")], cap: 0, next: "m-p3" },
+    { name: "evicts a row under the cap", rows: [], cap: 1, next: "m-p3" },
+    { name: "repoints the checkpoint row", rows: [], cap: 0, next: null },
+  ])(
+    "rewrites with a revision when it $name, even though the card matches",
+    async ({ rows, cap, next }) => {
+      const { db, store, card } = await seeded(next);
+      const moved = counterMoves(store, () =>
+        store.appendSessionParts("s1", rows, cap, boundary, () => card),
+      );
+      expect(moved).toMatchObject({ result: { changed: true }, rev: 1, stamped: 1 });
+      db.close();
+    },
+  );
+});
+
+describe("metadata and owned-column writes", () => {
+  const meta = { title: "T", directory: "/d", projectId: "prj", timeUpdated: 1000 };
+
+  /** A stamped card matching {@link meta}, archived and carrying a vector. */
+  async function seeded() {
+    const ctx = await fresh();
+    ctx.store.replaceSessionParts(
+      "s1",
+      [],
+      makeCard("s1", { ...meta, timeArchived: 7000, distillCursor: "old" }),
+    );
+    embed(ctx.store, "s1");
+    return { ...ctx, before: ctx.store.getCard("s1")! };
+  }
+
+  it("refreshCardMeta writes nothing for an unknown session", async () => {
+    const { db, store } = await fresh();
+    const moved = counterMoves(store, () => store.refreshCardMeta("ghost", meta, "c"));
+    expect(moved).toMatchObject({ result: { changed: false }, rev: 0 });
+    expect(store.getCard("ghost")).toBeUndefined();
+    db.close();
+  });
+
+  it("refreshCardMeta stores only the checkpoint when nothing differs, leaving an omitted archive time", async () => {
+    const { db, store, before } = await seeded();
+    const moved = counterMoves(store, () => store.refreshCardMeta("s1", meta, "new"));
+    expect(moved).toMatchObject({ result: { changed: false }, rev: 0 });
+    expect(store.getCard("s1")).toEqual({ ...before, distillCursor: "new" });
+    db.close();
+  });
+
+  it.each<{ name: string; change: Partial<Card> }>([
+    { name: "project", change: { projectId: "prj-2" } },
+    { name: "recency", change: { timeUpdated: 2000 } },
+    { name: "archive time", change: { timeArchived: 8000 } },
+  ])(
+    "refreshCardMeta writes a changed $name with a revision and keeps the vector",
+    async ({ change }) => {
+      const { db, store, before } = await seeded();
+      const moved = counterMoves(store, () =>
+        store.refreshCardMeta("s1", { ...meta, ...change }, "new"),
+      );
+      expect(moved).toMatchObject({ result: { changed: true }, rev: 1, stamped: 1 });
+      expect(store.getCard("s1")).toEqual({
+        ...before,
+        ...change,
+        distillCursor: "new",
+        writeRev: 2,
+      });
+      db.close();
+    },
+  );
+
+  it.each<{ name: string; change: Partial<Card> }>([
+    { name: "title", change: { title: "T2" } },
+    { name: "directory", change: { directory: "/d2" } },
+  ])("refreshCardMeta drops the vector when the embedded $name changes", async ({ change }) => {
+    const { db, store, before } = await seeded();
+    expect(store.refreshCardMeta("s1", { ...meta, ...change }, "new")).toEqual({ changed: true });
+    expect(store.getCard("s1")).toEqual({
+      ...before,
+      ...change,
+      embedding: null,
+      embeddingGen: null,
+      distillCursor: "new",
+      writeRev: 2,
+    });
+    db.close();
+  });
+
+  it("setFamilyRollup rewrites only the rollup, with a revision, keeping the vector", async () => {
+    const { db, store, before } = await seeded();
+    const rollup = [{ sessionId: "c1", messageId: "m1", snippet: "child" }];
+    const moved = counterMoves(store, () => store.setFamilyRollup("s1", rollup));
+    expect(moved).toMatchObject({ result: { changed: true }, rev: 1, stamped: 1 });
+    expect(store.getCard("s1")).toEqual({ ...before, familyRollup: rollup, writeRev: 2 });
+    expect(store.setFamilyRollup("ghost", rollup)).toEqual({ changed: false });
+    expect(store.getCard("ghost")).toBeUndefined();
+    db.close();
+  });
+
+  it("writeSummary stamps a changed summary or hash and drops the vector, and skips an unchanged one", async () => {
+    const { db, store } = await seeded();
+    expect(store.writeSummary("s1", "Summary.", "h1")).toEqual({ changed: true });
+    expect(store.getCard("s1")).toMatchObject({ nlSummary: "Summary.", embedding: null });
+
+    // The hash alone differing is still a change.
+    embed(store, "s1");
+    expect(store.writeSummary("s1", "Summary.", "h2")).toEqual({ changed: true });
+    expect(store.getCard("s1")?.embedding).toBeNull();
+
+    embed(store, "s1");
+    const moved = counterMoves(store, () => store.writeSummary("s1", "Summary.", "h2"));
+    expect(moved).toMatchObject({ result: { changed: false }, rev: 0 });
+    expect(store.getCard("s1")?.embedding).toEqual(VECTOR);
+
+    expect(counterMoves(store, () => store.writeSummary("ghost", "S", "h"))).toMatchObject({
+      result: { changed: false },
+      rev: 0,
+    });
+    db.close();
+  });
+});
+
+describe("repair reasons", () => {
+  it("records a reason without a revision, reporting whether it changed", async () => {
+    const { db, store } = await fresh();
+    store.replaceSessionParts("s1", [], makeCard("s1"));
+    const moved = counterMoves(store, () => store.markRepairPending("s1", "malformed"));
+    expect(moved).toMatchObject({ result: { changed: true }, rev: 0, stamped: 0 });
+    expect(store.getCard("s1")?.repairReason).toBe("malformed");
+    expect(store.markRepairPending("s1", "malformed")).toEqual({ changed: false });
+    expect(store.markRepairPending("s1", "missing")).toEqual({ changed: true });
+    expect(store.getCard("s1")?.repairReason).toBe("missing");
+    expect(store.markRepairPending("ghost", "malformed")).toEqual({ changed: false });
+    expect(store.cardStats().repairPending).toBe(1);
+    db.close();
+  });
+
+  it.each<{ name: string; card: Partial<Card> }>([
+    { name: "a suppressed", card: {} },
+    { name: "a changing", card: { title: "Rebuilt" } },
+    { name: "a higher-generation", card: { projectorGen: 3 } },
+  ])("clears the reason on $name replace", async ({ card }) => {
+    const { db, store } = await fresh();
+    store.replaceSessionParts("s1", [], makeCard("s1", { projectorGen: 2 }));
+    store.markRepairPending("s1", "malformed");
+    expect(
+      store.replaceSessionParts("s1", [], makeCard("s1", { projectorGen: 2, ...card })),
+    ).not.toHaveProperty("refused");
+    expect(store.getCard("s1")?.repairReason).toBeUndefined();
+    db.close();
+  });
+
+  it("keeps the reason through an append, which does not rebuild the card", async () => {
+    const { db, store } = await fresh();
+    store.replaceSessionParts("s1", [makePart("p1", "alpha")], makeCard("s1"));
+    store.markRepairPending("s1", "malformed");
+    store.appendSessionParts(
+      "s1",
+      [makePart("p2", "beta")],
+      0,
+      { checkpointMessageId: "m-p1", firstNewMessageId: "m-p2" },
+      (all) => makeCard("s1", { partCount: all.length }),
+    );
+    expect(store.getCard("s1")).toMatchObject({ partCount: 2, repairReason: "malformed" });
+    db.close();
+  });
+
+  it("clearRepairReasons clears every reason and counts them", async () => {
+    const { db, store } = await fresh();
+    for (const id of ["s1", "s2", "s3"]) store.replaceSessionParts(id, [], makeCard(id));
+    store.markRepairPending("s1", "malformed");
+    store.markRepairPending("s2", "missing");
+    expect(store.clearRepairReasons()).toBe(2);
+    expect(store.allCards().map((c) => c.repairReason)).toEqual([undefined, undefined, undefined]);
+    expect(store.cardStats().repairPending).toBe(0);
+    expect(store.clearRepairReasons()).toBe(0);
+    db.close();
+  });
+});
+
+describe("staleCards", () => {
+  it("returns nothing when no generation is given", async () => {
+    const { db, store } = await fresh();
+    store.upsertCard(makeCard("no-gen"));
+    store.upsertCard(makeCard("v1-cursor", { projectorGen: 1, distillCursor: '{"v":1}' }));
+    expect(store.staleCards()).toEqual([]);
+    db.close();
+  });
+
+  it("lists cards below the generation or with a v1 checkpoint, newest first, leaving out repair-pending ones", async () => {
+    const { db, store } = await fresh();
+    const cards = [
+      makeCard("no-gen", { timeUpdated: 7000 }),
+      makeCard("below", { projectorGen: 1, timeUpdated: 6000 }),
+      makeCard("current", { projectorGen: 2, timeUpdated: 5000, distillCursor: '{"v":2}' }),
+      makeCard("above", { projectorGen: 3, timeUpdated: 4000 }),
+      makeCard("v1-cursor", { projectorGen: 2, timeUpdated: 3000, distillCursor: '{"v":1}' }),
+      makeCard("v1-above", { projectorGen: 3, timeUpdated: 2000, distillCursor: '{"v":1}' }),
+      makeCard("pending", { projectorGen: 1, timeUpdated: 9000 }),
+    ];
+    for (const card of cards) store.upsertCard(card);
+    store.markRepairPending("pending", "malformed");
+    expect(store.staleCards(2)).toEqual([
+      { sessionId: "no-gen", timeUpdated: 7000 },
+      { sessionId: "below", timeUpdated: 6000 },
+      { sessionId: "v1-cursor", timeUpdated: 3000 },
+      { sessionId: "v1-above", timeUpdated: 2000 },
+    ]);
+    db.close();
+  });
+
+  it("reads a malformed checkpoint as not v1 instead of throwing", async () => {
+    const { db, store } = await fresh();
+    store.upsertCard(makeCard("garbled", { projectorGen: 2, distillCursor: "{not json" }));
+    store.upsertCard(makeCard("scalar", { projectorGen: 2, distillCursor: "1" }));
+    expect(store.staleCards(2)).toEqual([]);
+    expect(
+      store
+        .staleCards(3)
+        .map((c) => c.sessionId)
+        .sort(),
+    ).toEqual(["garbled", "scalar"]);
+    db.close();
+  });
+});
+
+describe("projector generation guard", () => {
+  it("refuses a replace below the stored generation and writes nothing", async () => {
+    const { db, store } = await fresh();
+    store.replaceSessionParts(
+      "s1",
+      [makePart("p1", "newer_marker")],
+      makeCard("s1", { projectorGen: 2, title: "Newer" }),
+      { rangeHashes: [rangeHash(0, "kept")] },
+    );
+    store.markRepairPending("s1", "malformed");
+    const before = store.getCard("s1");
+    const moved = counterMoves(store, () =>
+      store.replaceSessionParts(
+        "s1",
+        [makePart("p2", "older_marker")],
+        makeCard("s1", { projectorGen: 1, title: "Older" }),
+        { rangeHashes: [rangeHash(0, "older")] },
+      ),
+    );
+    expect(moved).toMatchObject({
+      result: { changed: false, refused: "older-generation" },
+      rev: 0,
+      stamped: 0,
+    });
+    expect(store.getCard("s1")).toEqual(before);
+    expect(sessions(store.ftsSearch({ strong: ["newer_marker"], weak: [] }))).toEqual(["s1"]);
+    expect(store.ftsSearch({ strong: ["older_marker"], weak: [] })).toEqual([]);
+    expect(store.getRangeHashes("s1")).toEqual([rangeHash(0, "kept")]);
+    db.close();
+  });
+
+  it("accepts a replace at or above the stored generation, or one naming none", async () => {
+    const { db, store } = await fresh();
+    store.replaceSessionParts("s1", [], makeCard("s1", { projectorGen: 2 }));
+    const same = makeCard("s1", { projectorGen: 2, title: "Same" });
+    expect(store.replaceSessionParts("s1", [], same)).toEqual({ changed: true });
+    const higher = makeCard("s1", { projectorGen: 3, title: "Higher" });
+    expect(store.replaceSessionParts("s1", [], higher)).toEqual({ changed: true });
+    expect(store.getCard("s1")?.projectorGen).toBe(3);
+    const none = makeCard("s1", { title: "None" });
+    expect(store.replaceSessionParts("s1", [], none)).toEqual({ changed: true });
+    db.close();
+  });
+
+  it("keeps the stored generation through an append unless its card names one", async () => {
+    const { db, store } = await fresh();
+    store.replaceSessionParts("s1", [makePart("p1", "alpha")], makeCard("s1", { projectorGen: 2 }));
+    store.appendSessionParts(
+      "s1",
+      [makePart("p2", "beta")],
+      0,
+      { checkpointMessageId: "m-p1", firstNewMessageId: "m-p2" },
+      (all) => makeCard("s1", { partCount: all.length }),
+    );
+    expect(store.getCard("s1")?.projectorGen).toBe(2);
+    store.appendSessionParts(
+      "s1",
+      [makePart("p3", "gamma")],
+      0,
+      { checkpointMessageId: "m-p2", firstNewMessageId: "m-p3" },
+      (all) => makeCard("s1", { partCount: all.length, projectorGen: 3 }),
+    );
+    expect(store.getCard("s1")?.projectorGen).toBe(3);
+    db.close();
+  });
+
+  it("refuses an append whose card is below the stored generation, rolling the whole append back", async () => {
+    const { db, store } = await fresh();
+    store.replaceSessionParts("s1", [makePart("p1", "alpha")], makeCard("s1", { projectorGen: 2 }));
+    const before = store.getCard("s1");
+    // A cap of one row makes the append evict the stored row before the
+    // generation check runs.
+    const moved = counterMoves(store, () =>
+      store.appendSessionParts(
+        "s1",
+        [makePart("p2", "rolledback_marker")],
+        1,
+        { checkpointMessageId: "m-p1", firstNewMessageId: "m-p2" },
+        (all) => makeCard("s1", { partCount: all.length, projectorGen: 1 }),
+        { rangeHashes: [rangeHash(0)] },
+      ),
+    );
+    expect(moved).toMatchObject({
+      result: { changed: false, refused: "older-generation" },
+      rev: 0,
+      stamped: 0,
+    });
+    expect(store.getCard("s1")).toEqual(before);
+    expect(store.ftsSearch({ strong: ["rolledback_marker"], weak: [] })).toEqual([]);
+    expect(sessions(store.ftsSearch({ strong: ["alpha"], weak: [] }))).toEqual(["s1"]);
+    expect(store.getRangeHashes("s1")).toEqual([]);
+    db.close();
+  });
+});
+
+describe("range hashes", () => {
+  it("upserts by start seq, lists ascending, and clears one session's", async () => {
+    const { db, store } = await fresh();
+    store.putRangeHashes("s1", [rangeHash(500), rangeHash(0)]);
+    store.putRangeHashes("s2", [rangeHash(0, "other")]);
+    expect(store.getRangeHashes("s1")).toEqual([rangeHash(0), rangeHash(500)]);
+
+    const rehashed: RangeHash = {
+      startSeq: 0,
+      endSeq: 620,
+      rowCount: 621,
+      hash: "rehashed",
+      sweepGen: 2,
+    };
+    const moved = counterMoves(store, () => store.putRangeHashes("s1", [rehashed]));
+    expect(moved).toMatchObject({ rev: 0, stamped: 0 });
+    expect(store.getRangeHashes("s1")).toEqual([rehashed, rangeHash(500)]);
+    store.putRangeHashes("s1", []);
+    expect(store.getRangeHashes("s1")).toHaveLength(2);
+
+    expect(store.clearRangeHashes("s1")).toBe(2);
+    expect(store.getRangeHashes("s1")).toEqual([]);
+    expect(store.clearRangeHashes("s1")).toBe(0);
+    expect(store.getRangeHashes("s2")).toEqual([rangeHash(0, "other")]);
+    db.close();
+  });
+
+  it("stores a changing replace's and an append's range hashes with the write", async () => {
+    const { db, store } = await fresh();
+    store.replaceSessionParts("s1", [makePart("p1", "alpha")], makeCard("s1"), {
+      rangeHashes: [rangeHash(0)],
+    });
+    store.appendSessionParts(
+      "s1",
+      [makePart("p2", "beta")],
+      0,
+      { checkpointMessageId: "m-p1", firstNewMessageId: "m-p2" },
+      (all) => makeCard("s1", { partCount: all.length }),
+      { rangeHashes: [rangeHash(0, "regrown"), rangeHash(500)] },
+    );
+    expect(store.getRangeHashes("s1")).toEqual([rangeHash(0, "regrown"), rangeHash(500)]);
+    db.close();
+  });
+});
+
+describe("change listing and stats", () => {
+  const revs = (cards: Card[]) => cards.map((c) => [c.sessionId, c.writeRev]);
+
+  it("cardsSince lists cards stamped after a revision, oldest first, each at its latest revision", async () => {
+    const { db, store } = await fresh();
+    for (const id of ["s1", "s2", "s3"]) store.replaceSessionParts(id, [], makeCard(id));
+    store.patchCardMeta("s1", { title: "Again" });
+    store.upsertCard(makeCard("unstamped"));
+    expect(revs(store.cardsSince(0, 10))).toEqual([
+      ["s2", 2],
+      ["s3", 3],
+      ["s1", 4],
+    ]);
+    expect(revs(store.cardsSince(2, 10))).toEqual([
+      ["s3", 3],
+      ["s1", 4],
+    ]);
+    // Paging continues from the last card's revision.
+    expect(revs(store.cardsSince(0, 2))).toEqual([
+      ["s2", 2],
+      ["s3", 3],
+    ]);
+    expect(revs(store.cardsSince(3, 2))).toEqual([["s1", 4]]);
+    expect(store.cardsSince(4, 10)).toEqual([]);
+    db.close();
+  });
+
+  it.each([0, -3, Number.NaN, 1.5])("cardsSince reads a limit of %s as one card", async (limit) => {
+    const { db, store } = await fresh();
+    for (const id of ["s1", "s2", "s3"]) store.replaceSessionParts(id, [], makeCard(id));
+    expect(revs(store.cardsSince(0, limit))).toEqual([["s1", 1]]);
+    db.close();
+  });
+
+  it("cardsSince returns vectors only on request", async () => {
+    const { db, store } = await fresh();
+    store.replaceSessionParts("s1", [], makeCard("s1"));
+    embed(store, "s1");
+    expect(store.cardsSince(0, 1)[0]?.embedding).toBeNull();
+    expect(store.cardsSince(0, 1, { withEmbeddings: true })[0]?.embedding).toEqual(VECTOR);
+    db.close();
+  });
+
+  it("cardStats counts cards, full cards and repair-pending cards, reading unset counters as zero", async () => {
+    const { db, store } = await fresh();
+    expect(store.cardStats()).toEqual({
+      cards: 0,
+      fullCards: 0,
+      repairPending: 0,
+      cardsRev: 0,
+      cardsStamped: 0,
+      cardsDeleted: 0,
+      vectorsRev: 0,
+    });
+    store.replaceSessionParts("s1", [], makeCard("s1", { distillState: "full" }));
+    store.replaceSessionParts("s2", [], makeCard("s2"));
+    store.replaceSessionParts("gone", [], makeCard("gone"));
+    store.deleteSession("gone");
+    store.markRepairPending("s2", "malformed");
+    embed(store, "s1");
+    expect(store.cardStats()).toEqual({
+      cards: 2,
+      fullCards: 1,
+      repairPending: 1,
+      cardsRev: 4,
+      cardsStamped: 4,
+      cardsDeleted: 1,
+      vectorsRev: 1,
+    });
+    db.close();
+  });
+
+  it("spaceStats reports the file's pages and the free pages a delete leaves", async () => {
+    const { db, store } = await fresh();
+    store.replaceSessionParts("s1", [makePart("p1", "lorem ".repeat(20_000))], makeCard("s1"));
+    const before = store.spaceStats();
+    expect(before.pageSize).toBe(db.get("PRAGMA page_size")?.page_size);
+    expect(before.pageCount).toBe(db.get("PRAGMA page_count")?.page_count);
+    store.deleteSession("s1");
+    expect(store.spaceStats().freelistCount).toBeGreaterThan(before.freelistCount);
+    db.close();
   });
 });

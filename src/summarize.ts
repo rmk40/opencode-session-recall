@@ -5,6 +5,7 @@ import type { FetchGate } from "./fetch-gate.js";
 import { errmsg, settleWithin } from "./types.js";
 import { tokenizeAll } from "./normalize.js";
 import { SUMMARIZER_SENTINEL, isSummarizerTitle } from "./extract.js";
+import { cyrb53 } from "./hash.js";
 
 /**
  * Path B: LLM-written card summaries via a worker-session summarizer.
@@ -178,21 +179,10 @@ function mechanicalDigest(card: Card): string {
     .join("\n");
 }
 
-/** 53-bit content hash (cyrb53), pure JS so `src/` stays Node-free. Used only
- *  for change detection, so a rare collision merely skips a re-summary. */
+/** Change-detection hash of a card's mechanical digest under prompt-template
+ *  version `rev`; a rare collision merely skips a re-summary. */
 function contentHash(rev: string, card: Card): string {
-  const text = `${rev} ${mechanicalDigest(card)}`;
-  let h1 = 0xdeadbeef;
-  let h2 = 0x41c6ce57;
-  for (let i = 0; i < text.length; i++) {
-    const ch = text.charCodeAt(i);
-    h1 = Math.imul(h1 ^ ch, 2654435761);
-    h2 = Math.imul(h2 ^ ch, 1597334677);
-  }
-  h1 = Math.imul(h1 ^ (h1 >>> 16), 2246822507) ^ Math.imul(h2 ^ (h2 >>> 13), 3266489909);
-  h2 = Math.imul(h2 ^ (h2 >>> 16), 2246822507) ^ Math.imul(h1 ^ (h1 >>> 13), 3266489909);
-  const hash = 4294967296 * (2097151 & h2) + (h1 >>> 0);
-  return hash.toString(36);
+  return cyrb53(`${rev} ${mechanicalDigest(card)}`);
 }
 
 /**
@@ -536,11 +526,6 @@ export function createSummarizer(deps: SummarizerDeps): Summarizer {
 
   // ── Queue + drain ──
 
-  function bumpCardsRev(): void {
-    const current = Number(store.getMeta("cards_rev")) || 0;
-    store.setMeta("cards_rev", String(current + 1));
-  }
-
   function cardsNeedingSummary(): Card[] {
     return store
       .allCards()
@@ -622,14 +607,13 @@ export function createSummarizer(deps: SummarizerDeps): Summarizer {
         break;
       }
 
-      let wrote = 0;
       const retry: string[] = [];
       for (const card of cards) {
         const summary = summaries.get(card.sessionId);
         if (summary) {
+          // Each summary write stamps its own card revision.
           store.writeSummary(card.sessionId, summary, contentHash(rev, card));
           summarized++;
-          wrote++;
           attempts.delete(card.sessionId);
         } else {
           const n = (attempts.get(card.sessionId) ?? 0) + 1;
@@ -643,7 +627,6 @@ export function createSummarizer(deps: SummarizerDeps): Summarizer {
       }
       for (const id of batchIds) inFlight.delete(id);
       if (retry.length > 0) enqueueOnly(retry);
-      if (wrote > 0) bumpCardsRev();
 
       if (summaries.size === 0) {
         if (++consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {

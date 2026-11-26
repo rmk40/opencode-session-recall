@@ -587,6 +587,25 @@ describe("summarizer drain (budget, latch, gating)", () => {
     expect(client.calls.prompts.length).toBe(1); // nothing changed → no new prompt
   });
 
+  it("allocates one stamped revision per summary written and none beyond", async () => {
+    const store = await freshStore();
+    store.upsertCard(fullCard("c1"));
+    store.upsertCard(fullCard("c2"));
+    const gate = createFetchGate({ concurrency: 2 });
+    const client = makeSummarizerClient(replyKeys((it) => `Summary ${it.key}.`));
+    await makeSummarizer(store, client.client, gate).runColdPass();
+
+    expect(client.calls.prompts.length).toBe(1); // both in one batch
+    // Every revision is a stamped one, so a reader sees no unstamped write.
+    expect(store.cardStats()).toMatchObject({ cardsRev: 2, cardsStamped: 2 });
+    expect(
+      store
+        .cardsSince(0, 10)
+        .map((card) => card.sessionId)
+        .sort(),
+    ).toEqual(["c1", "c2"]);
+  });
+
   it("re-summarizes when the prompt-template rev changes", async () => {
     const store = await freshStore();
     store.upsertCard(fullCard("c1"));

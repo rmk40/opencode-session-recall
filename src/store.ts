@@ -6,12 +6,12 @@ import { EMBED_REPRESENTATION } from "./embedding-text.js";
  * Card + slim-part-index store over a {@link SqliteDb}.
  *
  * The schema is versioned and self-healing: an absent (or pre-v1) stamp drops
- * everything and rebuilds at the current version, a v1, v2 or v3 stamp is
- * upgraded additively in place (chaining v1->v2->v3->v4, preserving all data), a
+ * everything and rebuilds at the current version, a v1 to v4 stamp is upgraded
+ * additively in place (chaining v1->v2->v3->v4->v5, preserving all data), a
  * newer stamp makes {@link openStore} refuse so the caller degrades to cards-lite.
  * All of that runs under one `BEGIN IMMEDIATE` so concurrent opencode processes
  * cannot race a rebuild. The newer-stamp refusal is the mixed-version fence: once
- * a store is bumped to v4, older plugin builds sharing the file degrade to
+ * a store is bumped to v5, older plugin builds that open the file degrade to
  * read-only cards-lite (no writes, no distill lease) rather than corrupting a
  * format they do not understand.
  *
@@ -22,13 +22,23 @@ import { EMBED_REPRESENTATION } from "./embedding-text.js";
  * two hosts pointed at one file never thrash it with rebuilds. Stores stamped 1-3
  * predate the fence and were all written by the v1 host.
  *
+ * Schema 5 adds revision accounting and repair state. Every lexical card write
+ * allocates the next `cards_rev` inside its own transaction, stamps it on the
+ * row it wrote (`card.write_rev`) and advances `cards_stamped` with it, so a
+ * reader can tell when an older build (which advances `cards_rev` alone) wrote
+ * in between. `card.projector_gen` records which history projection a card was
+ * built under, `card.repair_reason` why a stale card could not be rebuilt, and
+ * the `range_hash` table holds hashes of source row ranges for later checks.
+ *
  * Per-session writes are transactional delete-and-insert with an explicit FTS
  * mirror (the `part_fts` table is external-content, so deleting `part_text` rows
  * does not touch the index — the index is maintained by hand). Readers therefore
- * never observe half a replaced session.
+ * never observe half a replaced session. A replace whose card and rows match
+ * what is stored rewrites nothing but its checkpoint (see
+ * {@link Store.replaceSessionParts}).
  */
 
-export const SCHEMA_VERSION = 4;
+export const SCHEMA_VERSION = 5;
 
 /**
  * Who opens a store: the host lane (recorded in `meta.store_host`) and, for the
@@ -46,14 +56,16 @@ export type StoreIdentity = { host: "opencode-v1" } | { host: "opencode-v2"; sou
 export type StoreHost = StoreIdentity["host"];
 
 /**
- * Plugin build tag, `schema{N}.gen{M}.{host}`: recorded in the distill lease and
- * surfaced in `coverage.semantic.pluginVersion`, so one lease read or one tool
- * response shows which build and which host wrote a store. Derived from the
- * constants that gate mixed-version safety rather than the package semver,
- * which `src/` cannot read without a Node import.
+ * Plugin build tag, `schema{N}.gen{M}.{host}`, or `schema{N}.gen{M}.proj{P}.{host}`
+ * for a host that stamps a history projector generation `P`: recorded in the
+ * distill lease and surfaced in `coverage.semantic.pluginVersion`, so one lease
+ * read or one tool response shows which build and which host wrote a store.
+ * Derived from the constants that gate mixed-version safety rather than the
+ * package semver, which `src/` cannot read without a Node import.
  */
-export function pluginBuild(host: StoreHost): string {
-  return `schema${SCHEMA_VERSION}.gen${EMBED_REPRESENTATION}.${host}`;
+export function pluginBuild(host: StoreHost, projectorGen?: number): string {
+  const projector = projectorGen === undefined ? "" : `.proj${projectorGen}`;
+  return `schema${SCHEMA_VERSION}.gen${EMBED_REPRESENTATION}${projector}.${host}`;
 }
 
 const SCHEMA_VERSION_KEY = "schema_version";
@@ -79,6 +91,17 @@ export const VECTORS_REV_KEY = "vectors_rev";
 /** Meta stamp recording the summarizer prompt-template version the persisted
  *  `nl_summary` values were produced under (see {@link Store.writeSummary}). */
 export const SUMMARY_REV_KEY = "summary_rev";
+/** Meta counter: the newest lexical card revision. Every stamped write and
+ *  every {@link Store.deleteSession} that removed something allocates the next
+ *  value inside its own transaction; an older build bumps it after its write. */
+export const CARDS_REV_KEY = "cards_rev";
+/** Meta counter advanced by one with every revision this build allocates, in
+ *  the same transaction. A write that bumps `cards_rev` without it (an older
+ *  build's) widens the gap between the two, and later writes never close it. */
+export const CARDS_STAMPED_KEY = "cards_stamped";
+/** Meta counter advanced by every {@link Store.deleteSession} that removed
+ *  something, so a reader knows when to diff its card id set. */
+export const CARDS_DELETED_KEY = "cards_deleted";
 const DEFAULT_FTS_LIMIT = 200;
 
 // A lease whose heartbeat predates any realistic (or injected) cutoff, so a
@@ -97,11 +120,28 @@ const PRE_FENCE_PRAGMAS = "PRAGMA busy_timeout=5000;";
  *  fence's transaction commits. */
 const ACCEPTED_PRAGMAS = "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;";
 
-// Current-version (v4) DDL for a fresh store; older stores reach the same shape
+/** Index behind {@link Store.cardsSince}. Shared by the fresh DDL and the v4 -> v5
+ *  migration. */
+const WRITE_REV_INDEX_DDL = "CREATE INDEX card_write_rev ON card(write_rev);";
+
+/** Per-session hashes of source row ranges, keyed by the range's first `seq`
+ *  ({@link RangeHash}). Shared by the fresh DDL and the v4 -> v5 migration. */
+const RANGE_HASH_DDL = `
+CREATE TABLE range_hash (
+  session_id TEXT NOT NULL, start_seq INTEGER NOT NULL,
+  end_seq INTEGER NOT NULL, row_count INTEGER NOT NULL,
+  hash TEXT NOT NULL, sweep_gen INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (session_id, start_seq)
+) WITHOUT ROWID;
+`;
+
+// Current-version (v5) DDL for a fresh store; older stores reach the same shape
 // through the additive migrations below. No `prefix=` index: anchors are matched
 // as exact quoted phrases, so prefix indexes would be write/disk cost with no
 // query to serve them. `distill_cursor` is the v2 host's per-session checkpoint
-// ({@link Card.distillCursor}); the v1 lane leaves it NULL.
+// ({@link Card.distillCursor}); the v1 lane leaves it NULL, as it does
+// `projector_gen`. `settled_base` is reserved for a card's settled-prefix
+// aggregates: NULL means there is no base and the session is re-read in full.
 const DDL = `
 CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL) WITHOUT ROWID;
 
@@ -122,11 +162,18 @@ CREATE TABLE card (
   embedding_gen INTEGER,
   nl_summary TEXT NOT NULL DEFAULT '',
   summary_hash TEXT NOT NULL DEFAULT '',
-  distill_cursor TEXT
+  distill_cursor TEXT,
+  projector_gen INTEGER,
+  write_rev INTEGER,
+  repair_reason TEXT,
+  settled_base TEXT,
+  time_archived INTEGER
 );
 CREATE INDEX card_updated ON card(time_updated DESC);
 CREATE INDEX card_root ON card(root_id);
 CREATE INDEX card_project ON card(project_id);
+${WRITE_REV_INDEX_DDL}
+${RANGE_HASH_DDL}
 
 CREATE TABLE part_text (
   id INTEGER PRIMARY KEY, session_id TEXT NOT NULL, part_id TEXT NOT NULL,
@@ -155,7 +202,9 @@ export type FamilyRollup = {
 };
 
 /** One card, mirroring the `card` table with camelCase fields. JSON columns
- *  (`files`/`tools`/`errors`/`family_rollup`) are exposed parsed. */
+ *  (`files`/`tools`/`errors`/`family_rollup`) are exposed parsed. Optional
+ *  nullable columns read back absent when NULL, so a card written without them
+ *  reads back exactly as it was written. */
 export type Card = {
   sessionId: string;
   parentId: string | null;
@@ -176,6 +225,9 @@ export type Card = {
   files: string[];
   tools: string[];
   errors: string[];
+  /** The session's highlights from its children, newest first. Owned by
+   *  {@link Store.setFamilyRollup}: card writes keep the stored value (a first
+   *  insert takes the card's), so re-distilling a root never clears it. */
   familyRollup: FamilyRollup[];
   distillState: "metadata" | "full";
   distilledThrough: string | null;
@@ -204,6 +256,74 @@ export type Card = {
    *  rows from a rewritten tail. Absent/null on v1 and on a card written
    *  without one (the upsert then stores NULL, which reads as "not fresh"). */
   distillCursor?: string | null;
+  /** The history projector generation the card's content was derived under.
+   *  Only a host that stamps generations sets it; absent on the v1 host and on
+   *  a card written before one was stamped. A card below the host's current
+   *  generation is stale ({@link Store.staleCards}), and a write below the
+   *  stored generation is refused ({@link SessionWrite}). */
+  projectorGen?: number | null;
+  /** When the session was archived (ms epoch); absent or null when it is not. */
+  timeArchived?: number | null;
+  /** The `cards_rev` revision of the last stamped write to this card. Set by
+   *  the store; ignored on writes. Absent when no stamped write has touched the
+   *  card (one migrated from an older schema or written by an older build). */
+  writeRev?: number;
+  /** Why the card could not be rebuilt at the current projector generation
+   *  ({@link Store.markRepairPending}). Set by the store; ignored on writes.
+   *  Cleared by any accepted {@link Store.replaceSessionParts}. */
+  repairReason?: string;
+};
+
+/** Result of a stamped write: `changed` is true when it altered what readers
+ *  see, which allocated a `cards_rev` revision. False when nothing differed or
+ *  there was nothing to write. */
+export type CardWrite = { changed: boolean };
+
+/** Result of {@link Store.replaceSessionParts} and {@link Store.appendSessionParts}.
+ *  `refused` is set when the card's {@link Card.projectorGen} is below the
+ *  stored one: nothing was written, so an older projection never overwrites a
+ *  newer one. */
+export type SessionWrite = { changed: boolean; refused?: "older-generation" };
+
+/** A hash over one session's source rows from `startSeq` through `endSeq`
+ *  (both inclusive), as of when it was taken. `rowCount` is how many rows the
+ *  span held and `sweepGen` the check sweep that recorded it. The store keeps
+ *  the values opaque; one row per session and `startSeq`. */
+export type RangeHash = {
+  startSeq: number;
+  endSeq: number;
+  rowCount: number;
+  hash: string;
+  sweepGen: number;
+};
+
+/** One card {@link Store.staleCards} returns. */
+export type StaleCard = { sessionId: string; timeUpdated: number };
+
+/** Card counts and revision counters from {@link Store.cardStats}, read in one
+ *  statement so they describe the same moment. Counters read 0 when unset. */
+export type CardStats = {
+  cards: number;
+  fullCards: number;
+  repairPending: number;
+  cardsRev: number;
+  cardsStamped: number;
+  cardsDeleted: number;
+  vectorsRev: number;
+};
+
+/** The store file's page accounting from {@link Store.spaceStats}. Reclaimable
+ *  bytes are `freelistCount * pageSize`. */
+export type SpaceStats = { pageCount: number; freelistCount: number; pageSize: number };
+
+/** Session metadata {@link Store.refreshCardMeta} writes. `timeArchived` is
+ *  compared and written only when given. */
+export type CardMetaRefresh = {
+  title: string;
+  directory: string;
+  projectId: string;
+  timeUpdated: number;
+  timeArchived?: number | null;
 };
 
 /** One slim-index row to be written for a session (session id comes from the
@@ -271,9 +391,55 @@ export type OpenStoreResult =
   { ok: true; store: Store; warning?: string } | { ok: false; reason: StoreRefusal };
 
 export type Store = {
+  /**
+   * Write one card row as given, outside the revision accounting: no
+   * `cards_rev` is allocated, and `write_rev`, `repair_reason` and
+   * `settled_base` keep their stored values. On conflict the store-owned
+   * columns (the summary pair and the family rollup) keep theirs too. The
+   * distiller writes through the stamped methods instead.
+   */
   upsertCard(card: Card): void;
   getCard(sessionId: string): Card | undefined;
   allCards(opts?: { withEmbeddings?: boolean }): Card[];
+  /**
+   * Cards whose last stamped write is newer than revision `rev`, oldest
+   * revision first, at most `limit` of them (a positive integer; anything else
+   * reads as 1). Each revision stamps one card, so paging continues from the
+   * last card's {@link Card.writeRev}. A write that stamped nothing (an older
+   * build's, or a delete) is not listed; {@link cardStats} exposes the
+   * counters that reveal it.
+   */
+  cardsSince(rev: number, limit: number, opts?: { withEmbeddings?: boolean }): Card[];
+  /** Card counts plus the revision counters, from one statement. */
+  cardStats(): CardStats;
+  /** The store file's page count, free-list pages and page size. Read-only. */
+  spaceStats(): SpaceStats;
+  /**
+   * Cards a host at projector generation `gen` should rebuild: those below
+   * `gen` (a NULL generation included) and, whatever their generation, those
+   * whose checkpoint is `v: 1`. A host that passes `gen` writes later
+   * checkpoint versions, so a `v: 1` checkpoint marks a card an older build
+   * overwrote. Cards with a {@link Card.repairReason} are left out. Newest
+   * first. Returns nothing when `gen` is undefined, so a host without
+   * generations never sees stale cards.
+   */
+  staleCards(gen?: number): StaleCard[];
+  /**
+   * Record why a card could not be rebuilt, which takes it out of
+   * {@link staleCards} until an accepted replace or {@link clearRepairReasons}
+   * clears it. Allocates no revision: readers do not see the reason.
+   * `changed` is false when the card is unknown or already has this reason.
+   */
+  markRepairPending(sessionId: string, reason: string): CardWrite;
+  /** Clear every card's repair reason, returning how many were set. */
+  clearRepairReasons(): number;
+  /** A session's stored range hashes, by ascending `startSeq`. */
+  getRangeHashes(sessionId: string): RangeHash[];
+  /** Store range hashes for a session in one transaction, replacing any stored
+   *  hash with the same `startSeq` and leaving the others. */
+  putRangeHashes(sessionId: string, ranges: RangeHash[]): void;
+  /** Delete a session's range hashes, returning how many there were. */
+  clearRangeHashes(sessionId: string): number;
   /** Every card's session id, without loading the cards. */
   cardSessionIds(): string[];
   /** How many cards the store holds. */
@@ -330,20 +496,70 @@ export type Store = {
    * survives re-distills. Also clears the persisted vector: the embedding text
    * includes the summary, so a carried-over vector would be stale; null forces
    * the semantic layer to recompute with the summary on the next load (matching
-   * the re-distill clear). A no-op when the session id is unknown.
+   * the re-distill clear). Stamps a revision. A no-op when the session id is
+   * unknown or the card already holds this summary and hash.
    */
-  writeSummary(sessionId: string, summary: string, hash: string): void;
-  deleteSession(sessionId: string): void;
+  writeSummary(sessionId: string, summary: string, hash: string): CardWrite;
   /**
-   * Patch a card's session metadata in place (title, directory, project) and
-   * bump `cards_rev`, without touching its content. Returns false when no card
-   * exists. Used by a host's metadata signals (v2 renames and moves).
+   * Delete a session's card, slim-index rows, FTS entries and range hashes in
+   * one transaction. When anything was removed it allocates a revision (no row
+   * is left to stamp) and advances {@link CARDS_DELETED_KEY}.
+   */
+  deleteSession(sessionId: string): CardWrite;
+  /**
+   * Patch a card's session metadata in place (title, directory, project) with
+   * a revision, without touching its content. Title and directory feed the
+   * embedded text, so a change to either drops the vector. `changed` is false,
+   * and nothing is written, when no card exists or no value differs. Used by a
+   * host's metadata signals (v2 renames and moves).
    */
   patchCardMeta(
     sessionId: string,
     patch: { title?: string; directory?: string; projectId?: string },
-  ): boolean;
-  replaceSessionParts(sessionId: string, rows: PartTextRow[], card: Card): void;
+  ): CardWrite;
+  /**
+   * Refresh a card's session metadata after an append that found no new
+   * messages. When the title, directory, project, `timeUpdated` or a given
+   * `timeArchived` differs, it writes them with a revision and drops the
+   * vector if the title or directory changed. Either way it stores
+   * `distillCursor` as the card's checkpoint. A no-op for an unknown session.
+   */
+  refreshCardMeta(
+    sessionId: string,
+    meta: CardMetaRefresh,
+    distillCursor: string | null,
+  ): CardWrite;
+  /**
+   * Replace a session's family rollup with a revision, keeping every other
+   * column, the vector included. `changed` is false, and nothing is written,
+   * when the card is unknown or its rollup is already this one.
+   */
+  setFamilyRollup(sessionId: string, rollup: FamilyRollup[]): CardWrite;
+  /**
+   * Replace a session's slim-index rows and card in one transaction.
+   *
+   * Refused (`refused: "older-generation"`, nothing written) when the card's
+   * {@link Card.projectorGen} is below the stored one. A card that names no
+   * projector generation skips this check, and the write stores NULL over the
+   * stored generation, suppressed or not. {@link appendSessionParts} differs:
+   * it keeps the stored generation unless its recomputed card names one.
+   *
+   * When the stored card and rows already match the new ones, the write is
+   * suppressed: only the checkpoint ({@link Card.distillCursor}) and the
+   * projector generation are written, no revision is allocated and the stored
+   * vector is kept. The comparison covers every column a card write stores
+   * except the vector pair, the checkpoint and the generation, and every field
+   * of every row in order. Otherwise the rows and card are rewritten with a
+   * revision. Any accepted replace, suppressed or not, clears the card's
+   * {@link Card.repairReason}. `opts.rangeHashes` are stored in the same
+   * transaction (see {@link putRangeHashes}), suppressed or not.
+   */
+  replaceSessionParts(
+    sessionId: string,
+    rows: PartTextRow[],
+    card: Card,
+    opts?: { rangeHashes?: RangeHash[] },
+  ): SessionWrite;
   /**
    * Append new slim-index rows to a session's existing rows, enforce the
    * per-session FTS row cap over the combined set (newest-first, same semantics
@@ -359,6 +575,14 @@ export type Store = {
    * appended message id, so the checkpoint message's dangling `next_message_id`
    * is repointed across the append seam — matching what a full re-distill would
    * store, which the Tier-2 context walk relies on.
+   *
+   * The recomputed card keeps the stored projector generation unless it names
+   * one, and is refused like a replace when it names a lower one (the whole
+   * append rolls back). When no row was added, evicted or repointed and the
+   * recomputed card matches the stored one (compared as in
+   * {@link replaceSessionParts}), only the checkpoint and generation are
+   * written, with no revision. A repair reason is kept: an append does not
+   * rebuild the card.
    */
   appendSessionParts(
     sessionId: string,
@@ -366,7 +590,8 @@ export type Store = {
     ftsRowsPerSession: number,
     boundary: { checkpointMessageId: string; firstNewMessageId: string },
     recompute: (allRows: PartTextRow[]) => Card,
-  ): void;
+    opts?: { rangeHashes?: RangeHash[] },
+  ): SessionWrite;
   ftsSearch(input: { strong: string[]; weak: string[]; limit?: number }): FtsHit[];
   getMeta(key: string): string | undefined;
   setMeta(key: string, value: string): void;
@@ -438,23 +663,59 @@ const CARD_COLUMNS = [
   "nl_summary",
   "summary_hash",
   "distill_cursor",
+  "projector_gen",
+  "time_archived",
 ] as const;
 
-// Columns the card upsert must NEVER overwrite: they are owned by a separate
-// write path ({@link Store.writeSummary}) and would otherwise be wiped on every
-// re-distill (deriveCard has no summary to supply). On a new-card insert they
-// take their DEFAULT ''; on conflict they are simply left out of the UPDATE SET.
-const SUMMARY_OWNED_COLUMNS = new Set<string>(["nl_summary", "summary_hash"]);
+type CardColumn = (typeof CARD_COLUMNS)[number];
 
-const CARD_COLUMNS_ALL = CARD_COLUMNS.join(", ");
-const CARD_COLUMNS_NO_EMBEDDING = CARD_COLUMNS.filter((c) => c !== "embedding").join(", ");
+// Columns a card write must NEVER overwrite: each is owned by its own write
+// path ({@link Store.writeSummary} for the summary pair,
+// {@link Store.setFamilyRollup} for the rollup) and would otherwise be wiped on
+// every re-distill, which has neither to supply. A new-card insert takes the
+// card's values; on conflict they are simply left out of the UPDATE SET.
+const STORE_OWNED_COLUMNS = new Set<CardColumn>(["nl_summary", "summary_hash", "family_rollup"]);
+
+// Columns a content write stores but does not compare when deciding whether
+// anything changed: the vector pair (a suppressed write keeps the stored
+// vector), and the checkpoint and projector generation, which are written
+// either way.
+const UNCOMPARED_COLUMNS = new Set<CardColumn>([
+  "embedding",
+  "embedding_gen",
+  "distill_cursor",
+  "projector_gen",
+]);
+
+/** Columns read into a {@link Card} beyond those a card write supplies; only
+ *  the store writes them. */
+const CARD_STORE_COLUMNS = ["write_rev", "repair_reason"] as const;
+
+const CARD_READ_COLUMNS = [...CARD_COLUMNS, ...CARD_STORE_COLUMNS];
+const CARD_COLUMNS_ALL = CARD_READ_COLUMNS.join(", ");
+const CARD_COLUMNS_NO_EMBEDDING = CARD_READ_COLUMNS.filter((c) => c !== "embedding").join(", ");
 const CARD_PLACEHOLDERS = CARD_COLUMNS.map(() => "?").join(", ");
 const CARD_UPSERT_SET = CARD_COLUMNS.filter(
-  (c) => c !== "session_id" && !SUMMARY_OWNED_COLUMNS.has(c),
+  (c) => c !== "session_id" && !STORE_OWNED_COLUMNS.has(c),
 )
   .map((c) => `${c}=excluded.${c}`)
   .join(", ");
-const CARD_UPSERT_SQL = `INSERT INTO card(${CARD_COLUMNS_ALL}) VALUES(${CARD_PLACEHOLDERS}) ON CONFLICT(session_id) DO UPDATE SET ${CARD_UPSERT_SET}`;
+const CARD_UPSERT_SQL = `INSERT INTO card(${CARD_COLUMNS.join(", ")}) VALUES(${CARD_PLACEHOLDERS}) ON CONFLICT(session_id) DO UPDATE SET ${CARD_UPSERT_SET}`;
+// A stamped content write also records its revision and drops the settled
+// base, which no longer describes the rewritten card.
+const CARD_STAMPED_UPSERT_SQL = `INSERT INTO card(${CARD_COLUMNS.join(", ")}, write_rev) VALUES(${CARD_PLACEHOLDERS}, ?) ON CONFLICT(session_id) DO UPDATE SET ${CARD_UPSERT_SET}, write_rev=excluded.write_rev, settled_base=NULL`;
+
+const CARD_COMPARED_COLUMNS = CARD_COLUMNS.filter(
+  (c) => c !== "session_id" && !STORE_OWNED_COLUMNS.has(c) && !UNCOMPARED_COLUMNS.has(c),
+);
+/** Position of each compared column in {@link cardValues}' output. */
+const CARD_COMPARED_INDEXES = CARD_COMPARED_COLUMNS.map((c) => CARD_COLUMNS.indexOf(c));
+/** What a content write reads first: the stored generation (for the guard)
+ *  and every compared column. */
+const CARD_COMPARE_SQL = `SELECT projector_gen, ${CARD_COMPARED_COLUMNS.join(", ")} FROM card WHERE session_id=?`;
+
+const PART_ROW_COLUMNS =
+  "part_id, message_id, prev_message_id, next_message_id, class, time_created, raw, norm";
 
 // ── Value coercion (defensive against unexpected column shapes) ──────────────
 
@@ -514,6 +775,9 @@ function parseRollup(value: SqlValue | undefined): FamilyRollup[] {
 }
 
 function rowToCard(row: Row): Card {
+  const projectorGen = asNullableNumber(row.projector_gen);
+  const timeArchived = asNullableNumber(row.time_archived);
+  const writeRev = asNullableNumber(row.write_rev);
   return {
     sessionId: asString(row.session_id),
     parentId: asNullableString(row.parent_id),
@@ -543,6 +807,10 @@ function rowToCard(row: Row): Card {
     summaryHash: asString(row.summary_hash),
     // Omitted when NULL, so a v1 card reads back exactly as it was written.
     ...(typeof row.distill_cursor === "string" && { distillCursor: row.distill_cursor }),
+    ...(projectorGen !== null && { projectorGen }),
+    ...(timeArchived !== null && { timeArchived }),
+    ...(writeRev !== null && { writeRev }),
+    ...(typeof row.repair_reason === "string" && { repairReason: row.repair_reason }),
   };
 }
 
@@ -575,7 +843,68 @@ function cardValues(card: Card): SqlValue[] {
     card.nlSummary,
     card.summaryHash,
     card.distillCursor ?? null,
+    card.projectorGen ?? null,
+    card.timeArchived ?? null,
   ];
+}
+
+/** One stored column value against what a write would bind, reading a bigint
+ *  as a number and an absent value as NULL. */
+function sameSqlValue(stored: SqlValue | undefined, next: SqlValue): boolean {
+  const a = typeof stored === "bigint" ? Number(stored) : (stored ?? null);
+  const b = typeof next === "bigint" ? Number(next) : next;
+  return a === b;
+}
+
+/** Whether a stored card row (read with {@link CARD_COMPARE_SQL}) already holds
+ *  every compared column of `card`. */
+function sameCard(stored: Row, card: Card): boolean {
+  const values = cardValues(card);
+  return CARD_COMPARED_COLUMNS.every((column, i) =>
+    sameSqlValue(stored[column], values[CARD_COMPARED_INDEXES[i]!]!),
+  );
+}
+
+/** Whether stored slim-index rows (in id order) equal `rows`, field by field
+ *  and in order. */
+function sameRows(stored: Row[], rows: PartTextRow[]): boolean {
+  if (stored.length !== rows.length) return false;
+  return rows.every((row, i) => {
+    const old = stored[i]!;
+    return (
+      sameSqlValue(old.part_id, row.partId) &&
+      sameSqlValue(old.message_id, row.messageId) &&
+      sameSqlValue(old.prev_message_id, row.prevMessageId ?? null) &&
+      sameSqlValue(old.next_message_id, row.nextMessageId ?? null) &&
+      sameSqlValue(old.class, row.class) &&
+      sameSqlValue(old.time_created, row.timeCreated) &&
+      sameSqlValue(old.raw, row.raw) &&
+      sameSqlValue(old.norm, row.norm)
+    );
+  });
+}
+
+/** Whether a write at projector generation `next` must be refused because the
+ *  stored card is at a higher one. No generation on either side never refuses. */
+function belowStoredGen(next: number | null | undefined, stored: SqlValue | undefined): boolean {
+  const storedGen = asNullableNumber(stored);
+  return next != null && storedGen !== null && next < storedGen;
+}
+
+function rowToRangeHash(row: Row): RangeHash {
+  return {
+    startSeq: asNumber(row.start_seq),
+    endSeq: asNumber(row.end_seq),
+    rowCount: asNumber(row.row_count),
+    hash: asString(row.hash),
+    sweepGen: asNumber(row.sweep_gen),
+  };
+}
+
+/** A count from a SQL value or a meta counter string; 0 when absent. */
+function asCount(value: SqlValue | undefined): number {
+  if (typeof value === "string") return Number(value) || 0;
+  return asNumber(value);
 }
 
 // ── FTS MATCH construction ───────────────────────────────────────────────────
@@ -704,6 +1033,37 @@ function migrateV3ToV4(db: SqliteDb): void {
   stampVersion(db, 4);
 }
 
+/**
+ * Additive v4 -> v5 upgrade: add the nullable `card.projector_gen`,
+ * `card.write_rev` (with its index), `card.repair_reason`, `card.settled_base`
+ * and `card.time_archived` columns, and the `range_hash` table. Existing rows
+ * read NULL in each: no generation (so a host that stamps one sees them as
+ * stale), no stamped revision, no repair reason, no settled base. The host
+ * stamp is already present on every v4 store, so identity is untouched. Stamps
+ * the literal destination version 5, like {@link migrateV2ToV3}.
+ */
+function migrateV4ToV5(db: SqliteDb): void {
+  db.exec("ALTER TABLE card ADD COLUMN projector_gen INTEGER");
+  db.exec("ALTER TABLE card ADD COLUMN write_rev INTEGER");
+  db.exec("ALTER TABLE card ADD COLUMN repair_reason TEXT");
+  db.exec("ALTER TABLE card ADD COLUMN settled_base TEXT");
+  db.exec("ALTER TABLE card ADD COLUMN time_archived INTEGER");
+  db.exec(WRITE_REV_INDEX_DDL);
+  db.exec(RANGE_HASH_DDL);
+  stampVersion(db, 5);
+}
+
+/** A store at schema 1-3, written before the host fence existed: all of them
+ *  belong to the v1 host. */
+function isPreFence(version: number | null): boolean {
+  return version === 1 || version === 2 || version === 3;
+}
+
+/** A store at an older schema that upgrades additively in place. */
+function isMigratable(version: number | null): boolean {
+  return isPreFence(version) || version === 4;
+}
+
 /** The identity stamps, if the file has a `meta` table at all. */
 function readStampedIdentity(db: SqliteDb): { host?: string; source?: string } {
   if (!hasMetaTable(db)) return {};
@@ -730,17 +1090,17 @@ export function peekStoreIdentity(db: SqliteDb): { host?: string; source?: strin
 
 /**
  * The host fence for a store at a known schema version. A pre-fence store
- * (`legacy`, schema 1-3) implies {@link LEGACY_HOST}; a v4 store must carry an
+ * (schema 1-3) implies {@link LEGACY_HOST}; a v4 or later store must carry an
  * exact host stamp (a missing or unknown one is refused, never guessed). Source
  * identity must match exactly, absent on both sides for the v1 host.
  */
 function checkIdentity(
   db: SqliteDb,
-  legacy: boolean,
+  preFence: boolean,
   host: StoreHost,
   source: string | undefined,
 ): FenceRefusal | null {
-  const stampedHost = legacy ? LEGACY_HOST : readMetaValue(db, STORE_HOST_KEY);
+  const stampedHost = preFence ? LEGACY_HOST : readMetaValue(db, STORE_HOST_KEY);
   if (stampedHost !== host) return "host-mismatch";
   if (readMetaValue(db, SOURCE_DB_KEY) !== source) return "source-mismatch";
   return null;
@@ -781,16 +1141,17 @@ export function openStore(
       const refusal = fenceRefusal(db, host, source);
       if (refusal) throw new StoreRefused(refusal);
       const current = readSchemaVersion(db);
-      const legacy = current === 1 || current === 2 || current === 3;
+      const migratable = isMigratable(current);
       if (opts?.existingOnly && current !== SCHEMA_VERSION) {
-        throw new StoreRefused(legacy ? "needs-migration" : "needs-rebuild");
+        throw new StoreRefused(migratable ? "needs-migration" : "needs-rebuild");
       }
-      if (current === SCHEMA_VERSION || legacy) {
-        // v1, v2 and v3 upgrade additively in place, keeping all data, each
+      if (current === SCHEMA_VERSION || migratable) {
+        // v1 to v4 upgrade additively in place, keeping all data, each
         // chaining through every later step.
         if (current === 1) migrateV1ToV2(db);
         if (current === 1 || current === 2) migrateV2ToV3(db);
-        if (legacy) migrateV3ToV4(db);
+        if (isPreFence(current)) migrateV3ToV4(db);
+        if (migratable) migrateV4ToV5(db);
         return;
       }
       // Anything else older (absent stamp or a foreign layout) is dropped and
@@ -817,6 +1178,23 @@ class StoreRefused extends Error {
   }
 }
 
+/** Thrown inside an append's transaction to roll it back when the recomputed
+ *  card is below the stored projector generation. */
+class OlderGenerationRefused extends Error {
+  constructor() {
+    super("card write refused: older projector generation");
+  }
+}
+
+/** The session metadata columns {@link SqliteStore} patches and refreshes. */
+type StoredCardMeta = {
+  title: string;
+  directory: string;
+  projectId: string;
+  timeUpdated: number;
+  timeArchived: number | null;
+};
+
 /**
  * Every refusal {@link openStore} makes, in order, or null to proceed. Reads
  * only. Stamp first: a store that names another owner is refused before its
@@ -836,11 +1214,12 @@ function fenceRefusal(
   const current = readSchemaVersion(db);
   // Newer than this build understands: refuse (degrade), never misread it.
   if (current !== null && current > SCHEMA_VERSION) return "newer";
-  const legacy = current === 1 || current === 2 || current === 3;
-  // Past the stamped block, this still catches what it cannot: a v4 store with
-  // no host stamp, and a hand-stamped pre-fence store whose stamp claims a
-  // host other than the v1 host its schema implies.
-  if (current === SCHEMA_VERSION || legacy) return checkIdentity(db, legacy, host, source);
+  // Past the stamped block, this still catches what it cannot: a v4 or v5
+  // store with no host stamp, and a hand-stamped pre-fence store whose stamp
+  // claims a host other than the v1 host its schema implies.
+  if (current === SCHEMA_VERSION || isMigratable(current)) {
+    return checkIdentity(db, isPreFence(current), host, source);
+  }
   return null;
 }
 
@@ -877,6 +1256,144 @@ class SqliteStore implements Store {
       .all("SELECT session_id FROM card")
       .map((row) => row.session_id)
       .filter((id): id is string => typeof id === "string");
+  }
+
+  cardsSince(rev: number, limit: number, opts?: { withEmbeddings?: boolean }): Card[] {
+    const columns = opts?.withEmbeddings === true ? CARD_COLUMNS_ALL : CARD_COLUMNS_NO_EMBEDDING;
+    const after = Number.isFinite(rev) ? rev : 0;
+    const take = Number.isFinite(limit) && limit >= 1 ? Math.floor(limit) : 1;
+    const rows = this.db.all(
+      `SELECT ${columns} FROM card WHERE write_rev > ? ORDER BY write_rev, session_id LIMIT ?`,
+      [after, take],
+    );
+    return rows.map(rowToCard);
+  }
+
+  cardStats(): CardStats {
+    const row = this.db.get(
+      `SELECT c.cards, c.full_cards, c.repair_pending,
+         (SELECT value FROM meta WHERE key=?) AS cards_rev,
+         (SELECT value FROM meta WHERE key=?) AS cards_stamped,
+         (SELECT value FROM meta WHERE key=?) AS cards_deleted,
+         (SELECT value FROM meta WHERE key=?) AS vectors_rev
+       FROM (SELECT count(*) AS cards,
+                    coalesce(sum(distill_state = 'full'), 0) AS full_cards,
+                    coalesce(sum(repair_reason IS NOT NULL), 0) AS repair_pending
+             FROM card) AS c`,
+      [CARDS_REV_KEY, CARDS_STAMPED_KEY, CARDS_DELETED_KEY, VECTORS_REV_KEY],
+    );
+    return {
+      cards: asCount(row?.cards),
+      fullCards: asCount(row?.full_cards),
+      repairPending: asCount(row?.repair_pending),
+      cardsRev: asCount(row?.cards_rev),
+      cardsStamped: asCount(row?.cards_stamped),
+      cardsDeleted: asCount(row?.cards_deleted),
+      vectorsRev: asCount(row?.vectors_rev),
+    };
+  }
+
+  spaceStats(): SpaceStats {
+    return {
+      pageCount: asCount(this.db.get("PRAGMA page_count")?.page_count),
+      freelistCount: asCount(this.db.get("PRAGMA freelist_count")?.freelist_count),
+      pageSize: asCount(this.db.get("PRAGMA page_size")?.page_size),
+    };
+  }
+
+  staleCards(gen?: number): StaleCard[] {
+    if (gen === undefined || !Number.isFinite(gen)) return [];
+    // CASE, not AND: SQLite does not promise to skip json_extract on a
+    // malformed checkpoint, and json_extract throws on one.
+    const rows = this.db.all(
+      `SELECT session_id, time_updated FROM card
+       WHERE repair_reason IS NULL
+         AND (projector_gen IS NULL OR projector_gen < ?
+              OR (CASE WHEN json_valid(distill_cursor) THEN json_extract(distill_cursor, '$.v') END) = 1)
+       ORDER BY time_updated DESC, session_id`,
+      [gen],
+    );
+    return rows.map((row) => ({
+      sessionId: asString(row.session_id),
+      timeUpdated: asNumber(row.time_updated),
+    }));
+  }
+
+  markRepairPending(sessionId: string, reason: string): CardWrite {
+    const { changes } = this.db.run(
+      "UPDATE card SET repair_reason=? WHERE session_id=? AND repair_reason IS NOT ?",
+      [reason, sessionId, reason],
+    );
+    return { changed: changes > 0 };
+  }
+
+  clearRepairReasons(): number {
+    return this.db.run("UPDATE card SET repair_reason=NULL WHERE repair_reason IS NOT NULL")
+      .changes;
+  }
+
+  getRangeHashes(sessionId: string): RangeHash[] {
+    return this.db
+      .all(
+        "SELECT start_seq, end_seq, row_count, hash, sweep_gen FROM range_hash WHERE session_id=? ORDER BY start_seq",
+        [sessionId],
+      )
+      .map(rowToRangeHash);
+  }
+
+  putRangeHashes(sessionId: string, ranges: RangeHash[]): void {
+    if (ranges.length === 0) return;
+    this.db.tx(() => this.writeRangeHashes(sessionId, ranges));
+  }
+
+  clearRangeHashes(sessionId: string): number {
+    return this.db.run("DELETE FROM range_hash WHERE session_id=?", [sessionId]).changes;
+  }
+
+  /** Upsert range hashes by `(session, startSeq)`. Caller supplies the
+   *  transaction. */
+  private writeRangeHashes(sessionId: string, ranges: RangeHash[] | undefined): void {
+    for (const range of ranges ?? []) {
+      this.db.run(
+        `INSERT INTO range_hash(session_id, start_seq, end_seq, row_count, hash, sweep_gen)
+         VALUES(?, ?, ?, ?, ?, ?)
+         ON CONFLICT(session_id, start_seq) DO UPDATE SET end_seq=excluded.end_seq,
+           row_count=excluded.row_count, hash=excluded.hash, sweep_gen=excluded.sweep_gen`,
+        [sessionId, range.startSeq, range.endSeq, range.rowCount, range.hash, range.sweepGen],
+      );
+    }
+  }
+
+  /** Increment a meta counter and return its new value. Caller supplies the
+   *  transaction. */
+  private bumpCounter(key: string): number {
+    const next = (Number(this.getMeta(key)) || 0) + 1;
+    this.setMeta(key, String(next));
+    return next;
+  }
+
+  /** Allocate the next `cards_rev` and count it in `cards_stamped`. Caller
+   *  supplies the transaction and stamps the revision on what it wrote. */
+  private nextRev(): number {
+    const rev = this.bumpCounter(CARDS_REV_KEY);
+    this.bumpCounter(CARDS_STAMPED_KEY);
+    return rev;
+  }
+
+  /** Write a card with a freshly allocated revision (see
+   *  {@link CARD_STAMPED_UPSERT_SQL}). Caller supplies the transaction. */
+  private writeStampedCard(card: Card): void {
+    this.db.run(CARD_STAMPED_UPSERT_SQL, [...cardValues(card), this.nextRev()]);
+  }
+
+  /** Store only the checkpoint and projector generation of an unchanged card.
+   *  Caller supplies the transaction. */
+  private writeCheckpoint(sessionId: string, card: Card): void {
+    this.db.run("UPDATE card SET distill_cursor=?, projector_gen=? WHERE session_id=?", [
+      card.distillCursor ?? null,
+      card.projectorGen ?? null,
+      sessionId,
+    ]);
   }
 
   writeCardEmbeddings(
@@ -946,61 +1463,181 @@ class SqliteStore implements Store {
   /** Increment the vectors-revision counter (see {@link VECTORS_REV_KEY}) and
    *  return the new value. Caller supplies the transaction. */
   private bumpVectorsRev(): number {
-    const next = this.currentVectorsRev() + 1;
-    this.setMeta(VECTORS_REV_KEY, String(next));
-    return next;
+    return this.bumpCounter(VECTORS_REV_KEY);
   }
 
-  writeSummary(sessionId: string, summary: string, hash: string): void {
-    this.db.run("UPDATE card SET nl_summary=?, summary_hash=?, embedding=NULL WHERE session_id=?", [
-      summary,
-      hash,
-      sessionId,
-    ]);
+  writeSummary(sessionId: string, summary: string, hash: string): CardWrite {
+    return this.db.tx((): CardWrite => {
+      const stored = this.db.get("SELECT nl_summary, summary_hash FROM card WHERE session_id=?", [
+        sessionId,
+      ]);
+      if (!stored || (stored.nl_summary === summary && stored.summary_hash === hash)) {
+        return { changed: false };
+      }
+      this.db.run(
+        "UPDATE card SET nl_summary=?, summary_hash=?, embedding=NULL, write_rev=? WHERE session_id=?",
+        [summary, hash, this.nextRev(), sessionId],
+      );
+      return { changed: true };
+    });
   }
 
-  deleteSession(sessionId: string): void {
-    this.db.tx(() => {
-      this.evictFts(sessionId);
-      this.db.run("DELETE FROM part_text WHERE session_id=?", [sessionId]);
-      this.db.run("DELETE FROM card WHERE session_id=?", [sessionId]);
+  deleteSession(sessionId: string): CardWrite {
+    return this.db.tx((): CardWrite => {
+      this.evictFts(
+        this.db.all("SELECT id, raw, norm FROM part_text WHERE session_id=?", [sessionId]),
+      );
+      const parts = this.db.run("DELETE FROM part_text WHERE session_id=?", [sessionId]).changes;
+      const cards = this.db.run("DELETE FROM card WHERE session_id=?", [sessionId]).changes;
+      this.db.run("DELETE FROM range_hash WHERE session_id=?", [sessionId]);
+      if (parts === 0 && cards === 0) return { changed: false };
+      // No row is left to stamp, but the revision still moves so readers see
+      // the removal, and cards_deleted tells them to diff their id sets.
+      this.nextRev();
+      this.bumpCounter(CARDS_DELETED_KEY);
+      return { changed: true };
     });
   }
 
   patchCardMeta(
     sessionId: string,
     patch: { title?: string; directory?: string; projectId?: string },
-  ): boolean {
-    return this.db.tx(() => {
-      // Title and directory feed the embedded text (embeddingTextOf), so an
-      // actual change to either drops the persisted vector and its generation;
-      // the semantic layer recomputes it on the next load. (The right-hand
-      // sides of an UPDATE see the old row.)
-      const title = patch.title ?? null;
-      const directory = patch.directory ?? null;
-      const changed =
-        "(coalesce(?, title) IS NOT title OR coalesce(?, directory) IS NOT directory)";
-      const { changes } = this.db.run(
-        `UPDATE card SET
-           embedding=CASE WHEN ${changed} THEN NULL ELSE embedding END,
-           embedding_gen=CASE WHEN ${changed} THEN NULL ELSE embedding_gen END,
-           title=coalesce(?, title), directory=coalesce(?, directory),
-           project_id=coalesce(?, project_id)
-         WHERE session_id=?`,
-        [title, directory, title, directory, title, directory, patch.projectId ?? null, sessionId],
-      );
-      if (changes === 0) return false;
-      this.setMeta("cards_rev", String((Number(this.getMeta("cards_rev")) || 0) + 1));
-      return true;
+  ): CardWrite {
+    return this.db.tx(() =>
+      this.writeCardMeta(sessionId, (stored) => ({
+        ...stored,
+        title: patch.title ?? stored.title,
+        directory: patch.directory ?? stored.directory,
+        projectId: patch.projectId ?? stored.projectId,
+      })),
+    );
+  }
+
+  refreshCardMeta(
+    sessionId: string,
+    meta: CardMetaRefresh,
+    distillCursor: string | null,
+  ): CardWrite {
+    return this.db.tx(() =>
+      this.writeCardMeta(
+        sessionId,
+        (stored) => ({
+          title: meta.title,
+          directory: meta.directory,
+          projectId: meta.projectId,
+          timeUpdated: meta.timeUpdated,
+          timeArchived: meta.timeArchived === undefined ? stored.timeArchived : meta.timeArchived,
+        }),
+        distillCursor,
+      ),
+    );
+  }
+
+  /**
+   * Apply `next` to a card's session metadata. When any value differs it
+   * writes them all with a revision; title and directory feed the embedded
+   * text (embeddingTextOf), so a change to either also drops the vector and
+   * its generation, which the semantic layer recomputes on the next load.
+   * `distillCursor`, when given, is stored either way. Caller supplies the
+   * transaction.
+   */
+  private writeCardMeta(
+    sessionId: string,
+    next: (stored: StoredCardMeta) => StoredCardMeta,
+    distillCursor?: string | null,
+  ): CardWrite {
+    const row = this.db.get(
+      "SELECT title, directory, project_id, time_updated, time_archived FROM card WHERE session_id=?",
+      [sessionId],
+    );
+    if (!row) return { changed: false };
+    const stored: StoredCardMeta = {
+      title: asString(row.title),
+      directory: asString(row.directory),
+      projectId: asString(row.project_id),
+      timeUpdated: asNumber(row.time_updated),
+      timeArchived: asNullableNumber(row.time_archived),
+    };
+    const meta = next(stored);
+    const embedded = meta.title !== stored.title || meta.directory !== stored.directory;
+    const changed =
+      embedded ||
+      meta.projectId !== stored.projectId ||
+      meta.timeUpdated !== stored.timeUpdated ||
+      meta.timeArchived !== stored.timeArchived;
+    const cursorSet = distillCursor === undefined ? "" : ", distill_cursor=?";
+    const cursorParam: SqlValue[] = distillCursor === undefined ? [] : [distillCursor];
+    if (!changed) {
+      if (distillCursor !== undefined) {
+        this.db.run("UPDATE card SET distill_cursor=? WHERE session_id=?", [
+          distillCursor,
+          sessionId,
+        ]);
+      }
+      return { changed: false };
+    }
+    const vectorSet = embedded ? ", embedding=NULL, embedding_gen=NULL" : "";
+    this.db.run(
+      `UPDATE card SET title=?, directory=?, project_id=?, time_updated=?, time_archived=?,
+         write_rev=?${vectorSet}${cursorSet} WHERE session_id=?`,
+      [
+        meta.title,
+        meta.directory,
+        meta.projectId,
+        meta.timeUpdated,
+        meta.timeArchived,
+        this.nextRev(),
+        ...cursorParam,
+        sessionId,
+      ],
+    );
+    return { changed: true };
+  }
+
+  setFamilyRollup(sessionId: string, rollup: FamilyRollup[]): CardWrite {
+    return this.db.tx((): CardWrite => {
+      const json = JSON.stringify(rollup);
+      const stored = this.db.get("SELECT family_rollup FROM card WHERE session_id=?", [sessionId]);
+      if (!stored || stored.family_rollup === json) return { changed: false };
+      this.db.run("UPDATE card SET family_rollup=?, write_rev=? WHERE session_id=?", [
+        json,
+        this.nextRev(),
+        sessionId,
+      ]);
+      return { changed: true };
     });
   }
 
-  replaceSessionParts(sessionId: string, rows: PartTextRow[], card: Card): void {
-    this.db.tx(() => {
-      this.evictFts(sessionId);
-      this.db.run("DELETE FROM part_text WHERE session_id=?", [sessionId]);
-      for (const row of rows) this.insertRow(sessionId, row);
-      this.upsertCard(card);
+  replaceSessionParts(
+    sessionId: string,
+    rows: PartTextRow[],
+    card: Card,
+    opts?: { rangeHashes?: RangeHash[] },
+  ): SessionWrite {
+    return this.db.tx((): SessionWrite => {
+      const stored = this.db.get(CARD_COMPARE_SQL, [sessionId]);
+      if (belowStoredGen(card.projectorGen, stored?.projector_gen)) {
+        return { changed: false, refused: "older-generation" };
+      }
+      const storedRows = this.db.all(
+        `SELECT id, ${PART_ROW_COLUMNS} FROM part_text WHERE session_id=? ORDER BY id`,
+        [sessionId],
+      );
+      const changed = !stored || !sameCard(stored, card) || !sameRows(storedRows, rows);
+      if (changed) {
+        this.evictFts(storedRows);
+        this.db.run("DELETE FROM part_text WHERE session_id=?", [sessionId]);
+        for (const row of rows) this.insertRow(sessionId, row);
+        this.writeStampedCard(card);
+      } else {
+        this.writeCheckpoint(sessionId, card);
+      }
+      this.db.run(
+        "UPDATE card SET repair_reason=NULL WHERE session_id=? AND repair_reason IS NOT NULL",
+        [sessionId],
+      );
+      this.writeRangeHashes(sessionId, opts?.rangeHashes);
+      return { changed };
     });
   }
 
@@ -1010,39 +1647,59 @@ class SqliteStore implements Store {
     ftsRowsPerSession: number,
     boundary: { checkpointMessageId: string; firstNewMessageId: string },
     recompute: (allRows: PartTextRow[]) => Card,
-  ): void {
-    this.db.tx(() => {
-      const old = this.db.all(
-        "SELECT id, raw, norm FROM part_text WHERE session_id=? ORDER BY id",
-        [sessionId],
-      );
-      const total = old.length + rows.length;
-      const overflow =
-        ftsRowsPerSession > 0 && total > ftsRowsPerSession ? total - ftsRowsPerSession : 0;
-      // Newest-first cap over old + new (matching capRows): evict the oldest
-      // `overflow` rows — from the existing rows first (front of `old`), and any
-      // remaining overflow simply skips the oldest new rows so they never insert.
-      const evictOld = Math.min(overflow, old.length);
-      for (let i = 0; i < evictOld; i++) {
-        const row = old[i]!;
-        this.db.run("INSERT INTO part_fts(part_fts, rowid, raw, norm) VALUES('delete', ?, ?, ?)", [
-          asNumber(row.id),
-          asString(row.raw),
-          asString(row.norm),
-        ]);
-        this.db.run("DELETE FROM part_text WHERE id=?", [asNumber(row.id)]);
+    opts?: { rangeHashes?: RangeHash[] },
+  ): SessionWrite {
+    try {
+      return this.db.tx((): SessionWrite => {
+        const stored = this.db.get(CARD_COMPARE_SQL, [sessionId]);
+        const old = this.db.all(
+          "SELECT id, raw, norm FROM part_text WHERE session_id=? ORDER BY id",
+          [sessionId],
+        );
+        const total = old.length + rows.length;
+        const overflow =
+          ftsRowsPerSession > 0 && total > ftsRowsPerSession ? total - ftsRowsPerSession : 0;
+        // Newest-first cap over old + new (matching capRows): evict the oldest
+        // `overflow` rows — from the existing rows first (front of `old`), and any
+        // remaining overflow simply skips the oldest new rows so they never insert.
+        const evictOld = Math.min(overflow, old.length);
+        this.evictFts(old.slice(0, evictOld));
+        for (let i = 0; i < evictOld; i++) {
+          this.db.run("DELETE FROM part_text WHERE id=?", [asNumber(old[i]!.id)]);
+        }
+        const firstInserted = overflow - evictOld;
+        for (let i = firstInserted; i < rows.length; i++) this.insertRow(sessionId, rows[i]!);
+        // Repoint the checkpoint message's dangling next pointer at the first
+        // appended message (only surviving checkpoint rows still NULL). A no-op
+        // when the checkpoint was evicted by the cap — as it would be in a full
+        // re-distill of the same state.
+        const repointed = this.db.run(
+          "UPDATE part_text SET next_message_id=? WHERE session_id=? AND message_id=? AND next_message_id IS NULL",
+          [boundary.firstNewMessageId, sessionId, boundary.checkpointMessageId],
+        ).changes;
+        const recomputed = recompute(this.readSessionRows(sessionId));
+        // An append extends the card at its stored generation unless the
+        // recomputed card names one.
+        const card: Card =
+          recomputed.projectorGen === undefined
+            ? { ...recomputed, projectorGen: asNullableNumber(stored?.projector_gen) }
+            : recomputed;
+        if (belowStoredGen(card.projectorGen, stored?.projector_gen)) {
+          throw new OlderGenerationRefused();
+        }
+        const rowsChanged = evictOld > 0 || firstInserted < rows.length || repointed > 0;
+        const changed = rowsChanged || !stored || !sameCard(stored, card);
+        if (changed) this.writeStampedCard(card);
+        else this.writeCheckpoint(sessionId, card);
+        this.writeRangeHashes(sessionId, opts?.rangeHashes);
+        return { changed };
+      });
+    } catch (error) {
+      if (error instanceof OlderGenerationRefused) {
+        return { changed: false, refused: "older-generation" };
       }
-      for (let i = overflow - evictOld; i < rows.length; i++) this.insertRow(sessionId, rows[i]!);
-      // Repoint the checkpoint message's dangling next pointer at the first
-      // appended message (only surviving checkpoint rows still NULL). A no-op
-      // when the checkpoint was evicted by the cap — as it would be in a full
-      // re-distill of the same state.
-      this.db.run(
-        "UPDATE part_text SET next_message_id=? WHERE session_id=? AND message_id=? AND next_message_id IS NULL",
-        [boundary.firstNewMessageId, sessionId, boundary.checkpointMessageId],
-      );
-      this.upsertCard(recompute(this.readSessionRows(sessionId)));
-    });
+      throw error;
+    }
   }
 
   /** Insert one slim-index row into `part_text` and mirror it into the
@@ -1075,7 +1732,7 @@ class SqliteStore implements Store {
    *  set. */
   private readSessionRows(sessionId: string): PartTextRow[] {
     const rows = this.db.all(
-      "SELECT part_id, message_id, prev_message_id, next_message_id, class, time_created, raw, norm FROM part_text WHERE session_id=? ORDER BY id",
+      `SELECT ${PART_ROW_COLUMNS} FROM part_text WHERE session_id=? ORDER BY id`,
       [sessionId],
     );
     return rows.map((row) => ({
@@ -1090,11 +1747,11 @@ class SqliteStore implements Store {
     }));
   }
 
-  /** Delete a session's rows from the external-content FTS index using their
-   *  original indexed values (the FTS `'delete'` command requires them). Must
-   *  run before the `part_text` rows are deleted. Caller supplies the tx. */
-  private evictFts(sessionId: string): void {
-    const old = this.db.all("SELECT id, raw, norm FROM part_text WHERE session_id=?", [sessionId]);
+  /** Delete slim-index rows (read with their `id`, `raw` and `norm`) from the
+   *  external-content FTS index using their original indexed values (the FTS
+   *  `'delete'` command requires them). Must run before the `part_text` rows
+   *  are deleted. Caller supplies the tx. */
+  private evictFts(old: Row[]): void {
     for (const row of old) {
       this.db.run("INSERT INTO part_fts(part_fts, rowid, raw, norm) VALUES('delete', ?, ?, ?)", [
         asNumber(row.id),

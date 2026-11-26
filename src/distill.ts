@@ -1039,14 +1039,6 @@ export function createDistiller(options: DistillerOptions): Distiller {
       return listing.items;
     });
 
-  /** Bump the card-revision counter after every store write, so the tier-1 card
-   *  runtime knows to reload lazily. A separate write from the data write, which
-   *  is acceptable for a refresh hint (also time-gated on the reader). */
-  function bumpCardsRev(): void {
-    const current = Number(store.getMeta("cards_rev")) || 0;
-    store.setMeta("cards_rev", String(current + 1));
-  }
-
   // ── Fetch primitives (all through the gate at background priority) ──
 
   async function discoverSessions(): Promise<DistillSessionMeta[]> {
@@ -1267,7 +1259,7 @@ export function createDistiller(options: DistillerOptions): Distiller {
   }
 
   function recomputeRootRollup(rootId: string): void {
-    // Rollup writes replace the root card row; verify authoritative ownership
+    // Rollup writes change the root card row; verify authoritative ownership
     // once per rollup batch (callers reach here after awaited fetches, so the
     // cached flag alone can be stale after a >TTL suspension).
     if (!ownsLease()) return;
@@ -1276,8 +1268,7 @@ export function createDistiller(options: DistillerOptions): Distiller {
     const children = store
       .allCards()
       .filter((card) => card.rootId === rootId && card.sessionId !== rootId);
-    store.upsertCard({ ...root, familyRollup: buildRollup(children) });
-    bumpCardsRev();
+    store.setFamilyRollup(rootId, buildRollup(children));
   }
 
   async function recomputeAllRootRollups(): Promise<void> {
@@ -1288,11 +1279,7 @@ export function createDistiller(options: DistillerOptions): Distiller {
     if (!ownsLease()) return;
     const rootCards = new Map<string, Card>();
     const childrenByRoot = new Map<string, Card[]>();
-    // Load embeddings too: the rollup upsert below rewrites every card column, so
-    // a root loaded without its persisted vector would wipe it on write —
-    // silently defeating vector persistence for every family root on each cold
-    // pass, including warm restarts that skip re-distilling those cards.
-    for (const card of store.allCards({ withEmbeddings: true })) {
+    for (const card of store.allCards()) {
       if (card.rootId === card.sessionId) rootCards.set(card.sessionId, card);
       else {
         const siblings = childrenByRoot.get(card.rootId);
@@ -1300,22 +1287,19 @@ export function createDistiller(options: DistillerOptions): Distiller {
         else childrenByRoot.set(card.rootId, [card]);
       }
     }
-    let written = 0;
-    let paused = false;
+    // Counts every setFamilyRollup call, including those that skip an
+    // unchanged rollup: each still runs a transaction.
+    let rollupCalls = 0;
     for (const [rootId, root] of rootCards) {
       const rollup = buildRollup(childrenByRoot.get(rootId) ?? []);
       if (rollup.length > 0 || root.familyRollup.length > 0) {
-        if (pause && ++written % YIELD_EVERY_WRITES === 0) {
+        if (pause && ++rollupCalls % YIELD_EVERY_WRITES === 0) {
           await pause();
           if (stopped || !ownsLease()) return;
-          paused = true;
         }
-        // After a pause a card may have been re-distilled; never write the
-        // stale snapshot over it.
-        const base = paused ? store.getCard(rootId) : root;
-        if (!base) continue;
-        store.upsertCard({ ...base, familyRollup: rollup });
-        bumpCardsRev();
+        // Writes only the rollup column, so a card re-distilled during a pause
+        // keeps its new content.
+        store.setFamilyRollup(rootId, rollup);
       }
     }
   }
@@ -1343,7 +1327,6 @@ export function createDistiller(options: DistillerOptions): Distiller {
     // rows. One leaseStatus() read per write batch.
     if (stopped || !ownsLease()) return;
     store.replaceSessionParts(session.id, rows, withCheckpoint(card, checkpoint));
-    bumpCardsRev();
     noteSettled(session.id, checkpoint, moved);
   }
 
@@ -1371,23 +1354,17 @@ export function createDistiller(options: DistillerOptions): Distiller {
       // checkpoint, or the cold pass would keep finding it stale.
       if (sync) {
         // A title or directory change also changes the embedded text, so the
-        // persisted vector is dropped with it (as patchCardMeta does).
-        const identityChanged =
-          oldCard.title !== session.title || oldCard.directory !== session.directory;
-        store.upsertCard(
-          withCheckpoint(
-            {
-              ...oldCard,
-              title: session.title,
-              directory: session.directory,
-              projectId: session.projectId,
-              timeUpdated: session.timeUpdated,
-              ...(identityChanged && { embedding: null, embeddingGen: null }),
-            },
-            tail,
-          ),
+        // store drops the persisted vector with it.
+        store.refreshCardMeta(
+          session.id,
+          {
+            title: session.title,
+            directory: session.directory,
+            projectId: session.projectId,
+            timeUpdated: session.timeUpdated,
+          },
+          tail?.cursor ?? null,
         );
-        bumpCardsRev();
         noteSettled(session.id, tail, moved);
       }
       return;
@@ -1437,7 +1414,6 @@ export function createDistiller(options: DistillerOptions): Distiller {
         tail,
       ),
     );
-    bumpCardsRev();
     noteSettled(session.id, tail, moved);
   }
 
@@ -1651,7 +1627,6 @@ export function createDistiller(options: DistillerOptions): Distiller {
           // distilled.
           if (stopped || !ownsLease()) return;
           store.replaceSessionParts(session.id, rows, withCheckpoint(card, checkpoint));
-          bumpCardsRev();
           noteSettled(session.id, checkpoint, moved);
           distilled++;
           distilledCount = distilled; // status counts only sessions actually distilled
@@ -1982,7 +1957,6 @@ export function createDistiller(options: DistillerOptions): Distiller {
     if (!ownsLease()) return; // authoritative: this path deletes rows immediately
     const rootId = store.getCard(sessionID)?.rootId;
     store.deleteSession(sessionID);
-    bumpCardsRev();
     const timer = debounceTimers.get(sessionID);
     if (timer) {
       clearTimeout(timer);
@@ -1999,8 +1973,8 @@ export function createDistiller(options: DistillerOptions): Distiller {
 
   function handleMeta(sessionID: string, patch: SessionMetaPatch): void {
     if (!ownsLease()) return; // authoritative: this path writes immediately
-    // patchCardMeta bumps cards_rev itself; an unknown session has no card to
-    // patch and is picked up by the next distill.
+    // An unknown session has no card to patch and is picked up by the next
+    // distill.
     store.patchCardMeta(sessionID, patch);
   }
 

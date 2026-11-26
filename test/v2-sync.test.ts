@@ -618,11 +618,12 @@ describe("persisted vectors across metadata changes", () => {
   it("patchCardMeta drops the vector only when title or directory change", async () => {
     const d = await embeddedCard();
     await d.stop();
-    expect(store.patchCardMeta("ses_1", { projectId: "prj_other" })).toBe(true);
-    expect(store.patchCardMeta("ses_1", { title: "Title ses_1" })).toBe(true); // unchanged
+    expect(store.patchCardMeta("ses_1", { projectId: "prj_other" })).toEqual({ changed: true });
+    // An unchanged title writes nothing.
+    expect(store.patchCardMeta("ses_1", { title: "Title ses_1" })).toEqual({ changed: false });
     expect(store.getCard("ses_1")?.embedding).toEqual(vector);
     const rev = Number(store.getMeta("cards_rev"));
-    expect(store.patchCardMeta("ses_1", { title: "Renamed" })).toBe(true);
+    expect(store.patchCardMeta("ses_1", { title: "Renamed" })).toEqual({ changed: true });
     expect(store.getCard("ses_1")).toMatchObject({
       title: "Renamed",
       embedding: null,
@@ -652,11 +653,11 @@ describe("store.patchCardMeta", () => {
     await d.stop();
     const before = store.getCard("ses_1");
     const rev = Number(store.getMeta("cards_rev"));
-    expect(store.patchCardMeta("ses_1", { directory: "/elsewhere" })).toBe(true);
+    expect(store.patchCardMeta("ses_1", { directory: "/elsewhere" })).toEqual({ changed: true });
     const after = store.getCard("ses_1");
-    expect(after).toEqual({ ...before, directory: "/elsewhere" });
+    expect(after).toEqual({ ...before, directory: "/elsewhere", writeRev: rev + 1 });
     expect(Number(store.getMeta("cards_rev"))).toBe(rev + 1);
-    expect(store.patchCardMeta("ses_missing", { title: "x" })).toBe(false);
+    expect(store.patchCardMeta("ses_missing", { title: "x" })).toEqual({ changed: false });
     expect(Number(store.getMeta("cards_rev"))).toBe(rev + 1);
   });
 });
