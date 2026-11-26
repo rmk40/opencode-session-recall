@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { OpencodeClient } from "@opencode-ai/sdk/v2";
+import type { OpencodeClient, Session } from "@opencode-ai/sdk/v2";
 import { createV1HistorySource, fetchMessagePage } from "../src/history/v1.js";
 import { MalformedSessionError } from "../src/history/source.js";
 import {
@@ -209,6 +209,128 @@ describe("v1 history source", () => {
       ok: false,
       reason: "not-found",
     });
+  });
+});
+
+describe("v1 history source: truncation, archived sessions and continuations", () => {
+  /** Clients whose listings return `rows` and record the params they got. */
+  function listingClients(rows: Session[]) {
+    const calls = { project: [] as unknown[], global: [] as unknown[] };
+    const scoped = {
+      session: {
+        list: async (params: unknown) => {
+          calls.project.push(params);
+          return { data: rows };
+        },
+      },
+    } as unknown as OpencodeClient;
+    const unscoped = {
+      experimental: {
+        session: {
+          list: async (params: unknown) => {
+            calls.global.push(params);
+            return { data: rows };
+          },
+        },
+      },
+    } as unknown as OpencodeClient;
+    return { source: createV1HistorySource({ scoped, unscoped }), calls };
+  }
+
+  it("asks for one row past the limit and cuts it off as truncated", async () => {
+    const h = makeFakeHarness();
+    const source = createV1HistorySource({ scoped: h.client, unscoped: h.unscoped });
+    // The fixture's project listing holds two sessions, its global one three.
+    const one = await source.listSessions({ scope: "project", limit: 1 });
+    expect(one).toMatchObject({ ok: true, truncated: true });
+    expect(one.ok && one.items.map((s) => s.id)).toEqual(["s-current"]);
+    const both = await source.listSessions({ scope: "project", limit: 2 });
+    expect(both).toMatchObject({ ok: true, truncated: false });
+    expect(both.ok && both.items).toHaveLength(2);
+    const global = await source.listSessions({ scope: "global", limit: 2 });
+    expect(global).toMatchObject({ ok: true, truncated: true });
+    expect(global.ok && global.items).toHaveLength(2);
+    expect(h.calls.projectList.map((c) => c.limit)).toEqual([2, 3]);
+    expect(h.calls.globalList.map((c) => c.limit)).toEqual([3]);
+  });
+
+  it("fails an id-order listing or a cursor without calling the host", async () => {
+    const h = makeFakeHarness();
+    const source = createV1HistorySource({ scoped: h.client, unscoped: h.unscoped });
+    for (const scope of ["project", "global"] as const) {
+      expect(await source.listSessions({ scope, limit: 5, order: "id" })).toMatchObject({
+        ok: false,
+        error: expect.stringMatching(/id order/),
+      });
+      expect(await source.listSessions({ scope, limit: 5, after: "s-current" })).toMatchObject({
+        ok: false,
+      });
+    }
+    // A recency listing is still served.
+    expect(
+      await source.listSessions({ scope: "project", limit: 5, order: "recent" }),
+    ).toMatchObject({
+      ok: true,
+    });
+    expect(h.calls.projectList).toHaveLength(1);
+    expect(h.calls.globalList).toEqual([]);
+  });
+
+  it("asks the global endpoint for archived sessions only when they are included", async () => {
+    const { source, calls } = listingClients([]);
+    await source.listSessions({ scope: "global", limit: 5 });
+    await source.listSessions({ scope: "global", limit: 5, archived: "exclude" });
+    await source.listSessions({ scope: "global", limit: 5, archived: "include", search: "x" });
+    expect(calls.global).toEqual([
+      { limit: 6 },
+      { limit: 6 },
+      { search: "x", limit: 6, archived: true },
+    ]);
+    // The project endpoint takes no archived parameter.
+    await source.listSessions({ scope: "project", limit: 5, archived: "include" });
+    expect(calls.project).toEqual([{ limit: 6 }]);
+  });
+
+  it("drops archived sessions from a project listing only on exclude", async () => {
+    const live = session("s-live", "Live", PROJECT_DIR, 2_000);
+    const archived = session("s-arch", "Archived", PROJECT_DIR, 1_500, 1_800);
+    const { source } = listingClients([live, archived]);
+    const list = async (o: { archived?: "include" | "exclude" }) => {
+      const listing = await source.listSessions({ scope: "project", limit: 5, ...o });
+      return listing.ok && listing.items.map((s) => s.id);
+    };
+    expect(await list({})).toEqual(["s-live", "s-arch"]);
+    expect(await list({ archived: "include" })).toEqual(["s-live", "s-arch"]);
+    expect(await list({ archived: "exclude" })).toEqual(["s-live"]);
+  });
+
+  it("returns every child at once, never truncated, whatever the paging options", async () => {
+    const kids = [
+      session("c1", "One", PROJECT_DIR, 1_000, undefined, "s-current"),
+      session("c2", "Two", PROJECT_DIR, 2_000, 2_500, "s-current"),
+      session("c3", "Three", PROJECT_DIR, 3_000, undefined, "s-current"),
+    ];
+    const h = makeFakeHarness({ children: { "s-current": kids } });
+    const source = createV1HistorySource({ scoped: h.client, unscoped: h.unscoped });
+    const listed = await source.listChildren("s-current", { limit: 1, order: "id", after: "c1" });
+    expect(listed).toEqual({ ok: true, items: kids, truncated: false });
+    const live = await source.listChildren("s-current", { archived: "exclude" });
+    expect(live).toEqual({ ok: true, items: [kids[0], kids[2]], truncated: false });
+  });
+
+  it("answers a part continuation as unsupported without calling the host", async () => {
+    const h = makeFakeHarness();
+    const source = createV1HistorySource({ scoped: h.client, unscoped: h.unscoped });
+    for (const partOrdinal of [0, 3]) {
+      expect(await source.getMessage("s-current", "m-current-2", { partOrdinal })).toEqual({
+        ok: false,
+        reason: "unsupported",
+        error: expect.any(String),
+      });
+    }
+    expect(h.calls.message).toEqual([]);
+    const whole = await source.getMessage("s-current", "m-current-2", {});
+    expect(whole.ok && whole.value.partial).toBeUndefined();
   });
 });
 

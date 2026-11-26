@@ -2,15 +2,18 @@ import { describe, expect, it } from "vitest";
 import type { Part } from "@opencode-ai/sdk/v2";
 import {
   CLEARED_TOOL_OUTPUT,
+  decodePartRow,
   decodeRow,
   identityOf,
   projectMessage,
   projectSession,
   resolveIdentity,
   sessionContext,
+  type MessageParts,
   type SessionContext,
   type UserIdentity,
   type V2MessageRow,
+  type V2PartRow,
   type V2SessionRow,
 } from "../src/history/v2-project.js";
 import { formatMsg, pruned, searchableFields, isSelfToolPart } from "../src/extract.js";
@@ -375,6 +378,129 @@ describe("projectMessage", () => {
     if (!decoded.ok) throw new Error("expected ok");
     // Columns win over data keys.
     expect(projectMessage(decoded, CTX, WHO)!.info).toMatchObject({ id: "msg_real", role: "user" });
+  });
+});
+
+describe("decodePartRow", () => {
+  function partRow(data: unknown, extra: Partial<V2PartRow> = {}): V2PartRow {
+    return {
+      message_id: "msg_p",
+      session_id: "ses_1",
+      ordinal: 3,
+      type: "text",
+      call_id: null,
+      time_created: 1,
+      time_updated: 2,
+      data: typeof data === "string" ? data : JSON.stringify(data),
+      ...extra,
+    };
+  }
+
+  it("takes the type column over the type the data names", () => {
+    const decoded = decodePartRow(partRow({ type: "text", text: "t" }, { type: "reasoning" }));
+    expect(decoded.ok && decoded.item).toEqual({ type: "reasoning", text: "t" });
+    const untyped = decodePartRow(partRow({ text: "t" }, { type: "text" }));
+    expect(untyped.ok && untyped.item).toEqual({ text: "t", type: "text" });
+  });
+
+  it("gives a tool item without an id of its own the call_id column", () => {
+    const state = { status: "completed", input: {}, content: [] };
+    const bare = decodePartRow(
+      partRow({ type: "tool", name: "bash", state }, { type: "tool", call_id: "call_col" }),
+    );
+    expect(bare.ok && bare.item.id).toBe("call_col");
+    const own = decodePartRow(
+      partRow(
+        { type: "tool", id: "call_own", name: "bash", state },
+        { type: "tool", call_id: "x" },
+      ),
+    );
+    expect(own.ok && own.item.id).toBe("call_own");
+    // Only tool items take it.
+    const text = decodePartRow(partRow({ type: "text", text: "t" }, { call_id: "call_col" }));
+    expect(text.ok && "id" in text.item).toBe(false);
+  });
+
+  it("names the message and ordinal when the data is not JSON or not an object", () => {
+    expect(decodePartRow(partRow("{nope"))).toMatchObject({
+      ok: false,
+      reason: "message msg_p part 3 data is not valid JSON",
+    });
+    for (const data of ["[1]", "7", "null"]) {
+      expect(decodePartRow(partRow(data)), data).toMatchObject({
+        ok: false,
+        reason: "message msg_p part 3 data is not an object",
+      });
+    }
+  });
+});
+
+describe("projectMessage with part rows", () => {
+  const decodedAssistant = (content: unknown[], id = "msg_m") => {
+    const decoded = decodeRow(
+      row("assistant", { agent: "build", content, time: { created: 1, completed: 2 } }, id),
+    );
+    if (!decoded.ok) throw new Error(decoded.reason);
+    return decoded;
+  };
+  const texts = (m: { parts: Part[] }) =>
+    m.parts.map((p) => [p.id, p.type === "text" || p.type === "reasoning" ? p.text : p.type]);
+
+  it("puts part items before inline content, with ids positional from the start", () => {
+    const decoded = decodedAssistant([{ type: "text", text: "inline" }]);
+    const parts: MessageParts = {
+      items: [
+        { type: "reasoning", text: "row a" },
+        { type: "text", text: "row b" },
+      ],
+      start: 0,
+    };
+    const whole = projectMessage(decoded, CTX, WHO, parts)!;
+    expect(texts(whole)).toEqual([
+      ["msg_m:0", "row a"],
+      ["msg_m:1", "row b"],
+      ["msg_m:2", "inline"],
+    ]);
+    expect(whole.partial).toBeUndefined();
+    // A continuation names its parts from its start position on.
+    const rest = projectMessage(decoded, CTX, WHO, {
+      items: [{ type: "text", text: "row b" }],
+      start: 1,
+    })!;
+    expect(texts(rest)).toEqual([
+      ["msg_m:1", "row b"],
+      ["msg_m:2", "inline"],
+    ]);
+    // No part rows: exactly the inline projection.
+    expect(projectMessage(decoded, CTX, WHO, { items: [], start: 0 })).toEqual(
+      projectMessage(decoded, CTX, WHO),
+    );
+  });
+
+  it("ends a cut message with its note, leaves inline content for the continuation and marks it partial", () => {
+    const decoded = decodedAssistant([{ type: "text", text: "inline" }]);
+    const cut = { nextOrdinal: 7, omittedParts: 3, omittedBytes: 120, note: "[unavailable: cut]" };
+    const m = projectMessage(decoded, CTX, WHO, {
+      items: [{ type: "text", text: "row a" }],
+      start: 0,
+      cut,
+    })!;
+    expect(m.parts.map((p) => (p.type === "text" ? p.text : p.type))).toEqual([
+      "row a",
+      "[unavailable: cut]",
+    ]);
+    expect(m.parts[0]!.id).toBe("msg_m:0");
+    // The note's id is unique and not a position a later read gives a part.
+    expect(m.parts[1]!.id).toMatch(/^msg_m:/);
+    expect(m.parts[1]!.id).not.toMatch(/^msg_m:\d+$/);
+    expect(m.partial).toEqual({ nextOrdinal: 7, omittedParts: 3, omittedBytes: 120 });
+  });
+
+  it("ignores part items for a row that is not an assistant", () => {
+    const decoded = decodeRow(row("user", { text: "prompt" }, "msg_u2"));
+    if (!decoded.ok) throw new Error(decoded.reason);
+    const parts: MessageParts = { items: [{ type: "text", text: "stray" }], start: 0 };
+    expect(projectMessage(decoded, CTX, WHO, parts)).toEqual(projectMessage(decoded, CTX, WHO));
   });
 });
 

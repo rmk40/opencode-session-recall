@@ -29,18 +29,21 @@ import {
   insertSession,
   limitSpy,
   makeV2Db,
+  makeV2PartsDb,
   V2_DDL,
   violatesLimitRule,
   writeV1Corpus,
+  type CorpusLayout,
   type V2TestDb,
 } from "./v2-db.js";
 
 /**
  * The HistorySource contract, run against both adapters over the same data:
  * the v1 adapter over the fake SDK clients, and the v2 adapter over a temp
- * `opencode.db` holding the same fixture written as v2 rows. Every v2 read
- * goes through a spy that fails a `session_message` statement without
- * `LIMIT ?`.
+ * `opencode.db` holding the same fixture written as v2 rows, with assistant
+ * content inline and in opencode 2.4's `session_part` rows. Every v2 read
+ * goes through a spy that fails a `session_message` or `session_part`
+ * statement without `LIMIT ?`.
  */
 
 type Adapter = {
@@ -80,10 +83,10 @@ async function openV2(t: V2TestDb, projectID?: string) {
   return { source, spy, close: () => opened.db.close() };
 }
 
-async function v2Adapter(): Promise<Adapter> {
+async function v2Adapter(layout: CorpusLayout = "inline"): Promise<Adapter> {
   const h = makeFakeHarness();
-  const t = await makeV2Db();
-  writeV1Corpus(t.db, h.globalSessions, h.messagesBySession);
+  const t = layout === "inline" ? await makeV2Db() : await makeV2PartsDb();
+  writeV1Corpus(t.db, h.globalSessions, h.messagesBySession, layout);
   const { source, close } = await openV2(t, "project-main");
   const ids = Object.fromEntries(
     Object.entries(h.messagesBySession).map(([id, bundles]) => [id, chronoIds(bundles)]),
@@ -115,7 +118,8 @@ async function walk(source: HistorySource, sessionID: string, limit: number) {
 
 describe.each([
   ["v1 adapter (fake SDK clients)", v1Adapter],
-  ["v2 adapter (opencode.db)", v2Adapter],
+  ["v2 adapter (opencode.db)", () => v2Adapter()],
+  ["v2 adapter (opencode.db, content in session_part rows)", () => v2Adapter("parts")],
 ])("HistorySource contract: %s", (_name, make) => {
   async function adapter(): Promise<Adapter> {
     const a = await make();
