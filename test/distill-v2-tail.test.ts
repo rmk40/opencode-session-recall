@@ -8,6 +8,7 @@ import {
   type DeriveCardInput,
   type Distiller,
   type DistillerOptions,
+  type DistillSignal,
   type DistillSync,
 } from "../src/distill.js";
 import { createFetchGate } from "../src/fetch-gate.js";
@@ -873,5 +874,180 @@ describe("v2 metadata patched while a distill of the session is in progress", ()
     await waitFor(() => store.getCard(m.sessionID)?.timeArchived === to);
     await new Promise((resolve) => setTimeout(resolve, 30));
     expect(store.getCard(m.sessionID)?.timeArchived).toBe(to);
+  });
+
+  /** A source whose next read of `sessionID`'s messages after `pause()`
+   *  waits until released, and whose next lookup fails after `failNext()`. */
+  function gatedSource(sessionID: string) {
+    let hold: Promise<void> | undefined;
+    let held = false;
+    let release = (): void => {};
+    let fail = false;
+    return {
+      wrap: (inner: HistorySource): HistorySource => ({
+        ...inner,
+        messagePage: async (o) => {
+          const waiting = o.sessionID === sessionID ? hold : undefined;
+          if (waiting) {
+            hold = undefined;
+            held = true;
+            await waiting;
+          }
+          return inner.messagePage(o);
+        },
+        getSession: async (id, o) => {
+          if (fail && id === sessionID) {
+            fail = false;
+            throw new Error("lookup failed for now");
+          }
+          return inner.getSession(id, o);
+        },
+      }),
+      pause(): void {
+        held = false;
+        hold = new Promise((resolve) => (release = resolve));
+      },
+      held: () => held,
+      release: () => release(),
+      failNext(): void {
+        fail = true;
+      },
+    };
+  }
+
+  const archive = (m: Model, at: number): DistillSignal => {
+    v2db.db.run("UPDATE session_v2 SET time_archived = ?, time_updated = ? WHERE id = ?", [
+      at,
+      T0 + 10_000,
+      m.sessionID,
+    ]);
+    return {
+      type: "meta",
+      sessionID: m.sessionID,
+      patch: { title: `Title ${m.sessionID}`, timeArchived: at },
+    };
+  };
+
+  it("survives a cold pass that writes the session after a re-distill of it did", async () => {
+    const store = (await openTestStore("meta")).store;
+    const calls: string[] = [];
+    const m = streamingSession("ses_cold");
+    settleRunning(m);
+    const gate = gatedSource(m.sessionID);
+    const listing = createV2HistorySource(reader, { yieldBetween: noYield });
+    // The cold pass discovers the session unarchived and waits on its read.
+    gate.pause();
+    const d = startDistiller(recording(store, calls), {
+      limits: { ...TEST_LIMITS, coldPass: true, distillDelayMs: 0, distillConcurrency: 1 },
+      discover: async () => {
+        const listed = await listing.listSessions({
+          scope: "global",
+          limit: 100,
+          archived: "include",
+        });
+        if (!listed.ok) throw new Error(listed.error);
+        return listed.items;
+      },
+      wrapSource: gate.wrap,
+    });
+    await waitFor(gate.held);
+    const at = T0 + 9_000;
+    d.onEvent(archive(m, at));
+    // A re-distill reads the archived metadata and writes first.
+    d.onEvent({ type: "turn-ended", sessionID: m.sessionID });
+    await waitFor(() => store.getCard(m.sessionID)?.timeArchived === at);
+    const writes = calls.length;
+    // Then the cold pass writes what it discovered, and the follow-up reads
+    // the metadata again.
+    gate.release();
+    await waitFor(() => d.status().coldPass === "done");
+    expect(calls.length).toBeGreaterThan(writes);
+    await waitFor(() => store.getCard(m.sessionID)?.timeArchived === at);
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    expect(store.getCard(m.sessionID)?.timeArchived).toBe(at);
+  });
+
+  it("reads the metadata again after a lookup that failed", async () => {
+    const store = (await openTestStore("meta")).store;
+    const calls: string[] = [];
+    const m = streamingSession("ses_retry");
+    settleRunning(m);
+    const gate = gatedSource(m.sessionID);
+    const logs: string[] = [];
+    const d = startDistiller(recording(store, calls), {
+      wrapSource: gate.wrap,
+      metaRetryMs: 10,
+      logs,
+    });
+    await redistilled(d, calls, m.sessionID);
+
+    addUser(m, random(7));
+    gate.pause();
+    const writes = calls.length;
+    d.onEvent({ type: "turn-ended", sessionID: m.sessionID });
+    await waitFor(gate.held);
+    const at = T0 + 9_000;
+    d.onEvent(archive(m, at));
+    // The re-distill writes the metadata it read before the archive, and the
+    // first lookup after it fails.
+    gate.failNext();
+    gate.release();
+    await waitFor(() => calls.length > writes);
+    await waitFor(() => logs.some((line) => line.includes("metadata refresh failed")));
+    await waitFor(() => store.getCard(m.sessionID)?.timeArchived === at);
+  });
+});
+
+describe("a tail write stopped while it waits", () => {
+  it("reads nothing more from the store once the distiller stops", async () => {
+    const store = (await openTestStore("dispose")).store;
+    const calls: string[] = [];
+    let closed = false;
+    const after: string[] = [];
+    let holdNext = false;
+    let held = false;
+    let release = (): void => {};
+    const waiting = new Promise<void>((resolve) => (release = resolve));
+    // Every store call once the store counts as closed is recorded; the
+    // first yield after the tail write counts the stored rows waits.
+    const guarded = new Proxy(recording(store, calls), {
+      get(target, prop, receiver) {
+        const value: unknown = Reflect.get(target, prop, receiver);
+        if (typeof value !== "function") return value;
+        const method = value as (...args: unknown[]) => unknown;
+        return (...args: unknown[]) => {
+          if (closed) after.push(String(prop));
+          if (prop === "sessionRowCount") holdNext = true;
+          return method.apply(target, args);
+        };
+      },
+    });
+    const d = startDistiller(guarded, {
+      yieldBetween: async () => {
+        if (!holdNext) return;
+        holdNext = false;
+        held = true;
+        await waiting;
+      },
+    });
+    const m = streamingSession("ses_stop");
+    expect(await redistilled(d, calls, m.sessionID)).toBe("replaceSessionParts");
+    const r = m.running!;
+    insertPart(v2db.db, {
+      message_id: r.id,
+      session_id: m.sessionID,
+      ordinal: r.parts++,
+      time_created: T0 + r.seq,
+      time_updated: Date.now() + ++tick,
+      data: { type: "text", text: "whiskeygrown" },
+    });
+    d.onEvent({ type: "turn-ended", sessionID: m.sessionID });
+    await waitFor(() => held);
+    const stopping = d.stop();
+    closed = true;
+    release();
+    await stopping;
+    expect(after).toEqual([]);
+    expect(calls).toEqual(["replaceSessionParts"]);
   });
 });

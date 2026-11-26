@@ -122,7 +122,8 @@ describe("v1 archive changes during a distill of the session", () => {
     return updated(next);
   }
 
-  /** A distiller whose reads of the session's messages wait while held. */
+  /** A distiller whose next read of the session's messages after `pause()`
+   *  waits until released; later reads go through. */
   function pausable(h: FakeHarness) {
     let hold: Promise<void> | undefined;
     let held = false;
@@ -131,9 +132,11 @@ describe("v1 archive changes during a distill of the session", () => {
       source: {
         ...h.source,
         messagePage: async (o) => {
-          if (hold && o.sessionID === SID) {
+          const waiting = o.sessionID === SID ? hold : undefined;
+          if (waiting) {
+            hold = undefined;
             held = true;
-            await hold;
+            await waiting;
           }
           return h.source.messagePage(o);
         },
@@ -158,6 +161,30 @@ describe("v1 archive changes during a distill of the session", () => {
       },
     };
   }
+
+  it("reaches a card the cold pass writes after a re-distill of the session wrote first", async () => {
+    const h = makeFakeHarness();
+    setArchived(h, undefined);
+    const p = pausable(h);
+    // The cold pass discovers the session unarchived and waits on its read.
+    p.pause();
+    p.distiller.start();
+    await waitFor(p.held);
+    const archivedAt = 1_700_000_000_000;
+    p.distiller.onEvent(signal(setArchived(h, archivedAt)));
+    // A re-distill reads the archived metadata and writes first.
+    p.distiller.onEvent({ type: "turn-ended", sessionID: SID });
+    await waitFor(() => store.getCard(SID)?.timeArchived === archivedAt);
+    const rev = store.cardStats().cardsRev;
+    // Then the cold pass writes what it discovered, and the follow-up reads
+    // the metadata again.
+    p.release();
+    await waitFor(() => p.distiller.status().coldPass === "done");
+    await waitFor(() => store.cardStats().cardsRev > rev + 1);
+    await waitFor(() => store.getCard(SID)?.timeArchived === archivedAt);
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    expect(store.getCard(SID)?.timeArchived).toBe(archivedAt);
+  });
 
   const signal = (event: Event) => {
     const mapped = v1EventToSignal(event);

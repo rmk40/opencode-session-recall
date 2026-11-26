@@ -66,6 +66,9 @@ const DEFAULT_APPEND_THRESHOLD_PARTS = 2_000;
 const DEFAULT_IDLE_DEBOUNCE_MS = 2_000;
 const DEFAULT_LEASE_RETRY_MS = 60_000;
 const DEFAULT_COLD_PASS_RETRY_MS = 60_000;
+const DEFAULT_META_RETRY_MS = 5_000;
+/** Failed re-reads of a session's metadata before its follow-up is dropped. */
+const MAX_META_RETRIES = 5;
 const LEASE_TTL_MS = 30_000;
 const HEARTBEAT_MS = 10_000;
 /** Bound process-lifetime state retained for malformed legacy sessions. */
@@ -603,6 +606,9 @@ export type DistillerOptions = {
   /** Backoff before re-arming a cold pass that aborted on a transient error
    *  (spec: 60000ms). */
   coldPassRetryMs?: number;
+  /** First delay before a failed metadata re-read is retried, doubling
+   *  with each failure (spec: 5000ms). */
+  metaRetryMs?: number;
   /** Called (while holding the lease) once the cold pass finishes, so the Path B
    *  summarizer can run its own pass over the freshly distilled cards. */
   onColdPassDone?: () => void;
@@ -1482,8 +1488,18 @@ export function createDistiller(options: DistillerOptions): Distiller {
   const pendingRerun = new Set<string>();
   /** Sessions whose metadata a patch changed while a distill of them was in
    *  progress: that distill read the metadata before the patch and writes it
-   *  back over it, so their metadata is read again once it is done. */
-  const metaFollowUp = new Set<string>();
+   *  back over it, so their metadata is read again once it is done. The
+   *  value counts the patches noted, so a re-read clears only the entry it
+   *  started from. */
+  const metaFollowUp = new Map<string, number>();
+  /** Failed metadata re-reads per session, and the timers of their retries. */
+  const metaRetries = new Map<string, number>();
+  const metaRetryTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  const metaRetryMs = options.metaRetryMs ?? DEFAULT_META_RETRY_MS;
+  /** Sessions the running cold pass has written. It read every session's
+   *  metadata at discovery, so a session it has not written yet may still
+   *  be written from metadata older than a patch. */
+  const coldPassWrote = new Set<string>();
   /** Sync hosts only: sessions waiting for a re-distill slot. A poll can
    *  signal hundreds of sessions at once; at most `distillConcurrency`
    *  re-distills run at a time and the rest wait here, in signal order. */
@@ -2531,19 +2547,24 @@ export function createDistiller(options: DistillerOptions): Distiller {
 
   /**
    * The stored rows of a settled base that a tail write keeps (from offset
-   * `from` up to `to`), read a page at a time with a yield between pages,
-   * with the rows of the base's newest message pointing at the tail's first
-   * message.
+   * `from` to the base's last row), read a page at a time with a yield
+   * between pages, with the rows of the base's newest message pointing at
+   * the tail's first message. Null when the distiller stopped or lost the
+   * lease during a yield: the store may be closed by then, so nothing more is
+   * read.
    */
   async function keptBaseRows(
     sessionID: string,
     base: SettledBase,
     from: number,
     firstMessageId: string | null,
-  ): Promise<PartTextRow[]> {
+  ): Promise<PartTextRow[] | null> {
     const kept: PartTextRow[] = [];
     for (let offset = from; offset < base.rows; offset += BASE_ROWS_PAGE) {
-      if (pause) await pause();
+      if (pause) {
+        await pause();
+        if (stopped || !leaseHeld) return null;
+      }
       kept.push(
         ...store.sessionRows(sessionID, offset, Math.min(BASE_ROWS_PAGE, base.rows - offset)),
       );
@@ -2634,7 +2655,7 @@ export function createDistiller(options: DistillerOptions): Distiller {
     let replaceRangeHashes = false;
     if (plan.evict > 0) {
       const placed = await floorAfterAppend(session.id, floor, walk.rows, chrono, base.rows);
-      if (placed === "aborted") return { changed: false };
+      if (placed === "aborted" || stopped || !leaseHeld) return { changed: false };
       // The oldest row left belongs to a message the history no longer has.
       if (placed === null) return distillFull(session);
       if (rangesOn && placed.floor !== undefined && placed.floor !== floor) {
@@ -2654,13 +2675,13 @@ export function createDistiller(options: DistillerOptions): Distiller {
     // Every store read here describes the card as it was read with its base;
     // the write refuses if a write has moved its revision since.
     const writeRev = oldCard.writeRev ?? null;
-    const allRows = [
-      ...(await keptBaseRows(session.id, base, plan.evict, firstMessageId)),
-      ...walk.rows,
-    ];
+    const kept = await keptBaseRows(session.id, base, plan.evict, firstMessageId);
+    if (kept === null) return { changed: false };
+    const allRows = [...kept, ...walk.rows];
     const inventory = pause
       ? await deriveInventoryCooperative(allRows, caps.inventoryTokens, pause)
       : deriveInventory(allRows, caps.inventoryTokens);
+    if (stopped || !leaseHeld) return { changed: false };
     /** Rows of the messages past the new boundary. */
     const tailRows = walk.rows.length - (walk.prefix?.rows ?? 0);
     const card = stampCard(
@@ -2730,6 +2751,7 @@ export function createDistiller(options: DistillerOptions): Distiller {
   async function runColdPass(): Promise<void> {
     if (coldPassState === "running") return;
     coldPassState = "running";
+    coldPassWrote.clear();
     // A new pass's progress starts from nothing: never report the previous
     // pass's counts while this one is still discovering.
     examinedCount = 0;
@@ -2929,6 +2951,7 @@ export function createDistiller(options: DistillerOptions): Distiller {
             distilled++;
             distilledCount = distilled; // status counts only sessions actually distilled
           }
+          coldPassWrote.add(session.id);
           followUpMeta(session.id);
         } else {
           // Indexed and current (perhaps by another holder): not failing.
@@ -3466,7 +3489,8 @@ export function createDistiller(options: DistillerOptions): Distiller {
       if (coldPassPromise === running) coldPassPromise = undefined;
       // The pass wrote metadata it read at discovery: patches that arrived
       // since are read again.
-      for (const sessionID of [...metaFollowUp]) followUpMeta(sessionID);
+      coldPassWrote.clear();
+      for (const sessionID of [...metaFollowUp.keys()]) followUpMeta(sessionID);
     });
     coldPassPromise = running;
     return running;
@@ -3560,25 +3584,63 @@ export function createDistiller(options: DistillerOptions): Distiller {
   /**
    * Read a session's metadata again and patch it into its card, when a patch
    * arrived while a distill of it was in progress ({@link metaFollowUp}).
-   * Waits for any distill of the session still running, and runs as one
-   * itself, so a patch that arrives meanwhile is followed up again.
+   * Waits until no writer that may hold older metadata is left: a re-distill
+   * or sweep of the session, or a running cold pass that has not written it
+   * yet (the end of the pass follows up the rest). Runs as a distill itself,
+   * so a patch that arrives meanwhile is followed up again. A failed read
+   * keeps the follow-up and retries it later, at most
+   * {@link MAX_META_RETRIES} times.
    */
   function followUpMeta(sessionID: string): void {
-    if (stopped || !leaseHeld || !metaFollowUp.has(sessionID)) return;
+    if (stopped || !leaseHeld) return;
+    const noted = metaFollowUp.get(sessionID);
+    if (noted === undefined || metaRetryTimers.has(sessionID)) return;
     if (inFlight.has(sessionID) || sweeping.has(sessionID)) return;
-    metaFollowUp.delete(sessionID);
+    if (coldPassState === "running" && !coldPassWrote.has(sessionID)) return;
     const running = refreshSessionMeta(sessionID)
-      .catch((error: unknown) => {
-        lastError = errmsg(error);
-        logMsg(`session ${sessionID} metadata refresh failed: ${lastError}`);
-      })
+      .then(
+        () => {
+          metaRetries.delete(sessionID);
+          if (metaFollowUp.get(sessionID) === noted) metaFollowUp.delete(sessionID);
+        },
+        (error: unknown) => {
+          lastError = errmsg(error);
+          logMsg(`session ${sessionID} metadata refresh failed: ${lastError}`);
+          retryMetaFollowUp(sessionID);
+        },
+      )
       .finally(() => {
         inFlight.delete(sessionID);
         if (!stopped && pendingRerun.delete(sessionID)) scheduleReDistill(sessionID);
+        // A patch noted during the read is followed up again.
         followUpMeta(sessionID);
         drainReDistillQueue();
       });
     inFlight.set(sessionID, running);
+  }
+
+  /** Retry a failed metadata re-read after a delay that doubles with each
+   *  failure, or drop the follow-up after {@link MAX_META_RETRIES}. */
+  function retryMetaFollowUp(sessionID: string): void {
+    const failures = (metaRetries.get(sessionID) ?? 0) + 1;
+    if (stopped || failures > MAX_META_RETRIES) {
+      metaRetries.delete(sessionID);
+      metaFollowUp.delete(sessionID);
+      if (!stopped)
+        logMsg(`session ${sessionID} metadata follow-up dropped after ${failures - 1} retries`);
+      return;
+    }
+    metaRetries.set(sessionID, failures);
+    metaRetryTimers.set(
+      sessionID,
+      setTimeout(
+        () => {
+          metaRetryTimers.delete(sessionID);
+          followUpMeta(sessionID);
+        },
+        metaRetryMs * 2 ** (failures - 1),
+      ),
+    );
   }
 
   async function refreshSessionMeta(sessionID: string): Promise<void> {
@@ -3725,7 +3787,7 @@ export function createDistiller(options: DistillerOptions): Distiller {
     // With no distill in progress, an unknown session has no card to patch,
     // and the distill that creates one reads its metadata then.
     if (inFlight.has(sessionID) || sweeping.has(sessionID) || coldPassState === "running") {
-      metaFollowUp.add(sessionID);
+      metaFollowUp.set(sessionID, (metaFollowUp.get(sessionID) ?? 0) + 1);
     }
     store.patchCardMeta(sessionID, patch);
   }
@@ -3935,6 +3997,8 @@ export function createDistiller(options: DistillerOptions): Distiller {
     sweepRetryTimer = undefined;
     for (const timer of debounceTimers.values()) clearTimeout(timer);
     debounceTimers.clear();
+    for (const timer of metaRetryTimers.values()) clearTimeout(timer);
+    metaRetryTimers.clear();
     pendingRerun.clear();
     reDistillQueue.clear();
     // Wake any inter-page politeness sleep immediately: with a long
