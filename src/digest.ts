@@ -11,11 +11,12 @@
 export const DIGEST_HEAD_CHARS = 200;
 
 /**
- * Text a history source puts in place of a message it cannot load (a row over
- * the read cap, or one whose stored data does not decode). It is still indexed
- * and shown, so the gap is visible, but it is never a session's head: its
- * wording avoids domain words so it does not pull unrelated queries, and it
- * says nothing about what the session was for.
+ * Text a history source puts in place of content it cannot load (a row over
+ * the read cap, one whose stored data does not decode, or the rest of a
+ * message a read cut short). It is still indexed and shown, so the gap is
+ * visible, but it is never a session's head: its wording avoids domain words
+ * so it does not pull unrelated queries, and it says nothing about what the
+ * session was for.
  */
 const UNAVAILABLE_PREFIX = "[unavailable: ";
 
@@ -25,12 +26,23 @@ export function unavailableText(reason: string): string {
 
 /**
  * The exact placeholders the v2 source generates: an oversized row
- * (`<n>-byte row over the <n>-byte cap`) and the decoder's two reasons.
- * Matching only these shapes keeps the effect off ordinary text: a v1 (or v2)
- * statement is skipped as a head only if it is literally one of them.
+ * (`<n>-byte row over the <n>-byte cap`), the decoder's two reasons, and the
+ * two notes that end a message a read cut short (`cutNote` and `changedNote`
+ * in `history/v2.ts`). Matching only these shapes keeps the effect off
+ * ordinary text: a v1 (or v2) statement is skipped as a head only if it is
+ * literally one of them.
  */
-const UNAVAILABLE_SHAPE =
-  /^\[unavailable: (?:\d+-byte row over the \d+-byte cap|data is not valid JSON|data is not an object)\]$/;
+const UNAVAILABLE_SHAPE = new RegExp(
+  "^\\[unavailable: (?:" +
+    [
+      "\\d+-byte row over the \\d+-byte cap",
+      "data is not valid JSON",
+      "data is not an object",
+      "\\d+ more items(?: \\(\\d+ bytes\\))? over the read cap, continued from ordinal -?\\d+",
+      "\\d+ more items left out while the row changed, continued from ordinal -?\\d+",
+    ].join("|") +
+    ")\\]$",
+);
 
 /** Whether `text` is one of the placeholders from {@link unavailableText}. */
 export function isUnavailableText(text: string | undefined): boolean {

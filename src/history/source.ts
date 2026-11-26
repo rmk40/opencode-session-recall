@@ -37,9 +37,11 @@ export type Listing<T> =
  * tools read it before the seam); `unsupported` is a request this host cannot
  * answer (a part continuation on v1). `error` carries the host's string when
  * there was one, so callers can keep their own wording for the empty case.
+ * `counts` is what a message read could not project faithfully (v2
+ * `getMessage` only), present only when some count is non-zero.
  */
 export type Lookup<T> =
-  | { ok: true; value: T }
+  | { ok: true; value: T; counts?: HistoryReadCounts }
   | { ok: false; reason: "not-found"; error?: string }
   | { ok: false; reason: "error"; error: string }
   | { ok: false; reason: "malformed"; error: string }
@@ -270,12 +272,14 @@ export interface HistorySource {
    * fit. Following `partial.nextOrdinal` until a read is not `partial`
    * returns every part. Only an assistant message has part ordinals: v1, a
    * v2 database without part rows and a v2 message of any other type answer
-   * a `partOrdinal` with `unsupported`.
+   * a `partOrdinal` with `unsupported`. `strict` rejects a message or part
+   * whose data does not decode with a {@link MalformedSessionError} instead
+   * of projecting a placeholder, as `messagePage` does (v1 ignores it).
    */
   getMessage(
     sessionID: string,
     messageID: string,
-    o?: { partOrdinal?: number },
+    o?: { partOrdinal?: number; strict?: boolean },
   ): Promise<Lookup<HistoryMessage>>;
   /**
    * How the host database differs from what this build reads (see

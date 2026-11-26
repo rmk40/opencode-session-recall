@@ -1,8 +1,23 @@
 import type { Part } from "@opencode-ai/sdk/v2";
 import { errmsg, DISCOVERY_LIMIT, type IndexingProgress, type Limits } from "./types.js";
 import { compareMessages, type HistoryMessage, type HistorySession } from "./history/model.js";
-import { MalformedSessionError, type HistorySource } from "./history/source.js";
-import type { Card, FamilyRollup, LeaseInfo, PartTextRow, Store } from "./store.js";
+import {
+  addReadCounts,
+  emptyReadCounts,
+  MalformedSessionError,
+  type HistoryReadCounts,
+  type HistorySource,
+  type MessagePage,
+} from "./history/source.js";
+import type {
+  Card,
+  CardWrite,
+  FamilyRollup,
+  LeaseInfo,
+  PartTextRow,
+  RangeHash,
+  Store,
+} from "./store.js";
 import type { FetchGate } from "./fetch-gate.js";
 import { isSelfToolPart, toolNameMatches, isSummarizerTitle } from "./extract.js";
 import { tokenize } from "./normalize.js";
@@ -14,6 +29,7 @@ import {
   stripSubagentPrefix,
 } from "./digest.js";
 import { containsErrorPattern } from "./bm25.js";
+import { cyrb53 } from "./hash.js";
 
 /**
  * The distiller: the write side of the card + slim-part store.
@@ -83,6 +99,15 @@ class RetryFailed extends Error {
   }
 }
 
+/** Rows one range hash covers at most: one {@link DistillSync.rangeDigest}
+ *  read. */
+const RANGE_ROWS = 500;
+/** A `seq` below every history row's (they are non-negative). */
+const BEFORE_FIRST_SEQ = -1;
+/** Cards the range check looks at, at most, per poll while it searches for
+ *  one it may check. With the one digest it reads, this is its budget. */
+const RECONCILE_SCAN_LIMIT = 64;
+
 /** With `yieldBetween`, long store sweeps pause after this many writes. */
 const YIELD_EVERY_WRITES = 50;
 /** With `yieldBetween`, a poll's dispatch pauses after this many signals. */
@@ -116,6 +141,8 @@ export type DistillSessionMeta = {
   model: string | null;
   timeCreated: number;
   timeUpdated: number;
+  /** When the session was archived; absent or null when it is not. */
+  timeArchived?: number | null;
 };
 
 export type DeriveCardInput = {
@@ -156,6 +183,129 @@ const SKIP_LOG_LIMIT = 3;
  *  is reported instead (`stalled`). The holder refreshes it at least every
  *  heartbeat while a pass runs. */
 export const PROGRESS_STALE_MS = 5 * 60_000;
+
+/** Meta key where the lease holder shares the repair sweep's progress
+ *  ({@link RepairProgress}, as JSON), so every process can report it. */
+export const REPAIR_PROGRESS_KEY = "repair_progress";
+/** Meta key naming the projector generation the stored repair reasons were
+ *  recorded under. A distiller at a higher generation clears them before it
+ *  records its first reason or runs its first sweep, so every card a previous
+ *  generation could not repair is tried again and no reason recorded at the
+ *  current generation is lost. */
+export const REPAIR_GEN_KEY = "repair_gen";
+
+/** The repair sweep's progress: it rebuilds every card below the projector
+ *  generation (see {@link Store.staleCards}). */
+export type RepairProgress = {
+  /** Stale cards not yet rebuilt or marked repair-pending (at the end of a
+   *  sweep: the store's stale cards, counted again). */
+  pending: number;
+  /** Cards with a repair reason, which the sweep leaves alone. */
+  repairPending: number;
+  /** Cards the running (or last) sweep rebuilt. */
+  done: number;
+  /** The projector generation the sweep rebuilds to. */
+  gen: number;
+  /** When this was shared. */
+  at: number;
+  /** Whether a sweep is running. A running sweep's holder refreshes `at` at
+   *  least every heartbeat; {@link Distiller.repair} reports one whose `at`
+   *  is older than {@link PROGRESS_STALE_MS} as `stalled` instead. */
+  running: boolean;
+  stalled?: true;
+};
+
+/** Parse a {@link REPAIR_PROGRESS_KEY} value; undefined when malformed. */
+export function parseRepairProgress(raw: string | undefined): RepairProgress | undefined {
+  if (!raw) return undefined;
+  try {
+    const { pending, repairPending, done, gen, at, running } = JSON.parse(raw) as Record<
+      string,
+      unknown
+    >;
+    if (
+      !finite(pending) ||
+      !finite(repairPending) ||
+      !finite(done) ||
+      !finite(gen) ||
+      !finite(at) ||
+      typeof running !== "boolean"
+    ) {
+      return undefined;
+    }
+    return { pending, repairPending, done, gen, at, running };
+  } catch {
+    return undefined;
+  }
+}
+
+/** What a distiller reports about card repair ({@link Distiller.repair}). */
+export type RepairStatus = {
+  sweep?: RepairProgress;
+  reconcile?: ReconcileProgress;
+};
+
+/** Meta key where the lease holder keeps the range check's position and
+ *  counters ({@link ReconcileProgress}, as JSON), so the check resumes where
+ *  it stopped after a restart or a lease handoff and every process can report
+ *  it. */
+export const RECONCILE_PROGRESS_KEY = "reconcile_progress";
+
+/**
+ * The range check's state. It walks every eligible card in session id order,
+ * one range per poll; a walk over all of them is a sweep.
+ */
+export type ReconcileProgress = {
+  /** Completed sweeps. Range hashes record this value as their `sweepGen`
+   *  when written, and again when a check confirms them. */
+  sweep: number;
+  /** The oldest unchecked range of the running sweep: the card being
+   *  walked (null at the start of a sweep) and the `seq` after which its
+   *  next range starts (null at the start of the card). */
+  session: string | null;
+  after: number | null;
+  /** When the running sweep started. */
+  startedAt: number;
+  /** When the previous sweep started, null before one completes. Every
+   *  range the running sweep has not reached was checked or recorded no
+   *  earlier than this, so it bounds how long a change only this check can
+   *  find waits. */
+  previousStartedAt: number | null;
+  /** Ranges checked, and those that did not match (each dispatched a full
+   *  re-index), in the running sweep. */
+  checked: number;
+  mismatched: number;
+  /** When the last range was checked (0 before the first). */
+  at: number;
+};
+
+function finite(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value);
+}
+
+/** Parse a {@link RECONCILE_PROGRESS_KEY} value; undefined when malformed. */
+export function parseReconcileProgress(raw: string | undefined): ReconcileProgress | undefined {
+  if (!raw) return undefined;
+  try {
+    const v = JSON.parse(raw) as Record<string, unknown>;
+    const { sweep, session, after, startedAt, previousStartedAt, checked, mismatched, at } = v;
+    if (
+      !finite(sweep) ||
+      !(session === null || typeof session === "string") ||
+      !(after === null || finite(after)) ||
+      !finite(startedAt) ||
+      !(previousStartedAt === null || finite(previousStartedAt)) ||
+      !finite(checked) ||
+      !finite(mismatched) ||
+      !finite(at)
+    ) {
+      return undefined;
+    }
+    return { sweep, session, after, startedAt, previousStartedAt, checked, mismatched, at };
+  } catch {
+    return undefined;
+  }
+}
 
 /** Parse a {@link COLD_PASS_PROGRESS_KEY} value; undefined when malformed.
  *  `running: false` means the pass that wrote it ended without completing
@@ -282,6 +432,52 @@ export type DistillSync = {
   /** How often the lease holder's poll also drops cards of sessions the host
    *  no longer has ({@link DistillSync.missing}); the cold pass does it too. */
   readonly reconcileEveryMs: number;
+  /**
+   * A session's rows after `afterSeq`, ascending by `seq`, at most `limit`,
+   * each with the state of its part rows. Fewer than `limit` rows means the
+   * session ends there, so a caller never asks for more than the host's cap
+   * (500 on v2). The range hashes and the range check are built from these.
+   * Absent: the host keeps no range hashes.
+   */
+  rangeDigest?(sessionID: string, afterSeq: number, limit: number): Promise<RangeRow[]>;
+  /** Of `sessionIDs`, those with part rows. */
+  withParts?(sessionIDs: string[]): Promise<Set<string>>;
+  /** A message's `seq`, or null when the session has no such message. */
+  seqOf?(sessionID: string, messageID: string): Promise<number | null>;
+  /** What a stored checkpoint records, or null when it is not one. */
+  inspect?(cursor: string | null | undefined): CheckpointInfo | null;
+  /** `cursor` with what a write learned recorded in it: the lowest `seq` it
+   *  read when it stopped at the row cap, and the messages it left cut. */
+  annotate?(cursor: string, info: { floor?: number; cut?: number }): string;
+};
+
+/** One history row as {@link DistillSync.rangeDigest} reads it. */
+export type RangeRow = {
+  seq: number;
+  id: string;
+  timeUpdated: number;
+  /** Part rows of the message, their newest `time_updated` (0 when none)
+   *  and their distinct types, sorted. */
+  parts: number;
+  partsUpdated: number;
+  partTypes: string[];
+};
+
+/** What a stored checkpoint records ({@link DistillSync.inspect}). */
+export type CheckpointInfo = {
+  /** Format version. Version 1 is an older build's and makes the card
+   *  stale. */
+  version: number;
+  /** `seq` of the newest row the checkpoint describes. */
+  seq: number;
+  /** Whether the tail was settled when the checkpoint was taken. */
+  settled: boolean;
+  /** The lowest `seq` the card's last full write read, when it stopped at
+   *  the per-session row cap; rows below it are not in the card. */
+  floor?: number;
+  /** Messages the card holds cut short: each ends in a placeholder that says
+   *  what was left out, and nothing past it is indexed. */
+  cut?: number;
 };
 
 export type Distiller = {
@@ -311,6 +507,13 @@ export type Distiller = {
    * count; no lease read and no map scan.
    */
   indexing(): IndexingProgress | undefined;
+  /**
+   * The repair sweep's and the range check's progress, as the lease holder
+   * shares them in meta, so every process reports the same. Undefined when
+   * the host stamps no projector generation (neither runs). Query-path cost:
+   * two meta reads.
+   */
+  repair(): RepairStatus | undefined;
 };
 
 export type DistillerOptions = {
@@ -332,6 +535,16 @@ export type DistillerOptions = {
   /** Representation generation recorded in the distill-lease value
    *  ({@link import("./embedding-text.js").EMBED_REPRESENTATION}). Defaults to 0. */
   gen?: number;
+  /**
+   * The host's history projector generation, stamped on every card this
+   * distiller writes in full ({@link Card.projectorGen}). Only a host that
+   * versions its projection passes one (v2). With it, and with a `sync`
+   * that reads range digests, the distiller also records range hashes on
+   * every write, repairs stale cards in a sweep after each cold pass and
+   * checks one range per poll for changes no poll window sees. Absent: none
+   * of that runs.
+   */
+  projectorGen?: number;
   // ── Test affordances: default to the spec values above ──
   /** Messages per page fetch (spec: 50). */
   pageMessages?: number;
@@ -503,6 +716,120 @@ export function distillFields(part: Part): DistillField[] {
     default:
       return [];
   }
+}
+
+/** Slim-index rows a message contributes. */
+function rowsOf(msg: HistoryMessage): number {
+  let rows = 0;
+  for (const part of msg.parts) rows += distillFields(part).length;
+  return rows;
+}
+
+/** What one distiller read of a session returned. */
+type SessionRead = {
+  messages: HistoryMessage[];
+  /** Messages still cut short once their continuations were followed. */
+  cut: number;
+  /** What the read's pages could not project faithfully, summed. */
+  counts: HistoryReadCounts;
+  /** The lowest `seq` read, when the read stopped at the per-session row cap
+   *  with older messages left. */
+  floor?: number;
+};
+
+/** A session's rows as a write digested them before its read, in groups of
+ *  one digest read each, and the range-check sweep current at the time. */
+type Digest = { groups: RangeRow[][]; sweepGen: number };
+
+/**
+ * Why a read's projection is known to have lost content, or undefined: part
+ * rows of a type the projector does not read (every assistant content type
+ * carries content), or completed assistant messages that projected nothing
+ * although part rows were read for them.
+ */
+function lossOf(counts: HistoryReadCounts): string | undefined {
+  const found: string[] = [];
+  if (counts.unknownPartTypes > 0) {
+    found.push(`${counts.unknownPartTypes} part rows of unknown types`);
+  }
+  if (counts.emptyWithParts > 0) {
+    found.push(`${counts.emptyWithParts} completed assistant messages empty despite part rows`);
+  }
+  return found.length > 0 ? `projection lost content: ${found.join(", ")}` : undefined;
+}
+
+/** The hash a range of rows is recorded and checked under. */
+function rangeHashOf(rows: RangeRow[]): string {
+  return cyrb53(
+    rows
+      .map(
+        (r) =>
+          `${r.seq}\t${r.id}\t${r.timeUpdated}\t${r.parts}\t${r.partsUpdated}\t${r.partTypes.join(",")}`,
+      )
+      .join("\n"),
+  );
+}
+
+/** What one range check found ({@link compareSpans}). */
+type SpanCheck = {
+  /** Stored spans the read holds in full and that still match. */
+  confirmed: RangeHash[];
+  /** The `seq` through which the card is now checked. */
+  verified: number;
+  /** Whether everything through the checkpoint is checked. */
+  done: boolean;
+  /** The first difference: where it starts and what it is. */
+  mismatch?: { seq: number; reason: string };
+};
+
+/**
+ * Compare one digest read with a card's stored range hashes. `rows` are the
+ * session's rows after `start` in `seq` order, at most {@link RANGE_ROWS}, a
+ * shorter read meaning the session ends there; `end` is the checkpoint's
+ * `seq`. The stored spans are walked by their recorded boundaries from
+ * `start` towards `end`, and each must hold exactly the rows it recorded:
+ * rows gone from a span (a whole span deleted included), a changed row, a row
+ * outside every span, or a span that starts at or below `start` (one that
+ * covers rows below the card's floor) is a mismatch. The walk stops at a
+ * span the read does not reach, to go on from `verified` next time.
+ */
+function compareSpans(rows: RangeRow[], spans: RangeHash[], start: number, end: number): SpanCheck {
+  const complete = rows.length < RANGE_ROWS;
+  const lastRead = rows.length > 0 ? rows[rows.length - 1]!.seq : start;
+  const confirmed: RangeHash[] = [];
+  let verified = start;
+  let k = 0;
+  const differ = (seq: number, reason: string): SpanCheck => ({
+    confirmed,
+    verified,
+    done: false,
+    mismatch: { seq, reason },
+  });
+  for (const span of spans) {
+    if (span.endSeq <= start) continue;
+    if (span.startSeq > end) break;
+    if (span.startSeq <= start) return differ(span.startSeq, "hash starts below the floor");
+    const next = rows[k];
+    if (next && next.seq < span.startSeq) return differ(next.seq, "no stored hash");
+    if (span.endSeq > lastRead && !complete) {
+      // A span holds at most one read's rows, so only rows added inside it
+      // can keep the first one out of reach.
+      if (confirmed.length === 0) return differ(span.startSeq, "hash differs");
+      return { confirmed, verified, done: false };
+    }
+    const inSpan: RangeRow[] = [];
+    while (k < rows.length && rows[k]!.seq <= span.endSeq) inSpan.push(rows[k++]!);
+    if (inSpan.length < span.rowCount) return differ(span.startSeq, "rows missing");
+    if (inSpan.length > span.rowCount || rangeHashOf(inSpan) !== span.hash) {
+      return differ(span.startSeq, "hash differs");
+    }
+    confirmed.push(span);
+    verified = span.endSeq;
+    if (verified >= end) return { confirmed, verified, done: true };
+  }
+  const unhashed = rows[k];
+  if (unhashed && unhashed.seq <= end) return differ(unhashed.seq, "no stored hash");
+  return { confirmed, verified, done: complete || lastRead >= end };
 }
 
 // ── Card derivation ──────────────────────────────────────────────────────────
@@ -832,6 +1159,9 @@ function assembleCard(
     // existing summary across re-distills).
     nlSummary: "",
     summaryHash: "",
+    // A full write stores this over the stored value, so it always comes
+    // from the session.
+    ...(session.timeArchived != null && { timeArchived: session.timeArchived }),
   };
   return { card, rows };
 }
@@ -840,8 +1170,9 @@ function assembleCard(
 
 function toMeta(session: HistorySession): DistillSessionMeta {
   const record = session as unknown as Record<string, unknown>;
-  const time = (record.time ?? {}) as { created?: number; updated?: number };
+  const time = (record.time ?? {}) as { created?: number; updated?: number; archived?: number };
   return {
+    ...(typeof time.archived === "number" && { timeArchived: time.archived }),
     id: typeof record.id === "string" ? record.id : "",
     parentId: typeof record.parentID === "string" ? record.parentID : null,
     title: typeof record.title === "string" ? record.title : "",
@@ -879,6 +1210,7 @@ export function createDistiller(options: DistillerOptions): Distiller {
       onEvent() {},
       status: noopStatus,
       indexing: () => undefined,
+      repair: () => undefined,
     };
   }
   const store: Store = options.store;
@@ -895,6 +1227,7 @@ export function createDistiller(options: DistillerOptions): Distiller {
   // Recorded in the lease value for cross-process diagnosis; no behavioral effect.
   const build = options.build ?? "unknown";
   const gen = options.gen ?? 0;
+  const projectorGen = options.projectorGen;
   const caps = {
     ftsRowsPerSession: limits.ftsRowsPerSession,
     inventoryTokens: limits.inventoryTokens,
@@ -922,6 +1255,16 @@ export function createDistiller(options: DistillerOptions): Distiller {
   /** The poll in flight, if any: stop() waits for it, so no read of the
    *  history outlives the stop (the host closes the handle after it). */
   let pollPromise: Promise<void> | undefined;
+  /** The repair sweep in flight, if any (stop() waits for it too), the
+   *  timer that retries a sweep some sessions failed in, and the sessions
+   *  the sweep is rebuilding now: a re-distill signaled for one of them runs
+   *  after it, like one signaled during another re-distill. */
+  let sweepPromise: Promise<void> | undefined;
+  let sweepRetryTimer: ReturnType<typeof setTimeout> | undefined;
+  const sweeping = new Set<string>();
+  /** The progress this holder last shared, refreshed on each heartbeat while
+   *  its sweep runs. */
+  let sweepProgress: RepairProgress | undefined;
   const inFlight = new Map<string, Promise<void>>();
   const pendingRerun = new Set<string>();
   /** Sync hosts only: sessions waiting for a re-distill slot. A poll can
@@ -1071,22 +1414,71 @@ export function createDistiller(options: DistillerOptions): Distiller {
     return toMeta(lookup.value);
   }
 
+  /**
+   * Follow a message a read cut short (`partial`) through its continuations
+   * (`getMessage` from its next part ordinal), so the card gets the whole
+   * message. Each continuation replaces the message's last part, which is
+   * always the cut placeholder, with the parts it read. It stops, leaving the
+   * message partial, once the session's rows reach `maxRows` (counting
+   * `rowsBefore` from the rest of the read), when the source cannot continue
+   * (`unsupported`, a vanished message), or when the lease is lost. The
+   * continuations are strict, as the page read is, so a part whose data does
+   * not decode rejects as a malformed session, and what they could not
+   * project is added to `counts` for the loss guard.
+   */
+  async function completeMessage(
+    sessionID: string,
+    msg: HistoryMessage,
+    rowsBefore: number,
+    maxRows: number,
+    counts: HistoryReadCounts,
+  ): Promise<HistoryMessage> {
+    let current = msg;
+    while (current.partial) {
+      if (stopped || !leaseHeld) return current;
+      if (rowsBefore + rowsOf(current) >= maxRows) return current;
+      if (limits.distillDelayMs > 0) {
+        await sleep(limits.distillDelayMs);
+        if (stopped || !leaseHeld) return current;
+      }
+      const from = current.partial.nextOrdinal;
+      const next = await gate.runBackground(() => {
+        if (stopped || !leaseHeld) return Promise.resolve(null);
+        return source.getMessage(sessionID, msg.info.id, { partOrdinal: from, strict: true });
+      });
+      if (!next?.ok) return current;
+      if (next.counts) addReadCounts(counts, next.counts);
+      const parts = [...current.parts.slice(0, -1), ...next.value.parts];
+      const partial = next.value.partial;
+      current = partial ? { info: msg.info, parts, partial } : { info: msg.info, parts };
+      // A continuation always moves past at least one part row; one that does
+      // not cannot finish the message.
+      if (partial && partial.nextOrdinal <= from) return current;
+    }
+    return current;
+  }
+
+  /** Add a page's read counts to a read's running total. */
+  function countPage(into: HistoryReadCounts, page: MessagePage): void {
+    if (page.counts) addReadCounts(into, page.counts);
+  }
+
   /** Page a session newest-first, stopping once `maxRows` human-layer rows have
    *  accrued so a giant session never forces a full fetch (its newest rows win
    *  the per-session cap). */
-  async function fetchSessionMessages(
-    sessionID: string,
-    maxRows: number,
-  ): Promise<HistoryMessage[]> {
+  async function fetchSessionMessages(sessionID: string, maxRows: number): Promise<SessionRead> {
     const all: HistoryMessage[] = [];
+    const counts = emptyReadCounts();
     let cursor: string | undefined;
     let rowCount = 0;
+    let cut = 0;
     let first = true;
+    const read = (): SessionRead => ({ messages: all, cut, counts });
     do {
-      if (stopped || !leaseHeld) return all;
+      if (stopped || !leaseHeld) return read();
       if (!first && limits.distillDelayMs > 0) {
         await sleep(limits.distillDelayMs);
-        if (stopped || !leaseHeld) return all;
+        if (stopped || !leaseHeld) return read();
       }
       first = false;
       const before = cursor;
@@ -1094,10 +1486,15 @@ export function createDistiller(options: DistillerOptions): Distiller {
         if (stopped || !leaseHeld) return Promise.resolve({ items: [], nextCursor: null });
         return source.messagePage({ sessionID, limit: pageMessages, before, strict: true });
       });
+      countPage(counts, page);
       try {
-        for (const msg of page.items) {
+        for (const item of page.items) {
+          const msg = item.partial
+            ? await completeMessage(sessionID, item, rowCount, maxRows, counts)
+            : item;
+          if (msg.partial) cut++;
           all.push(msg);
-          for (const part of msg.parts) rowCount += distillFields(part).length;
+          rowCount += rowsOf(msg);
         }
       } catch (error) {
         // Only a TypeError here is a data-shape failure (e.g. `parts` missing
@@ -1110,27 +1507,47 @@ export function createDistiller(options: DistillerOptions): Distiller {
       }
       cursor = page.nextCursor ?? undefined;
     } while (cursor && rowCount < maxRows);
-    return all;
+    // Stopped at the row cap with older pages left: rows below the oldest
+    // message read are not in the card.
+    if (cursor) {
+      let floor: number | undefined;
+      for (const msg of all) {
+        const seq = msg.info.seq;
+        if (typeof seq === "number" && (floor === undefined || seq < floor)) floor = seq;
+      }
+      if (floor !== undefined) return { ...read(), floor };
+    }
+    return read();
   }
 
   /** Page newest-first collecting only messages newer than `checkpoint`, halting
    *  as soon as the checkpoint message is reached. `reached` is false when the
    *  pages exhausted without ever seeing the checkpoint (it was compacted/removed
    *  upstream), which means append is unsafe and the caller must fall back to a
-   *  full re-distill. */
+   *  full re-distill. A cut message is continued as in a full read, under the
+   *  same per-session row cap. */
   async function fetchNewMessages(
     sessionID: string,
     checkpoint: string,
-  ): Promise<{ messages: HistoryMessage[]; reached: boolean }> {
+  ): Promise<SessionRead & { reached: boolean }> {
     const collected: HistoryMessage[] = [];
+    const counts = emptyReadCounts();
     let cursor: string | undefined;
     let first = true;
     let reached = false;
+    let rowCount = 0;
+    let cut = 0;
+    const unreached = (): SessionRead & { reached: boolean } => ({
+      messages: collected,
+      cut,
+      counts,
+      reached: false,
+    });
     do {
-      if (stopped || !leaseHeld) return { messages: collected, reached: false };
+      if (stopped || !leaseHeld) return unreached();
       if (!first && limits.distillDelayMs > 0) {
         await sleep(limits.distillDelayMs);
-        if (stopped || !leaseHeld) return { messages: collected, reached: false };
+        if (stopped || !leaseHeld) return unreached();
       }
       first = false;
       const before = cursor;
@@ -1138,13 +1555,19 @@ export function createDistiller(options: DistillerOptions): Distiller {
         if (stopped || !leaseHeld) return Promise.resolve({ items: [], nextCursor: null });
         return source.messagePage({ sessionID, limit: pageMessages, before, strict: true });
       });
+      countPage(counts, page);
       try {
-        for (const msg of page.items) {
-          if (msg.info.id === checkpoint) {
+        for (const item of page.items) {
+          if (item.info.id === checkpoint) {
             reached = true;
             break;
           }
+          const msg = item.partial
+            ? await completeMessage(sessionID, item, rowCount, caps.ftsRowsPerSession, counts)
+            : item;
+          if (msg.partial) cut++;
           collected.push(msg);
+          rowCount += rowsOf(msg);
         }
       } catch (error) {
         // TypeError only, matching fetchSessionMessages: a data-shape failure
@@ -1156,7 +1579,7 @@ export function createDistiller(options: DistillerOptions): Distiller {
       }
       cursor = reached ? undefined : (page.nextCursor ?? undefined);
     } while (cursor);
-    return { messages: collected, reached };
+    return { messages: collected, cut, counts, reached };
   }
 
   /**
@@ -1214,10 +1637,194 @@ export function createDistiller(options: DistillerOptions): Distiller {
     });
   }
 
-  /** Stamp a derived card with its checkpoint (sync hosts only; v1 cards keep
-   *  their exact shape). */
-  function withCheckpoint(card: Card, checkpoint: DistillCheckpoint | null): Card {
-    return sync ? { ...card, distillCursor: checkpoint?.cursor ?? null } : card;
+  /** A checkpoint's cursor with what the write learned recorded in it, or
+   *  null without a checkpoint. */
+  function cursorOf(
+    checkpoint: DistillCheckpoint | null,
+    info: { floor?: number; cut?: number },
+  ): string | null {
+    if (!checkpoint) return null;
+    return sync?.annotate ? sync.annotate(checkpoint.cursor, info) : checkpoint.cursor;
+  }
+
+  /** Stamp a card with the projector generation (when the host has one) and
+   *  its checkpoint (sync hosts only; v1 cards keep their exact shape). */
+  function stampCard(
+    card: Card,
+    checkpoint: DistillCheckpoint | null,
+    info: { floor?: number; cut?: number } = {},
+  ): Card {
+    const stamped = projectorGen === undefined ? card : { ...card, projectorGen };
+    return sync ? { ...stamped, distillCursor: cursorOf(checkpoint, info) } : stamped;
+  }
+
+  /** Whether this distiller records range hashes and checks ranges. */
+  const rangesOn = projectorGen !== undefined && sync?.rangeDigest !== undefined;
+
+  /**
+   * Whether a card needs rebuilding at this distiller's projector generation:
+   * it names none or a lower one, or its checkpoint is version 1, which only
+   * an older build writes (the same test as {@link Store.staleCards}, which
+   * also leaves out repair-pending cards). Never true without a generation.
+   */
+  function belowGeneration(card: Card): boolean {
+    if (projectorGen === undefined) return false;
+    if (card.projectorGen == null || card.projectorGen < projectorGen) return true;
+    return sync?.inspect?.(card.distillCursor)?.version === 1;
+  }
+
+  /** The `sweepGen` a range hash recorded now carries. */
+  function currentSweepGen(): number {
+    return parseReconcileProgress(store.getMeta(RECONCILE_PROGRESS_KEY))?.sweep ?? 0;
+  }
+
+  /**
+   * A session's rows after `afterSeq`, in groups of up to
+   * {@link RANGE_ROWS} rows (one digest read each), for a write to record as
+   * range hashes ({@link spansOf}). A write takes them before it reads
+   * anything else, so a row that changes between this digest and the
+   * write's own read is recorded with its older state and fails the next
+   * range check. Undefined when range hashes are off, or when the lease was
+   * lost or the distiller stopped mid-digest (the write does not happen
+   * then).
+   */
+  async function digestSpans(sessionID: string, afterSeq: number): Promise<Digest | undefined> {
+    const digest = sync?.rangeDigest;
+    if (!rangesOn || !digest) return undefined;
+    const sweepGen = currentSweepGen();
+    const groups: RangeRow[][] = [];
+    let after = afterSeq;
+    for (;;) {
+      const rows = await gate.runBackground(() => {
+        if (stopped || !leaseHeld) return Promise.resolve<RangeRow[] | null>(null);
+        return digest(sessionID, after, RANGE_ROWS);
+      });
+      if (rows === null) return undefined;
+      if (rows.length === 0) break;
+      groups.push(rows);
+      // A short read is the end of the session.
+      if (rows.length < RANGE_ROWS) break;
+      after = rows[rows.length - 1]!.seq;
+    }
+    return { groups, sweepGen };
+  }
+
+  /**
+   * The range hashes of a digest, each group trimmed to the rows at or above
+   * `floor` (a group left empty is dropped), so the first one starts at the
+   * write's floor and no hash covers a row below it.
+   */
+  function spansOf(digest: Digest, floor: number | undefined): RangeHash[] {
+    const spans: RangeHash[] = [];
+    for (const group of digest.groups) {
+      const rows = floor === undefined ? group : group.filter((row) => row.seq >= floor);
+      if (rows.length === 0) continue;
+      spans.push({
+        startSeq: rows[0]!.seq,
+        endSeq: rows[rows.length - 1]!.seq,
+        rowCount: rows.length,
+        hash: rangeHashOf(rows),
+        sweepGen: digest.sweepGen,
+      });
+    }
+    return spans;
+  }
+
+  /**
+   * The digest a write takes before its read, or undefined to keep the
+   * stored hashes. Only a tail that is settled now is worth a digest: a
+   * write that reads a running tail stores an unsettled checkpoint, which the
+   * range check never checks, and the first write over a settled tail takes
+   * its own digest and replaces the hashes. Nor is a repair-pending card's:
+   * its re-reads are usually kept by the loss guard, which writes no hashes,
+   * so a whole-session digest on each of them would be wasted work that
+   * grows with the session. A re-read that does replace the card leaves the
+   * stored hashes, the range check finds them out of date and the re-index it
+   * dispatches takes the digest.
+   */
+  async function digestFor(
+    sessionID: string,
+    before: DistillCheckpoint | null,
+    afterSeq: number,
+  ): Promise<Digest | undefined> {
+    if (!before?.settled) return undefined;
+    if (store.getCard(sessionID)?.repairReason !== undefined) return undefined;
+    return digestSpans(sessionID, afterSeq);
+  }
+
+  /**
+   * Make the stored repair reasons this distiller's projector generation's,
+   * before it records one or the sweep reads the stale set. When
+   * {@link REPAIR_GEN_KEY} names no generation or a lower one, every reason
+   * belongs to an earlier generation: they are cleared, so those cards are
+   * tried again, and this generation is stamped. Every reason this distiller
+   * records is preceded by this call, so a reason recorded at the current
+   * generation (by the cold pass, a re-distill or the sweep) is never
+   * cleared. A higher stamp is a newer build's, whose reasons are left
+   * alone. No-op without a projector generation.
+   */
+  function adoptRepairGeneration(): void {
+    if (projectorGen === undefined) return;
+    const raw = store.getMeta(REPAIR_GEN_KEY);
+    const stamped = raw !== undefined && /^-?\d+$/.test(raw) ? Number(raw) : undefined;
+    if (stamped !== undefined && stamped >= projectorGen) return;
+    const cleared = store.clearRepairReasons();
+    store.setMeta(REPAIR_GEN_KEY, String(projectorGen));
+    if (cleared > 0) {
+      logMsg(`cleared ${cleared} repair reason(s) for projector generation ${projectorGen}`);
+    }
+  }
+
+  /** Record a read's projection loss as the card's repair reason. */
+  function markLoss(sessionId: string, loss: string, kept: boolean): void {
+    adoptRepairGeneration();
+    store.markRepairPending(sessionId, loss);
+    logMsg(`session ${sessionId} ${kept ? "kept its card" : "is repair-pending"}: ${loss}`);
+  }
+
+  /**
+   * Store a full derivation with its checkpoint, the generation and, with a
+   * `digest`, its range hashes trimmed to the read's floor, which replace
+   * every hash stored for the session in the same transaction (hashes of an
+   * earlier write can start at seqs this one's do not, rows removed since,
+   * and a range check must never find them). Without a digest the stored
+   * hashes are kept. Returns the store's verdict.
+   *
+   * The loss guard: when the read shows the projection lost content
+   * ({@link lossOf}), an existing card is kept as it is, nothing is written
+   * and the card gets the loss as its repair reason (`kept`), which takes it
+   * out of the stale set until a projector generation bump clears it. With no
+   * card to keep, the card is written and then marked the same way. The
+   * read's counts are in the source's drift state already.
+   */
+  function writeFull(
+    session: DistillSessionMeta,
+    derived: DerivedCard,
+    read: SessionRead,
+    checkpoint: DistillCheckpoint | null,
+    moved: boolean,
+    digest: Digest | undefined,
+  ): CardWrite & { kept?: string } {
+    const loss = lossOf(read.counts);
+    if (loss && store.getCard(session.id)) {
+      markLoss(session.id, loss, true);
+      // The tail read is current even though the card is kept, so a session
+      // whose turn has ended stops being re-read on every poll.
+      noteSettled(session.id, checkpoint, moved);
+      return { changed: false, kept: loss };
+    }
+    const card = stampCard(derived.card, checkpoint, { floor: read.floor, cut: read.cut });
+    const rangeHashes = digest ? spansOf(digest, read.floor) : undefined;
+    const result = store.replaceSessionParts(
+      session.id,
+      derived.rows,
+      card,
+      rangeHashes ? { rangeHashes, replaceRangeHashes: true } : undefined,
+    );
+    // An accepted replace clears the repair reason, so the mark follows it.
+    if (loss && !result.refused) markLoss(session.id, loss, false);
+    noteSettled(session.id, checkpoint, moved);
+    return { changed: result.changed };
   }
 
   function noteSettled(
@@ -1306,17 +1913,18 @@ export function createDistiller(options: DistillerOptions): Distiller {
 
   // ── Distill one session ──
 
-  async function distillFull(session: DistillSessionMeta): Promise<void> {
+  async function distillFull(session: DistillSessionMeta): Promise<CardWrite & { kept?: string }> {
     const before = await fetchCheckpoint(session.id);
-    const messages = await fetchSessionMessages(session.id, caps.ftsRowsPerSession);
+    const digest = await digestFor(session.id, before, BEFORE_FIRST_SEQ);
+    const read = await fetchSessionMessages(session.id, caps.ftsRowsPerSession);
     const { checkpoint, moved } = await bracketCheckpoint(session.id, before);
     // Cheap flag check before parentChainOf touches the store: a detached
     // continuation (the fetch settled after dispose's bounded wait) must not
     // read SQLite, which may already be closed.
-    if (stopped || !leaseHeld) return;
-    const { card, rows } = await derive({
+    if (stopped || !leaseHeld) return { changed: false };
+    const derived = await derive({
       session,
-      messages,
+      messages: read.messages,
       parentById: parentChainOf(session),
       caps,
     });
@@ -1325,96 +1933,230 @@ export function createDistiller(options: DistillerOptions): Distiller {
     // suspended past the TTL can lose the lease to a rival before its heartbeat
     // callback ever runs; the resumed fetch must not replace the new holder's
     // rows. One leaseStatus() read per write batch.
-    if (stopped || !ownsLease()) return;
-    store.replaceSessionParts(session.id, rows, withCheckpoint(card, checkpoint));
-    noteSettled(session.id, checkpoint, moved);
+    if (stopped || !ownsLease()) return { changed: false };
+    return writeFull(session, derived, read, checkpoint, moved, digest);
   }
 
-  async function distillAppend(session: DistillSessionMeta, oldCard: Card): Promise<void> {
-    const checkpoint = oldCard.distilledThrough;
-    if (!checkpoint) {
-      await distillFull(session);
-      return;
+  /**
+   * The floor of a card after an append adds `newRows` slim-index rows to
+   * the stored ones (oldest first, as the store inserts them). Under the
+   * per-session row cap the store evicts the oldest rows, so the floor moves
+   * up to the message that owns the oldest row left (its `seq` from the
+   * appended messages, or read from the history for a stored one).
+   * Otherwise the card keeps the floor it had. `null` when that message is
+   * gone from the history, so the stored rows no longer describe the
+   * session; `aborted` when the lease was lost. Only the range check reads
+   * the floor, so without range hashes the card keeps its floor and this
+   * reads nothing.
+   */
+  async function floorAfterAppend(
+    sessionID: string,
+    stored: number | undefined,
+    newRows: PartTextRow[],
+    appended: HistoryMessage[],
+  ): Promise<{ floor: number | undefined } | null | "aborted"> {
+    const cap = caps.ftsRowsPerSession;
+    if (!rangesOn || cap <= 0) return { floor: stored };
+    const kept = store.sessionRowCount(sessionID);
+    const evicted = kept + newRows.length - cap;
+    if (evicted <= 0) return { floor: stored };
+    const owner =
+      evicted >= kept
+        ? newRows[evicted - kept]?.messageId
+        : store.sessionRowMessage(sessionID, evicted);
+    if (owner === undefined) return { floor: stored };
+    let seq = appended.find((msg) => msg.info.id === owner)?.info.seq;
+    const seqOf = sync.seqOf;
+    if (seq === undefined && seqOf) {
+      const found = await gate.runBackground(() => {
+        if (stopped || !leaseHeld) return Promise.resolve<number | null | "aborted">("aborted");
+        return seqOf(sessionID, owner);
+      });
+      if (found === "aborted") return "aborted";
+      if (found === null) return null;
+      seq = found;
     }
+    if (seq === undefined) return { floor: stored };
+    return { floor: stored === undefined ? seq : Math.max(stored, seq) };
+  }
+
+  /**
+   * A session's stored range hashes once its floor moves up to `floor`:
+   * spans wholly below it are dropped, and the one span that holds rows on
+   * both sides of it is trimmed to the rows at or above it. That span is
+   * read again first and trimmed only when it still matches its stored hash,
+   * so a change the range check would have found is not hashed away;
+   * `changed` when it no longer matches, `aborted` when the lease was lost.
+   */
+  async function spansAboveFloor(
+    sessionID: string,
+    floor: number,
+  ): Promise<RangeHash[] | "changed" | "aborted"> {
+    const digest = sync?.rangeDigest;
+    const kept: RangeHash[] = [];
+    for (const span of store.getRangeHashes(sessionID)) {
+      if (span.endSeq < floor) continue;
+      if (span.startSeq >= floor) {
+        kept.push(span);
+        continue;
+      }
+      if (!digest) return "changed";
+      const rows = await gate.runBackground(() => {
+        if (stopped || !leaseHeld) return Promise.resolve<RangeRow[] | null>(null);
+        return digest(sessionID, span.startSeq - 1, span.rowCount);
+      });
+      if (rows === null) return "aborted";
+      const inSpan = rows.filter((row) => row.seq <= span.endSeq);
+      if (
+        inSpan.length !== span.rowCount ||
+        inSpan[0]?.seq !== span.startSeq ||
+        rangeHashOf(inSpan) !== span.hash
+      ) {
+        return "changed";
+      }
+      const above = inSpan.filter((row) => row.seq >= floor);
+      if (above.length === 0) continue;
+      kept.push({
+        startSeq: above[0]!.seq,
+        endSeq: above[above.length - 1]!.seq,
+        rowCount: above.length,
+        hash: rangeHashOf(above),
+        sweepGen: span.sweepGen,
+      });
+    }
+    return kept;
+  }
+
+  async function distillAppend(
+    session: DistillSessionMeta,
+    oldCard: Card,
+  ): Promise<CardWrite & { kept?: string }> {
+    const checkpoint = oldCard.distilledThrough;
+    if (!checkpoint) return distillFull(session);
     const before = await fetchCheckpoint(session.id);
-    const { messages: newMessages, reached } = await fetchNewMessages(session.id, checkpoint);
+    // The rows past the stored checkpoint are the ones this append reads.
+    const stored = sync?.inspect?.(oldCard.distillCursor) ?? null;
+    const digest = stored ? await digestFor(session.id, before, stored.seq) : undefined;
+    const fetched = await fetchNewMessages(session.id, checkpoint);
     const { checkpoint: tail, moved } = await bracketCheckpoint(session.id, before);
     // Authoritative ownership check before the append write (see distillFull);
     // only synchronous derivation sits between here and appendSessionParts.
-    if (stopped || !ownsLease()) return;
+    if (stopped || !ownsLease()) return { changed: false };
     // If the checkpoint message was never found, the newest pages are NOT a clean
     // append tail (they'd re-insert already-stored parts and hit a UNIQUE
     // violation, wedging the session). Fall back to a full re-distill.
-    if (!reached) {
-      await distillFull(session);
-      return;
+    if (!fetched.reached) return distillFull(session);
+    // The loss guard, before anything is written: an append can evict stored
+    // rows at the cap and replaces the card's aggregates, so a lossy one
+    // keeps the card, its rows and its checkpoint, as a full write does.
+    const loss = lossOf(fetched.counts);
+    if (loss) {
+      markLoss(session.id, loss, true);
+      noteSettled(session.id, tail, moved);
+      return { changed: false, kept: loss };
     }
+    // The card keeps the cut messages of the write that read its rows.
+    const cut = (stored?.cut ?? 0) + fetched.cut;
+    const newMessages = fetched.messages;
     if (newMessages.length === 0) {
+      const info = { ...(stored?.floor !== undefined && { floor: stored.floor }), cut };
       // Nothing appended. A sync host still refreshes the card's metadata and
       // checkpoint, or the cold pass would keep finding it stale.
-      if (sync) {
-        // A title or directory change also changes the embedded text, so the
-        // store drops the persisted vector with it.
-        store.refreshCardMeta(
-          session.id,
-          {
-            title: session.title,
-            directory: session.directory,
-            projectId: session.projectId,
-            timeUpdated: session.timeUpdated,
-          },
-          tail?.cursor ?? null,
-        );
-        noteSettled(session.id, tail, moved);
-      }
-      return;
+      if (!sync) return { changed: false };
+      // A title or directory change also changes the embedded text, so the
+      // store drops the persisted vector with it.
+      const result = store.refreshCardMeta(
+        session.id,
+        {
+          title: session.title,
+          directory: session.directory,
+          projectId: session.projectId,
+          timeUpdated: session.timeUpdated,
+          timeArchived: session.timeArchived ?? null,
+        },
+        cursorOf(tail, info),
+      );
+      // Rows that are not messages (a switch, an idle marker) can still move
+      // the checkpoint past the stored hashes.
+      const spans = digest ? spansOf(digest, stored?.floor) : [];
+      if (spans.length > 0) store.putRangeHashes(session.id, spans);
+      noteSettled(session.id, tail, moved);
+      return result;
     }
 
     const chrono = sortChronological(newMessages);
     const walk = walkMessages(chrono, checkpoint);
+    const placed = await floorAfterAppend(session.id, stored?.floor, walk.rows, chrono);
+    if (placed === "aborted") return { changed: false };
+    // The oldest row left belongs to a message the history no longer has.
+    if (placed === null) return distillFull(session);
+    if (stopped || !ownsLease()) return { changed: false };
+    const info = { ...(placed.floor !== undefined && { floor: placed.floor }), cut };
+    // An append that evicts more rows than the card held raises the floor
+    // into the rows it read, so its own hashes are trimmed to the floor too.
+    let rangeHashes = digest ? spansOf(digest, placed.floor) : undefined;
+    let replaceRangeHashes = false;
+    if (rangesOn && placed.floor !== undefined && placed.floor !== stored?.floor) {
+      // The append evicts rows: the stored hashes follow the floor up.
+      const kept = await spansAboveFloor(session.id, placed.floor);
+      if (kept === "aborted") return { changed: false };
+      if (kept === "changed") return distillFull(session);
+      if (stopped || !ownsLease()) return { changed: false };
+      rangeHashes = [...kept, ...(rangeHashes ?? [])];
+      replaceRangeHashes = true;
+    }
     const rootId = resolveRootId(session.id, parentChainOf(session));
     const boundary = { checkpointMessageId: checkpoint, firstNewMessageId: chrono[0]!.info.id };
 
-    store.appendSessionParts(session.id, walk.rows, caps.ftsRowsPerSession, boundary, (allRows) =>
-      withCheckpoint(
-        {
-          sessionId: session.id,
-          parentId: session.parentId,
-          rootId,
-          title: session.title,
-          slug: session.slug,
-          directory: session.directory,
-          projectId: session.projectId,
-          agent: session.agent,
-          model: session.model,
-          timeCreated: session.timeCreated,
-          timeUpdated: session.timeUpdated,
-          partCount: oldCard.partCount + walk.partCount,
-          retainedChars: allRows.reduce((sum, row) => sum + row.raw.length, 0),
-          summaryHead: oldCard.summaryHead || walk.firstUserHead,
-          outcomeHead: walk.lastTextHead || oldCard.outcomeHead,
-          inventory: deriveInventory(allRows, caps.inventoryTokens),
-          files: mergeKeepLast(oldCard.files, walk.files, FILES_CAP),
-          tools: mergeKeepFirst(oldCard.tools, walk.tools, TOOLS_CAP),
-          errors: mergeKeepFirst(oldCard.errors, walk.errors, ERRORS_CAP),
-          familyRollup: oldCard.familyRollup,
-          distillState: "full",
-          distilledThrough: walk.newestMessageId ?? checkpoint,
-          // Clear any persisted vector: the append changed the inventory and
-          // heads the embedding is derived from, so a carried-over vector would be
-          // stale. Null forces the semantic layer to recompute on the next load,
-          // matching a full re-distill (deriveCard also stores a null embedding).
-          embedding: null,
-          embeddingGen: null,
-          // Preserved by the store's card upsert (excluded from its UPDATE SET);
-          // these values apply only to a first insert.
-          nlSummary: "",
-          summaryHash: "",
-        },
-        tail,
-      ),
+    const result = store.appendSessionParts(
+      session.id,
+      walk.rows,
+      caps.ftsRowsPerSession,
+      boundary,
+      (allRows) =>
+        stampCard(
+          {
+            sessionId: session.id,
+            parentId: session.parentId,
+            rootId,
+            title: session.title,
+            slug: session.slug,
+            directory: session.directory,
+            projectId: session.projectId,
+            agent: session.agent,
+            model: session.model,
+            timeCreated: session.timeCreated,
+            timeUpdated: session.timeUpdated,
+            partCount: oldCard.partCount + walk.partCount,
+            retainedChars: allRows.reduce((sum, row) => sum + row.raw.length, 0),
+            summaryHead: oldCard.summaryHead || walk.firstUserHead,
+            outcomeHead: walk.lastTextHead || oldCard.outcomeHead,
+            inventory: deriveInventory(allRows, caps.inventoryTokens),
+            files: mergeKeepLast(oldCard.files, walk.files, FILES_CAP),
+            tools: mergeKeepFirst(oldCard.tools, walk.tools, TOOLS_CAP),
+            errors: mergeKeepFirst(oldCard.errors, walk.errors, ERRORS_CAP),
+            familyRollup: oldCard.familyRollup,
+            distillState: "full",
+            distilledThrough: walk.newestMessageId ?? checkpoint,
+            // Clear any persisted vector: the append changed the inventory and
+            // heads the embedding is derived from, so a carried-over vector would be
+            // stale. Null forces the semantic layer to recompute on the next load,
+            // matching a full re-distill (deriveCard also stores a null embedding).
+            embedding: null,
+            embeddingGen: null,
+            // Preserved by the store's card upsert (excluded from its UPDATE SET);
+            // these values apply only to a first insert.
+            nlSummary: "",
+            summaryHash: "",
+            ...(session.timeArchived != null && { timeArchived: session.timeArchived }),
+          },
+          tail,
+          info,
+        ),
+      rangeHashes ? { rangeHashes, replaceRangeHashes } : undefined,
     );
     noteSettled(session.id, tail, moved);
+    return { changed: result.changed };
   }
 
   // ── Cold pass ──
@@ -1531,6 +2273,13 @@ export function createDistiller(options: DistillerOptions): Distiller {
           if (stopped || !leaseHeld) return;
         }
         const existing = store.getCard(session.id);
+        // A card built below the projector generation is left to the repair
+        // sweep, which takes sessions with part rows first; a change to the
+        // session still re-indexes it through the per-session path.
+        if (existing && belowGeneration(existing)) {
+          countExamined(session);
+          return;
+        }
         let upToDate =
           existing?.distillState === "full" && existing.timeUpdated === session.timeUpdated;
         // A sync host also needs the tail unchanged: v2 session times do not
@@ -1545,12 +2294,14 @@ export function createDistiller(options: DistillerOptions): Distiller {
             return;
           }
 
-          let messages: HistoryMessage[];
+          let read: SessionRead;
+          let digest: Digest | undefined;
           let checkpoint: DistillCheckpoint | null;
           let moved: boolean;
           try {
             const before = await fetchCheckpoint(session.id);
-            messages = await fetchSessionMessages(session.id, caps.ftsRowsPerSession);
+            digest = await digestFor(session.id, before, BEFORE_FIRST_SEQ);
+            read = await fetchSessionMessages(session.id, caps.ftsRowsPerSession);
             ({ checkpoint, moved } = await bracketCheckpoint(session.id, before));
           } catch (error) {
             // Every error except MalformedSessionError (quarantined below)
@@ -1592,10 +2343,9 @@ export function createDistiller(options: DistillerOptions): Distiller {
           consecutiveFailures = 0;
           clearStrikesOnSuccess(session.id);
 
-          let card: Card;
-          let rows: PartTextRow[];
+          let derived: DerivedCard;
           try {
-            ({ card, rows } = await derive({ session, messages, parentById, caps }));
+            derived = await derive({ session, messages: read.messages, parentById, caps });
             if (pause) await pause();
           } catch (error) {
             // Quarantine only data-shape failures (mirroring the fetch path
@@ -1626,10 +2376,10 @@ export function createDistiller(options: DistillerOptions): Distiller {
           // the cached flag — and skip it, counting the session as not
           // distilled.
           if (stopped || !ownsLease()) return;
-          store.replaceSessionParts(session.id, rows, withCheckpoint(card, checkpoint));
-          noteSettled(session.id, checkpoint, moved);
-          distilled++;
-          distilledCount = distilled; // status counts only sessions actually distilled
+          if (writeFull(session, derived, read, checkpoint, moved, digest).kept === undefined) {
+            distilled++;
+            distilledCount = distilled; // status counts only sessions actually distilled
+          }
         } else {
           // Indexed and current (perhaps by another holder): not failing.
           clearStrikesOnSuccess(session.id);
@@ -1701,6 +2451,8 @@ export function createDistiller(options: DistillerOptions): Distiller {
         `cold pass done (${distilled} distilled / ${examined} examined / ${knownCount} known)`,
       );
       options.onColdPassDone?.();
+      // Cards below the projector generation were left to the sweep.
+      startRepairSweep();
       if (retryFailure !== undefined) {
         // Some sessions still fail: the rest is indexed, and a follow-up pass
         // (which skips everything up to date) retries them later.
@@ -1759,6 +2511,384 @@ export function createDistiller(options: DistillerOptions): Distiller {
       removed++;
     }
     if (removed > 0) logMsg(`removed ${removed} card(s) of deleted sessions`);
+  }
+
+  // ── Repair sweep (hosts with a projector generation) ──
+
+  /** Share the sweep's progress in {@link REPAIR_PROGRESS_KEY}, at most every
+   *  {@link PROGRESS_WRITE_MS} unless `force`. Holder-only. */
+  let repairWrittenAt = Number.NEGATIVE_INFINITY;
+  function shareRepair(progress: Omit<RepairProgress, "at">, force = false): void {
+    if (stopped || !leaseHeld) return;
+    const t = now();
+    sweepProgress = { ...progress, at: t };
+    if (!force && t - repairWrittenAt < PROGRESS_WRITE_MS) return;
+    if (!ownsLease()) return;
+    repairWrittenAt = t;
+    store.setMeta(REPAIR_PROGRESS_KEY, JSON.stringify(sweepProgress));
+  }
+
+  /** Start a repair sweep unless one is running (holder only, and only with
+   *  a projector generation and a sync host). */
+  function startRepairSweep(): void {
+    if (projectorGen === undefined || !sync || stopped || !leaseHeld || sweepPromise) return;
+    clearTimer(sweepRetryTimer);
+    sweepRetryTimer = undefined;
+    const running = runRepairSweep(projectorGen)
+      .catch((error: unknown) => {
+        lastError = errmsg(error);
+        logMsg(`repair sweep failed: ${lastError}`);
+        scheduleSweepRetry();
+      })
+      .finally(() => {
+        if (sweepPromise === running) sweepPromise = undefined;
+        sweepProgress = undefined;
+      });
+    sweepPromise = running;
+  }
+
+  function scheduleSweepRetry(): void {
+    if (stopped || !leaseHeld) return;
+    clearTimer(sweepRetryTimer);
+    sweepRetryTimer = setTimeout(() => {
+      sweepRetryTimer = undefined;
+      startRepairSweep();
+    }, coldPassRetryMs);
+  }
+
+  /**
+   * Rebuild one stale card. `gone` when the session no longer exists (its
+   * card is left to the deletion reconcile), `marked` when it is malformed or
+   * the loss guard kept its card (both get a repair reason), `done` when its
+   * card is now at the current generation, `skipped` when the lease was lost
+   * or another write left it stale.
+   */
+  async function repairOne(sessionId: string): Promise<"done" | "marked" | "gone" | "skipped"> {
+    try {
+      const session = await fetchSessionMeta(sessionId);
+      if (stopped || !leaseHeld) return "skipped";
+      if (!session || isSummarizerTitle(session.title)) return "gone";
+      const result = await distillFull(session);
+      if (stopped || !leaseHeld) return "skipped";
+      if (result.kept !== undefined) return "marked";
+      const card = store.getCard(sessionId);
+      return card && !belowGeneration(card) ? "done" : "skipped";
+    } catch (error) {
+      // A data-shape failure, as the cold pass quarantines it; anything else
+      // (a transport failure) leaves the card stale for the next sweep.
+      if (!(error instanceof MalformedSessionError) && !(error instanceof TypeError)) throw error;
+      if (stopped || !ownsLease()) return "skipped";
+      adoptRepairGeneration();
+      store.markRepairPending(sessionId, `malformed: ${errmsg(error)}`);
+      logMsg(`session ${sessionId} is repair-pending: ${errmsg(error)}`);
+      return "marked";
+    }
+  }
+
+  /**
+   * The repair sweep: rebuild every card below projector generation `gen`
+   * ({@link Store.staleCards}, archived sessions included), sessions with
+   * part rows first, at `distillConcurrency`, through the fetch gate behind
+   * foreground work. A session being re-distilled is skipped (that write
+   * stamps the generation too). A card leaves the stale set only when its
+   * rebuild commits or it gets a repair reason, so an interrupted sweep
+   * resumes from the store on the next one. Failing fetches leave their
+   * cards stale and arm another sweep; several in a row mean an outage and
+   * stop this one.
+   */
+  async function runRepairSweep(gen: number): Promise<void> {
+    if (stopped || !ownsLease()) return;
+    // A new generation retries every card an earlier one could not repair.
+    adoptRepairGeneration();
+    const stale = store.staleCards(gen);
+    const repairPending = (): number => store.cardStats().repairPending;
+    if (stale.length === 0) {
+      shareRepair(
+        { pending: 0, repairPending: repairPending(), done: 0, gen, running: false },
+        true,
+      );
+      return;
+    }
+    const ids = stale.map((card) => card.sessionId);
+    const withParts = sync?.withParts;
+    const bearing = withParts
+      ? await gate.runBackground(() => {
+          if (stopped || !leaseHeld) return Promise.resolve(new Set<string>());
+          return withParts(ids);
+        })
+      : new Set<string>();
+    if (stopped || !leaseHeld) return;
+    // Newest first within each group (staleCards' order).
+    const ordered = [
+      ...ids.filter((id) => bearing.has(id)),
+      ...ids.filter((id) => !bearing.has(id)),
+    ];
+    logMsg(`repair sweep started: ${ordered.length} stale card(s), ${bearing.size} with part rows`);
+    let done = 0;
+    let settled = 0;
+    let failed = 0;
+    let firstFailure: string | undefined;
+    let consecutiveFailures = 0;
+    let aborted = false;
+    /** Sessions this sweep did not rebuild: being re-distilled when it got
+     *  to them, or left stale by its own write (a lost lease, a refusal). */
+    const skipped: string[] = [];
+    const progress = (running: boolean): Omit<RepairProgress, "at"> => ({
+      pending: ordered.length - settled,
+      repairPending: repairPending(),
+      done,
+      gen,
+      running,
+    });
+    shareRepair(progress(true), true);
+
+    await runPool(ordered, limits.distillConcurrency, async (sessionId) => {
+      if (stopped || !leaseHeld || aborted) return;
+      if (pause) {
+        await pause();
+        if (stopped || !leaseHeld || aborted) return;
+      }
+      if (inFlight.has(sessionId)) {
+        skipped.push(sessionId);
+        return;
+      }
+      sweeping.add(sessionId);
+      try {
+        const outcome = await repairOne(sessionId);
+        consecutiveFailures = 0;
+        if (outcome === "done") done++;
+        if (outcome === "done" || outcome === "marked") settled++;
+        if (outcome === "skipped") skipped.push(sessionId);
+      } catch (error) {
+        failed++;
+        firstFailure ??= `session ${sessionId}: ${errmsg(error)}`;
+        if (++consecutiveFailures >= MAX_CONSECUTIVE_FETCH_FAILURES) aborted = true;
+      } finally {
+        sweeping.delete(sessionId);
+        if (!stopped && pendingRerun.delete(sessionId)) scheduleReDistill(sessionId);
+      }
+      // Counting repair-pending cards reads every card, so only when the
+      // progress is due to be shared.
+      if (now() - repairWrittenAt >= PROGRESS_WRITE_MS) shareRepair(progress(true));
+    });
+    if (stopped || !ownsLease()) return;
+    if (done > 0) await recomputeAllRootRollups();
+    if (stopped || !ownsLease()) return;
+    shareRepair(
+      {
+        pending: store.staleCards(gen).length,
+        repairPending: repairPending(),
+        done,
+        gen,
+        running: false,
+      },
+      true,
+    );
+    logMsg(
+      `repair sweep ${aborted ? "stopped after repeated failures" : "done"}: ${done} rebuilt, ${failed} failed`,
+    );
+    if (failed > 0) {
+      lastError = failed > 1 ? `${firstFailure} (and ${failed - 1} more)` : firstFailure;
+    }
+    // A skipped card the re-distill that held it did not rebuild stays stale,
+    // and nothing else would reach it before the next cold pass.
+    const stillStale = skipped.filter((id) => {
+      const card = store.getCard(id);
+      return card !== undefined && card.repairReason === undefined && belowGeneration(card);
+    });
+    if (stillStale.length > 0) {
+      logMsg(`repair sweep left ${stillStale.length} card(s) it skipped stale; retrying them`);
+    }
+    if (failed > 0 || stillStale.length > 0) scheduleSweepRetry();
+  }
+
+  // ── Range check (hosts with a projector generation and range digests) ──
+
+  /** This process's sorted card ids for the running range-check sweep, read
+   *  when it first needs them and dropped when the sweep completes. */
+  let reconcileIds: string[] | undefined;
+
+  function readReconcile(): ReconcileProgress {
+    return (
+      parseReconcileProgress(store.getMeta(RECONCILE_PROGRESS_KEY)) ?? {
+        sweep: 0,
+        session: null,
+        after: null,
+        startedAt: now(),
+        previousStartedAt: null,
+        checked: 0,
+        mismatched: 0,
+        at: 0,
+      }
+    );
+  }
+
+  /** The checkpoint of a card the range check may look at now, or
+   *  undefined: it must be fully indexed at this generation with a settled
+   *  checkpoint and no repair reason, and no write may be pending for it. */
+  function checkable(card: Card): CheckpointInfo | undefined {
+    const id = card.sessionId;
+    if (card.distillState !== "full" || card.repairReason !== undefined) return undefined;
+    if (card.projectorGen !== projectorGen) return undefined;
+    if (
+      unsettled.has(id) ||
+      inFlight.has(id) ||
+      sweeping.has(id) ||
+      reDistillQueue.has(id) ||
+      debounceTimers.has(id) ||
+      pendingRerun.has(id) ||
+      removalSince.has(id)
+    ) {
+      return undefined;
+    }
+    const info = sync?.inspect?.(card.distillCursor);
+    return info && info.version !== 1 && info.settled ? info : undefined;
+  }
+
+  /** The first index in sorted `ids` whose id is at or after `id`. */
+  function lowerBound(ids: string[], id: string): number {
+    let lo = 0;
+    let hi = ids.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >>> 1;
+      if (ids[mid]! < id) lo = mid + 1;
+      else hi = mid;
+    }
+    return lo;
+  }
+
+  /**
+   * Check stored ranges for a change no poll window sees (a part row
+   * rewritten in a settled session moves neither the message nor the
+   * session watermark). Runs from the poll, one digest read (at most
+   * {@link RANGE_ROWS} rows) per poll, only while this process holds the
+   * lease, no cold pass or repair sweep runs and no foreground query is in
+   * the fetch gate.
+   *
+   * It walks the cards in session id order, skipping any it may not check
+   * ({@link checkable}), at most {@link RECONCILE_SCAN_LIMIT} per poll. For a
+   * card it starts at its floor (the lowest `seq` its last full write read;
+   * rows below it are not in the card) or at the session's start, and walks
+   * the stored spans by their recorded boundaries to its checkpoint
+   * ({@link compareSpans}), as many as the digest holds. Matching spans
+   * record the current sweep; a mismatch, or rows with no stored hash,
+   * dispatches a removal, so the session is re-indexed in full and that
+   * write records fresh hashes. The position, the sweep count and the
+   * counters persist in {@link RECONCILE_PROGRESS_KEY}.
+   */
+  async function checkOneRange(): Promise<void> {
+    const digest = sync?.rangeDigest;
+    if (!rangesOn || !digest || projectorGen === undefined) return;
+    if (stopped || coldPassState === "running" || sweepPromise || gate.activeQueries() > 0) return;
+    if (!ownsLease()) return;
+    reconcileIds ??= store.cardSessionIds().sort();
+    const ids = reconcileIds;
+    if (ids.length === 0) {
+      reconcileIds = undefined;
+      return;
+    }
+    let state = readReconcile();
+    let index = state.session === null ? 0 : lowerBound(ids, state.session);
+    let after = state.session !== null && ids[index] === state.session ? state.after : null;
+
+    const save = (): void => {
+      if (!stopped && ownsLease()) store.setMeta(RECONCILE_PROGRESS_KEY, JSON.stringify(state));
+    };
+    /** Move to the next card, completing the sweep past the last one. */
+    const advance = (): void => {
+      index++;
+      after = null;
+      if (index < ids.length) {
+        state = { ...state, session: ids[index]!, after: null };
+        return;
+      }
+      logMsg(
+        `range check sweep ${state.sweep + 1} done: ${state.checked} range(s), ${state.mismatched} changed`,
+      );
+      state = {
+        sweep: state.sweep + 1,
+        session: null,
+        after: null,
+        startedAt: now(),
+        previousStartedAt: state.startedAt,
+        checked: 0,
+        mismatched: 0,
+        at: state.at,
+      };
+      reconcileIds = undefined;
+    };
+
+    for (let scanned = 0; scanned < RECONCILE_SCAN_LIMIT; scanned++) {
+      if (index >= ids.length) {
+        // A stored position past every card: the sweep is done.
+        index = ids.length - 1;
+        advance();
+        save();
+        return;
+      }
+      const id = ids[index]!;
+      const card = store.getCard(id);
+      const info = card ? checkable(card) : undefined;
+      if (!info) {
+        advance();
+        if (index >= ids.length) {
+          save();
+          return;
+        }
+        continue;
+      }
+      const spans = store.getRangeHashes(id);
+      // Rows below the floor are not in the card, so the walk starts at it.
+      const first = info.floor !== undefined ? info.floor - 1 : BEFORE_FIRST_SEQ;
+      // A position inside a stored span means the card's hashes were
+      // rewritten since the walk stopped there: walk the card again. A
+      // position below the floor (an append that evicted rows raised it
+      // since) resumes at the floor.
+      const resume =
+        after !== null && !spans.some((span) => span.startSeq <= after! && span.endSeq > after!)
+          ? Math.max(after, first)
+          : first;
+      if (resume >= info.seq) {
+        advance();
+        if (index >= ids.length) {
+          save();
+          return;
+        }
+        continue;
+      }
+      const rows = await gate.runBackground(() => {
+        if (stopped || !leaseHeld) return Promise.resolve<RangeRow[] | null>(null);
+        return digest(id, resume, RANGE_ROWS);
+      });
+      if (rows === null || stopped || !ownsLease()) return;
+      const found = compareSpans(rows, spans, resume, info.seq);
+      state = {
+        ...state,
+        session: id,
+        after: resume,
+        checked: state.checked + found.confirmed.length + (found.mismatch ? 1 : 0),
+        at: now(),
+      };
+      const restamp = found.confirmed
+        .filter((span) => span.sweepGen !== state.sweep)
+        .map((span) => ({ ...span, sweepGen: state.sweep }));
+      if (restamp.length > 0) store.putRangeHashes(id, restamp);
+      if (found.mismatch) {
+        logMsg(
+          `session ${id} changed in rows ${found.mismatch.seq} and on (${found.mismatch.reason}); re-indexing it`,
+        );
+        state = { ...state, mismatched: state.mismatched + 1 };
+        advance();
+        save();
+        dispatch({ type: "removal", sessionID: id });
+        return;
+      }
+      if (found.done) advance();
+      else state = { ...state, after: found.verified };
+      save();
+      return;
+    }
+    save();
   }
 
   function quarantine(session: DistillSessionMeta, error: unknown): void {
@@ -1854,7 +2984,7 @@ export function createDistiller(options: DistillerOptions): Distiller {
 
   function startReDistill(sessionID: string): void {
     if (stopped || !leaseHeld) return; // non-holders and stopped instances write nothing
-    if (inFlight.has(sessionID)) {
+    if (inFlight.has(sessionID) || sweeping.has(sessionID)) {
       pendingRerun.add(sessionID); // coalesce: run once more after the in-flight pass
       return;
     }
@@ -1908,29 +3038,48 @@ export function createDistiller(options: DistillerOptions): Distiller {
             existing.distillState === "full" &&
             existing.timeUpdated === session.timeUpdated &&
             existing.title === session.title &&
-            existing.directory === session.directory
+            existing.directory === session.directory &&
+            (existing.timeArchived ?? null) === (session.timeArchived ?? null) &&
+            // A card below the projector generation is rebuilt whatever its
+            // tail says; the repair sweep skips sessions being re-distilled.
+            !belowGeneration(existing)
           ) {
             succeeded = true; // nothing changed since the card was written
             return;
           }
           rewritten = change === "rewritten";
         }
+        // An append extends the stored card, so it must be at this
+        // distiller's projector generation (none and NULL are the same). A
+        // repair-pending card is re-read in full instead: the loss guard keeps
+        // its checkpoint where the last write left it, so an append would page
+        // back to it on every turn with no row cap, while the capped full read
+        // costs the same each turn and replaces the card once the lossy
+        // message is past the cap.
         const canAppend =
           existing != null &&
           existing.distilledThrough != null &&
           existing.partCount > appendThresholdParts &&
+          (existing.projectorGen ?? null) === (projectorGen ?? null) &&
+          existing.repairReason === undefined &&
           !hadRemoval &&
           !rewritten;
-        if (canAppend && existing) await distillAppend(session, existing);
-        else await distillFull(session);
+        const result =
+          canAppend && existing
+            ? await distillAppend(session, existing)
+            : await distillFull(session);
         if (stopped || !leaseHeld) return;
-        // Keep the root's family highlights current with its live children.
-        const stored = store.getCard(sessionID);
-        if (stored && stored.rootId !== sessionID) recomputeRootRollup(stored.rootId);
         succeeded = true;
         reDistillFailures.delete(sessionID);
         clearStrikesOnSuccess(sessionID); // it fetched fine: no longer failing
-        options.onSessionDistilled?.(sessionID);
+        // An unchanged write left readers nothing new: no rollup to refresh
+        // and nothing to summarize.
+        if (result.changed) {
+          // Keep the root's family highlights current with its live children.
+          const stored = store.getCard(sessionID);
+          if (stored && stored.rootId !== sessionID) recomputeRootRollup(stored.rootId);
+          options.onSessionDistilled?.(sessionID);
+        }
       }
     } catch (error) {
       lastError = errmsg(error);
@@ -2001,6 +3150,18 @@ export function createDistiller(options: DistillerOptions): Distiller {
         if (!stopped && ownsLease()) store.setMeta(key, value);
       },
     };
+    // Changes no poll window sees, one digest at a time. This runs before the
+    // poll's signals are dispatched: the poll's overlap re-signals a recently
+    // active session on every poll, and a session with a re-distill pending
+    // is not checked, so after dispatch such a session would never be. By
+    // now the previous poll's debounced re-distills have run.
+    try {
+      await checkOneRange();
+    } catch (error) {
+      lastError = errmsg(error);
+      logMsg(`range check failed: ${lastError}`);
+    }
+    if (stopped || !leaseHeld) return;
     try {
       const result = await gate.runBackground(() => {
         if (stopped || !leaseHeld) return Promise.resolve<PollResult | null>(null);
@@ -2071,6 +3232,8 @@ export function createDistiller(options: DistillerOptions): Distiller {
       if (store.heartbeatLease(instanceId)) {
         // Keep shared progress fresh through a long stretch on one session.
         if (coldPassState === "running") shareProgress();
+        // And the sweep's, so readers never take a long rebuild for a stall.
+        if (sweepPromise && sweepProgress) shareRepair(sweepProgress);
         scheduleHeartbeat();
       } else {
         // Lost the lease (taken over): stop acting as holder and try to regain.
@@ -2112,8 +3275,27 @@ export function createDistiller(options: DistillerOptions): Distiller {
       if (limits.coldPass && coldPassState === "idle") void startColdPass();
     } else {
       leaseHeld = false;
+      noteForeignHolder();
       scheduleLeaseRetry();
     }
+  }
+
+  /** The holder and build last logged by {@link noteForeignHolder}. */
+  let foreignHolderLogged: string | undefined;
+  /**
+   * Log, once per holder, a lease held by another build: until that process
+   * restarts it keeps writing as its own build (an older one stamps no
+   * projector generation and writes cards the repair sweep must rebuild).
+   */
+  function noteForeignHolder(): void {
+    const holder = store.leaseStatus();
+    if (!holder?.holder || holder.holder === instanceId || holder.build === build) return;
+    const key = `${holder.holder} ${holder.build}`;
+    if (key === foreignHolderLogged) return;
+    foreignHolderLogged = key;
+    logMsg(
+      `lease held by ${holder.holder} running build ${holder.build || "(unknown, an older one)"}, not this build ${build}; restart every OpenCode process sharing the store to run one build`,
+    );
   }
 
   function ownsLease(): boolean {
@@ -2143,9 +3325,11 @@ export function createDistiller(options: DistillerOptions): Distiller {
     clearTimer(leaseRetryTimer);
     clearTimer(coldPassRetryTimer);
     clearTimer(pollTimer);
+    clearTimer(sweepRetryTimer);
     leaseRetryTimer = undefined;
     coldPassRetryTimer = undefined;
     pollTimer = undefined;
+    sweepRetryTimer = undefined;
     for (const timer of debounceTimers.values()) clearTimeout(timer);
     debounceTimers.clear();
     pendingRerun.clear();
@@ -2187,7 +3371,7 @@ export function createDistiller(options: DistillerOptions): Distiller {
         }
       }
       leaseHeld = false;
-      const running = [coldPassPromise, pollPromise, ...inFlight.values()].filter(
+      const running = [coldPassPromise, pollPromise, sweepPromise, ...inFlight.values()].filter(
         (promise): promise is Promise<void> => promise !== undefined,
       );
       stopPromise = Promise.allSettled(running).then(() => {});
@@ -2224,6 +3408,18 @@ export function createDistiller(options: DistillerOptions): Distiller {
         return { indexed: cards, examined: shared.examined, known: shared.known, stalled: true };
       }
       return { indexed: cards, examined: shared.examined, known: shared.known };
+    },
+
+    repair(): RepairStatus | undefined {
+      if (projectorGen === undefined) return undefined;
+      let sweep = parseRepairProgress(store.getMeta(REPAIR_PROGRESS_KEY));
+      // A holder refreshes a running sweep's progress every heartbeat, so an
+      // old one is a sweep whose holder went away.
+      if (sweep?.running && now() - sweep.at > PROGRESS_STALE_MS) {
+        sweep = { ...sweep, running: false, stalled: true };
+      }
+      const reconcile = parseReconcileProgress(store.getMeta(RECONCILE_PROGRESS_KEY));
+      return { ...(sweep && { sweep }), ...(reconcile && { reconcile }) };
     },
 
     status(): DistillStatus {

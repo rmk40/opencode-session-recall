@@ -20,17 +20,29 @@ import {
 } from "../cards.js";
 import { createLiteRefresh, type LiteRefreshController } from "../lite-refresh.js";
 import { createDrill, type Drill } from "../drill.js";
-import { createDistiller, type Distiller } from "../distill.js";
+import { createDistiller, type Distiller, type RepairStatus } from "../distill.js";
 import type { HistorySession } from "../history/model.js";
-import { createUnavailableSource, type HistorySource } from "../history/source.js";
-import { createV2HistorySource, openOpencodeDb } from "../history/v2.js";
+import {
+  createHistoryDriftState,
+  createUnavailableSource,
+  type HistoryDrift,
+  type HistoryDriftState,
+  type HistorySource,
+} from "../history/source.js";
+import {
+  createV2HistorySource,
+  openOpencodeDb,
+  v2DriftBase,
+  type V2SchemaInfo,
+} from "../history/v2.js";
+import { V2_PROJECTOR_GEN } from "../history/v2-project.js";
 import { opencodeDbPath } from "../history/v2-path.js";
 import { createV2Sync, type V2SyncOptions } from "../history/v2-sync.js";
 import { createV2EventMapper } from "../history/v2-events.js";
 import type { SearchDeps, SemanticSearchConfig } from "../search.js";
 import type { SessionEnrichment } from "../sessions.js";
 import type { ResolvedOptions } from "../options.js";
-import { DISCOVERY_LIMIT, errmsg, settleWithin, type Limits } from "../types.js";
+import { errmsg, settleWithin, type Limits } from "../types.js";
 import { loadFs, loadPath } from "../node-import.js";
 import type { V2Event } from "./opencode-v2-types.js";
 import { createIdDedupe, type ResolvedIdentity, type RuntimeFactory } from "./runtime.js";
@@ -49,9 +61,14 @@ import { createIdDedupe, type ResolvedIdentity, type RuntimeFactory } from "./ru
 
 const STORE_HOST: StoreHost = "opencode-v2";
 /** Build tag recorded in the lease and `coverage.semantic.pluginVersion`. */
-export const V2_PLUGIN_BUILD = pluginBuild(STORE_HOST);
+export const V2_PLUGIN_BUILD = pluginBuild(STORE_HOST, V2_PROJECTOR_GEN);
 /** Per-phase bound on dispose's awaited waits (as on v1). */
 const SHUTDOWN_TIMEOUT_MS = 2_500;
+/** Sessions per discovery page. */
+const DISCOVERY_PAGE = 2_000;
+/** How often the runtime compares the history drift with what it last
+ *  logged. */
+const DRIFT_LOG_EVERY_MS = 5 * 60_000;
 
 /** The runtime-shaping options: first writer wins (see `runtime.ts`). */
 export type V2RuntimeOptions = Pick<
@@ -77,6 +94,16 @@ export type V2Runtime = {
   readonly globalSource: HistorySource;
   /** A session's parent id (`null` for a root), or undefined when unknown. */
   parentOf(sessionID: string): Promise<string | null | undefined>;
+  /**
+   * How `opencode.db` differs from what this build reads (capabilities,
+   * migration, unknown tables, and what reads could not project), summed
+   * over every facade's reads: the same state each facade's `history()`
+   * returns. Undefined when `opencode.db` is unavailable.
+   */
+  history(): HistoryDrift | undefined;
+  /** The repair sweep's and the range check's progress, as the lease holder
+   *  shares them in the store; undefined without a store or a source. */
+  repair(): RepairStatus | undefined;
   /** One bus event from any attached instance; deduplicated by id. */
   onEvent(event: V2Event): void;
   /** Track a foreground operation so dispose never closes a handle under it. */
@@ -199,6 +226,35 @@ async function openStampedStore(
   return null;
 }
 
+/** Log what the schema check found that this build was not tested against
+ *  (the log is the debug sink, so this shows only under `RECALL_DEBUG`). A
+ *  database without `session_part` (opencode before 2.4) is not drift. */
+function logSchemaDrift(schema: V2SchemaInfo, log: (message: string) => void): void {
+  const notes: string[] = [];
+  if (schema.missingOptional.length > 0) {
+    notes.push(`part rows not read, the table lacks ${schema.missingOptional.join(", ")}`);
+  }
+  if (!schema.migrationTested) {
+    notes.push(`untested newest migration ${schema.migration ?? "(unreadable)"}`);
+  }
+  if (schema.unknownTables.length > 0) {
+    notes.push(`unknown history tables ${schema.unknownTables.join(", ")}`);
+  }
+  if (notes.length > 0) log(`opencode history drift: ${notes.join("; ")}`);
+}
+
+/** The read counts a drift snapshot holds, as one line; empty when every
+ *  read projected faithfully. */
+function readDriftLine(drift: HistoryDrift): string {
+  const found = Object.entries(drift.counts)
+    .filter(([, count]) => count > 0)
+    .map(([name, count]) => `${name} ${count}`);
+  if (drift.unknownPartTypeNames.length > 0) {
+    found.push(`unknown part types ${drift.unknownPartTypeNames.join(", ")}`);
+  }
+  return found.join(", ");
+}
+
 /** Close a handle, swallowing errors (a failed close must not reject dispose). */
 function closeQuietly(db: Pick<SqliteDb, "close"> | null): void {
   try {
@@ -260,25 +316,36 @@ async function createV2Runtime(
 
   // ── opencode.db (read-only) ──
   let opencodeDb: ReadOnlyDb | null = null;
+  let schema: V2SchemaInfo | undefined;
   let unavailable: string | undefined;
   if (identity.source === null) {
     unavailable = sourceProblem ?? "no opencode database path";
   } else {
     const opened = await openOpencodeDb(identity.source);
-    if (opened.ok) opencodeDb = opened.db;
-    else unavailable = opened.reason;
+    if (opened.ok) {
+      opencodeDb = opened.db;
+      schema = opened.schema;
+    } else unavailable = opened.reason;
   }
   if (unavailable !== undefined) log(`opencode history unavailable: ${unavailable}`);
 
+  // One schema and one drift state for every facade over the handle, and
+  // the sync, so all of them report the same database the same way.
+  const drift: HistoryDriftState | undefined = schema
+    ? createHistoryDriftState(v2DriftBase(schema))
+    : undefined;
+  if (schema) logSchemaDrift(schema, log);
+
   const facades = new Map<string, HistorySource>();
-  const globalSource: HistorySource = opencodeDb
-    ? createV2HistorySource(opencodeDb)
-    : createUnavailableSource("v2-sqlite", unavailable ?? "unknown");
+  const globalSource: HistorySource =
+    opencodeDb && schema && drift
+      ? createV2HistorySource(opencodeDb, { schema, drift })
+      : createUnavailableSource("v2-sqlite", unavailable ?? "unknown");
   const sourceFor = (projectID: string): HistorySource => {
-    if (!opencodeDb) return globalSource;
+    if (!opencodeDb || !schema || !drift) return globalSource;
     let facade = facades.get(projectID);
     if (!facade) {
-      facade = createV2HistorySource(opencodeDb, { projectID });
+      facade = createV2HistorySource(opencodeDb, { projectID, schema, drift });
       facades.set(projectID, facade);
     }
     return facade;
@@ -360,12 +427,32 @@ async function createV2Runtime(
 
   const gate = createFetchGate({ concurrency: limits.concurrency });
 
+  const macrotask = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0));
+
   // The distiller and cards-lite always discover globally: one store per
-  // process serves every location.
+  // process serves every location. The listing pages by the immutable
+  // session id, so a session updated during the walk is neither skipped nor
+  // listed twice, and it has no overall cap. Archived sessions are included
+  // in both: archiving hides a session from opencode's list but keeps its
+  // history, which is still past work to recall, and cards-lite (the
+  // store-less mode) then covers the same sessions the store does.
   const discover = async (): Promise<HistorySession[]> => {
-    const listing = await globalSource.listSessions({ scope: "global", limit: DISCOVERY_LIMIT });
-    if (!listing.ok) throw new Error(listing.error);
-    return listing.items;
+    const sessions: HistorySession[] = [];
+    let after: string | undefined;
+    for (;;) {
+      const listing = await globalSource.listSessions({
+        scope: "global",
+        limit: DISCOVERY_PAGE,
+        order: "id",
+        archived: "include",
+        ...(after !== undefined && { after }),
+      });
+      if (!listing.ok) throw new Error(listing.error);
+      sessions.push(...listing.items);
+      if (!listing.truncated || listing.nextCursor === undefined) return sessions;
+      after = listing.nextCursor;
+      await macrotask();
+    }
   };
 
   let liteCards: Card[] = [];
@@ -426,7 +513,6 @@ async function createV2Runtime(
     globalThis.crypto?.randomUUID?.() ??
     `recall-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 
-  const macrotask = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0));
   const distiller = createDistiller({
     source: globalSource,
     // No history, no distilling: the distiller does not start. Nor for a
@@ -437,14 +523,32 @@ async function createV2Runtime(
     instanceId,
     build: V2_PLUGIN_BUILD,
     gen: EMBED_REPRESENTATION,
+    // Cards built under an older projection are rebuilt by the repair
+    // sweep, and range checks catch part-only changes.
+    projectorGen: V2_PROJECTOR_GEN,
     discover,
     log,
     // The poll, checkpoints and deletion reconcile keep the store fresh with
     // no events at all; the yields keep long passes off the shared loop.
-    ...(opencodeDb && { sync: createV2Sync(opencodeDb, inputs.sync) }),
+    ...(opencodeDb && {
+      sync: createV2Sync(opencodeDb, { ...inputs.sync, ...(schema && { schema }) }),
+    }),
     yieldBetween: macrotask,
     ...(inputs.idleDebounceMs !== undefined && { idleDebounceMs: inputs.idleDebounceMs }),
   });
+  // What reads could not project, logged when it changes (debug log only).
+  let driftLogged = "";
+  const logDrift = (): void => {
+    const snapshot = drift?.snapshot();
+    if (!snapshot) return;
+    const line = readDriftLine(snapshot);
+    if (line === driftLogged) return;
+    driftLogged = line;
+    if (line) log(`opencode history drift: ${line} (over ${snapshot.reads} reads)`);
+  };
+  const driftTimer = drift ? setInterval(logDrift, DRIFT_LOG_EVERY_MS) : undefined;
+  // A Node or Bun timer must not keep the process alive on its own.
+  (driftTimer as { unref?: () => void } | undefined)?.unref?.();
   if (limits.coldPass) distiller.start();
   const mapper = createV2EventMapper({ emit: (signal) => distiller.onEvent(signal) });
 
@@ -485,6 +589,8 @@ async function createV2Runtime(
     sourceFor,
     globalSource,
     parentOf,
+    history: () => drift?.snapshot(),
+    repair: () => distiller.repair(),
     track,
     onEvent(event) {
       if (disposed) return;
@@ -494,6 +600,7 @@ async function createV2Runtime(
     dispose() {
       if (disposePromise) return disposePromise;
       disposed = true;
+      if (driftTimer !== undefined) clearInterval(driftTimer);
       mapper.dispose();
       distiller.quiesce();
       cards.dispose();

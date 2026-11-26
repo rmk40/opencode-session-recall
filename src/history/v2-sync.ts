@@ -1,12 +1,16 @@
 import type { ReadOnlyDb, Row, SqlValue } from "../sqlite.js";
+import { cyrb53 } from "../hash.js";
 import type {
+  CheckpointInfo,
   DistillCheckpoint,
   DistillSignal,
   DistillSync,
   PollMeta,
   PollResult,
+  RangeRow,
   TailChange,
 } from "../distill.js";
+import { inspectV2Schema, type V2SchemaInfo } from "./v2.js";
 
 /**
  * Freshness for the v2 distiller, read straight from `opencode.db`.
@@ -16,10 +20,15 @@ import type {
  * the store correct without them:
  *
  * - **Checkpoints.** Before each distill the session's tail is snapshotted
- *   (`{ seq, msgId, msgUpdated, sessKey, unsettled }`, stored as
- *   `card.distill_cursor`). A later {@link DistillSync.compare} tells an
- *   unchanged tail from appended rows and from a rewritten one (a revert
- *   removes the checkpoint row; streaming output updates it in place).
+ *   (see {@link Checkpoint}, stored as `card.distill_cursor`). A later
+ *   {@link DistillSync.compare} tells an unchanged tail from appended rows
+ *   and from a rewritten one (a revert removes the checkpoint row; streaming
+ *   output updates it in place). opencode 2.4 writes an assistant's content
+ *   to `session_part` without touching its message row, so the checkpoint
+ *   also records the part state of the newest row (the belt) and a
+ *   fingerprint of the rows ending at it, each row with its part count and
+ *   newest part `time_updated`. Rows appended after the checkpoint are
+ *   outside the fingerprint, so they read as growth, never as a rewrite.
  * - **Unsettled tails.** An assistant without `time.completed`, or a shell or
  *   compaction still `running`, among the newest rows marks the checkpoint
  *   unsettled, which the distiller re-reads on every poll. The predicate is
@@ -40,11 +49,16 @@ import type {
  *   new cold pass. Each window reads one page per turn: the message window one page per
  *   poll, the session scan one page per `sessionScanEveryMs`. A poll returns
  *   its watermark updates for the distiller to commit after it dispatched
- *   the signals, and a failing window is isolated from the other.
+ *   the signals, and a failing window is isolated from the other. A
+ *   part-only change in a settled session moves neither window; the
+ *   distiller's range check finds it ({@link DistillSync.rangeDigest}).
+ * - **Range digests.** A session's rows in `seq` order with the state of
+ *   their part rows, for the distiller's range hashes, and which sessions
+ *   have part rows at all ({@link DistillSync.withParts}).
  *
- * Every `session_message` statement binds `LIMIT ?`, reads happen one
- * statement at a time with a macrotask between them, and nothing here writes
- * to `opencode.db`.
+ * Every `session_message` and `session_part` statement binds `LIMIT ?`,
+ * reads happen one statement at a time with a macrotask between them, and
+ * nothing here writes to `opencode.db`.
  */
 
 export const POLL_WATERMARK_KEY = "v2_poll_watermark";
@@ -76,21 +90,58 @@ export type V2SyncOptions = {
   tailRows?: number;
   /** An unsettled row untouched this long counts as settled. Default 1 hour. */
   abandonAfterMs?: number;
+  /** Rows ending at the checkpoint row that its fingerprint covers.
+   *  Default 64. */
+  fingerprintRows?: number;
+  /** What the schema check found (`openOpencodeDb`'s `schema`), which says
+   *  whether `session_part` is read. Default: probed once. */
+  schema?: V2SchemaInfo;
   now?: () => number;
   /** Awaited between statements. Default: one macrotask. */
   yieldBetween?: () => Promise<void>;
 };
 
+/**
+ * The stored checkpoint (`card.distill_cursor`). Version 1, written by older
+ * builds, lacks the part state and the fingerprint and always compares as
+ * rewritten.
+ */
 type Checkpoint = {
-  v: 1;
+  v: 2;
+  /** The newest row: its `seq`, id and `time_updated` (0 and null for an
+   *  empty session). */
   seq: number;
   msgId: string | null;
   msgUpdated: number;
+  /** The session's recency, as the session scan computes it. */
   sessKey: number;
+  /** The lowest `seq` of a row still running, or null when settled. */
   unsettled: number | null;
+  /** Part rows of the newest row and their newest `time_updated` (0 when
+   *  it has none). */
+  parts: number;
+  partsUpdated: number;
+  /** Hash of the rows ending at `seq` (at most `fingerprintRows`), each with
+   *  its id, `time_updated` and part state. */
+  fp: string;
+  /** The lowest `seq` the write read, when it stopped at the per-session
+   *  row cap. Absent when it read the whole session. */
+  floor?: number;
+  /** Messages the card holds cut short (they end in a placeholder). */
+  cut?: number;
 };
 
+/** A stored checkpoint of any version: the fields every version shares,
+ *  checked, and the rest unchecked. */
+type StoredCheckpoint = { v: 1 | 2; seq: number; unsettled: number | null } & Partial<
+  Omit<Checkpoint, "v" | "seq" | "unsettled">
+>;
+
 const MISSING_CHUNK = 500;
+/** Message ids per `session_part` statement. */
+const PART_CHUNK = 500;
+/** Rows one range digest reads at most. */
+export const RANGE_DIGEST_MAX = 500;
 
 const macrotask = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0));
 
@@ -102,6 +153,11 @@ function num(value: SqlValue | undefined): number | null {
 
 function str(value: SqlValue | undefined): string | null {
   return typeof value === "string" ? value : null;
+}
+
+/** `n` comma-separated SQL parameters. */
+function bindList(n: number): string {
+  return Array.from({ length: n }, () => "?").join(", ");
 }
 
 type KeysetPos = { t: number; id: string };
@@ -124,24 +180,79 @@ function parsePos(stored: string | undefined): KeysetPos | null {
   return null;
 }
 
-function parseCheckpoint(stored: string | null | undefined): Checkpoint | null {
+function isNumber(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value);
+}
+
+/** A stored checkpoint's shared fields (`v`, `seq`, `unsettled`) checked, or
+ *  null for anything that is not a checkpoint of a known version. */
+function parseAny(stored: string | null | undefined): StoredCheckpoint | null {
   if (typeof stored !== "string") return null;
+  let value: unknown;
   try {
-    const value = JSON.parse(stored) as Partial<Checkpoint>;
-    if (
-      value?.v !== 1 ||
-      typeof value.seq !== "number" ||
-      typeof value.msgUpdated !== "number" ||
-      typeof value.sessKey !== "number" ||
-      !(value.msgId === null || typeof value.msgId === "string") ||
-      !(value.unsettled === null || typeof value.unsettled === "number")
-    ) {
-      return null;
-    }
-    return value as Checkpoint;
+    value = JSON.parse(stored);
   } catch {
     return null;
   }
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
+  const cp = value as Record<string, unknown>;
+  if ((cp.v !== 1 && cp.v !== 2) || !isNumber(cp.seq)) return null;
+  if (!(cp.unsettled === null || isNumber(cp.unsettled))) return null;
+  return cp as StoredCheckpoint;
+}
+
+function parseCheckpoint(stored: string | null | undefined): Checkpoint | null {
+  const value = parseAny(stored);
+  if (
+    value === null ||
+    value.v !== 2 ||
+    !isNumber(value.msgUpdated) ||
+    !isNumber(value.sessKey) ||
+    !(value.msgId === null || typeof value.msgId === "string") ||
+    !isNumber(value.parts) ||
+    !isNumber(value.partsUpdated) ||
+    typeof value.fp !== "string" ||
+    !(value.floor === undefined || isNumber(value.floor)) ||
+    !(value.cut === undefined || isNumber(value.cut))
+  ) {
+    return null;
+  }
+  return value as Checkpoint;
+}
+
+/**
+ * What a stored checkpoint records beyond freshness, or null when `stored`
+ * is not a checkpoint. Version 1 checkpoints (older builds) report their
+ * version and tail only.
+ */
+export function inspectCheckpoint(stored: string | null | undefined): CheckpointInfo | null {
+  const value = parseAny(stored);
+  if (!value) return null;
+  const seq = value.seq;
+  const settled = value.unsettled === null;
+  if (value.v === 1) return { version: 1, seq, settled };
+  const cp = parseCheckpoint(stored);
+  if (!cp) return null;
+  return {
+    version: 2,
+    seq,
+    settled,
+    ...(cp.floor !== undefined && { floor: cp.floor }),
+    ...(cp.cut !== undefined && cp.cut > 0 && { cut: cp.cut }),
+  };
+}
+
+/** `stored` with a write's row floor and cut messages recorded; any other
+ *  value (an older version, garbage) is returned unchanged. */
+export function annotateCheckpoint(stored: string, info: { floor?: number; cut?: number }): string {
+  const cp = parseCheckpoint(stored);
+  if (!cp) return stored;
+  const next: Checkpoint = { ...cp };
+  delete next.floor;
+  delete next.cut;
+  if (info.floor !== undefined) next.floor = info.floor;
+  if (info.cut !== undefined && info.cut > 0) next.cut = info.cut;
+  return JSON.stringify(next);
 }
 
 export function createV2Sync(db: ReadOnlyDb, opts: V2SyncOptions = {}): DistillSync {
@@ -154,8 +265,11 @@ export function createV2Sync(db: ReadOnlyDb, opts: V2SyncOptions = {}): DistillS
   const sessionScanLimit = opts.sessionScanLimit ?? 2_000;
   const tailRows = opts.tailRows ?? 20;
   const abandonAfterMs = opts.abandonAfterMs ?? 3_600_000;
+  const fingerprintRows = Math.max(1, Math.floor(opts.fingerprintRows ?? 64));
   const now = opts.now ?? Date.now;
   const pause = opts.yieldBetween ?? macrotask;
+  /** Whether `session_part` is read (opencode 2.4+). */
+  const partsOn = (opts.schema ?? inspectV2Schema(db)).parts;
   let lastScanAt = Number.NEGATIVE_INFINITY;
 
   /** `time_compacting` exists in every 2.0.x schema, but it is not one of the
@@ -203,6 +317,85 @@ export function createV2Sync(db: ReadOnlyDb, opts: V2SyncOptions = {}): DistillS
     return first;
   }
 
+  /**
+   * Part count, newest part `time_updated` and part types of each of `ids`
+   * (messages of `sessionID`): one grouped `session_part` statement per
+   * {@link PART_CHUNK} ids, each after a yield. Messages without part rows,
+   * and every message on a database without `session_part`, are absent.
+   */
+  async function partState(
+    sessionID: string,
+    ids: string[],
+    withTypes: boolean,
+  ): Promise<Map<string, { parts: number; updated: number; types: string[] }>> {
+    const out = new Map<string, { parts: number; updated: number; types: string[] }>();
+    if (!partsOn || ids.length === 0) return out;
+    const types = withTypes ? ", group_concat(DISTINCT type) AS types" : "";
+    for (let i = 0; i < ids.length; i += PART_CHUNK) {
+      const chunk = ids.slice(i, i + PART_CHUNK);
+      await pause();
+      const rows = db.all(
+        `SELECT message_id, count(*) AS n, max(time_updated) AS t${types} FROM session_part
+         WHERE session_id = ? AND message_id IN (${bindList(chunk.length)})
+         GROUP BY message_id LIMIT ?`,
+        [sessionID, ...chunk, chunk.length],
+      );
+      for (const row of rows) {
+        const listed = str(row.types);
+        out.set(str(row.message_id) ?? "", {
+          parts: num(row.n) ?? 0,
+          updated: num(row.t) ?? 0,
+          types: listed ? listed.split(",").sort() : [],
+        });
+      }
+    }
+    return out;
+  }
+
+  /**
+   * The fingerprint of the rows ending at `seq`: up to `fingerprintRows`
+   * rows newest first, each as `(seq, id, time_updated, part count, newest
+   * part time_updated)`, read by two bounded statements. Rows after `seq`
+   * are outside it, so appended rows never change it. `newest` is the row
+   * at the top of the window, with its part state (the belt).
+   */
+  async function fingerprint(
+    sessionID: string,
+    seq: number,
+  ): Promise<{
+    hash: string;
+    newest?: { seq: number; id: string; updated: number; parts: number; partsUpdated: number };
+  }> {
+    await pause();
+    const rows = db.all(
+      `SELECT seq, id, time_updated FROM session_message
+       WHERE session_id = ? AND seq <= ? ORDER BY seq DESC LIMIT ?`,
+      [sessionID, seq, fingerprintRows],
+    );
+    const ids = rows.map((row) => str(row.id) ?? "");
+    const parts = await partState(sessionID, ids, false);
+    const lines: string[] = [];
+    let newest:
+      | { seq: number; id: string; updated: number; parts: number; partsUpdated: number }
+      | undefined;
+    for (const row of rows) {
+      const id = str(row.id) ?? "";
+      const own = parts.get(id);
+      const entry = {
+        seq: num(row.seq) ?? 0,
+        id,
+        updated: num(row.time_updated) ?? 0,
+        parts: own?.parts ?? 0,
+        partsUpdated: own?.updated ?? 0,
+      };
+      newest ??= entry;
+      lines.push(
+        `${entry.seq}\t${entry.id}\t${entry.updated}\t${entry.parts}\t${entry.partsUpdated}`,
+      );
+    }
+    return { hash: cyrb53(lines.join("\n")), ...(newest && { newest }) };
+  }
+
   async function checkpoint(sessionID: string): Promise<DistillCheckpoint | null> {
     const sessKey = sessionKey(sessionID);
     if (sessKey === null) return null;
@@ -220,13 +413,23 @@ export function createV2Sync(db: ReadOnlyDb, opts: V2SyncOptions = {}): DistillS
     );
     const tail = rows[0];
     const unsettled = unsettledSeq(rows, now());
+    const seq = num(tail?.seq) ?? 0;
+    const msgId = str(tail?.id);
+    const fp = msgId === null ? { hash: cyrb53("") } : await fingerprint(sessionID, seq);
+    // The belt is the tail row's own part state; a fingerprint whose newest
+    // row is another one (the tail was removed between the statements) then
+    // fails the next compare, as it should.
+    const belt = fp.newest?.id === msgId ? fp.newest : undefined;
     const value: Checkpoint = {
-      v: 1,
-      seq: num(tail?.seq) ?? 0,
-      msgId: str(tail?.id),
+      v: 2,
+      seq,
+      msgId,
       msgUpdated: num(tail?.time_updated) ?? 0,
       sessKey,
       unsettled,
+      parts: belt?.parts ?? 0,
+      partsUpdated: belt?.partsUpdated ?? 0,
+      fp: fp.hash,
     };
     return { cursor: JSON.stringify(value), settled: unsettled === null };
   }
@@ -240,7 +443,8 @@ export function createV2Sync(db: ReadOnlyDb, opts: V2SyncOptions = {}): DistillS
     // place, so an append from it would keep its partial text. The cost is a
     // full re-distill of that session on every poll while a turn streams,
     // bounded by the per-session row cap and only for sessions with a live or
-    // recently abandoned turn (see abandonAfterMs).
+    // recently abandoned turn (see abandonAfterMs). A version 1 checkpoint
+    // (an older build's) has no part state, so it is rewritten too.
     if (!cp || cp.unsettled !== null) return "rewritten";
     const sessKey = sessionKey(sessionID);
     if (sessKey === null) return "rewritten";
@@ -254,19 +458,84 @@ export function createV2Sync(db: ReadOnlyDb, opts: V2SyncOptions = {}): DistillS
       if (tail) return "grown";
       return sessKey === cp.sessKey ? "fresh" : "grown";
     }
-    await pause();
-    const row = db.get(
-      "SELECT seq, time_updated FROM session_message WHERE id = ? AND session_id = ? LIMIT ?",
-      [cp.msgId, sessionID, 1],
-    );
+    const fp = await fingerprint(sessionID, cp.seq);
+    const row = fp.newest;
     // The checkpoint row is gone (a revert) or moved: nothing distilled from
     // it can be trusted.
-    if (!row || num(row.seq) !== cp.seq) return "rewritten";
-    // It changed in place (streaming output, a completed compaction).
-    if (num(row.time_updated) !== cp.msgUpdated) return "rewritten";
+    if (!row || row.seq !== cp.seq || row.id !== cp.msgId) return "rewritten";
+    // It changed in place (streaming output, a completed compaction), or its
+    // part rows did (opencode writes parts without touching the row).
+    if (row.updated !== cp.msgUpdated) return "rewritten";
+    if (row.parts !== cp.parts || row.partsUpdated !== cp.partsUpdated) return "rewritten";
+    // A row before it changed, was removed, or had its parts change.
+    if (fp.hash !== cp.fp) return "rewritten";
     if (tailSeq < cp.seq) return "rewritten";
     if (tailSeq > cp.seq) return "grown";
     return sessKey === cp.sessKey ? "fresh" : "grown";
+  }
+
+  async function rangeDigest(
+    sessionID: string,
+    afterSeq: number,
+    limit: number,
+  ): Promise<RangeRow[]> {
+    const take = Number.isInteger(limit) && limit >= 1 ? Math.min(limit, RANGE_DIGEST_MAX) : 1;
+    await pause();
+    const rows = db.all(
+      `SELECT seq, id, time_updated FROM session_message
+       WHERE session_id = ? AND seq > ? ORDER BY seq ASC LIMIT ?`,
+      [sessionID, afterSeq, take],
+    );
+    const parts = await partState(
+      sessionID,
+      rows.map((row) => str(row.id) ?? ""),
+      true,
+    );
+    return rows.map((row) => {
+      const id = str(row.id) ?? "";
+      const own = parts.get(id);
+      return {
+        seq: num(row.seq) ?? 0,
+        id,
+        timeUpdated: num(row.time_updated) ?? 0,
+        parts: own?.parts ?? 0,
+        partsUpdated: own?.updated ?? 0,
+        partTypes: own?.types ?? [],
+      };
+    });
+  }
+
+  async function seqOf(sessionID: string, messageID: string): Promise<number | null> {
+    await pause();
+    const row = db.get("SELECT seq FROM session_message WHERE id = ? AND session_id = ? LIMIT ?", [
+      messageID,
+      sessionID,
+      1,
+    ]);
+    return num(row?.seq);
+  }
+
+  async function withParts(sessionIDs: string[]): Promise<Set<string>> {
+    const found = new Set<string>();
+    if (!partsOn) return found;
+    for (let i = 0; i < sessionIDs.length; i += PART_CHUNK) {
+      const chunk = sessionIDs.slice(i, i + PART_CHUNK);
+      await pause();
+      // EXISTS stops at a session's first part row (the session_id prefix of
+      // the part index), so a session with many parts costs one seek.
+      const rows = db.all(
+        `WITH ids(id) AS (VALUES ${chunk.map(() => "(?)").join(", ")})
+         SELECT id FROM ids
+         WHERE EXISTS (SELECT 1 FROM session_part WHERE session_id = ids.id)
+         LIMIT ?`,
+        [...chunk, chunk.length],
+      );
+      for (const row of rows) {
+        const id = str(row.id);
+        if (id !== null) found.add(id);
+      }
+    }
+    return found;
   }
 
   async function missing(ids: string[]): Promise<string[]> {
@@ -424,5 +693,17 @@ export function createV2Sync(db: ReadOnlyDb, opts: V2SyncOptions = {}): DistillS
     };
   }
 
-  return { checkpoint, compare, missing, poll, pollIntervalMs, reconcileEveryMs };
+  return {
+    checkpoint,
+    compare,
+    missing,
+    poll,
+    pollIntervalMs,
+    reconcileEveryMs,
+    rangeDigest,
+    withParts,
+    seqOf,
+    inspect: inspectCheckpoint,
+    annotate: annotateCheckpoint,
+  };
 }

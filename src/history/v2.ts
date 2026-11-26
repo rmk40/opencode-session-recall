@@ -1363,20 +1363,22 @@ export function createV2HistorySource(db: ReadOnlyDb, opts: V2SourceOptions = {}
     return hasReadCounts(counts) ? counts : undefined;
   }
 
-  /** Project one point read and record it. */
+  /** Project one point read and record it; the result carries the read's
+   *  counts when any is non-zero. */
   async function finishPoint(
     decoded: Decoded,
     session: SessionContext,
     load: PartLoad | undefined,
     counts: HistoryReadCounts,
     unknownTypes: Set<string>,
+    strict: boolean,
   ): Promise<Lookup<HistoryMessage>> {
     const id = decoded.row.id;
     const loads = new Map<string, PartLoad>(load ? [[id, load]] : []);
-    const [message] = await project([decoded], session, false, loads, counts, unknownTypes);
-    recordRead(counts, unknownTypes);
+    const [message] = await project([decoded], session, strict, loads, counts, unknownTypes);
+    const readCounts = recordRead(counts, unknownTypes);
     return message
-      ? { ok: true, value: message }
+      ? { ok: true, value: message, ...(readCounts && { counts: readCounts }) }
       : { ok: false, reason: "not-found", error: `Message not found: ${id}` };
   }
 
@@ -1434,6 +1436,7 @@ export function createV2HistorySource(db: ReadOnlyDb, opts: V2SourceOptions = {}
     messageID: string,
     from: number,
     fork: SqlValue[],
+    strict: boolean,
   ): Promise<Lookup<HistoryMessage>> {
     // Body bytes this call has loaded, discarded attempts included, and the
     // read to fall back on when a discarded attempt is not read again.
@@ -1494,7 +1497,9 @@ export function createV2HistorySource(db: ReadOnlyDb, opts: V2SourceOptions = {}
           : malformedPlaceholder(placeholder.row, placeholder.reason);
       } else if (shape === "invalid" || shape === "other") {
         const what = shape === "invalid" ? "is not valid JSON" : "is not an object";
-        decoded = malformedPlaceholder(message, `message ${messageID} data ${what}`);
+        const reason = `message ${messageID} data ${what}`;
+        if (strict) throw new MalformedSessionError(reason);
+        decoded = malformedPlaceholder(message, reason);
       } else {
         inlineCount = asNumber(head.inline_count) ?? 0;
         let data: Record<string, unknown> = {};
@@ -1530,7 +1535,7 @@ export function createV2HistorySource(db: ReadOnlyDb, opts: V2SourceOptions = {}
       const unknownTypes = new Set<string>();
       const load: PartLoad = { rows: got.loaded, start };
       if (inlinePending) load.inlineCount = inlineCount;
-      const finish = () => finishPoint(decoded, session, load, counts, unknownTypes);
+      const finish = () => finishPoint(decoded, session, load, counts, unknownTypes, strict);
       if (got.cut) {
         load.cut = await cutAt(sessionID, messageID, got.cut.ordinal);
         if (retry && got.loaded.length === 0) return settle!();
@@ -1891,8 +1896,9 @@ export function createV2HistorySource(db: ReadOnlyDb, opts: V2SourceOptions = {}
       if (!fork) {
         return { ok: false, reason: "not-found", error: `Session not found: ${sessionID}` };
       }
+      const strict = o.strict === true;
       if (partOrdinal !== undefined) {
-        return continueMessage(sessionID, messageID, partOrdinal, fork);
+        return continueMessage(sessionID, messageID, partOrdinal, fork, strict);
       }
 
       // Body bytes this call has loaded, discarded attempts included, and the
@@ -1919,7 +1925,7 @@ export function createV2HistorySource(db: ReadOnlyDb, opts: V2SourceOptions = {}
         if (settle && row.data == null && bytes <= byteCeiling) return settle();
         const session = contextOf(sessionID);
         if (!session) return sessionNotFound(sessionID);
-        const decoded = await decodeRows([row], false);
+        const decoded = await decodeRows([row], strict);
         const envelope = row.data != null ? bytes : 0;
         spent += envelope;
 
@@ -1946,7 +1952,7 @@ export function createV2HistorySource(db: ReadOnlyDb, opts: V2SourceOptions = {}
           if (moved.size > 0) {
             const settled = (): Promise<Lookup<HistoryMessage>> => {
               leaveInline(load, FIRST_ORDINAL, counts);
-              return finishPoint(decoded[0]!, session, load, counts, unknownTypes);
+              return finishPoint(decoded[0]!, session, load, counts, unknownTypes, strict);
             };
             // Read again only while what is left of the ceiling holds
             // another read of the same size.
@@ -1957,7 +1963,14 @@ export function createV2HistorySource(db: ReadOnlyDb, opts: V2SourceOptions = {}
             return settled();
           }
         }
-        return finishPoint(decoded[0]!, session, loads.get(messageID), counts, unknownTypes);
+        return finishPoint(
+          decoded[0]!,
+          session,
+          loads.get(messageID),
+          counts,
+          unknownTypes,
+          strict,
+        );
       }
     },
   };

@@ -440,6 +440,11 @@ export type Store = {
   putRangeHashes(sessionId: string, ranges: RangeHash[]): void;
   /** Delete a session's range hashes, returning how many there were. */
   clearRangeHashes(sessionId: string): number;
+  /** How many slim-index rows a session has. */
+  sessionRowCount(sessionId: string): number;
+  /** The message id of a session's slim-index row at `offset` in insertion
+   *  (oldest-first) order, or undefined past the last row. */
+  sessionRowMessage(sessionId: string, offset: number): string | undefined;
   /** Every card's session id, without loading the cards. */
   cardSessionIds(): string[];
   /** How many cards the store holds. */
@@ -552,13 +557,16 @@ export type Store = {
    * of every row in order. Otherwise the rows and card are rewritten with a
    * revision. Any accepted replace, suppressed or not, clears the card's
    * {@link Card.repairReason}. `opts.rangeHashes` are stored in the same
-   * transaction (see {@link putRangeHashes}), suppressed or not.
+   * transaction (see {@link putRangeHashes}), suppressed or not; with
+   * `opts.replaceRangeHashes` they replace every hash stored for the session
+   * instead. A refused or failed replace leaves the stored hashes as they
+   * were.
    */
   replaceSessionParts(
     sessionId: string,
     rows: PartTextRow[],
     card: Card,
-    opts?: { rangeHashes?: RangeHash[] },
+    opts?: { rangeHashes?: RangeHash[]; replaceRangeHashes?: boolean },
   ): SessionWrite;
   /**
    * Append new slim-index rows to a session's existing rows, enforce the
@@ -582,7 +590,9 @@ export type Store = {
    * recomputed card matches the stored one (compared as in
    * {@link replaceSessionParts}), only the checkpoint and generation are
    * written, with no revision. A repair reason is kept: an append does not
-   * rebuild the card.
+   * rebuild the card. `opts` stores range hashes as
+   * {@link replaceSessionParts} does, and like it keeps the stored ones when
+   * the append is refused or fails.
    */
   appendSessionParts(
     sessionId: string,
@@ -590,7 +600,7 @@ export type Store = {
     ftsRowsPerSession: number,
     boundary: { checkpointMessageId: string; firstNewMessageId: string },
     recompute: (allRows: PartTextRow[]) => Card,
-    opts?: { rangeHashes?: RangeHash[] },
+    opts?: { rangeHashes?: RangeHash[]; replaceRangeHashes?: boolean },
   ): SessionWrite;
   ftsSearch(input: { strong: string[]; weak: string[]; limit?: number }): FtsHit[];
   getMeta(key: string): string | undefined;
@@ -1251,6 +1261,21 @@ class SqliteStore implements Store {
     return row && typeof row.n === "number" ? row.n : Number(row?.n ?? 0);
   }
 
+  sessionRowCount(sessionId: string): number {
+    return asCount(
+      this.db.get("SELECT count(*) AS n FROM part_text WHERE session_id=?", [sessionId])?.n,
+    );
+  }
+
+  sessionRowMessage(sessionId: string, offset: number): string | undefined {
+    if (!Number.isInteger(offset) || offset < 0) return undefined;
+    const row = this.db.get(
+      "SELECT message_id FROM part_text WHERE session_id=? ORDER BY id LIMIT 1 OFFSET ?",
+      [sessionId, offset],
+    );
+    return typeof row?.message_id === "string" ? row.message_id : undefined;
+  }
+
   cardSessionIds(): string[] {
     return this.db
       .all("SELECT session_id FROM card")
@@ -1612,12 +1637,15 @@ class SqliteStore implements Store {
     sessionId: string,
     rows: PartTextRow[],
     card: Card,
-    opts?: { rangeHashes?: RangeHash[] },
+    opts?: { rangeHashes?: RangeHash[]; replaceRangeHashes?: boolean },
   ): SessionWrite {
     return this.db.tx((): SessionWrite => {
       const stored = this.db.get(CARD_COMPARE_SQL, [sessionId]);
       if (belowStoredGen(card.projectorGen, stored?.projector_gen)) {
         return { changed: false, refused: "older-generation" };
+      }
+      if (opts?.replaceRangeHashes) {
+        this.db.run("DELETE FROM range_hash WHERE session_id=?", [sessionId]);
       }
       const storedRows = this.db.all(
         `SELECT id, ${PART_ROW_COLUMNS} FROM part_text WHERE session_id=? ORDER BY id`,
@@ -1647,7 +1675,7 @@ class SqliteStore implements Store {
     ftsRowsPerSession: number,
     boundary: { checkpointMessageId: string; firstNewMessageId: string },
     recompute: (allRows: PartTextRow[]) => Card,
-    opts?: { rangeHashes?: RangeHash[] },
+    opts?: { rangeHashes?: RangeHash[]; replaceRangeHashes?: boolean },
   ): SessionWrite {
     try {
       return this.db.tx((): SessionWrite => {
@@ -1691,6 +1719,9 @@ class SqliteStore implements Store {
         const changed = rowsChanged || !stored || !sameCard(stored, card);
         if (changed) this.writeStampedCard(card);
         else this.writeCheckpoint(sessionId, card);
+        if (opts?.replaceRangeHashes) {
+          this.db.run("DELETE FROM range_hash WHERE session_id=?", [sessionId]);
+        }
         this.writeRangeHashes(sessionId, opts?.rangeHashes);
         return { changed };
       });
