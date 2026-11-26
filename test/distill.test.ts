@@ -873,7 +873,8 @@ describe("cold pass", () => {
     distiller.start();
     await waitFor(() => distiller.status().coldPass === "done");
 
-    expect(store.getCard("bad")).toEqual(seeded.card);
+    // Unchanged since the seeding write, which stamped revision 1.
+    expect(store.getCard("bad")).toEqual({ ...seeded.card, writeRev: 1 });
     expect(ftsSessions(store.ftsSearch({ strong: ["preserved_fts_marker"], weak: [] }))).toEqual([
       "bad",
     ]);
@@ -1813,7 +1814,12 @@ describe("cold pass", () => {
     const afterCold = Number(store.getMeta("cards_rev"));
     expect(afterCold).toBeGreaterThan(0);
 
-    feed(distiller, idleEvent("s1")); // an incremental re-distill bumps it again
+    // An incremental re-distill that changes the card bumps it again (one that
+    // finds nothing new writes no revision).
+    graph.messagesBySession.s1!.push(
+      bundle(userMessage("m2", "s1", 200), [textPart("p2", "s1", "m2", "two content")]),
+    );
+    feed(distiller, idleEvent("s1"));
     await waitFor(() => Number(store.getMeta("cards_rev")) > afterCold);
     distiller.stop();
     db.close();
@@ -2264,7 +2270,9 @@ describe("incremental", () => {
       messages: [...initial, ...appended],
       parentById: new Map<string, string | null>([["s1", null]]),
     }).card;
-    expect(store.getCard("s1")).toEqual(full); // equivalence: append == full re-distill
+    // Equivalence: append == full re-distill. The append stamped the second
+    // revision, after the cold pass's.
+    expect(store.getCard("s1")).toEqual({ ...full, writeRev: 2 });
     expect(store.getCard("s1")!.embedding).toBeNull(); // append cleared the stale vector
     distiller.stop();
     db.close();
@@ -2310,8 +2318,9 @@ describe("incremental", () => {
     });
     store2.replaceSessionParts("s1", full.rows, full.card);
 
-    // Card equivalence over the capped set.
-    expect(store.getCard("s1")).toEqual(store2.getCard("s1"));
+    // Card equivalence over the capped set. The append stamped the second
+    // revision, after the cold pass's; the single full write stamped the first.
+    expect(store.getCard("s1")).toEqual({ ...store2.getCard("s1"), writeRev: 2 });
     // FTS-visible rows match exactly: the oldest 3 markers are gone from both,
     // the newest 5 survive in both, under the same part ids.
     for (let i = 0; i < 8; i++) {

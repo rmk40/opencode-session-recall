@@ -308,9 +308,9 @@ async function buildV3Store(path: string): Promise<void> {
   db.close();
 }
 
-/** Create a fresh v4 store at `path` as `identity` and seed one card so a later
- *  rebuild would be visible. */
-async function buildV4Store(path: string, identity: StoreIdentity): Promise<void> {
+/** Create a fresh current-schema store at `path` as `identity` and seed one
+ *  card so a later rebuild would be visible. */
+async function buildCurrentStore(path: string, identity: StoreIdentity): Promise<void> {
   const db = await openSqlite(path);
   if (!db) throw new Error("open failed");
   const opened = openStore(db, identity);
@@ -320,9 +320,9 @@ async function buildV4Store(path: string, identity: StoreIdentity): Promise<void
 }
 
 describe("store migration", () => {
-  it("creates schema v4 on a fresh db, stamped for the v1 host with no source", async () => {
+  it("creates schema v5 on a fresh db, stamped for the v1 host with no source", async () => {
     const { db, store } = await fresh();
-    expect(store.getMeta("schema_version")).toBe("4");
+    expect(store.getMeta("schema_version")).toBe("5");
     expect(store.getMeta("store_host")).toBe("opencode-v1");
     expect(store.getMeta("source_db")).toBeUndefined();
     expect(columnNames(db, "card")).toContain("distill_cursor");
@@ -335,7 +335,7 @@ describe("store migration", () => {
     if (!db) throw new Error("open failed");
     const opened = openStore(db, v2("/data/opencode.db"));
     if (!opened.ok) throw new Error(opened.reason);
-    expect(opened.store.getMeta("schema_version")).toBe("4");
+    expect(opened.store.getMeta("schema_version")).toBe("5");
     expect(opened.store.getMeta("store_host")).toBe("opencode-v2");
     expect(opened.store.getMeta("source_db")).toBe("/data/opencode.db");
     db.close();
@@ -356,7 +356,7 @@ describe("store migration", () => {
     if (!db2) throw new Error("reopen failed");
     const store2 = openV1Store(db2);
     if (!store2) throw new Error("reopen store failed");
-    expect(store2.getMeta("schema_version")).toBe("4");
+    expect(store2.getMeta("schema_version")).toBe("5");
     expect(store2.getMeta("store_host")).toBe("opencode-v1");
     expect(store2.allCards()).toEqual([]);
     expect(db2.get("SELECT name FROM sqlite_master WHERE name='junk'")).toBeUndefined();
@@ -375,14 +375,14 @@ describe("store migration", () => {
     if (!db2) throw new Error("reopen failed");
     const opened = openStore(db2, v2("/data/opencode.db"));
     if (!opened.ok) throw new Error(opened.reason);
-    expect(opened.store.getMeta("schema_version")).toBe("4");
+    expect(opened.store.getMeta("schema_version")).toBe("5");
     expect(opened.store.getMeta("store_host")).toBe("opencode-v2");
     expect(opened.store.getMeta("source_db")).toBe("/data/opencode.db");
     expect(db2.get("SELECT name FROM sqlite_master WHERE name='foreign_thing'")).toBeUndefined();
     db2.close();
   });
 
-  it("chains a populated v1 store additively to v4, preserving cards/FTS/vectors/stamps", async () => {
+  it("chains a populated v1 store additively to v5, preserving cards/FTS/vectors/stamps", async () => {
     const path = freshDbPath();
     // Build a v1-shaped store by hand (the v1 card table has no summary columns),
     // populated with a card, its slim-index/FTS rows, a persisted vector, and the
@@ -445,14 +445,14 @@ describe("store migration", () => {
     ]);
     db1.close();
 
-    // Reopen with the current (v4) code: additive upgrade chaining
-    // v1->v2->v3->v4, no rebuild.
+    // Reopen with the current (v5) code: additive upgrade chaining
+    // v1->v2->v3->v4->v5, no rebuild.
     const db2 = await openSqlite(path);
     if (!db2) throw new Error("reopen failed");
     const store2 = openV1Store(db2);
     if (!store2) throw new Error("reopen store failed");
 
-    expect(store2.getMeta("schema_version")).toBe("4");
+    expect(store2.getMeta("schema_version")).toBe("5");
     expect(store2.getMeta("store_host")).toBe("opencode-v1");
     expect(columnNames(db2, "card")).toContain("distill_cursor");
     // Everything survived: card, its vector, the semantic stamp, cards_rev.
@@ -485,7 +485,7 @@ describe("store migration", () => {
     db2.close();
   });
 
-  it("chains a populated v2 store additively to v4, preserving cards/FTS/vectors/summaries", async () => {
+  it("chains a populated v2 store additively to v5, preserving cards/FTS/vectors/summaries", async () => {
     const path = freshDbPath();
     // Build a v2-shaped store by hand: the v2 card table HAS the summary columns
     // but NOT embedding_gen. Populate it as a real install would be.
@@ -559,13 +559,13 @@ describe("store migration", () => {
     ]);
     db1.close();
 
-    // Reopen with the current (v4) code: additive v2->v3->v4 steps.
+    // Reopen with the current (v5) code: additive v2->v3->v4->v5 steps.
     const db2 = await openSqlite(path);
     if (!db2) throw new Error("reopen failed");
     const store2 = openV1Store(db2);
     if (!store2) throw new Error("reopen store failed");
 
-    expect(store2.getMeta("schema_version")).toBe("4");
+    expect(store2.getMeta("schema_version")).toBe("5");
     expect(store2.getMeta("store_host")).toBe("opencode-v1");
     expect(columnNames(db2, "card")).toContain("distill_cursor");
     // Card, vector, summary, stamp, and cards_rev all survived.
@@ -583,7 +583,7 @@ describe("store migration", () => {
     db2.close();
   });
 
-  it("upgrades a populated v3 store additively to v4 for the v1 host, keeping every row and stamp", async () => {
+  it("upgrades a populated v3 store additively to v5 for the v1 host, keeping every row and stamp", async () => {
     const path = freshDbPath();
     await buildV3Store(path);
 
@@ -592,7 +592,7 @@ describe("store migration", () => {
     const store = openV1Store(db);
     if (!store) throw new Error("reopen store failed");
 
-    expect(store.getMeta("schema_version")).toBe("4");
+    expect(store.getMeta("schema_version")).toBe("5");
     expect(store.getMeta("store_host")).toBe("opencode-v1");
     expect(store.getMeta("source_db")).toBeUndefined();
     expect(columnNames(db, "card")).toContain("distill_cursor");
@@ -630,7 +630,7 @@ describe("store migration", () => {
 
   it("opens a migrated store with a warning when the WAL switch fails", async () => {
     // The migration commits before the WAL switch, so a failing switch must not
-    // turn a committed schema 4 store into an `error` refusal.
+    // turn a committed schema 5 store into an `error` refusal.
     const path = freshDbPath();
     await buildV3Store(path);
     const db = await openSqlite(path);
@@ -639,7 +639,7 @@ describe("store migration", () => {
     const opened = openStore(spy.db, V1);
     if (!opened.ok) throw new Error(opened.reason);
     expect(opened.warning).toContain("could not enable WAL");
-    expect(opened.store.getMeta("schema_version")).toBe("4");
+    expect(opened.store.getMeta("schema_version")).toBe("5");
     expect(opened.store.getCard("s-v3")?.title).toBe("V3 session");
     opened.store.upsertCard(makeCard("s-new"));
     expect(opened.store.getCard("s-new")).toBeDefined();
@@ -673,7 +673,7 @@ describe("store migration", () => {
       const retry = await openSqlite(path);
       const store = retry && openV1Store(retry);
       if (!retry || !store) throw new Error("retry open failed");
-      expect(store.getMeta("schema_version")).toBe("4");
+      expect(store.getMeta("schema_version")).toBe("5");
       expect(store.getCard("s-v3")?.nlSummary).toBe("Linked the sprockets.");
       retry.close();
     }
@@ -725,21 +725,21 @@ describe("store migration", () => {
     db.close();
   });
 
-  it("refuses a v4 store owned by the v1 host when the v2 host opens it", async () => {
+  it("refuses a current store owned by the v1 host when the v2 host opens it", async () => {
     const path = freshDbPath();
-    await buildV4Store(path, V1);
+    await buildCurrentStore(path, V1);
     await expectRefusal(path, v2("/data/opencode.db"), "host-mismatch");
   });
 
-  it("refuses a v4 store owned by the v2 host when the v1 host opens it", async () => {
+  it("refuses a current store owned by the v2 host when the v1 host opens it", async () => {
     const path = freshDbPath();
-    await buildV4Store(path, v2("/data/opencode.db"));
+    await buildCurrentStore(path, v2("/data/opencode.db"));
     await expectRefusal(path, V1, "host-mismatch");
   });
 
-  it("refuses a v4 store whose host stamp is missing instead of guessing an owner", async () => {
+  it("refuses a current store whose host stamp is missing instead of guessing an owner", async () => {
     const path = freshDbPath();
-    await buildV4Store(path, V1);
+    await buildCurrentStore(path, V1);
     const db = await openSqlite(path);
     if (!db) throw new Error("reopen failed");
     db.run("DELETE FROM meta WHERE key='store_host'");
@@ -749,7 +749,7 @@ describe("store migration", () => {
 
   it("refuses a v2-host store distilled from a different source database", async () => {
     const path = freshDbPath();
-    await buildV4Store(path, v2("/data/a/opencode.db"));
+    await buildCurrentStore(path, v2("/data/a/opencode.db"));
     await expectRefusal(path, v2("/data/b/opencode.db"), "source-mismatch");
   });
 
@@ -766,7 +766,7 @@ describe("store migration", () => {
     // without a source stamp only arises from a hand edit. It is refused, not
     // adopted by whichever source opens it next.
     const path = freshDbPath();
-    await buildV4Store(path, v2("/data/opencode.db"));
+    await buildCurrentStore(path, v2("/data/opencode.db"));
     const db = await openSqlite(path);
     if (!db) throw new Error("reopen failed");
     db.run("DELETE FROM meta WHERE key='source_db'");
@@ -776,7 +776,7 @@ describe("store migration", () => {
 
   it("opens a store whose host and source both match, keeping its data", async () => {
     const path = freshDbPath();
-    await buildV4Store(path, v2("/data/opencode.db"));
+    await buildCurrentStore(path, v2("/data/opencode.db"));
     const db = await openSqlite(path);
     if (!db) throw new Error("reopen failed");
     const opened = openStore(db, v2("/data/opencode.db"));
@@ -790,7 +790,7 @@ describe("store migration", () => {
 
   it("rolls the fence transaction back on a refusal instead of committing it", async () => {
     const path = freshDbPath();
-    await buildV4Store(path, v2("/data/opencode.db"));
+    await buildCurrentStore(path, v2("/data/opencode.db"));
     const db = await openSqlite(path);
     if (!db) throw new Error("reopen failed");
     const spy = instrument(db);
@@ -801,7 +801,7 @@ describe("store migration", () => {
 
   it("leaves a refused file's journal mode alone and switches an accepted one to WAL", async () => {
     const path = freshDbPath();
-    await buildV4Store(path, v2("/data/opencode.db"));
+    await buildCurrentStore(path, v2("/data/opencode.db"));
     const raw = await openSqlite(path);
     if (!raw) throw new Error("reopen failed");
     raw.exec("PRAGMA journal_mode=DELETE;");
@@ -823,10 +823,10 @@ describe("store migration", () => {
 
   it("refuses a store whose schema is newer than the code, for either host", async () => {
     const path = freshDbPath();
-    await buildV4Store(path, V1);
+    await buildCurrentStore(path, V1);
     const db = await openSqlite(path);
     if (!db) throw new Error("reopen failed");
-    db.run("UPDATE meta SET value='5' WHERE key='schema_version'");
+    db.run("UPDATE meta SET value='6' WHERE key='schema_version'");
     db.close();
     await expectRefusal(path, V1, "newer");
     // A foreign host stamp is checked before the schema stamp, so the other
@@ -842,7 +842,7 @@ describe("store migration", () => {
       "UPDATE meta SET value='not-a-number' WHERE key='schema_version'",
     ]) {
       const path = freshDbPath();
-      await buildV4Store(path, v2("/data/opencode.db"));
+      await buildCurrentStore(path, v2("/data/opencode.db"));
       const db = await openSqlite(path);
       if (!db) throw new Error("reopen failed");
       db.run(damage);
@@ -891,8 +891,8 @@ describe("store migration", () => {
 
 describe("pluginBuild", () => {
   it("tags the schema, representation generation and host", () => {
-    expect(pluginBuild("opencode-v1")).toBe("schema4.gen4.opencode-v1");
-    expect(pluginBuild("opencode-v2")).toBe("schema4.gen4.opencode-v2");
+    expect(pluginBuild("opencode-v1")).toBe("schema5.gen4.opencode-v1");
+    expect(pluginBuild("opencode-v2")).toBe("schema5.gen4.opencode-v2");
   });
 });
 
@@ -1275,30 +1275,30 @@ describe("meta and lease", () => {
 
     // Fresh acquire, and idempotent re-acquire by the same holder. The build tag
     // and generation ride the lease value for cross-process diagnosis.
-    expect(store.acquireLease("A", ttl, "schema4.gen4.opencode-v1", 4)).toBe(true);
-    expect(store.acquireLease("A", ttl, "schema4.gen4.opencode-v1", 4)).toBe(true);
+    expect(store.acquireLease("A", ttl, "schema5.gen4.opencode-v1", 4)).toBe(true);
+    expect(store.acquireLease("A", ttl, "schema5.gen4.opencode-v1", 4)).toBe(true);
     expect(store.leaseStatus()).toMatchObject({
       holder: "A",
-      build: "schema4.gen4.opencode-v1",
+      build: "schema5.gen4.opencode-v1",
       gen: 4,
     });
 
     // A second holder is refused while A's lease is fresh.
     clock = 1_000_100;
-    expect(store.acquireLease("B", ttl, "schema4.gen4.opencode-v1", 4)).toBe(false);
+    expect(store.acquireLease("B", ttl, "schema5.gen4.opencode-v1", 4)).toBe(false);
 
     // A heartbeat (only the holder's own) extends the lease and preserves build/gen.
     expect(store.heartbeatLease("A")).toBe(true);
     expect(store.heartbeatLease("B")).toBe(false);
     expect(store.leaseStatus()).toMatchObject({
       holder: "A",
-      build: "schema4.gen4.opencode-v1",
+      build: "schema5.gen4.opencode-v1",
       gen: 4,
     });
 
     // Past the ORIGINAL acquire + ttl but within heartbeat + ttl: still A's.
     clock = 1_005_050;
-    expect(store.acquireLease("B", ttl, "schema4.gen4.opencode-v1", 4)).toBe(false);
+    expect(store.acquireLease("B", ttl, "schema5.gen4.opencode-v1", 4)).toBe(false);
 
     // Past heartbeat + ttl: B, a DIFFERENT build, takes over the expired lease —
     // and leaseStatus now names it (the mixed-version diagnosis path).
@@ -1314,7 +1314,7 @@ describe("meta and lease", () => {
 
     // A released lease is immediately acquirable by anyone.
     clock = 1_005_102;
-    expect(store.acquireLease("A", ttl, "schema4.gen4.opencode-v1", 4)).toBe(true);
+    expect(store.acquireLease("A", ttl, "schema5.gen4.opencode-v1", 4)).toBe(true);
     db.close();
   });
 

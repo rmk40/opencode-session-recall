@@ -805,7 +805,7 @@ describe("plugin entry", () => {
         );
         // Still the v2 host's store: no rebuild, no restamp, no lease taken.
         expect(meta).toEqual({
-          schema_version: "4",
+          schema_version: "5",
           store_host: "opencode-v2",
           source_db: "/data/opencode.db",
         });
