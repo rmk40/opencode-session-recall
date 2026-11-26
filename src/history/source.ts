@@ -204,8 +204,8 @@ export function createHistoryDriftState(base: HistoryDriftBase): HistoryDriftSta
 }
 
 export interface HistorySource {
-  /** Which host backend this is. Nothing reads it yet; it exists so tool
-   *  `coverage` can show which history a response searched. */
+  /** Which host backend this is, so tool `coverage` can show which history a
+   *  response searched. */
   readonly kind: "v1-http" | "v2-sqlite";
   /** Whether project and global lookups can disagree (v1: a directory-scoped
    *  client can 404 on a session the unscoped client resolves). Callers that

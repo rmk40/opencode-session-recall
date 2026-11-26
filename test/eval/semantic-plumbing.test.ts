@@ -25,7 +25,7 @@ import { makeConceptEmbedder } from "./fake-embedder.js";
  * zero lexical hits, and (c) reported in coverage.semantic diagnostics. The
  * real-model counterpart lives in semantic.test.ts (RECALL_EVAL_SEMANTIC=1).
  *
- * The four paraphrase queries are the plan's failing real-corpus cases.
+ * The four paraphrase queries are the failing real-corpus cases.
  */
 const PARAPHRASES = [
   "pseudo-terminal testing real host",

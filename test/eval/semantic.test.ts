@@ -95,7 +95,7 @@ describe.skipIf(!process.env.RECALL_EVAL_SEMANTIC)(
   },
 );
 
-// ── Vocabulary-gap target + four paraphrase queries (the plan's real failure) ──
+// ── Vocabulary-gap target + four paraphrase queries (the real-corpus failure) ──
 // The default-gate counterpart (fake embedder) is semantic-plumbing.test.ts. This
 // measures the REAL model against a GENUINE vocabulary gap: the target's card is
 // identifier soup that uses SYNONYMS of the query concepts (console/tty/headless/

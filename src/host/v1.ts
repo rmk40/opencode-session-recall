@@ -56,7 +56,7 @@ const STORE_HOST: StoreHost = STORE_IDENTITY.host;
  * `coverage.semantic.pluginVersion`, so a store shared by mixed-version processes
  * can be diagnosed from one lease read / one tool response.
  *
- * DEVIATION (see the plan's build-tag decision): this is NOT the package.json
+ * This is NOT the package.json
  * semver. `src/` cannot read package.json cleanly — `tsconfig` sets `rootDir` to
  * `./src` and leaves `resolveJsonModule` off, so importing `../package.json` fails
  * `tsc`, and a hand-copied version const would drift silently on release (the

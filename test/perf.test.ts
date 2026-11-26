@@ -3,7 +3,7 @@
  *
  * Gated behind RECALL_PERF=1 — machine-dependent wall-clock timing is not
  * CI-stable, so these never run in the normal suite. Enable them to prove the
- * plan's budgets still hold after a change:
+ * budgets below still hold after a change:
  *
  *     RECALL_PERF=1 npx vitest run test/perf.test.ts
  *
@@ -12,7 +12,7 @@
  *   - Single-session distill+replace p50 < 150ms (20 sessions of ~64 parts).
  *   - ftsSearch over ~50k slim-index rows < 100ms.
  *   - A drilled smart query end-to-end (~100-session seeded store) < 1.5s.
- *   - Heap stays under 150MB (generous CI headroom; the plan's 80MB steady
+ *   - Heap stays under 150MB (generous CI headroom; the 80MB steady
  *     target is validated live, not in vitest).
  *
  * Each gate warms up before measuring and uses real timers with honest
