@@ -489,6 +489,27 @@ describe("recall continuations that no longer fit their search", { timeout: 30_0
     ).toEqual({ ok: false, error: expect.stringContaining("continues a different search") });
   });
 
+  it("keys a continuation on whether excludeFamily is literally true", async () => {
+    const h = makeFakeHarness();
+    addBulk(h);
+    const { tool } = await recallOver(h);
+    const refused = { ok: false, error: expect.stringContaining("continues a different search") };
+
+    const family = (await call(tool, { ...ARGS, excludeFamily: true })).continuation!;
+    expect(family).toEqual(expect.any(String));
+    const resumed = await call(tool, { ...ARGS, excludeFamily: true, cursor: family });
+    expect(resumed.ok, resumed.error).toBe(true);
+    expect(await call(tool, { ...ARGS, cursor: family })).toEqual(refused);
+
+    // Every value but true reads as unset, so it continues the search without it.
+    const plain = (await call(tool, ARGS)).continuation!;
+    for (const unset of [false, "yes", 1, null]) {
+      const out = await call(tool, { ...ARGS, excludeFamily: unset, cursor: plain });
+      expect(out.ok, `${String(unset)}: ${out.error}`).toBe(true);
+    }
+    expect(await call(tool, { ...ARGS, excludeFamily: true, cursor: plain })).toEqual(refused);
+  });
+
   it("takes a continuation back with arguments that differ only by the defaults the tool fills in", async () => {
     const h = makeFakeHarness();
     addBulk(h);

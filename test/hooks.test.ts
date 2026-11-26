@@ -6,9 +6,15 @@ import { partId } from "../src/hooks/part-id.js";
 import type { CardRecallHit } from "../src/hooks/card-recall.js";
 import type { Card } from "../src/store.js";
 import {
+  PROJECT_DIR,
+  assistantMessage,
+  bundle,
+  globalSessionFrom,
   makeFakeHarness,
   makeRecallDeps,
+  session,
   setStrictNoLimitMessages,
+  textPart,
   type FakeHarness,
 } from "./helpers.js";
 
@@ -258,6 +264,54 @@ describe("autoRecall hook", () => {
     );
     expect(synthetic?.text).toContain(`session ${"s-project-2".slice(0, 8)}`);
     expect(synthetic?.text).not.toContain(`session ${"s-current".slice(0, 8)}`);
+  });
+
+  it("excludes the subagents of the session it fires in, too", async () => {
+    const h = makeFakeHarness();
+    const now = Date.now();
+    const kid = session(
+      "s-kidrate",
+      "Rate limit subagent",
+      PROJECT_DIR,
+      now - 3_000,
+      undefined,
+      "s-current",
+    );
+    h.sessions.push(kid);
+    h.globalSessions.push(globalSessionFrom(kid));
+    h.messagesBySession[kid.id] = [
+      bundle(assistantMessage("m-kidrate", kid.id, now - 3_000), [
+        textPart(
+          "p-kidrate",
+          kid.id,
+          "m-kidrate",
+          "The rate limit uses a token bucket per tenant.",
+        ),
+      ]),
+    ];
+    const { deps, cleanup } = await hookDeps(h);
+    const hook = autoRecall(deps);
+    const fire = async (sessionID: string): Promise<string | undefined> => {
+      const output = {
+        message: { id: "m-x" } as never,
+        parts: [
+          { type: "text", text: "what did we decide about rate limit last time?" },
+        ] as unknown[],
+      };
+      await hook({ sessionID } as never, output as never);
+      return (output.parts as Array<{ synthetic?: boolean; text?: string }>).find(
+        (p) => p.synthetic,
+      )?.text;
+    };
+    const kidCitation = `session ${kid.id.slice(0, 8)}`;
+
+    const fromElsewhere = await fire("s-other");
+    const fromParent = await fire("s-current");
+    cleanup();
+    // From an unrelated session the subagent is cited, so it matches.
+    expect(fromElsewhere).toContain(kidCitation);
+    expect(fromParent).toContain(`session ${"s-project-2".slice(0, 8)}`);
+    expect(fromParent).not.toContain(kidCitation);
   });
 
   it("does nothing when the gate does not fire", async () => {

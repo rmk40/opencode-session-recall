@@ -425,6 +425,9 @@ describe("calls that read only the card map", () => {
     });
     const readMap = (): void => {
       runtime.list({});
+      // Each exclusion filter is resolved from the card map alone.
+      runtime.list({ excludeSessionId: "s2" });
+      runtime.list({ excludeFamilyOf: "s2", excludeSessionId: "s3" });
       runtime.get("s1");
       runtime.exclusionFamily("s2");
       runtime.familyOf("s1");

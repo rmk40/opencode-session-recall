@@ -221,6 +221,138 @@ describe("cards tier-1 rank", () => {
     db.close();
   });
 
+  it("excludes only the named session with excludeSessionId, in rank and list alike", async () => {
+    const { db, store } = await freshStore();
+    store.upsertCard(makeCard("root", { inventory: "auth login debug" }));
+    store.upsertCard(
+      makeCard("child", { inventory: "auth login debug", parentId: "root", rootId: "root" }),
+    );
+    store.upsertCard(
+      makeCard("grandchild", { inventory: "auth login debug", parentId: "child", rootId: "root" }),
+    );
+    store.upsertCard(
+      makeCard("sibling", { inventory: "auth login debug", parentId: "root", rootId: "root" }),
+    );
+    const runtime = createCardsRuntime({ source: storeSource(store) });
+    const q = parseQuery("auth login debug");
+
+    // The parent, the subagent and the sibling all stay in.
+    const kept = ["grandchild", "root", "sibling"];
+    expect(ids(runtime.rank(q, { excludeSessionId: "child" })).sort()).toEqual(kept);
+    expect(ids(runtime.list({ excludeSessionId: "child" })).sort()).toEqual(kept);
+    db.close();
+  });
+
+  it("applies excludeSessionId and excludeFamilyOf together", async () => {
+    const { db, store } = await freshStore();
+    store.upsertCard(makeCard("root", { inventory: "auth login debug" }));
+    store.upsertCard(
+      makeCard("child", { inventory: "auth login debug", parentId: "root", rootId: "root" }),
+    );
+    store.upsertCard(makeCard("other", { inventory: "auth login debug" }));
+    store.upsertCard(makeCard("third", { inventory: "auth login debug" }));
+    const runtime = createCardsRuntime({ source: storeSource(store) });
+    const filters = { excludeFamilyOf: "child", excludeSessionId: "other" };
+
+    expect(ids(runtime.rank(parseQuery("auth login debug"), filters))).toEqual(["third"]);
+    expect(ids(runtime.list(filters))).toEqual(["third"]);
+    db.close();
+  });
+
+  describe("excluded matches", () => {
+    /** Cards given in an order other than session-id order, so the reported
+     *  order is the ranking's own. */
+    function staticRuntime(
+      cards: Card[],
+      deps: Partial<Parameters<typeof createCardsRuntime>[0]> = {},
+    ) {
+      return createCardsRuntime({
+        source: { getCards: () => cards, revision: () => undefined },
+        ...deps,
+      });
+    }
+    const stats = (): RankStats => ({ rootOnlySkipped: [] });
+    const matchedIds = (s: RankStats): string[] | undefined =>
+      s.excludedMatched?.map((card) => card.sessionId);
+
+    it("reports the family cards the exclusion removed that match the query, in session-id order", () => {
+      const runtime = staticRuntime([
+        makeCard("s-root", { inventory: "widget parser" }),
+        makeCard("s-kid-b", { inventory: "widget parser", parentId: "s-root", rootId: "s-root" }),
+        makeCard("s-kid-a", { inventory: "widget parser", parentId: "s-root", rootId: "s-root" }),
+        // Excluded, but nothing in it matches the query.
+        makeCard("s-kid-quiet", { inventory: "unrelated", parentId: "s-root", rootId: "s-root" }),
+        makeCard("s-other", { inventory: "widget parser" }),
+      ]);
+      const s = stats();
+      expect(
+        ids(runtime.rank(parseQuery("widget parser"), { excludeFamilyOf: "s-kid-b" }, s)),
+      ).toEqual(["s-other"]);
+      expect(matchedIds(s)).toEqual(["s-kid-a", "s-kid-b", "s-root"]);
+    });
+
+    it("reports the one session excludeSessionId removed when it matches", () => {
+      const runtime = staticRuntime([
+        makeCard("s-root", { inventory: "widget parser" }),
+        makeCard("s-kid", { inventory: "widget parser", parentId: "s-root", rootId: "s-root" }),
+      ]);
+      const q = parseQuery("widget parser");
+
+      const matching = stats();
+      runtime.rank(q, { excludeSessionId: "s-kid" }, matching);
+      expect(matchedIds(matching)).toEqual(["s-kid"]);
+
+      // An exclusion that removes nothing still measures: the list is empty.
+      const absent = stats();
+      runtime.rank(q, { excludeSessionId: "s-unknown" }, absent);
+      expect(matchedIds(absent)).toEqual([]);
+    });
+
+    it("leaves out an excluded card another filter removes as well", () => {
+      const runtime = staticRuntime([
+        makeCard("s-root", { inventory: "widget parser", timeUpdated: 9_000 }),
+        makeCard("s-kid", {
+          inventory: "widget parser",
+          parentId: "s-root",
+          rootId: "s-root",
+          timeUpdated: 100,
+        }),
+      ]);
+      const s = stats();
+      runtime.rank(parseQuery("widget parser"), { excludeFamilyOf: "s-root", since: 1_000 }, s);
+      expect(matchedIds(s)).toEqual(["s-root"]);
+    });
+
+    it("does not count an excluded card whose only signal is semantic", () => {
+      // Every card maps to the query's axis, so each one carries a semantic
+      // score; only s-lex shares a word with the query.
+      const embedder = { ready: true, embed: () => Float32Array.from([1, 0]) };
+      const runtime = staticRuntime(
+        [
+          makeCard("s-root", { inventory: `widget parser ${SUBST}` }),
+          makeCard("s-sem", { inventory: SUBST, parentId: "s-root", rootId: "s-root" }),
+          makeCard("s-lex", { inventory: `widget ${SUBST}`, parentId: "s-root", rootId: "s-root" }),
+        ],
+        { embedder, semanticWeight: 0.5 },
+      );
+      const s = stats();
+      const hits = runtime.rank(parseQuery("widget parser"), { excludeSessionId: "s-sem" }, s);
+      expect(hits.find((h) => h.sessionId === "s-root")?.semanticScore).toBeGreaterThan(0);
+      expect(matchedIds(s)).toEqual([]);
+
+      const lexical = stats();
+      runtime.rank(parseQuery("widget parser"), { excludeSessionId: "s-lex" }, lexical);
+      expect(matchedIds(lexical)).toEqual(["s-lex"]);
+    });
+
+    it("is not set when no exclusion filter is", () => {
+      const runtime = staticRuntime([makeCard("s-root", { inventory: "widget parser" })]);
+      const s = stats();
+      runtime.rank(parseQuery("widget parser"), { since: 1_000 }, s);
+      expect(s.excludedMatched).toBeUndefined();
+    });
+  });
+
   it("reloads lazily on a revision change past the refresh interval", async () => {
     const { db, store } = await freshStore();
     let clock = 1_000_000;
