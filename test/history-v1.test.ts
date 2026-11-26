@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import type { OpencodeClient } from "@opencode-ai/sdk/v2";
+import type { OpencodeClient, Session } from "@opencode-ai/sdk/v2";
 import { createV1HistorySource, fetchMessagePage } from "../src/history/v1.js";
 import { MalformedSessionError } from "../src/history/source.js";
 import {
@@ -32,8 +32,9 @@ describe("v1 history source", () => {
     expect(global.ok && global.items.map((s) => s.id)).toEqual(["s-other"]);
     expect(global.ok && global.items[0]?.project?.worktree).toBe("/workspace/other");
 
-    expect(h.calls.projectList).toEqual([{ search: undefined, limit: 1 }]);
-    expect(h.calls.globalList).toEqual([{ search: "walkthrough", limit: 5 }]);
+    // One row past the limit decides `truncated`.
+    expect(h.calls.projectList).toEqual([{ search: undefined, limit: 2 }]);
+    expect(h.calls.globalList).toEqual([{ search: "walkthrough", limit: 6 }]);
   });
 
   it("returns a listing error with the host's message", async () => {
@@ -50,7 +51,11 @@ describe("v1 history source", () => {
       const h = makeFakeHarness({ listBody: { unexpected: true } });
       const source = createV1HistorySource({ scoped: h.client, unscoped: h.unscoped });
       // Discovery (not strict) keeps v1's `Array.isArray(data) ? data : []`.
-      expect(await source.listSessions({ scope, limit: 5 })).toEqual({ ok: true, items: [] });
+      expect(await source.listSessions({ scope, limit: 5 })).toEqual({
+        ok: true,
+        items: [],
+        truncated: false,
+      });
       await expect(source.listSessions({ scope, limit: 5, strict: true })).rejects.toThrow(
         "session listing response was not an array",
       );
@@ -60,6 +65,7 @@ describe("v1 history source", () => {
       expect(await emptySource.listSessions({ scope, limit: 5, strict: true })).toEqual({
         ok: true,
         items: [],
+        truncated: false,
       });
     }
   });
@@ -123,7 +129,11 @@ describe("v1 history source", () => {
 
     const odd = makeFakeHarness({ childrenNonArray: true });
     const oddSource = createV1HistorySource({ scoped: odd.client, unscoped: odd.unscoped });
-    expect(await oddSource.listChildren("s-current")).toEqual({ ok: true, items: [] });
+    expect(await oddSource.listChildren("s-current")).toEqual({
+      ok: true,
+      items: [],
+      truncated: false,
+    });
 
     const failed = makeFakeHarness({ childrenError: "no children for you" });
     const failedSource = createV1HistorySource({
@@ -199,6 +209,155 @@ describe("v1 history source", () => {
       ok: false,
       reason: "not-found",
     });
+  });
+});
+
+describe("v1 history source: truncation, archived sessions and continuations", () => {
+  /** Clients whose listings return `rows` and record the params they got. */
+  function listingClients(rows: Session[]) {
+    const calls = { project: [] as unknown[], global: [] as unknown[] };
+    const scoped = {
+      session: {
+        list: async (params: unknown) => {
+          calls.project.push(params);
+          return { data: rows };
+        },
+      },
+    } as unknown as OpencodeClient;
+    const unscoped = {
+      experimental: {
+        session: {
+          list: async (params: unknown) => {
+            calls.global.push(params);
+            return { data: rows };
+          },
+        },
+      },
+    } as unknown as OpencodeClient;
+    return { source: createV1HistorySource({ scoped, unscoped }), calls };
+  }
+
+  it("asks for one row past the limit and cuts it off as truncated", async () => {
+    const h = makeFakeHarness();
+    const source = createV1HistorySource({ scoped: h.client, unscoped: h.unscoped });
+    // The fixture's project listing holds two sessions, its global one three.
+    const one = await source.listSessions({ scope: "project", limit: 1 });
+    expect(one).toMatchObject({ ok: true, truncated: true });
+    expect(one.ok && one.items.map((s) => s.id)).toEqual(["s-current"]);
+    const both = await source.listSessions({ scope: "project", limit: 2 });
+    expect(both).toMatchObject({ ok: true, truncated: false });
+    expect(both.ok && both.items).toHaveLength(2);
+    const global = await source.listSessions({ scope: "global", limit: 2 });
+    expect(global).toMatchObject({ ok: true, truncated: true });
+    expect(global.ok && global.items).toHaveLength(2);
+    expect(h.calls.projectList.map((c) => c.limit)).toEqual([2, 3]);
+    expect(h.calls.globalList.map((c) => c.limit)).toEqual([3]);
+  });
+
+  it("fails an id-order listing or a cursor without calling the host", async () => {
+    const h = makeFakeHarness();
+    const source = createV1HistorySource({ scoped: h.client, unscoped: h.unscoped });
+    for (const scope of ["project", "global"] as const) {
+      expect(await source.listSessions({ scope, limit: 5, order: "id" })).toMatchObject({
+        ok: false,
+        error: expect.stringMatching(/id order/),
+      });
+      expect(await source.listSessions({ scope, limit: 5, after: "s-current" })).toMatchObject({
+        ok: false,
+      });
+    }
+    // A recency listing is still served.
+    expect(
+      await source.listSessions({ scope: "project", limit: 5, order: "recent" }),
+    ).toMatchObject({
+      ok: true,
+    });
+    expect(h.calls.projectList).toHaveLength(1);
+    expect(h.calls.globalList).toEqual([]);
+  });
+
+  it("asks the global endpoint for archived sessions only when they are included", async () => {
+    const { source, calls } = listingClients([]);
+    await source.listSessions({ scope: "global", limit: 5 });
+    await source.listSessions({ scope: "global", limit: 5, archived: "exclude" });
+    await source.listSessions({ scope: "global", limit: 5, archived: "include", search: "x" });
+    expect(calls.global).toEqual([
+      { limit: 6 },
+      { limit: 6 },
+      { search: "x", limit: 6, archived: true },
+    ]);
+    // The project endpoint takes no archived parameter.
+    await source.listSessions({ scope: "project", limit: 5, archived: "include" });
+    expect(calls.project).toEqual([{ limit: 6 }]);
+  });
+
+  it("drops archived sessions from a project listing only on exclude", async () => {
+    const live = session("s-live", "Live", PROJECT_DIR, 2_000);
+    const archived = session("s-arch", "Archived", PROJECT_DIR, 1_500, 1_800);
+    const { source } = listingClients([live, archived]);
+    const list = async (o: { archived?: "include" | "exclude" }) => {
+      const listing = await source.listSessions({ scope: "project", limit: 5, ...o });
+      return listing.ok && listing.items.map((s) => s.id);
+    };
+    expect(await list({})).toEqual(["s-live", "s-arch"]);
+    expect(await list({ archived: "include" })).toEqual(["s-live", "s-arch"]);
+    expect(await list({ archived: "exclude" })).toEqual(["s-live"]);
+  });
+
+  it("drops archived sessions before cutting to the limit, truncated while the host had more", async () => {
+    const archived = session("s-arch", "Archived", PROJECT_DIR, 2_000, 2_100);
+    const live = session("s-live", "Live", PROJECT_DIR, 1_500);
+    const { source, calls } = listingClients([archived, live]);
+    // The host returned the extra row, so more live sessions may follow.
+    expect(await source.listSessions({ scope: "project", limit: 1, archived: "exclude" })).toEqual({
+      ok: true,
+      items: [live],
+      truncated: true,
+    });
+    expect(calls.project).toEqual([{ limit: 2 }]);
+    // Within the limit, the listing is complete.
+    expect(await source.listSessions({ scope: "project", limit: 2, archived: "exclude" })).toEqual({
+      ok: true,
+      items: [live],
+      truncated: false,
+    });
+  });
+
+  it("keeps rows of the wrong shape instead of throwing while excluding archived ones", async () => {
+    const live = session("s-live", "Live", PROJECT_DIR, 1_500);
+    const odd = [{ id: "no-time" }, null, { id: "bad-time", time: 5 }] as unknown as Session[];
+    const { source } = listingClients([...odd, live]);
+    const listing = await source.listSessions({ scope: "project", limit: 10, archived: "exclude" });
+    expect(listing).toEqual({ ok: true, items: [...odd, live], truncated: false });
+  });
+
+  it("returns every child at once, never truncated, whatever the paging options", async () => {
+    const kids = [
+      session("c1", "One", PROJECT_DIR, 1_000, undefined, "s-current"),
+      session("c2", "Two", PROJECT_DIR, 2_000, 2_500, "s-current"),
+      session("c3", "Three", PROJECT_DIR, 3_000, undefined, "s-current"),
+    ];
+    const h = makeFakeHarness({ children: { "s-current": kids } });
+    const source = createV1HistorySource({ scoped: h.client, unscoped: h.unscoped });
+    const listed = await source.listChildren("s-current", { limit: 1, order: "id", after: "c1" });
+    expect(listed).toEqual({ ok: true, items: kids, truncated: false });
+    const live = await source.listChildren("s-current", { archived: "exclude" });
+    expect(live).toEqual({ ok: true, items: [kids[0], kids[2]], truncated: false });
+  });
+
+  it("answers a part continuation as unsupported without calling the host", async () => {
+    const h = makeFakeHarness();
+    const source = createV1HistorySource({ scoped: h.client, unscoped: h.unscoped });
+    for (const partOrdinal of [0, 3]) {
+      expect(await source.getMessage("s-current", "m-current-2", { partOrdinal })).toEqual({
+        ok: false,
+        reason: "unsupported",
+        error: expect.any(String),
+      });
+    }
+    expect(h.calls.message).toEqual([]);
+    const whole = await source.getMessage("s-current", "m-current-2", {});
+    expect(whole.ok && whole.value.partial).toBeUndefined();
   });
 });
 

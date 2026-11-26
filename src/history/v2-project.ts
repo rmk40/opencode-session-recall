@@ -1,12 +1,17 @@
 import type { Part, ToolState } from "@opencode-ai/sdk/v2";
-import type { HistoryMessage, HistoryMessageInfo, HistorySession } from "./model.js";
+import type {
+  HistoryMessage,
+  HistoryMessageInfo,
+  HistorySession,
+  MessagePartial,
+} from "./model.js";
 
 /**
  * The v2 projector: maps `opencode.db` rows (`session_v2`, `session_message`,
- * `project`) into the read model the core already consumes, so `extract.ts`,
- * `candidates.ts`, `distill.ts` and `authorship.ts` read v2 history unchanged.
- * The field mapping follows opencode v2's `schema/src/session-message.ts`
- * and `core/src/session/sql.ts`.
+ * `session_part`, `project`) into the read model the core already consumes, so
+ * `extract.ts`, `candidates.ts`, `distill.ts` and `authorship.ts` read v2
+ * history unchanged. The field mapping follows opencode v2's
+ * `schema/src/session-message.ts` and `core/src/session/sql.ts`.
  *
  * Pure and total: no I/O, and a row of the wrong shape degrades field by field
  * (a missing string becomes `""`, a missing number `0`) rather than throwing.
@@ -43,6 +48,24 @@ export type V2MessageRow = {
   time_created: number;
   time_updated: number;
   /** The encoded message minus `id` and `type` (`core/src/session/sql.ts:22`). */
+  data: string;
+};
+
+/**
+ * One `session_part` row: an assistant message's content item, stored apart
+ * from the message row since opencode 2.4. Primary key `(message_id,
+ * ordinal)`; `type` repeats the item's type and is authoritative.
+ */
+export type V2PartRow = {
+  message_id: string;
+  session_id: string;
+  ordinal: number;
+  type: string;
+  /** A tool item's call id; NULL for other items. */
+  call_id: string | null;
+  time_created: number;
+  time_updated: number;
+  /** The encoded content item. */
   data: string;
 };
 
@@ -183,6 +206,35 @@ export function decodeRow(row: V2MessageRow): DecodedRow {
   }
   if (!isObj(data)) return { ok: false, row, reason: `message ${row.id} data is not an object` };
   return { ok: true, row, data };
+}
+
+/** Assistant content item types the projector reads
+ *  (`schema/src/session-message.ts` `AssistantContent`). */
+export const PART_TYPES = ["text", "reasoning", "tool"];
+
+export type DecodedPart =
+  | { ok: true; row: V2PartRow; item: Obj }
+  | { ok: false; row: V2PartRow; reason: string };
+
+/**
+ * Parse a part row's `data` into a content item. The `type` column wins over
+ * any `type` in the data, as opencode decodes `{ ...data, type }`
+ * (`core/src/session/history.ts` `decodePartRowSync`); a tool item without an
+ * `id` of its own takes the `call_id` column. The reason names the message
+ * and ordinal, in the `message <id> ...` form {@link decodeRow} uses.
+ */
+export function decodePartRow(row: V2PartRow): DecodedPart {
+  const where = `message ${row.message_id} part ${row.ordinal}`;
+  let data: unknown;
+  try {
+    data = JSON.parse(row.data);
+  } catch {
+    return { ok: false, row, reason: `${where} data is not valid JSON` };
+  }
+  if (!isObj(data)) return { ok: false, row, reason: `${where} data is not an object` };
+  const item: Obj = { ...data, type: row.type };
+  if (row.type === "tool" && typeof item.id !== "string" && row.call_id) item.id = row.call_id;
+  return { ok: true, row, item };
 }
 
 /** Whether a decoded row carries content (see {@link CONTENT_TYPES}). */
@@ -425,19 +477,44 @@ function userInfo(row: V2MessageRow, identity: UserIdentity): HistoryMessageInfo
 }
 
 /**
+ * The `session_part` items an assistant message is projected with. The source
+ * reads them and builds placeholders; {@link projectMessage} merges them.
+ */
+export type MessageParts = {
+  /** Content items from part rows in ordinal order, placeholder items
+   *  included in place of rows that could not be loaded. */
+  items: unknown[];
+  /** Merged position of the first item: the number of part rows before a
+   *  continuation ordinal, 0 for a whole message. */
+  start: number;
+  /** Set when the read cut the parts short. The message then ends with one
+   *  text part carrying `note`, and its inline content is left for the
+   *  continuation, which reads the merged list from `nextOrdinal` on. */
+  cut?: MessagePartial & { note: string };
+};
+
+/**
  * Project one decoded content row. Returns `undefined` for a row that is not
  * content (see {@link isContentRow}). `identity` attributes user-role rows and
- * is ignored for assistant and compaction rows.
+ * is ignored for assistant and compaction rows. `parts` carries an assistant
+ * row's `session_part` items and is ignored for every other type.
  *
  * Part ids are `${messageId}:<suffix>`: deterministic, unique
  * (message ids are the table's primary key), and free of `#`, which the
  * distiller appends to them. Tool call ids repeat across sessions and are
  * never used.
+ *
+ * An assistant's content is its part rows by ordinal followed by its inline
+ * `data.content`, the order opencode 2.4 reads it in, and its part ids are
+ * positions in that merged list. A row with no part rows projects exactly as
+ * inline content always has, and opencode's lazy move of inline items into
+ * part rows appends them after the existing ordinals, so it keeps every id.
  */
 export function projectMessage(
   decoded: { row: V2MessageRow; data: Obj },
   session: SessionContext,
   identity: UserIdentity,
+  parts?: MessageParts,
 ): HistoryMessage | undefined {
   if (!isContentRow(decoded)) return undefined;
   const { row, data } = decoded;
@@ -531,11 +608,21 @@ export function projectMessage(
       return { info: userInfo(row, identity), parts: [toolPart(at("0"), row.id, "shell", state)] };
     }
     case "assistant": {
-      const parts: Part[] = [];
-      arr(data.content).forEach((item, i) => {
-        const part = assistantContentPart(at(String(i)), item, row.time_created, row.time_updated);
-        if (part) parts.push(part);
+      const out: Part[] = [];
+      const inline = arr(data.content);
+      const start = parts?.start ?? 0;
+      const items = parts ? (parts.cut ? parts.items : [...parts.items, ...inline]) : inline;
+      items.forEach((item, i) => {
+        const part = assistantContentPart(
+          at(String(start + i)),
+          item,
+          row.time_created,
+          row.time_updated,
+        );
+        if (part) out.push(part);
       });
+      const cut = parts?.cut;
+      if (cut) out.push({ ...at(`cut${cut.nextOrdinal}`), type: "text", text: cut.note });
       const completed = typeof time.completed === "number" ? time.completed : undefined;
       const info = assistantInfo(row, session, {
         agent: str(data.agent) || session.agent || "",
@@ -545,7 +632,13 @@ export function projectMessage(
         tokens: data.tokens,
         finish: data.finish,
       });
-      return { info, parts };
+      if (!cut) return { info, parts: out };
+      const partial: MessagePartial = {
+        nextOrdinal: cut.nextOrdinal,
+        omittedParts: cut.omittedParts,
+        omittedBytes: cut.omittedBytes,
+      };
+      return { info, parts: out, partial };
     }
     case "compaction": {
       const parts: Part[] = [{ ...at("c"), type: "compaction", auto: data.reason === "auto" }];

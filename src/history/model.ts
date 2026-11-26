@@ -15,8 +15,25 @@ import type { GlobalSession, Message, Part, Session } from "@opencode-ai/sdk/v2"
  */
 export type HistoryMessageInfo = Message & { seq?: number };
 
-/** One message with its parts (the SDK's `{ info, parts }` bundle). */
-export type HistoryMessage = { info: HistoryMessageInfo; parts: Part[] };
+/**
+ * What a read left out of a message whose parts did not fit in it. The
+ * message's parts then end in one placeholder text part, and
+ * `HistorySource.getMessage` with `partOrdinal: nextOrdinal` reads the rest.
+ */
+export type MessagePartial = {
+  /** The part ordinal the rest starts at. */
+  nextOrdinal: number;
+  /** Content items left out: part rows from `nextOrdinal` on, plus the
+   *  message's inline content items. */
+  omittedParts: number;
+  /** Encoded bytes of the part rows left out, as measured when the read was
+   *  cut. Inline content left out counts in `omittedParts` only. */
+  omittedBytes: number;
+};
+
+/** One message with its parts (the SDK's `{ info, parts }` bundle). `partial`
+ *  is set only on a v2 message a read cut short; v1 never sets it. */
+export type HistoryMessage = { info: HistoryMessageInfo; parts: Part[]; partial?: MessagePartial };
 
 /** One session row. A global listing also carries the owning project summary. */
 export type HistorySession = Session & { project?: GlobalSession["project"] };

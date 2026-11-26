@@ -60,7 +60,8 @@ describe("recall_sessions", () => {
 
     expect(out).toMatchObject({ ok: true, returned: 2, scope: "project" });
     expect(out.sessions.map((s) => s.id)).toEqual(["s-current", "s-project-2"]);
-    expect(h.calls.projectList).toEqual([{ search: undefined, limit: 20 }]);
+    // One row past the limit decides the listing's `truncated`.
+    expect(h.calls.projectList).toEqual([{ search: undefined, limit: 21 }]);
   });
 
   it("pins the fake's deliberate divergence: its global listing includes an archived session", async () => {
@@ -82,7 +83,7 @@ describe("recall_sessions", () => {
       search: "   ",
     });
 
-    expect(h.calls.globalList).toEqual([{ search: undefined, limit: 20 }]);
+    expect(h.calls.globalList).toEqual([{ search: undefined, limit: 21 }]);
     expect(out.sessions.map((s) => s.id)).toEqual(["s-other", "s-current", "s-project-2"]);
     expect(out.sessions.find((s) => s.id === "s-project-2")?.archived).toBe(true);
     expect(out.sessions.find((s) => s.id === "s-other")?.project?.name).toBe("other");
