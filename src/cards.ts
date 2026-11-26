@@ -28,7 +28,7 @@ import type { DirectoryRelevance } from "./types.js";
  * basenames) is kept in step with the store; each hit is then lifted by exact
  * code-token presence in the inventory, a recency prior, and — when enabled — a
  * semantic blend over card text. Metadata predicates (since/until, directory
- * scope, agent, current-session family exclusion) filter the ranked hits.
+ * scope, agent, current-session or family exclusion) filter the ranked hits.
  *
  * The runtime keeps two layers. The metadata layer is a map of every card,
  * which `list`, `get`, `exclusionFamily`, `familyOf`, `coverage` and
@@ -138,6 +138,9 @@ export type CardFilters = {
   directoryFilter?: string;
   /** Exclude the current session and its whole family (see {@link exclusionFamilyFromCards}). */
   excludeFamilyOf?: string;
+  /** Exclude this one session and nothing else, so its parent, siblings and
+   *  subagents stay in. With {@link excludeFamilyOf} both apply. */
+  excludeSessionId?: string;
   /** Declared as `never` so the ranking-only restriction cannot be smuggled in
    *  here; see {@link CardRankFilters}. */
   rootOnly?: never;
@@ -194,6 +197,14 @@ export type RankStats = {
    *  index had yet to take their current content (an index update was still
    *  running). Set by every `rank` call given this object. */
   pending?: number;
+  /** Cards the exclusion filters ({@link CardFilters.excludeSessionId},
+   *  {@link CardFilters.excludeFamilyOf}) alone removed that matched the query
+   *  lexically, in session-id order: the ones the caller's exclusion arguments
+   *  would let back in. Cards are returned, like {@link rootOnlySkipped}, so
+   *  the caller can apply the selection guards `rank` does not see. A semantic
+   *  score alone does not count, since nearly every card carries one. Set
+   *  only when an exclusion filter is. */
+  excludedMatched?: Card[];
 };
 
 export type CardsCoverage = {
@@ -377,9 +388,9 @@ function toDoc(card: Card): CardDoc {
  * The current session's family within the card graph: ascend `parentId` to the
  * highest known ancestor (bounded, cycle-guarded), then collect that ancestor's
  * whole subtree via `rootId`. Produces the SAME set `search.ts`'s
- * `exclusionFamily()` derives from a discovery walk — so the default
- * self-exclusion keeps working without any part fetch. Exported for the
- * equivalence test.
+ * `exclusionFamily()` derives from a discovery walk — so family exclusion
+ * (recall's `excludeFamily`, the v1 hooks) and recall's family diversity work
+ * without any part fetch. Exported for the equivalence test.
  */
 export function exclusionFamilyFromCards(
   cards: Iterable<Card>,
@@ -1252,6 +1263,18 @@ export function createCardsRuntime(deps: CardsRuntimeDeps): CardsRuntime {
     return "global";
   }
 
+  /** The session ids the exclusion filters remove, read from the card map
+   *  alone, so a call that does not rank never touches the index. */
+  function exclusionOf(
+    filters: Pick<CardFilters, "excludeFamilyOf" | "excludeSessionId">,
+  ): Set<string> {
+    const excluded = filters.excludeFamilyOf
+      ? exclusionFamilyFromCards(cardById.values(), filters.excludeFamilyOf)
+      : new Set<string>();
+    if (filters.excludeSessionId) excluded.add(filters.excludeSessionId);
+    return excluded;
+  }
+
   function passesFilters(card: Card, filters: CardRankFilters, excluded: Set<string>): boolean {
     // A summarizer worker card (a crash can leave one persisted) is never a
     // result; centralize the exclusion here so rank() and list() both honor it.
@@ -1373,9 +1396,12 @@ export function createCardsRuntime(deps: CardsRuntimeDeps): CardsRuntime {
     rank(query, filters, stats): CardHit[] {
       syncIndex();
       const cards = cardById.values();
-      const excluded = filters.excludeFamilyOf
-        ? exclusionFamilyFromCards(cardById.values(), filters.excludeFamilyOf)
-        : new Set<string>();
+      const excluded = exclusionOf(filters);
+      // The excluded cards that matched are counted against the same filters
+      // with the exclusion lifted, so a card some other filter also removes is
+      // not reported as one the exclusion arguments would let back in.
+      const excludedMatched: Card[] | undefined = stats && excluded.size > 0 ? [] : undefined;
+      const noExclusion = new Set<string>();
 
       const lexical = lexicalHits(query);
       const semantic = semanticScore(query);
@@ -1409,6 +1435,14 @@ export function createCardsRuntime(deps: CardsRuntimeDeps): CardsRuntime {
           continue;
         }
         if (!passesFilters(card, filters, excluded)) {
+          if (
+            excludedMatched &&
+            excluded.has(card.sessionId) &&
+            (lexical.get(card.sessionId) ?? 0) > 0 &&
+            passesFilters(card, filters, noExclusion)
+          ) {
+            excludedMatched.push(card);
+          }
           // Count only cards the restriction ALONE removed and that would have
           // become hits: the contention set every other skippedByReason key is
           // measured against. The near-miss fallback below is deliberately not
@@ -1446,6 +1480,11 @@ export function createCardsRuntime(deps: CardsRuntimeDeps): CardsRuntime {
         stats.rootOnlySkipped.push(...skipped);
       }
       if (stats) stats.pending = pending;
+      if (stats && excludedMatched) {
+        stats.excludedMatched = excludedMatched.sort((a, b) =>
+          compareIds(a.sessionId, b.sessionId),
+        );
+      }
       hits.sort(
         (a, b) =>
           b.score - a.score ||
@@ -1470,9 +1509,7 @@ export function createCardsRuntime(deps: CardsRuntimeDeps): CardsRuntime {
 
     list(filters): Card[] {
       syncMeta();
-      const excluded = filters.excludeFamilyOf
-        ? exclusionFamilyFromCards(cardById.values(), filters.excludeFamilyOf)
-        : new Set<string>();
+      const excluded = exclusionOf(filters);
       return [...cardById.values()]
         .filter((card) => passesFilters(card, filters, excluded))
         .sort(byRecency);
