@@ -2,7 +2,12 @@ import { describe, expect, it } from "vitest";
 import {
   buildCandidates,
   candidateEligible,
+  candidateFilter,
+  closestToolName,
+  compileToolFilter,
   populateNormalized,
+  toolFilterMatches,
+  toolFilterNames,
   type Candidate,
 } from "../src/candidates.js";
 import {
@@ -21,6 +26,7 @@ import { bm25Search } from "../src/bm25.js";
 import {
   capAndSlice,
   groupBySession,
+  toolNamesCoverage,
   truncateExpandedPart,
   type ExpansionBudget,
 } from "../src/search.js";
@@ -1150,5 +1156,159 @@ describe("search ranking helpers", () => {
         candidateEligible(c, { type: "text", role: "all", toolName: "bash" }),
       ),
     ).toHaveLength(1);
+  });
+});
+
+describe("toolName filters", () => {
+  const accepts = (filter: string, recorded: string | undefined): boolean =>
+    toolFilterMatches(compileToolFilter(filter), recorded);
+
+  it("accepts every name of an aliased tool, in any case, whichever name is given", () => {
+    const groups: Array<[string, string[]]> = [
+      ["Shell", ["bash", "BASH", "shell", "Shell"]],
+      ["bash", ["Bash", "SHELL"]],
+      ["subagent", ["task", "Task", "SUBAGENT"]],
+      ["APPLY_PATCH", ["apply_patch", "patch", "Patch"]],
+    ];
+    for (const [filter, recorded] of groups) {
+      for (const name of recorded) expect(accepts(filter, name), `${filter} / ${name}`).toBe(true);
+    }
+  });
+
+  it("keeps alias groups apart and accepts no other form of an aliased name", () => {
+    expect(accepts("bash", "task")).toBe(false);
+    expect(accepts("subagent", "patch")).toBe(false);
+    expect(accepts("bash", "mcp__shell__bash")).toBe(false);
+    expect(accepts("shell", "bash_session")).toBe(false);
+    expect(accepts("bash", undefined)).toBe(false);
+  });
+
+  it("matches any other name exactly, case included", () => {
+    expect(accepts("Read", "Read")).toBe(true);
+    expect(accepts("Read", "read")).toBe(false);
+    expect(accepts("read", "READ")).toBe(false);
+    expect(accepts("read", "mcp__fs__read")).toBe(false);
+    expect(accepts("read", undefined)).toBe(false);
+  });
+
+  it("names the alias group in lower case, or the name as given", () => {
+    expect(toolFilterNames(compileToolFilter("SHELL")).sort()).toEqual(["bash", "shell"]);
+    expect(toolFilterNames(compileToolFilter("Read"))).toEqual(["Read"]);
+  });
+
+  it("applies the tool filter to tool parts only, alongside the role and time filters", () => {
+    const bash = candidate({
+      rawText: "x",
+      partType: "tool",
+      toolName: "Bash",
+      role: "assistant",
+      time: 1_000,
+    });
+    const text = candidate({ rawText: "x", partType: "text", role: "assistant", time: 1_000 });
+    const read = candidate({ rawText: "x", partType: "tool", toolName: "Read", time: 1_000 });
+
+    const shell = candidateFilter({ type: "all", role: "all", toolName: "shell" });
+    expect(shell(bash)).toBe(true);
+    expect(shell(text)).toBe(false);
+    expect(candidateFilter({ type: "all", role: "user", toolName: "shell" })(bash)).toBe(false);
+    expect(
+      candidateFilter({ type: "all", role: "all", after: 1_000, toolName: "shell" })(bash),
+    ).toBe(false);
+    expect(candidateFilter({ type: "all", role: "all", toolName: "read" })(read)).toBe(false);
+    expect(candidateFilter({ type: "all", role: "all", toolName: "Read" })(read)).toBe(true);
+    // The one-candidate form honours aliases the same way.
+    expect(candidateEligible(bash, { type: "all", role: "all", toolName: "SHELL" })).toBe(true);
+    expect(candidateEligible(read, { type: "all", role: "all", toolName: "read" })).toBe(false);
+  });
+});
+
+describe("closestToolName", () => {
+  const closest = (requested: string, counts: Record<string, number>): string | undefined =>
+    closestToolName(requested, new Map(Object.entries(counts)), compileToolFilter(requested));
+
+  it("prefers the same name in another case over a more frequent near name", () => {
+    expect(closest("Read", { reader: 50, read: 1 })).toBe("read");
+  });
+
+  it("prefers a namespaced form, either way round, over a name that contains it", () => {
+    expect(closest("grep", { grep_search: 40, mcp__fs__grep: 1 })).toBe("mcp__fs__grep");
+    expect(closest("provider.webfetch", { "provider.webfetch_v2": 9, webfetch: 1 })).toBe(
+      "webfetch",
+    );
+  });
+
+  it("prefers a name that contains the other over a one-letter edit", () => {
+    expect(closest("grep", { grap: 100, grep_search: 1 })).toBe("grep_search");
+  });
+
+  it("does not treat containment as close when either name is shorter than three letters", () => {
+    expect(closest("ls", { tools: 5 })).toBeUndefined();
+  });
+
+  it("allows edits up to a third of the longer name's length", () => {
+    expect(closest("glob", { blob: 1 })).toBe("blob");
+    expect(closest("glob", { slab: 1 })).toBeUndefined();
+    expect(closest("webfetch", { webfatcx: 1 })).toBe("webfatcx");
+    expect(closest("webfetch", { wobfatcx: 1 })).toBeUndefined();
+    // Two edits between a four- and a six-letter name: the longer one sets the allowance.
+    expect(closest("srch", { search: 1 })).toBe("search");
+    expect(closest("search", { srch: 1 })).toBe("srch");
+  });
+
+  it("prefers fewer edits, then the more frequent name, then the alphabetically first", () => {
+    expect(closest("webfetch", { webfatcx: 50, webfetcx: 1 })).toBe("webfetcx");
+    expect(closest("glob", { blob: 2, glib: 5 })).toBe("glib");
+    expect(closest("glob", { glib: 2, blob: 2 })).toBe("blob");
+  });
+
+  it("never names a tool the filter already accepts", () => {
+    expect(closest("bash", { Bash: 10, SHELL: 3, bash_session: 1 })).toBe("bash_session");
+    expect(closest("bash", { Bash: 10, shell: 3 })).toBeUndefined();
+    expect(closest("read", { read: 9, Read: 1 })).toBe("Read");
+  });
+});
+
+describe("toolNamesCoverage", () => {
+  it("is absent when no tool part was counted", () => {
+    expect(toolNamesCoverage("bash", compileToolFilter("bash"), new Map())).toBeUndefined();
+  });
+
+  it("counts every recorded form an alias filter accepts as matched", () => {
+    const counts = new Map([
+      ["Bash", 2],
+      ["shell", 3],
+      ["read", 4],
+    ]);
+    expect(toolNamesCoverage("BASH", compileToolFilter("BASH"), counts)).toStrictEqual({
+      filter: "BASH",
+      accepted: ["bash", "shell"],
+      matched: 5,
+      parts: 9,
+      distinct: 3,
+      top: [
+        { name: "read", count: 4 },
+        { name: "shell", count: 3 },
+        { name: "Bash", count: 2 },
+      ],
+    });
+  });
+
+  it("lists the ten most frequent names, ties in alphabetical order", () => {
+    // Twelve names, inserted in reverse alphabetical order; only tool_k is
+    // called more than once.
+    const names = "abcdefghijkl".split("").map((letter) => `tool_${letter}`);
+    const counts = new Map(
+      names.reverse().map((name): [string, number] => [name, name === "tool_k" ? 5 : 1]),
+    );
+    const coverage = toolNamesCoverage("playwright", compileToolFilter("playwright"), counts);
+    expect(coverage).toMatchObject({ matched: 0, parts: 16, distinct: 12 });
+    expect(coverage).not.toHaveProperty("closest");
+    expect(coverage?.top).toEqual([
+      { name: "tool_k", count: 5 },
+      ...["a", "b", "c", "d", "e", "f", "g", "h", "i"].map((l) => ({
+        name: `tool_${l}`,
+        count: 1,
+      })),
+    ]);
   });
 });

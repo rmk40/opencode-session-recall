@@ -2712,6 +2712,148 @@ describe("recall drill accounting", () => {
   });
 });
 
+// ── toolName aliases and the report on a miss ───────────────────────────────
+
+describe("recall toolName aliases and misses", () => {
+  // One session of tool calls on assistant messages, oldest first: the shell
+  // tool once as "Shell" and once as "bash", then read three times and
+  // webfetch twice. Every part mentions the needle.
+  const NEEDLE = "zorblat";
+  const SID = "s-tools";
+  const now = Date.now();
+  const SHELL_AT = now - 9_000;
+  const BASH_AT = now - 8_000;
+
+  function toolHarness(): FakeHarness {
+    const h = makeFakeHarness();
+    const s = session(SID, "Tool session", PROJECT_DIR, now - 5_000);
+    h.sessions.push(s);
+    h.globalSessions.push(globalSessionFrom(s));
+    const call = (id: string, tool: string) =>
+      completedToolPart(id, SID, `m-${id}`, tool, { target: NEEDLE }, `${NEEDLE} ${tool} output`);
+    h.messagesBySession[SID] = [
+      bundle(userMessage("m-ask", SID, now - 10_000), [
+        textPart("p-ask", SID, "m-ask", `check the ${NEEDLE} deploy`),
+      ]),
+      bundle(assistantMessage("m-shell", SID, SHELL_AT), [call("shell", "Shell")]),
+      bundle(assistantMessage("m-bash", SID, BASH_AT), [call("bash", "bash")]),
+      bundle(assistantMessage("m-read", SID, now - 7_000), [
+        call("read", "read"),
+        { ...call("read-2", "read"), messageID: "m-read" },
+        { ...call("read-3", "read"), messageID: "m-read" },
+      ]),
+      bundle(assistantMessage("m-fetch", SID, now - 6_000), [
+        call("fetch", "webfetch"),
+        { ...call("fetch-2", "webfetch"), messageID: "m-fetch" },
+      ]),
+    ];
+    return h;
+  }
+  const base = { query: NEEDLE, sessionID: SID };
+  const toolNameSuggestion = (out: SearchOutput) =>
+    out.suggestions?.find((s) => s.reason.startsWith("toolName:"));
+
+  it("matches every recorded name of an aliased tool and reports no names when it finds results", async () => {
+    const out = await runTool<SearchOutput>(await recallTool(toolHarness()), {
+      ...base,
+      toolName: "BASH",
+    });
+    expect(out.results.map((r) => r.partID).sort()).toEqual(["bash", "shell"]);
+    expect(out.coverage?.toolNames).toBeUndefined();
+  });
+
+  it("reports the counted names and suggests the closest when an exact name matches none", async () => {
+    const out = await runTool<SearchOutput>(await recallTool(toolHarness()), {
+      ...base,
+      toolName: "Read",
+    });
+    expect(out.results).toEqual([]);
+    expect(out.coverage?.toolNames).toStrictEqual({
+      filter: "Read",
+      accepted: ["Read"],
+      matched: 0,
+      parts: 7,
+      distinct: 4,
+      top: [
+        { name: "read", count: 3 },
+        { name: "webfetch", count: 2 },
+        { name: "bash", count: 1 },
+        { name: "Shell", count: 1 },
+      ],
+      closest: "read",
+    });
+    const suggestion = toolNameSuggestion(out);
+    expect(suggestion?.reason).toContain('toolName:"Read" matched none of the 7 tool parts');
+    expect(suggestion?.reason).toContain("read (3), webfetch (2), bash (1).");
+    expect(suggestion?.action).toContain('toolName:"read"');
+    expect(suggestion?.example).toEqual({ toolName: "read" });
+  });
+
+  it("points at the listed names when no counted name is close", async () => {
+    const out = await runTool<SearchOutput>(await recallTool(toolHarness()), {
+      ...base,
+      toolName: "playwright",
+    });
+    expect(out.coverage?.toolNames).toMatchObject({ matched: 0, parts: 7 });
+    expect(out.coverage?.toolNames).not.toHaveProperty("closest");
+    const suggestion = toolNameSuggestion(out);
+    expect(suggestion?.action).toContain("coverage.toolNames.top");
+    expect(suggestion).not.toHaveProperty("example");
+  });
+
+  it("reports the names without a suggestion when the filter matched parts the query did not", async () => {
+    const out = await runTool<SearchOutput>(await recallTool(toolHarness()), {
+      ...base,
+      query: "quuxnowhere",
+      toolName: "shell",
+    });
+    expect(out.results).toEqual([]);
+    expect(out.coverage?.toolNames).toMatchObject({
+      filter: "shell",
+      accepted: ["bash", "shell"],
+      matched: 2,
+      parts: 7,
+    });
+    expect(toolNameSuggestion(out)).toBeUndefined();
+  });
+
+  it("counts only the tool parts the time and role filters keep", async () => {
+    const recall = await recallTool(toolHarness());
+
+    // `after` drops the Shell call, the oldest tool part.
+    const later = await runTool<SearchOutput>(recall, {
+      ...base,
+      toolName: "playwright",
+      after: SHELL_AT,
+    });
+    expect(later.coverage?.toolNames).toMatchObject({ parts: 6, distinct: 3 });
+    expect(later.coverage?.toolNames?.top.map((t) => t.name)).toEqual(["read", "webfetch", "bash"]);
+
+    // Every tool part is on an assistant message, so a user-only search counts
+    // none and reports no names.
+    const users = await runTool<SearchOutput>(recall, {
+      ...base,
+      toolName: "playwright",
+      role: "user",
+    });
+    expect(users.results).toEqual([]);
+    expect(users.coverage?.toolNames).toBeUndefined();
+    expect(toolNameSuggestion(users)).toBeUndefined();
+  });
+
+  it("counts the tool parts the authorship filter removes", async () => {
+    // Tool parts on assistant messages classify as model-authored.
+    const out = await runTool<SearchOutput>(await recallTool(toolHarness()), {
+      ...base,
+      toolName: "read",
+      authorship: "human",
+    });
+    expect(out.results).toEqual([]);
+    expect(out.coverage?.toolNames).toMatchObject({ matched: 3, parts: 7 });
+    expect(toolNameSuggestion(out)).toBeUndefined();
+  });
+});
+
 describe("recall drill cache", () => {
   it("serves a session-scoped search the re-indexed content at once when the session time is unchanged", async () => {
     const h = makeFakeHarness();
