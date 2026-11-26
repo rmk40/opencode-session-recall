@@ -188,6 +188,65 @@ const SKIP_LOG_LIMIT = 3;
  *  heartbeat while a pass runs. */
 export const PROGRESS_STALE_MS = 5 * 60_000;
 
+/** Meta key where the lease holder shares the repair sweep's progress
+ *  ({@link RepairProgress}, as JSON), so every process can report it. */
+export const REPAIR_PROGRESS_KEY = "repair_progress";
+/** Meta key naming the projector generation the stored repair reasons were
+ *  recorded under. A sweep at another generation clears them first, so every
+ *  card a previous generation could not repair is tried again. */
+export const REPAIR_GEN_KEY = "repair_gen";
+
+/** The repair sweep's progress: it rebuilds every card below the projector
+ *  generation (see {@link Store.staleCards}). */
+export type RepairProgress = {
+  /** Stale cards not yet rebuilt or marked repair-pending (at the end of a
+   *  sweep: the store's stale cards, counted again). */
+  pending: number;
+  /** Cards with a repair reason, which the sweep leaves alone. */
+  repairPending: number;
+  /** Cards the running (or last) sweep rebuilt. */
+  done: number;
+  /** The projector generation the sweep rebuilds to. */
+  gen: number;
+  /** When this was shared. */
+  at: number;
+  /** Whether a sweep is running. A running sweep's holder refreshes `at` at
+   *  least every heartbeat; {@link Distiller.repair} reports one whose `at`
+   *  is older than {@link PROGRESS_STALE_MS} as `stalled` instead. */
+  running: boolean;
+  stalled?: true;
+};
+
+/** Parse a {@link REPAIR_PROGRESS_KEY} value; undefined when malformed. */
+export function parseRepairProgress(raw: string | undefined): RepairProgress | undefined {
+  if (!raw) return undefined;
+  try {
+    const { pending, repairPending, done, gen, at, running } = JSON.parse(raw) as Record<
+      string,
+      unknown
+    >;
+    if (
+      !finite(pending) ||
+      !finite(repairPending) ||
+      !finite(done) ||
+      !finite(gen) ||
+      !finite(at) ||
+      typeof running !== "boolean"
+    ) {
+      return undefined;
+    }
+    return { pending, repairPending, done, gen, at, running };
+  } catch {
+    return undefined;
+  }
+}
+
+/** What a distiller reports about card repair ({@link Distiller.repair}). */
+export type RepairStatus = {
+  sweep?: RepairProgress;
+  reconcile?: ReconcileProgress;
+};
+
 /** Meta key where the lease holder keeps the range check's position and
  *  counters ({@link ReconcileProgress}, as JSON), so the check resumes where
  *  it stopped after a restart or a lease handoff and every process can report
@@ -447,6 +506,13 @@ export type Distiller = {
    * count; no lease read and no map scan.
    */
   indexing(): IndexingProgress | undefined;
+  /**
+   * The repair sweep's and the range check's progress, as the lease holder
+   * shares them in meta, so every process reports the same. Undefined when
+   * the host stamps no projector generation (neither runs). Query-path cost:
+   * two meta reads.
+   */
+  repair(): RepairStatus | undefined;
 };
 
 export type DistillerOptions = {
@@ -1077,6 +1143,7 @@ export function createDistiller(options: DistillerOptions): Distiller {
       onEvent() {},
       status: noopStatus,
       indexing: () => undefined,
+      repair: () => undefined,
     };
   }
   const store: Store = options.store;
@@ -1121,6 +1188,16 @@ export function createDistiller(options: DistillerOptions): Distiller {
   /** The poll in flight, if any: stop() waits for it, so no read of the
    *  history outlives the stop (the host closes the handle after it). */
   let pollPromise: Promise<void> | undefined;
+  /** The repair sweep in flight, if any (stop() waits for it too), the
+   *  timer that retries a sweep some sessions failed in, and the sessions
+   *  the sweep is rebuilding now: a re-distill signaled for one of them runs
+   *  after it, like one signaled during another re-distill. */
+  let sweepPromise: Promise<void> | undefined;
+  let sweepRetryTimer: ReturnType<typeof setTimeout> | undefined;
+  const sweeping = new Set<string>();
+  /** The progress this holder last shared, refreshed on each heartbeat while
+   *  its sweep runs. */
+  let sweepProgress: RepairProgress | undefined;
   const inFlight = new Map<string, Promise<void>>();
   const pendingRerun = new Set<string>();
   /** Sync hosts only: sessions waiting for a re-distill slot. A poll can
@@ -1521,6 +1598,18 @@ export function createDistiller(options: DistillerOptions): Distiller {
   /** Whether this distiller records range hashes and checks ranges. */
   const rangesOn = projectorGen !== undefined && sync?.rangeDigest !== undefined;
 
+  /**
+   * Whether a card needs rebuilding at this distiller's projector generation:
+   * it names none or a lower one, or its checkpoint is version 1, which only
+   * an older build writes (the same test as {@link Store.staleCards}, which
+   * also leaves out repair-pending cards). Never true without a generation.
+   */
+  function belowGeneration(card: Card): boolean {
+    if (projectorGen === undefined) return false;
+    if (card.projectorGen == null || card.projectorGen < projectorGen) return true;
+    return sync?.inspect?.(card.distillCursor)?.version === 1;
+  }
+
   /** The `sweepGen` a range hash recorded now carries. */
   function currentSweepGen(): number {
     return parseReconcileProgress(store.getMeta(RECONCILE_PROGRESS_KEY))?.sweep ?? 0;
@@ -1704,7 +1793,7 @@ export function createDistiller(options: DistillerOptions): Distiller {
 
   // ── Distill one session ──
 
-  async function distillFull(session: DistillSessionMeta): Promise<CardWrite> {
+  async function distillFull(session: DistillSessionMeta): Promise<CardWrite & { kept?: string }> {
     const before = await fetchCheckpoint(session.id);
     const spans = await digestSpans(session.id, BEFORE_FIRST_SEQ);
     const read = await fetchSessionMessages(session.id, caps.ftsRowsPerSession);
@@ -1950,6 +2039,13 @@ export function createDistiller(options: DistillerOptions): Distiller {
           if (stopped || !leaseHeld) return;
         }
         const existing = store.getCard(session.id);
+        // A card built below the projector generation is left to the repair
+        // sweep, which takes sessions with part rows first; a change to the
+        // session still re-indexes it through the per-session path.
+        if (existing && belowGeneration(existing)) {
+          countExamined(session);
+          return;
+        }
         let upToDate =
           existing?.distillState === "full" && existing.timeUpdated === session.timeUpdated;
         // A sync host also needs the tail unchanged: v2 session times do not
@@ -2121,6 +2217,8 @@ export function createDistiller(options: DistillerOptions): Distiller {
         `cold pass done (${distilled} distilled / ${examined} examined / ${knownCount} known)`,
       );
       options.onColdPassDone?.();
+      // Cards below the projector generation were left to the sweep.
+      startRepairSweep();
       if (retryFailure !== undefined) {
         // Some sessions still fail: the rest is indexed, and a follow-up pass
         // (which skips everything up to date) retries them later.
@@ -2179,6 +2277,183 @@ export function createDistiller(options: DistillerOptions): Distiller {
       removed++;
     }
     if (removed > 0) logMsg(`removed ${removed} card(s) of deleted sessions`);
+  }
+
+  // ── Repair sweep (hosts with a projector generation) ──
+
+  /** Share the sweep's progress in {@link REPAIR_PROGRESS_KEY}, at most every
+   *  {@link PROGRESS_WRITE_MS} unless `force`. Holder-only. */
+  let repairWrittenAt = Number.NEGATIVE_INFINITY;
+  function shareRepair(progress: Omit<RepairProgress, "at">, force = false): void {
+    if (stopped || !leaseHeld) return;
+    const t = now();
+    sweepProgress = { ...progress, at: t };
+    if (!force && t - repairWrittenAt < PROGRESS_WRITE_MS) return;
+    if (!ownsLease()) return;
+    repairWrittenAt = t;
+    store.setMeta(REPAIR_PROGRESS_KEY, JSON.stringify(sweepProgress));
+  }
+
+  /** Start a repair sweep unless one is running (holder only, and only with
+   *  a projector generation and a sync host). */
+  function startRepairSweep(): void {
+    if (projectorGen === undefined || !sync || stopped || !leaseHeld || sweepPromise) return;
+    clearTimer(sweepRetryTimer);
+    sweepRetryTimer = undefined;
+    const running = runRepairSweep(projectorGen)
+      .catch((error: unknown) => {
+        lastError = errmsg(error);
+        logMsg(`repair sweep failed: ${lastError}`);
+        scheduleSweepRetry();
+      })
+      .finally(() => {
+        if (sweepPromise === running) sweepPromise = undefined;
+        sweepProgress = undefined;
+      });
+    sweepPromise = running;
+  }
+
+  function scheduleSweepRetry(): void {
+    if (stopped || !leaseHeld) return;
+    clearTimer(sweepRetryTimer);
+    sweepRetryTimer = setTimeout(() => {
+      sweepRetryTimer = undefined;
+      startRepairSweep();
+    }, coldPassRetryMs);
+  }
+
+  /**
+   * Rebuild one stale card. `gone` when the session no longer exists (its
+   * card is left to the deletion reconcile), `marked` when it is malformed or
+   * the loss guard kept its card (both get a repair reason), `done` when its
+   * card is now at the current generation, `skipped` when the lease was lost
+   * or another write left it stale.
+   */
+  async function repairOne(sessionId: string): Promise<"done" | "marked" | "gone" | "skipped"> {
+    try {
+      const session = await fetchSessionMeta(sessionId);
+      if (stopped || !leaseHeld) return "skipped";
+      if (!session || isSummarizerTitle(session.title)) return "gone";
+      const result = await distillFull(session);
+      if (stopped || !leaseHeld) return "skipped";
+      if (result.kept !== undefined) return "marked";
+      const card = store.getCard(sessionId);
+      return card && !belowGeneration(card) ? "done" : "skipped";
+    } catch (error) {
+      // A data-shape failure, as the cold pass quarantines it; anything else
+      // (a transport failure) leaves the card stale for the next sweep.
+      if (!(error instanceof MalformedSessionError) && !(error instanceof TypeError)) throw error;
+      if (stopped || !ownsLease()) return "skipped";
+      store.markRepairPending(sessionId, `malformed: ${errmsg(error)}`);
+      logMsg(`session ${sessionId} is repair-pending: ${errmsg(error)}`);
+      return "marked";
+    }
+  }
+
+  /**
+   * The repair sweep: rebuild every card below projector generation `gen`
+   * ({@link Store.staleCards}, archived sessions included), sessions with
+   * part rows first, at `distillConcurrency`, through the fetch gate behind
+   * foreground work. A session being re-distilled is skipped (that write
+   * stamps the generation too). A card leaves the stale set only when its
+   * rebuild commits or it gets a repair reason, so an interrupted sweep
+   * resumes from the store on the next one. Failing fetches leave their
+   * cards stale and arm another sweep; several in a row mean an outage and
+   * stop this one.
+   */
+  async function runRepairSweep(gen: number): Promise<void> {
+    if (stopped || !ownsLease()) return;
+    // A new generation retries every card an earlier one could not repair.
+    if (store.getMeta(REPAIR_GEN_KEY) !== String(gen)) {
+      const cleared = store.clearRepairReasons();
+      store.setMeta(REPAIR_GEN_KEY, String(gen));
+      if (cleared > 0)
+        logMsg(`cleared ${cleared} repair reason(s) for projector generation ${gen}`);
+    }
+    const stale = store.staleCards(gen);
+    const repairPending = (): number => store.cardStats().repairPending;
+    if (stale.length === 0) {
+      shareRepair(
+        { pending: 0, repairPending: repairPending(), done: 0, gen, running: false },
+        true,
+      );
+      return;
+    }
+    const ids = stale.map((card) => card.sessionId);
+    const withParts = sync?.withParts;
+    const bearing = withParts
+      ? await gate.runBackground(() => {
+          if (stopped || !leaseHeld) return Promise.resolve(new Set<string>());
+          return withParts(ids);
+        })
+      : new Set<string>();
+    if (stopped || !leaseHeld) return;
+    // Newest first within each group (staleCards' order).
+    const ordered = [
+      ...ids.filter((id) => bearing.has(id)),
+      ...ids.filter((id) => !bearing.has(id)),
+    ];
+    logMsg(`repair sweep started: ${ordered.length} stale card(s), ${bearing.size} with part rows`);
+    let done = 0;
+    let settled = 0;
+    let failed = 0;
+    let firstFailure: string | undefined;
+    let consecutiveFailures = 0;
+    let aborted = false;
+    const progress = (running: boolean): Omit<RepairProgress, "at"> => ({
+      pending: ordered.length - settled,
+      repairPending: repairPending(),
+      done,
+      gen,
+      running,
+    });
+    shareRepair(progress(true), true);
+
+    await runPool(ordered, limits.distillConcurrency, async (sessionId) => {
+      if (stopped || !leaseHeld || aborted) return;
+      if (pause) {
+        await pause();
+        if (stopped || !leaseHeld || aborted) return;
+      }
+      if (inFlight.has(sessionId)) return;
+      sweeping.add(sessionId);
+      try {
+        const outcome = await repairOne(sessionId);
+        consecutiveFailures = 0;
+        if (outcome === "done") done++;
+        if (outcome === "done" || outcome === "marked") settled++;
+      } catch (error) {
+        failed++;
+        firstFailure ??= `session ${sessionId}: ${errmsg(error)}`;
+        if (++consecutiveFailures >= MAX_CONSECUTIVE_FETCH_FAILURES) aborted = true;
+      } finally {
+        sweeping.delete(sessionId);
+        if (!stopped && pendingRerun.delete(sessionId)) scheduleReDistill(sessionId);
+      }
+      // Counting repair-pending cards reads every card, so only when the
+      // progress is due to be shared.
+      if (now() - repairWrittenAt >= PROGRESS_WRITE_MS) shareRepair(progress(true));
+    });
+    if (stopped || !ownsLease()) return;
+    if (done > 0) await recomputeAllRootRollups();
+    if (stopped || !ownsLease()) return;
+    shareRepair(
+      {
+        pending: store.staleCards(gen).length,
+        repairPending: repairPending(),
+        done,
+        gen,
+        running: false,
+      },
+      true,
+    );
+    logMsg(
+      `repair sweep ${aborted ? "stopped after repeated failures" : "done"}: ${done} rebuilt, ${failed} failed`,
+    );
+    if (failed > 0) {
+      lastError = failed > 1 ? `${firstFailure} (and ${failed - 1} more)` : firstFailure;
+      scheduleSweepRetry();
+    }
   }
 
   function quarantine(session: DistillSessionMeta, error: unknown): void {
@@ -2274,7 +2549,7 @@ export function createDistiller(options: DistillerOptions): Distiller {
 
   function startReDistill(sessionID: string): void {
     if (stopped || !leaseHeld) return; // non-holders and stopped instances write nothing
-    if (inFlight.has(sessionID)) {
+    if (inFlight.has(sessionID) || sweeping.has(sessionID)) {
       pendingRerun.add(sessionID); // coalesce: run once more after the in-flight pass
       return;
     }
@@ -2501,6 +2776,8 @@ export function createDistiller(options: DistillerOptions): Distiller {
       if (store.heartbeatLease(instanceId)) {
         // Keep shared progress fresh through a long stretch on one session.
         if (coldPassState === "running") shareProgress();
+        // And the sweep's, so readers never take a long rebuild for a stall.
+        if (sweepPromise && sweepProgress) shareRepair(sweepProgress);
         scheduleHeartbeat();
       } else {
         // Lost the lease (taken over): stop acting as holder and try to regain.
@@ -2573,9 +2850,11 @@ export function createDistiller(options: DistillerOptions): Distiller {
     clearTimer(leaseRetryTimer);
     clearTimer(coldPassRetryTimer);
     clearTimer(pollTimer);
+    clearTimer(sweepRetryTimer);
     leaseRetryTimer = undefined;
     coldPassRetryTimer = undefined;
     pollTimer = undefined;
+    sweepRetryTimer = undefined;
     for (const timer of debounceTimers.values()) clearTimeout(timer);
     debounceTimers.clear();
     pendingRerun.clear();
@@ -2617,7 +2896,7 @@ export function createDistiller(options: DistillerOptions): Distiller {
         }
       }
       leaseHeld = false;
-      const running = [coldPassPromise, pollPromise, ...inFlight.values()].filter(
+      const running = [coldPassPromise, pollPromise, sweepPromise, ...inFlight.values()].filter(
         (promise): promise is Promise<void> => promise !== undefined,
       );
       stopPromise = Promise.allSettled(running).then(() => {});
@@ -2654,6 +2933,18 @@ export function createDistiller(options: DistillerOptions): Distiller {
         return { indexed: cards, examined: shared.examined, known: shared.known, stalled: true };
       }
       return { indexed: cards, examined: shared.examined, known: shared.known };
+    },
+
+    repair(): RepairStatus | undefined {
+      if (projectorGen === undefined) return undefined;
+      let sweep = parseRepairProgress(store.getMeta(REPAIR_PROGRESS_KEY));
+      // A holder refreshes a running sweep's progress every heartbeat, so an
+      // old one is a sweep whose holder went away.
+      if (sweep?.running && now() - sweep.at > PROGRESS_STALE_MS) {
+        sweep = { ...sweep, running: false, stalled: true };
+      }
+      const reconcile = parseReconcileProgress(store.getMeta(RECONCILE_PROGRESS_KEY));
+      return { ...(sweep && { sweep }), ...(reconcile && { reconcile }) };
     },
 
     status(): DistillStatus {
