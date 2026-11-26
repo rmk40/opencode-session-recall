@@ -79,6 +79,12 @@ export type DrillInput = {
    *  `assembleSession` filter. Absent = keep every candidate. Never cached: the
    *  drill cache holds unfiltered candidates, so the filter runs per query. */
   filter?: (candidate: Candidate) => boolean;
+  /** When set, each pool counts the tool parts among its unfiltered
+   *  candidates that this predicate accepts, by tool name, keeping those
+   *  `authorship` removes apart ({@link DrilledPool.toolNames}).
+   *  recall passes its filters without `toolName`, so a `toolName` that
+   *  matches nothing can report the names the other filters left. */
+  countTools?: (candidate: Candidate) => boolean;
   /** Append each session's bound title candidate to its pool (mirrors the old
    *  `assembleSession` title binding) — the newest eligible candidate carries
    *  the session title so title hits participate in ranking/scanning. */
@@ -113,6 +119,16 @@ export type DrilledPool = {
    *  tells "the pass emptied this pool" apart from "eligibility left it empty",
    *  including for a pool whose only survivor would have been its title. */
   authorshipRemoved?: number;
+  /** Tool parts per tool name among the session's candidates the input's
+   *  `countTools` accepted and its `authorship` keeps, whatever `filter`
+   *  does with them. Set by the history drill and the deep sweep when the
+   *  input set `countTools`; the card drill builds no tool candidates and
+   *  never sets it. */
+  toolNames?: Map<string, number>;
+  /** The same count for the tool parts `countTools` accepted and the
+   *  input's `authorship` removes. Set alongside `toolNames` when the
+   *  input also set `authorship`. */
+  authorshipToolNames?: Map<string, number>;
 };
 
 /** A target's {@link DrillSessionStats}, with the session it describes. */
@@ -161,6 +177,8 @@ export type DeepInput = {
   /** Per-query candidate eligibility (type/role/time/toolName), applied to each
    *  swept session's candidates (mirrors the drill's `filter`). */
   filter?: (candidate: Candidate) => boolean;
+  /** Count tool names per pool (mirrors {@link DrillInput.countTools}). */
+  countTools?: (candidate: Candidate) => boolean;
   /** Append each session's bound title candidate (mirrors the drill). */
   searchTitles?: boolean;
   /** Authorship buckets to keep (mirrors {@link DrillInput.authorship}). */
@@ -384,6 +402,26 @@ export function countMessages(candidates: readonly Candidate[]): number {
     if (candidate.partType !== "title") ids.add(candidate.messageID);
   }
   return ids.size;
+}
+
+/** Tool parts per tool name among the `candidates` that `accept` passes:
+ *  `kept` for those whose authorship `authorship` holds (all of them without
+ *  an `authorship`), `removed` for the rest (only with an `authorship`). */
+function countToolNames(
+  candidates: readonly Candidate[],
+  accept: (candidate: Candidate) => boolean,
+  authorship: ReadonlySet<Authorship> | undefined,
+): { kept: Map<string, number>; removed?: Map<string, number> } {
+  const kept = new Map<string, number>();
+  const removed = authorship ? new Map<string, number>() : undefined;
+  for (const candidate of candidates) {
+    if (candidate.partType !== "tool" || candidate.toolName === undefined) continue;
+    if (!accept(candidate)) continue;
+    const counts =
+      authorship && removed && !authorship.has(authorshipOf(candidate)) ? removed : kept;
+    counts.set(candidate.toolName, (counts.get(candidate.toolName) ?? 0) + 1);
+  }
+  return removed ? { kept, removed } : { kept };
 }
 
 /** Zero-count stats for `targets` from `from` on, none of which was read. */
@@ -835,7 +873,7 @@ export function createDrill(deps: DrillDeps): Drill {
    * STAGES. The order is load-bearing:
    *
    * 1. **Eligibility** — the query's type/role/time/toolName predicate
-   *    (`candidateEligible`), mirroring `assembleSession`.
+   *    (`candidateFilter`), mirroring `assembleSession`.
    * 2. **Title construction** — from the ELIGIBLE pool, exactly as before: the
    *    representative is `eligible[0]` (newest eligible) and the bound title
    *    candidate is appended when title search applies.
@@ -848,6 +886,10 @@ export function createDrill(deps: DrillDeps): Drill {
    * this order the title needs no special-casing at all: it classifies `title`
    * and the ordinary filter decides.
    *
+   * The tool-name counts (`countTools`) are taken over the candidates before
+   * stage 1 and classify each counted part by the stage 3 rule on its own,
+   * so they change none of the stages.
+   *
    * Shared by the bounded drill and the deep sweep.
    */
   function poolFor(
@@ -855,10 +897,19 @@ export function createDrill(deps: DrillDeps): Drill {
     cached: Candidate[],
     input: {
       filter?: (candidate: Candidate) => boolean;
+      countTools?: (candidate: Candidate) => boolean;
       searchTitles?: boolean;
       authorship?: ReadonlySet<Authorship>;
     },
-  ): { candidates: Candidate[]; authorshipDropped?: AuthorshipCounts; authorshipRemoved?: number } {
+  ): Omit<DrilledPool, "target" | "stats"> {
+    const counted = input.countTools
+      ? countToolNames(cached, input.countTools, input.authorship)
+      : undefined;
+    const toolCounts = counted && {
+      toolNames: counted.kept,
+      ...(counted.removed && { authorshipToolNames: counted.removed }),
+    };
+
     // ── Stage 1: eligibility ──
     const eligible = input.filter ? cached.filter(input.filter) : cached;
 
@@ -886,7 +937,7 @@ export function createDrill(deps: DrillDeps): Drill {
     }
 
     // ── Stage 3: authorship over the combined pool (title included) ──
-    if (!input.authorship) return { candidates: pool };
+    if (!input.authorship) return { candidates: pool, ...toolCounts };
     const wanted = input.authorship;
     const kept: Candidate[] = [];
     const authorshipDropped: AuthorshipCounts = {};
@@ -902,7 +953,12 @@ export function createDrill(deps: DrillDeps): Drill {
       if (candidate.partType === "title") continue;
       authorshipDropped[bucket] = (authorshipDropped[bucket] ?? 0) + 1;
     }
-    return { candidates: kept, authorshipDropped, authorshipRemoved };
+    return {
+      candidates: kept,
+      authorshipDropped,
+      authorshipRemoved,
+      ...toolCounts,
+    };
   }
 
   return {

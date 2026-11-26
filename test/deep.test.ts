@@ -634,3 +634,125 @@ describe("deep cursor hardening", () => {
     }
   });
 });
+
+// ── toolName in the deep sweep ───────────────────────────────────────────────
+
+describe("deep toolName aliases and misses", () => {
+  // The shell tool under both its names, one capitalized, and two webfetch
+  // calls. The needle is in the tool outputs only.
+  const NEEDLE = "quorvex";
+  const SID = "s-deep-tools";
+
+  function buildHarness(): FakeHarness {
+    const h = makeFakeHarness();
+    const s = session(SID, "Deep tool session", PROJECT_DIR, NOW - 50_000);
+    const call = (id: string, tool: string, at: number) =>
+      bundle(assistantMessage(`m-${id}`, SID, at), [
+        completedToolPart(id, SID, `m-${id}`, tool, { step: id }, `${NEEDLE} from ${tool}`),
+      ]);
+    addSession(h, s, [
+      bundle(userMessage("m-ask", SID, NOW - 61_000), [
+        textPart("p-ask", SID, "m-ask", "run the checks"),
+      ]),
+      call("p-shell", "Shell", NOW - 60_000),
+      call("p-bash", "bash", NOW - 59_000),
+      call("p-fetch-1", "webfetch", NOW - 58_000),
+      call("p-fetch-2", "webfetch", NOW - 57_000),
+    ]);
+    return h;
+  }
+
+  it("matches every recorded name of an aliased tool", async () => {
+    const h = buildHarness();
+    const { deps, cleanup } = await recallDeps(h, TEST_LIMITS);
+    try {
+      const recall = search(h.source, true, TEST_LIMITS, deps);
+      const out = await runTool<SearchOutput>(recall, {
+        query: NEEDLE,
+        deep: true,
+        sessions: [SID],
+        toolName: "shell",
+      });
+      expect(out.coverage?.deep?.sessionsCovered).toBe(1);
+      expect(out.results.map((r) => r.partID).sort()).toEqual(["p-bash", "p-shell"]);
+      expect(out.coverage?.toolNames).toBeUndefined();
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("reports the swept tool names and the closest one when the name matches none", async () => {
+    const h = buildHarness();
+    const { deps, cleanup } = await recallDeps(h, TEST_LIMITS);
+    try {
+      const recall = search(h.source, true, TEST_LIMITS, deps);
+      const out = await runTool<SearchOutput>(recall, {
+        query: NEEDLE,
+        deep: true,
+        sessions: [SID],
+        toolName: "webfech",
+      });
+      expect(out.results).toEqual([]);
+      expect(out.coverage?.toolNames).toMatchObject({
+        matched: 0,
+        parts: 4,
+        distinct: 3,
+        top: [
+          { name: "webfetch", count: 2 },
+          { name: "bash", count: 1 },
+          { name: "Shell", count: 1 },
+        ],
+        closest: "webfetch",
+      });
+      const suggestion = out.suggestions?.find((s) => s.reason.startsWith("toolName:"));
+      expect(suggestion?.example).toEqual({ toolName: "webfetch" });
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("asks to continue a sweep the budget stopped before suggesting another name", async () => {
+    // Three sessions with one webfetch call each, its output padded so a
+    // 400-char budget stops the sweep before the last session.
+    const h = makeFakeHarness();
+    const ids = ["s-fetch-a", "s-fetch-b", "s-fetch-c"];
+    ids.forEach((id, i) => {
+      const at = NOW - 10_000 * (i + 1);
+      addSession(h, session(id, `Fetch ${id}`, PROJECT_DIR, at), [
+        bundle(assistantMessage(`m-${id}`, id, at - 500), [
+          completedToolPart(
+            `p-${id}`,
+            id,
+            `m-${id}`,
+            "webfetch",
+            { url: "https://example.com" },
+            `${NEEDLE} ${"x".repeat(300)}`,
+          ),
+        ]),
+      ]);
+    });
+    const limits: Limits = { ...TEST_LIMITS, deepCharsPerQuery: 400 };
+    const { deps, cleanup } = await recallDeps(h, limits);
+    try {
+      const recall = search(h.source, true, limits, deps);
+      const out = await runTool<SearchOutput>(recall, {
+        query: NEEDLE,
+        deep: true,
+        sessions: ids,
+        toolName: "webfech",
+      });
+      expect(out.results).toEqual([]);
+      expect(out.coverage?.deep?.exhaustedBudget).toBe(true);
+      expect(out.nextCursor).toBeDefined();
+      // The report still names what the swept sessions hold.
+      expect(out.coverage?.toolNames).toMatchObject({ matched: 0, closest: "webfetch" });
+
+      const suggestion = out.suggestions?.find((s) => s.reason.startsWith("toolName:"));
+      expect(suggestion?.reason).toContain("in the sessions swept so far");
+      expect(suggestion?.action).toContain("pass nextCursor as deepCursor");
+      expect(suggestion).not.toHaveProperty("example");
+    } finally {
+      cleanup();
+    }
+  });
+});

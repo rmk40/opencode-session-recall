@@ -136,7 +136,7 @@ Every tool returns through the serializer in `src/output.ts`, which keeps a resu
 | `hash.ts`                    | `cyrb53`, the pure-JS 53-bit string hash for change detection (summary hashes, range hashes, checkpoint fingerprints and continuation fingerprints)                                                                                                                                                                                                                                                                     |
 | `normalize.ts`               | Tokenizers/normalizer: `tokenizeAll()` (dup-preserving, for BM25) and `tokenize()` (deduped)                                                                                                                                                                                                                                                                                                                            |
 | `query.ts`                   | Query parsing: `parseQuery()` → `ParsedQuery` with raw, lower, tokens, phrases, codeTokens                                                                                                                                                                                                                                                                                                                              |
-| `candidates.ts`              | Candidate construction over drilled messages; `candidateEligible()` query-time filter predicate                                                                                                                                                                                                                                                                                                                         |
+| `candidates.ts`              | Candidate construction over drilled messages; `candidateFilter()` query-time filter predicate; `toolName` alias groups and the closest-name search                                                                                                                                                                                                                                                                      |
 | `digest.ts`                  | Digest-token rules (`isDigestToken`, stopwords) shared by the distiller and session digests                                                                                                                                                                                                                                                                                                                             |
 | `bm25.ts`                    | BM25 relevance ranking (MiniSearch) with structural boosts/penalties, applied within drilled sessions                                                                                                                                                                                                                                                                                                                   |
 | `node-import.ts`             | Dynamic `node:fs`/`node:path`/`node:os` loaders, so `src/` stays free of Node type deps                                                                                                                                                                                                                                                                                                                                 |
@@ -153,12 +153,12 @@ Every tool returns through the serializer in `src/output.ts`, which keeps a resu
 
 ### Search paths
 
-Every search resolves a shortlist of sessions from the card store (tier 1) plus the slim FTS index (tier 1.5), then drills those sessions through the history source under budgets (tier 2) and runs the match path over the drilled candidates. Query-time filters (`type`, `role`, `before`/`after`, `toolName`) are applied by the pure predicate `candidateEligible()` on each drilled session's candidates. `deep: true` replaces tier-1 selection with an exhaustive sweep of an explicitly scoped session set (see [Deep mode](#deep-mode)). From there, three distinct execution paths, selected by `match`:
+Every search resolves a shortlist of sessions from the card store (tier 1) plus the slim FTS index (tier 1.5), then drills those sessions through the history source under budgets (tier 2) and runs the match path over the drilled candidates. Query-time filters (`type`, `role`, `before`/`after`, `toolName`) are applied by the pure predicate `candidateFilter()`, built once per query, on each drilled session's candidates. `deep: true` replaces tier-1 selection with an exhaustive sweep of an explicitly scoped session set (see [Deep mode](#deep-mode)). From there, three distinct execution paths, selected by `match`:
 
 ```mermaid
 flowchart TB
     Start["recall(query, match, ...)"] --> Rank["cards.rank() + FTS needle → shortlist"]
-    Rank --> Drill["drill: bounded paginated fetch + candidateEligible()"]
+    Rank --> Drill["drill: bounded paginated fetch + candidateFilter()"]
     Drill --> Guard{"match?"}
 
     Guard -->|literal| Literal["scan() over drilled pools"]
@@ -222,7 +222,7 @@ flowchart TB
     end
 
     subgraph "Tier 2: Drill + rank"
-        Drill["drill: bounded fetch + candidateEligible()"]
+        Drill["drill: bounded fetch + candidateFilter()"]
         Drill --> Broad["Broad pass: bm25Search()<br/>over all drilled candidates"]
         Drill --> Deep["Deep pass: bm25Search()<br/>over card-supported neighborhood"]
         Broad --> Merge["mergeShortlistHits()"]
@@ -240,7 +240,7 @@ flowchart TB
 
 #### Stage 1: Shortlist and drill (`cards.ts`, `drill.ts`, `candidates.ts`)
 
-Tier 1 ranks the in-memory cards (`cards.rank()`), tier 1.5 adds any sessions whose slim FTS rows carry an anchor the card missed, and the two merge into a shortlist capped at `drillSessions` (default 12). Tier 2 (`drill.ts`) fetches those sessions in bounded newest-first pages through `fetchMessagePage()`, truncating each part to `MAX_CHARS_PER_CANDIDATE` immediately, and stops paging at the per-session budget or once pages stop matching any query anchor. For each drilled session, `buildCandidates()` scans messages newest-first: `searchableFields()` extracts each part's field texts (joined as `rawText`, tool outputs included), `tokenize()` produces the deduplicated token set, and `populateNormalized()` fills the indexed fields (camelCase splitting, separator → space, lowercase, whitespace collapse). Query-time filters (`type`, `role`, `before`/`after`, `toolName`) are the pure predicate `candidateEligible()`, applied to each drilled session's candidates.
+Tier 1 ranks the in-memory cards (`cards.rank()`), tier 1.5 adds any sessions whose slim FTS rows carry an anchor the card missed, and the two merge into a shortlist capped at `drillSessions` (default 12). Tier 2 (`drill.ts`) fetches those sessions in bounded newest-first pages through `fetchMessagePage()`, truncating each part to `MAX_CHARS_PER_CANDIDATE` immediately, and stops paging at the per-session budget or once pages stop matching any query anchor. For each drilled session, `buildCandidates()` scans messages newest-first: `searchableFields()` extracts each part's field texts (joined as `rawText`, tool outputs included), `tokenize()` produces the deduplicated token set, and `populateNormalized()` fills the indexed fields (camelCase splitting, separator → space, lowercase, whitespace collapse). Query-time filters (`type`, `role`, `before`/`after`, `toolName`) are the pure predicate `candidateFilter()`, built once per query and applied to each drilled session's candidates.
 
 The drill budgets (all plugin options, defaults from `DEFAULTS`):
 
