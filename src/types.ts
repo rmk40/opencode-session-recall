@@ -159,6 +159,30 @@ export type DrillSessionStats = {
 /** One drilled (or not drilled) target in `coverage.sessionStops`. */
 export type SessionStop = DrillSessionStats & { sessionID: string };
 
+/**
+ * `coverage.toolNames`: the tool parts a search with a `toolName` filter
+ * read, by tool name, reported when it returned no results. Counted in the
+ * searched sessions' drilled parts under every filter but `toolName` (time,
+ * role, type), before the authorship stage and the query match.
+ */
+export type ToolNamesCoverage = {
+  /** The `toolName` filter as given. */
+  filter: string;
+  /** The names it accepts: its alias group in any case, or itself exactly. */
+  accepted: string[];
+  /** Tool parts the filter accepted. */
+  matched: number;
+  /** Tool parts counted. */
+  parts: number;
+  /** Distinct tool names among them. */
+  distinct: number;
+  /** The most frequent names, most frequent first, the first 10. */
+  top: Array<{ name: string; count: number }>;
+  /** The counted name closest to `filter` that it does not accept, when one
+   *  is close. */
+  closest?: string;
+};
+
 /** The repair sweep's progress as `coverage.history.repair` reports it. */
 export type HistoryRepairCoverage = {
   /** Cards built under an older history reader not yet rebuilt. */
@@ -242,6 +266,9 @@ export type SearchCoverage = {
    *  `count` targets in all (drilled or not), the first 10 of them
    *  listed. */
   sessionStops?: { count: number; sessions: SessionStop[] };
+  /** Present when a `toolName` filter left no results while the searched
+   *  sessions held tool parts. */
+  toolNames?: ToolNamesCoverage;
   sessionsSkipped: number;
   skippedByReason?: Record<string, number>;
   directoryBucketsSearched?: Array<"exact" | "project" | "global">;

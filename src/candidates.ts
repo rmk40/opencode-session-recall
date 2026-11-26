@@ -1,6 +1,7 @@
 import type { Part } from "@opencode-ai/sdk/v2";
+import { distance } from "fastest-levenshtein";
 import { tokenize, normalize } from "./normalize.js";
-import { searchableFields, pruned, type SearchableField } from "./extract.js";
+import { searchableFields, pruned, toolNameMatches, type SearchableField } from "./extract.js";
 import type { DirectoryRelevance, ResultSource, ResultWhy } from "./types.js";
 
 export type SessionMeta = {
@@ -64,10 +65,95 @@ export type Candidate = {
 export const MAX_CHARS_PER_CANDIDATE = 20_000;
 
 /**
+ * Tool names that name the same tool. OpenCode v2 renamed `bash` to `shell`,
+ * `task` to `subagent` and `apply_patch` to `patch` (`RENAMED_TOOLS` in
+ * opencode's `core/src/database/v1-migration.bun.ts`), so one history holds
+ * both names, and some recorded calls name them in another case (`Bash`,
+ * `Shell`). Members are lower case.
+ */
+export const TOOL_NAME_ALIASES: ReadonlyArray<readonly string[]> = [
+  ["bash", "shell"],
+  ["task", "subagent"],
+  ["apply_patch", "patch"],
+];
+
+/**
+ * The tool names a `toolName` filter accepts, worked out once per filter. A
+ * name in an alias group accepts every member of the group in any case
+ * (`group`, lower case); any other name accepts only itself, exactly.
+ */
+export type ToolFilter = { name: string; group?: ReadonlySet<string> };
+
+export function compileToolFilter(name: string): ToolFilter {
+  const folded = name.toLowerCase();
+  const group = TOOL_NAME_ALIASES.find((members) => members.includes(folded));
+  return group ? { name, group: new Set(group) } : { name };
+}
+
+/** Whether a tool part named `toolName` passes the filter. */
+export function toolFilterMatches(filter: ToolFilter, toolName: string | undefined): boolean {
+  if (toolName === undefined) return false;
+  return filter.group ? filter.group.has(toolName.toLowerCase()) : toolName === filter.name;
+}
+
+/** The names a filter accepts, for reporting: its alias group, or the name. */
+export function toolFilterNames(filter: ToolFilter): string[] {
+  return filter.group ? [...filter.group] : [filter.name];
+}
+
+/**
+ * How close a tool name is to a requested one, lower being closer, or
+ * undefined when it is not close at all. Compared in lower case: the same
+ * name in another case scores 0, a host-namespaced form of either
+ * (`mcp__server__read` for `read`, see {@link toolNameMatches}) 1, a name
+ * containing the other 2, and otherwise 2 plus the edit distance when that is
+ * at most a third of the longer name (at least 1).
+ */
+function toolNameCloseness(requested: string, name: string): number | undefined {
+  if (name === requested) return 0;
+  if (toolNameMatches(name, requested) || toolNameMatches(requested, name)) return 1;
+  if (Math.min(name.length, requested.length) >= 3) {
+    if (name.includes(requested) || requested.includes(name)) return 2;
+  }
+  const edits = distance(name, requested);
+  const allowed = Math.max(1, Math.floor(Math.max(name.length, requested.length) / 3));
+  return edits <= allowed ? 2 + edits : undefined;
+}
+
+/**
+ * The name in `counts` closest to `requested` (see `toolNameCloseness`),
+ * leaving out any name `filter` accepts; ties go to the more frequent name,
+ * then the alphabetically first. Undefined when no name is close.
+ */
+export function closestToolName(
+  requested: string,
+  counts: ReadonlyMap<string, number>,
+  filter: ToolFilter,
+): string | undefined {
+  const folded = requested.toLowerCase();
+  let best: { name: string; score: number; count: number } | undefined;
+  for (const [name, count] of counts) {
+    if (toolFilterMatches(filter, name)) continue;
+    const score = toolNameCloseness(folded, name.toLowerCase());
+    if (score === undefined) continue;
+    if (
+      !best ||
+      score < best.score ||
+      (score === best.score &&
+        (count > best.count || (count === best.count && name.localeCompare(best.name) < 0)))
+    ) {
+      best = { name, score, count };
+    }
+  }
+  return best?.name;
+}
+
+/**
  * Query-time filters applied to cached candidates. Semantics match the old
  * per-query message/part filters exactly: `before` excludes messages at or
  * after the timestamp, `after` excludes messages at or before it, `toolName`
- * implies tool parts only, and `type` applies only without `toolName`.
+ * implies tool parts only and matches through {@link toolFilterMatches}, and
+ * `type` applies only without `toolName`.
  */
 export type CandidateFilters = {
   type: string;
@@ -77,12 +163,29 @@ export type CandidateFilters = {
   toolName?: string;
 };
 
+/** The eligibility predicate for `filters`, with the tool filter compiled
+ *  once, for testing many candidates. */
+export function candidateFilter(filters: CandidateFilters): (candidate: Candidate) => boolean {
+  const tool = filters.toolName ? compileToolFilter(filters.toolName) : undefined;
+  return (candidate) => eligibleUnder(candidate, filters, tool);
+}
+
+/** Whether one candidate passes `filters`. Compiles the tool filter on every
+ *  call; use {@link candidateFilter} to test many candidates. */
 export function candidateEligible(candidate: Candidate, filters: CandidateFilters): boolean {
+  return candidateFilter(filters)(candidate);
+}
+
+function eligibleUnder(
+  candidate: Candidate,
+  filters: CandidateFilters,
+  tool: ToolFilter | undefined,
+): boolean {
   if (filters.role !== "all" && candidate.role !== filters.role) return false;
   if (filters.before != null && candidate.time >= filters.before) return false;
   if (filters.after != null && candidate.time <= filters.after) return false;
-  if (filters.toolName) {
-    return candidate.partType === "tool" && candidate.toolName === filters.toolName;
+  if (tool) {
+    return candidate.partType === "tool" && toolFilterMatches(tool, candidate.toolName);
   }
   if (filters.type !== "all" && candidate.partType !== filters.type) return false;
   return true;

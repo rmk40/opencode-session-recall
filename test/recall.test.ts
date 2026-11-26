@@ -547,6 +547,21 @@ describe("recall", () => {
     expect(invalid.error).toContain("toolName can only be used");
   });
 
+  it("matches a raw toolName alias and reads a non-string toolName as none", async () => {
+    const recall = await recallTool(makeFakeHarness());
+    const base = { query: "unauthorized", scope: "project", excludeCurrentSession: false };
+
+    const alias = await runToolRaw<SearchOutput>(recall, { ...base, toolName: "Shell" });
+    expect(alias.results.map((r) => [r.partID, r.toolName])).toEqual([["p-current-3", "bash"]]);
+
+    const plain = await runToolRaw<SearchOutput>(recall, base);
+    for (const toolName of [42, null, "   "]) {
+      const out = await runToolRaw<SearchOutput>(recall, { ...base, toolName });
+      expect(out.ok).toBe(true);
+      expect(out.results).toEqual(plain.results);
+    }
+  });
+
   it("applies toolName filtering to smart-ranked searches", async () => {
     const h = makeFakeHarness();
     const out = await runTool<SearchOutput>(await recallTool(h), {
