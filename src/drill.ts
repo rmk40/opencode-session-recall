@@ -80,10 +80,10 @@ export type DrillInput = {
    *  drill cache holds unfiltered candidates, so the filter runs per query. */
   filter?: (candidate: Candidate) => boolean;
   /** When set, each pool counts the tool parts among its unfiltered
-   *  candidates that this predicate accepts, by tool name
-   *  ({@link DrilledPool.toolNames}). recall passes its filters without
-   *  `toolName`, so a `toolName` that matches nothing can report the names
-   *  the other filters left. */
+   *  candidates that this predicate accepts, by tool name, keeping those
+   *  `authorship` removes apart ({@link DrilledPool.toolNames}).
+   *  recall passes its filters without `toolName`, so a `toolName` that
+   *  matches nothing can report the names the other filters left. */
   countTools?: (candidate: Candidate) => boolean;
   /** Append each session's bound title candidate to its pool (mirrors the old
    *  `assembleSession` title binding) — the newest eligible candidate carries
@@ -120,10 +120,15 @@ export type DrilledPool = {
    *  including for a pool whose only survivor would have been its title. */
   authorshipRemoved?: number;
   /** Tool parts per tool name among the session's candidates the input's
-   *  `countTools` accepted, before `filter` and the authorship stage. Set by
-   *  the history drill and the deep sweep when the input set `countTools`;
-   *  the card drill builds no tool candidates and never sets it. */
+   *  `countTools` accepted and its `authorship` keeps, whatever `filter`
+   *  does with them. Set by the history drill and the deep sweep when the
+   *  input set `countTools`; the card drill builds no tool candidates and
+   *  never sets it. */
   toolNames?: Map<string, number>;
+  /** The same count for the tool parts `countTools` accepted and the
+   *  input's `authorship` removes. Set alongside `toolNames` when the
+   *  input also set `authorship`. */
+  authorshipToolNames?: Map<string, number>;
 };
 
 /** A target's {@link DrillSessionStats}, with the session it describes. */
@@ -399,18 +404,24 @@ export function countMessages(candidates: readonly Candidate[]): number {
   return ids.size;
 }
 
-/** Tool parts per tool name among the `candidates` that `accept` passes. */
+/** Tool parts per tool name among the `candidates` that `accept` passes:
+ *  `kept` for those whose authorship `authorship` holds (all of them without
+ *  an `authorship`), `removed` for the rest (only with an `authorship`). */
 function countToolNames(
   candidates: readonly Candidate[],
   accept: (candidate: Candidate) => boolean,
-): Map<string, number> {
-  const counts = new Map<string, number>();
+  authorship: ReadonlySet<Authorship> | undefined,
+): { kept: Map<string, number>; removed?: Map<string, number> } {
+  const kept = new Map<string, number>();
+  const removed = authorship ? new Map<string, number>() : undefined;
   for (const candidate of candidates) {
     if (candidate.partType !== "tool" || candidate.toolName === undefined) continue;
     if (!accept(candidate)) continue;
+    const counts =
+      authorship && removed && !authorship.has(authorshipOf(candidate)) ? removed : kept;
     counts.set(candidate.toolName, (counts.get(candidate.toolName) ?? 0) + 1);
   }
-  return counts;
+  return removed ? { kept, removed } : { kept };
 }
 
 /** Zero-count stats for `targets` from `from` on, none of which was read. */
@@ -876,7 +887,8 @@ export function createDrill(deps: DrillDeps): Drill {
    * and the ordinary filter decides.
    *
    * The tool-name counts (`countTools`) are taken over the candidates before
-   * stage 1, so they do not depend on the stages.
+   * stage 1 and classify each counted part by the stage 3 rule on its own,
+   * so they change none of the stages.
    *
    * Shared by the bounded drill and the deep sweep.
    */
@@ -890,7 +902,13 @@ export function createDrill(deps: DrillDeps): Drill {
       authorship?: ReadonlySet<Authorship>;
     },
   ): Omit<DrilledPool, "target" | "stats"> {
-    const toolNames = input.countTools ? countToolNames(cached, input.countTools) : undefined;
+    const counted = input.countTools
+      ? countToolNames(cached, input.countTools, input.authorship)
+      : undefined;
+    const toolCounts = counted && {
+      toolNames: counted.kept,
+      ...(counted.removed && { authorshipToolNames: counted.removed }),
+    };
 
     // ── Stage 1: eligibility ──
     const eligible = input.filter ? cached.filter(input.filter) : cached;
@@ -919,7 +937,7 @@ export function createDrill(deps: DrillDeps): Drill {
     }
 
     // ── Stage 3: authorship over the combined pool (title included) ──
-    if (!input.authorship) return { candidates: pool, ...(toolNames && { toolNames }) };
+    if (!input.authorship) return { candidates: pool, ...toolCounts };
     const wanted = input.authorship;
     const kept: Candidate[] = [];
     const authorshipDropped: AuthorshipCounts = {};
@@ -939,7 +957,7 @@ export function createDrill(deps: DrillDeps): Drill {
       candidates: kept,
       authorshipDropped,
       authorshipRemoved,
-      ...(toolNames && { toolNames }),
+      ...toolCounts,
     };
   }
 

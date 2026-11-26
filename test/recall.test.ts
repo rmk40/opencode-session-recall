@@ -2841,7 +2841,7 @@ describe("recall toolName aliases and misses", () => {
     expect(toolNameSuggestion(users)).toBeUndefined();
   });
 
-  it("counts the tool parts the authorship filter removes", async () => {
+  it("counts the named tool's parts the authorship filter removes apart, and says so", async () => {
     // Tool parts on assistant messages classify as model-authored.
     const out = await runTool<SearchOutput>(await recallTool(toolHarness()), {
       ...base,
@@ -2849,8 +2849,19 @@ describe("recall toolName aliases and misses", () => {
       authorship: "human",
     });
     expect(out.results).toEqual([]);
-    expect(out.coverage?.toolNames).toMatchObject({ matched: 3, parts: 7 });
-    expect(toolNameSuggestion(out)).toBeUndefined();
+    expect(out.coverage?.toolNames).toStrictEqual({
+      filter: "read",
+      accepted: ["read"],
+      matched: 0,
+      excludedByAuthorship: 3,
+      parts: 0,
+      distinct: 0,
+      top: [],
+    });
+    const suggestion = toolNameSuggestion(out);
+    expect(suggestion?.reason).toContain('authorship:["human"] filter removed them all');
+    expect(suggestion?.example).toEqual({ authorship: "any" });
+    expect(out.suggestions?.filter((s) => /authorship/.test(s.reason))).toHaveLength(1);
   });
 });
 

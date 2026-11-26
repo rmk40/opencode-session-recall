@@ -1671,15 +1671,26 @@ describe("drill tool-name counts", () => {
     expect(out.pools[0]!.toolNames).toEqual(expected);
   });
 
-  it("counts the tool parts the authorship stage removes", async () => {
+  it("counts the tool parts the authorship stage removes apart from those it keeps", async () => {
     const { source } = makeControlledSource(toolGraph());
-    const out = await newDrill(source).pools({
+    const drill = newDrill(source);
+    const removing = await drill.pools({
       ...poolsInput([revised("s-a")], "alpha"),
       authorship: new Set(["human"] as const),
       countTools: olderThan3000,
     });
-    expect(out.pools[0]!.candidates.some((c) => c.partType === "tool")).toBe(false);
-    expect(out.pools[0]!.toolNames).toEqual(expected);
+    expect(removing.pools[0]!.candidates.some((c) => c.partType === "tool")).toBe(false);
+    expect(removing.pools[0]!.toolNames).toEqual(new Map());
+    expect(removing.pools[0]!.authorshipToolNames).toEqual(expected);
+
+    // Tool parts on assistant messages classify as model-authored.
+    const keeping = await drill.pools({
+      ...poolsInput([revised("s-a")], "alpha"),
+      authorship: new Set(["model"] as const),
+      countTools: olderThan3000,
+    });
+    expect(keeping.pools[0]!.toolNames).toEqual(expected);
+    expect(keeping.pools[0]!.authorshipToolNames).toEqual(new Map());
   });
 
   it("counts nothing without countTools", async () => {
@@ -1700,7 +1711,8 @@ describe("drill tool-name counts", () => {
     };
     const counted = await drill.deep({ ...sweep, countTools: olderThan3000 });
     expect(counted.pools[0]!.candidates).toEqual([]);
-    expect(counted.pools[0]!.toolNames).toEqual(expected);
+    expect(counted.pools[0]!.toolNames).toEqual(new Map());
+    expect(counted.pools[0]!.authorshipToolNames).toEqual(expected);
 
     const uncounted = await drill.deep(sweep);
     expect(uncounted.pools[0]).not.toHaveProperty("toolNames");

@@ -123,18 +123,25 @@ function toolNameCloseness(requested: string, name: string): number | undefined 
 /**
  * The name in `counts` closest to `requested` (see `toolNameCloseness`),
  * leaving out any name `filter` accepts; ties go to the more frequent name,
- * then the alphabetically first. Undefined when no name is close.
+ * then the alphabetically first. An alias filter scores each name by its
+ * closest group member, so the answer is the same whichever alias was given.
+ * Undefined when no name is close.
  */
 export function closestToolName(
   requested: string,
   counts: ReadonlyMap<string, number>,
   filter: ToolFilter,
 ): string | undefined {
-  const folded = requested.toLowerCase();
+  const targets = filter.group ? [...filter.group] : [requested.toLowerCase()];
   let best: { name: string; score: number; count: number } | undefined;
   for (const [name, count] of counts) {
     if (toolFilterMatches(filter, name)) continue;
-    const score = toolNameCloseness(folded, name.toLowerCase());
+    const folded = name.toLowerCase();
+    let score: number | undefined;
+    for (const target of targets) {
+      const closeness = toolNameCloseness(target, folded);
+      if (closeness !== undefined && (score === undefined || closeness < score)) score = closeness;
+    }
     if (score === undefined) continue;
     if (
       !best ||

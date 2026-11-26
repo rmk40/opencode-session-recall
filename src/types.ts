@@ -163,7 +163,7 @@ export type SessionStop = DrillSessionStats & { sessionID: string };
  * `coverage.toolNames`: the tool parts a search with a `toolName` filter
  * read, by tool name, reported when it returned no results. Counted in the
  * searched sessions' drilled parts under every filter but `toolName` (time,
- * role, type), before the authorship stage and the query match.
+ * role, type, authorship), before the query match.
  */
 export type ToolNamesCoverage = {
   /** The `toolName` filter as given. */
@@ -172,6 +172,10 @@ export type ToolNamesCoverage = {
   accepted: string[];
   /** Tool parts the filter accepted. */
   matched: number;
+  /** Tool parts the filter accepted that the `authorship` filter removed,
+   *  which count in none of the other fields; present only when above
+   *  zero. */
+  excludedByAuthorship?: number;
   /** Tool parts counted. */
   parts: number;
   /** Distinct tool names among them. */
@@ -267,7 +271,8 @@ export type SearchCoverage = {
    *  listed. */
   sessionStops?: { count: number; sessions: SessionStop[] };
   /** Present when a `toolName` filter left no results while the searched
-   *  sessions held tool parts. */
+   *  sessions held tool parts the other filters keep, or parts of the named
+   *  tool that only the authorship filter removed. */
   toolNames?: ToolNamesCoverage;
   sessionsSkipped: number;
   skippedByReason?: Record<string, number>;
