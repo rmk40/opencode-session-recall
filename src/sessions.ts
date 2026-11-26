@@ -163,7 +163,7 @@ export function sessions(
         runFingerprint(listed.slice(start)) !== cursor.rest
       ) {
         return writeError(
-          `This listing changed since the cursor was made (a session not yet shown was updated, added or removed); list again without cursor`,
+          `This listing changed since the cursor was made (sessions were updated, added or removed); list again without cursor`,
         );
       }
     }
