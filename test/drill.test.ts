@@ -661,9 +661,9 @@ function makeControlledSource(graph: Graph): { source: HistorySource; ctl: Sourc
   const source: HistorySource = {
     kind: "v1-http",
     scopedLookup: false,
-    listSessions: async () => ({ ok: true, items: [] }),
+    listSessions: async () => ({ ok: true, items: [], truncated: false }),
     getSession: async () => ({ ok: false, reason: "not-found" }),
-    listChildren: async () => ({ ok: true, items: [] }),
+    listChildren: async () => ({ ok: true, items: [], truncated: false }),
     async messagePage(o) {
       const req = { sessionID: o.sessionID, before: o.before };
       ctl.pages.push(req);
