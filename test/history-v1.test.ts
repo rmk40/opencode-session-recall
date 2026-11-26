@@ -304,6 +304,33 @@ describe("v1 history source: truncation, archived sessions and continuations", (
     expect(await list({ archived: "exclude" })).toEqual(["s-live"]);
   });
 
+  it("drops archived sessions before cutting to the limit, truncated while the host had more", async () => {
+    const archived = session("s-arch", "Archived", PROJECT_DIR, 2_000, 2_100);
+    const live = session("s-live", "Live", PROJECT_DIR, 1_500);
+    const { source, calls } = listingClients([archived, live]);
+    // The host returned the extra row, so more live sessions may follow.
+    expect(await source.listSessions({ scope: "project", limit: 1, archived: "exclude" })).toEqual({
+      ok: true,
+      items: [live],
+      truncated: true,
+    });
+    expect(calls.project).toEqual([{ limit: 2 }]);
+    // Within the limit, the listing is complete.
+    expect(await source.listSessions({ scope: "project", limit: 2, archived: "exclude" })).toEqual({
+      ok: true,
+      items: [live],
+      truncated: false,
+    });
+  });
+
+  it("keeps rows of the wrong shape instead of throwing while excluding archived ones", async () => {
+    const live = session("s-live", "Live", PROJECT_DIR, 1_500);
+    const odd = [{ id: "no-time" }, null, { id: "bad-time", time: 5 }] as unknown as Session[];
+    const { source } = listingClients([...odd, live]);
+    const listing = await source.listSessions({ scope: "project", limit: 10, archived: "exclude" });
+    expect(listing).toEqual({ ok: true, items: [...odd, live], truncated: false });
+  });
+
   it("returns every child at once, never truncated, whatever the paging options", async () => {
     const kids = [
       session("c1", "One", PROJECT_DIR, 1_000, undefined, "s-current"),

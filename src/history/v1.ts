@@ -151,21 +151,34 @@ function errorLookup(resp: SdkResponse): {
   };
 }
 
-/** A listing response: an error return keeps the host's message, and a
- *  non-array body is an empty listing. `limit`, when given, is how many rows
- *  the caller asked for; the request asked for one more, and a response that
- *  holds it is truncated. `archived: "exclude"` drops archived sessions after
- *  the cut, for endpoints that cannot filter them. */
+/**
+ * A listing response: an error return keeps the host's message, and a
+ * non-array body is an empty listing. `archived: "exclude"` drops archived
+ * sessions, for endpoints that cannot filter them, before the listing is cut
+ * to `limit`. `limit`, when given, is how many rows the caller asked for; the
+ * request asked for one more, so a response that holds it is truncated.
+ * Whether rows past it match cannot be known once some were dropped, so the
+ * listing is then truncated even when fewer than `limit` sessions remain.
+ */
 function toListing(
   resp: SdkResponse,
   o: { limit?: number; archived?: ArchivedFilter } = {},
 ): Listing<HistorySession> {
   if (resp.error) return { ok: false, error: errmsg(resp.error) };
-  let items = Array.isArray(resp.data) ? (resp.data as HistorySession[]) : [];
-  const truncated = o.limit !== undefined && items.length > o.limit;
-  if (truncated) items = items.slice(0, o.limit);
-  if (o.archived === "exclude") items = items.filter((s) => s.time.archived == null);
+  const rows = Array.isArray(resp.data) ? (resp.data as HistorySession[]) : [];
+  let items = o.archived === "exclude" ? rows.filter((s) => !isArchived(s)) : rows;
+  const truncated = o.limit !== undefined && rows.length > o.limit;
+  if (o.limit !== undefined) items = items.slice(0, o.limit);
   return { ok: true, items, truncated };
+}
+
+/** Whether a listed session is archived, read defensively: a host body of the
+ *  wrong shape is passed through, not thrown on. */
+function isArchived(session: unknown): boolean {
+  if (typeof session !== "object" || session === null) return false;
+  const time = (session as { time?: unknown }).time;
+  if (typeof time !== "object" || time === null) return false;
+  return (time as { archived?: unknown }).archived != null;
 }
 
 /** Why a part continuation fails on v1. */
