@@ -304,17 +304,25 @@ each column.
 - `write_rev` is the `cards_rev` revision of the last stamped write to the card,
   indexed for `cardsSince`.
 - `repair_reason` says why a stale card could not be rebuilt (`markRepairPending`).
-- `settled_base` is reserved and stays NULL, which means the session is re-read in
-  full.
+- `settled_base` is the card's settled base, which every card write stores with the
+  checkpoint. It is set only when the checkpoint is unsettled with a boundary (see the
+  checkpoint section below). It records the boundary's `seq` and the newest message at
+  or below it. It also records how many of the session's oldest `part_text` rows
+  belong to that prefix and the prefix's share of the card's aggregates (part count,
+  summary and outcome heads, files, tools, errors, cut messages). NULL means there is
+  no base and the
+  next re-read of the session is full. `refreshCardMeta` clears it with the
+  checkpoint it writes.
 - `time_archived` is when the session was archived. Both hosts fill it from the
   session's metadata.
 - The `range_hash` table holds hashes of source row ranges per session, keyed by
   the range's first `seq`, for the v2 range check.
 
-Every lexical write (`replaceSessionParts`, `appendSessionParts`, `patchCardMeta`,
-`refreshCardMeta`, `writeSummary`, `setFamilyRollup`) allocates the next `cards_rev`
-through the store's private `nextRev()` inside its own transaction, stamps it on the
-row as `write_rev` and advances the `cards_stamped` meta counter with it.
+Every lexical write (`replaceSessionParts`, `appendSessionParts`,
+`replaceSessionTail`, `patchCardMeta`, `refreshCardMeta`, `writeSummary`,
+`setFamilyRollup`) allocates the next `cards_rev` through the store's private
+`nextRev()` inside its own transaction, stamps it on the row as `write_rev` and
+advances the `cards_stamped` meta counter with it.
 `deleteSession` allocates a revision too, with no row left to stamp, advances
 `cards_deleted` and clears the session's range hashes. An older build bumps
 `cards_rev` alone, so the gap between `cards_rev` and `cards_stamped` grows with each
@@ -324,13 +332,30 @@ never by bumping `cards_rev` from outside the store.
 
 Each write returns `{ changed }`, true only when it changed what a reader sees and
 so allocated a revision. When `replaceSessionParts` finds the stored card and rows
-equal to the new ones, it writes the checkpoint, the projector generation and any
-range hashes it was handed, clears the repair reason, allocates no revision and keeps
-the vector. `patchCardMeta`, `refreshCardMeta`, `writeSummary` and `setFamilyRollup`
-allocate a revision only when a value changed. The distiller skips rollup recomputes and summarizer work after
-an unchanged write. `family_rollup` is store-owned. Card writes keep the stored
-value and only `setFamilyRollup` replaces it, so re-indexing a root never clears its
-rollup.
+equal to the new ones, it writes the checkpoint, the projector generation, the
+settled base and any range hashes it was handed, clears the repair reason, allocates
+no revision and keeps the vector. An append or tail write that changes no row and
+leaves the card as it was writes the same and keeps the repair reason.
+`patchCardMeta`, `refreshCardMeta`, `writeSummary` and `setFamilyRollup` allocate a
+revision only when a value changed. `patchCardMeta` settles a patch that changes
+nothing with a plain read, before any transaction. The distiller skips rollup
+recomputes and summarizer work after an unchanged write. `family_rollup` is
+store-owned. Card writes keep the stored value and only `setFamilyRollup` replaces
+it, so re-indexing a root never clears its rollup.
+
+`replaceSessionTail` writes a card distilled against a running tail without
+rereading its settled base. The caller reads the base's rows (`sessionRows`) and
+builds the card before the transaction. Inside it the store reads only the rows it
+replaces, after checking that the card still holds the caller's settled base, at
+least its rows and the `write_rev` the caller read them at. Any other state refuses
+the write as `base-changed` with nothing written. The distiller then reads the
+session in full. The previous tail's rows are replaced unless they equal the new
+ones. The rows of the base's newest message are repointed at the tail's first
+message. Under the row cap the card keeps what an append of the same messages
+keeps, which is the aggregates of every message the card has held and the newest
+`ftsRowsPerSession` rows. A longer tail evicts the base's oldest rows. A shorter one
+would need back rows that an earlier write evicted, so the distiller reads in full
+when the store holds exactly the cap (every eviction leaves exactly the cap).
 
 ## Embedding representation changes MUST ride a schema bump
 
@@ -419,13 +444,55 @@ no stored hash,
 dispatches a removal, which re-indexes the session in full. Its position and counters
 live in `meta.reconcile_progress`.
 
-The hashes come from the index writes themselves. Every write over a settled tail (a
-full write, an append, a sweep rebuild) takes a range digest of the rows it is about
-to read before it reads them. It stores the hashes in its own transaction, a
-suppressed write included. A row that changes in between is recorded in its older
-state and fails the next check. A write over a running tail or a repair-pending card
-keeps the stored hashes. Since a range with no hash counts as changed, no hash ever
-exists without an index write that read the same rows.
+The hashes come from the index writes themselves. Every index write (a full write,
+an append, a tail write, a sweep rebuild) takes a range digest of the settled rows it
+is about to read before it reads them. Over a settled tail that is every row it
+reads. Over a running tail it is the rows through the checkpoint's boundary. The
+running rows get their hashes from the write that first reads them settled, so the
+write that settles a tail hashes only the rows past the boundary. A write stores
+its hashes in its own transaction, a suppressed write included. A row that changes
+in between is recorded in its older state and fails the next check. A write with no
+settled rows to read, or over a repair-pending card, keeps the stored hashes. Since
+a range with no hash counts as changed, no hash ever exists without an index write
+that read the same rows.
+
+## The v2 checkpoint and running tails
+
+The checkpoint (`card.distill_cursor`, from `src/history/v2-sync.ts`) records the
+newest row, the session's recency, the newest row's part state and a fingerprint of
+the 64 rows ending at it. When a row among the newest 20 still runs (an assistant
+without `time.completed`, a shell or compaction `running`), the checkpoint is
+unsettled. It then also records its boundary (`base`), the newest inspected row
+below the lowest running one, with the fingerprint of the rows ending there and
+whether the main fingerprint covers every row past it. A running tail never
+compares as fresh or grown. It compares as `tail` while the boundary row and the
+rows ending at it are unchanged. Otherwise, or without a boundary, it compares as
+`rewritten`.
+
+On `tail` the distiller re-reads only the messages past the boundary and merges
+them with the card's settled base (`replaceSessionTail`). It reads and writes
+nothing when a checkpoint taken first shows nothing past the boundary changed and
+the card holds the session's metadata. After its read it compares the stored
+checkpoint once more and reads in full if a row through the boundary changed at any
+point since the card was written. The two checkpoints around a read only prove
+nothing changed during the read. Row times only move forward, so this one check
+covers the gap before the first of them too.
+
+When the tail moves during a read, the write stores the checkpoint taken before the
+read when that one is unsettled (marked `moved`) and otherwise none. A moved
+checkpoint still compares as `tail`, since the card's rows past the boundary are
+read again on the next poll. It is never taken as proof that nothing changed,
+because the card may hold rows newer than it describes.
+
+## Metadata patches during a distill
+
+A metadata patch (a rename, a move, an archive or unarchive) is applied to the card
+at once. If a re-distill or sweep of the session is running, or a cold pass that has
+not written the session yet, that writer read the session's metadata earlier and
+writes it over the patch. So the distiller notes the session and reads its metadata
+from the host again once the last such writer has finished. A cold pass follows up
+the sessions it never wrote when it ends. A failed read keeps the follow-up and
+retries it after a delay that doubles each time, up to five times.
 
 ## The summarizer only runs while holding the distill lease
 

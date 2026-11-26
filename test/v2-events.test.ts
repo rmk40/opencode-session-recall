@@ -62,6 +62,16 @@ describe("v2 event mapper", () => {
     ]);
   });
 
+  it("re-distills on archive and unarchive, which carry no archive time", () => {
+    mapper.map(ev("session.archived", { time: 5_000 }));
+    mapper.map(ev("session.unarchived"));
+    mapper.map({ type: "session.archived", data: {} });
+    expect(signals).toEqual([
+      { type: "meta", sessionID: "ses_1" },
+      { type: "meta", sessionID: "ses_1" },
+    ]);
+  });
+
   it("ignores other events and events without a session", () => {
     mapper.map(ev("session.text.delta", { text: "x" }));
     mapper.map({ type: "session.execution.succeeded", data: {} });

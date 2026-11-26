@@ -35,10 +35,14 @@ import { inspectV2Schema, type V2SchemaInfo } from "./v2.js";
  *   the one opencode's fork projector uses (`core/src/session/projector.ts`).
  *   A row unchanged for {@link V2SyncOptions.abandonAfterMs} counts as
  *   settled, so a crashed turn cannot keep a session re-distilling forever.
+ *   An unsettled checkpoint also records its boundary, the newest settled
+ *   row below the running ones, with a fingerprint of the rows ending at it:
+ *   while those rows are unchanged, only the rows past the boundary need
+ *   reading again (`tail`).
  * - **The poll** (lease holder only): every 30 s the indexed
  *   `session_message_time_created_idx` finds sessions with new rows past a
  *   persisted watermark; every 5 minutes a bounded scan of `session_v2`
- *   catches renames, moves and other metadata-only changes. Both watermarks
+ *   catches renames, moves, archiving and other metadata-only changes. Both watermarks
  *   carry an overlap for late commits. Each window is read in bounded pages
  *   keyed by `(time, session id)`, with the key persisted between polls, and
  *   the watermark moves only once the window is drained. So a page that
@@ -117,6 +121,13 @@ type Checkpoint = {
   sessKey: number;
   /** The lowest `seq` of a row still running, or null when settled. */
   unsettled: number | null;
+  /** With a running tail, the boundary: the newest row below the running
+   *  ones (its `seq` and id) and the hash of the rows ending at it, as `fp`
+   *  hashes those ending at `seq`. `covered` when `fp` covers every row past
+   *  the boundary. Absent when the checkpoint is settled, or when no row
+   *  below the running ones is among the rows it inspected (so none is known
+   *  to be settled). */
+  base?: { seq: number; id: string; fp: string; covered?: true };
   /** Part rows of the newest row and their newest `time_updated` (0 when
    *  it has none). */
   parts: number;
@@ -129,6 +140,10 @@ type Checkpoint = {
   floor?: number;
   /** Messages the card holds cut short (they end in a placeholder). */
   cut?: number;
+  /** The write that stored this checkpoint found the tail moved during its
+   *  read: the checkpoint is the one taken before the read, and the card may
+   *  hold rows newer than it describes. */
+  moved?: true;
 };
 
 /** A stored checkpoint of any version: the fields every version shares,
@@ -213,11 +228,24 @@ function parseCheckpoint(stored: string | null | undefined): Checkpoint | null {
     !isNumber(value.partsUpdated) ||
     typeof value.fp !== "string" ||
     !(value.floor === undefined || isNumber(value.floor)) ||
-    !(value.cut === undefined || isNumber(value.cut))
+    !(value.cut === undefined || isNumber(value.cut)) ||
+    !(value.base === undefined || isBase(value.base)) ||
+    !(value.moved === undefined || value.moved === true)
   ) {
     return null;
   }
   return value as Checkpoint;
+}
+
+function isBase(value: unknown): value is Checkpoint["base"] {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const base = value as Record<string, unknown>;
+  return (
+    isNumber(base.seq) &&
+    typeof base.id === "string" &&
+    typeof base.fp === "string" &&
+    (base.covered === undefined || base.covered === true)
+  );
 }
 
 /**
@@ -237,22 +265,53 @@ export function inspectCheckpoint(stored: string | null | undefined): Checkpoint
     version: 2,
     seq,
     settled,
+    ...(!settled && cp.base !== undefined && { boundary: cp.base.seq }),
     ...(cp.floor !== undefined && { floor: cp.floor }),
     ...(cp.cut !== undefined && cp.cut > 0 && { cut: cp.cut }),
+    ...(cp.moved && { moved: true }),
   };
 }
 
-/** `stored` with a write's row floor and cut messages recorded; any other
- *  value (an older version, garbage) is returned unchanged. */
-export function annotateCheckpoint(stored: string, info: { floor?: number; cut?: number }): string {
+/** `stored` with a write's row floor, cut messages and moved read recorded;
+ *  any other value (an older version, garbage) is returned unchanged. */
+export function annotateCheckpoint(
+  stored: string,
+  info: { floor?: number; cut?: number; moved?: boolean },
+): string {
   const cp = parseCheckpoint(stored);
   if (!cp) return stored;
   const next: Checkpoint = { ...cp };
   delete next.floor;
   delete next.cut;
+  delete next.moved;
   if (info.floor !== undefined) next.floor = info.floor;
   if (info.cut !== undefined && info.cut > 0) next.cut = info.cut;
+  if (info.moved) next.moved = true;
   return JSON.stringify(next);
+}
+
+/**
+ * Whether `current`, a checkpoint just taken, shows that nothing past the
+ * boundary of `stored`, a card's checkpoint, changed: both describe the same
+ * running tail field for field (the write's annotations aside), and
+ * `current`'s fingerprint covers every row past the boundary, so no row
+ * there changed unseen. Never for a checkpoint a moved read stored, whose
+ * card may hold rows newer than it describes.
+ */
+export function sameTail(stored: string | null | undefined, current: string): boolean {
+  const before = parseCheckpoint(stored);
+  const now = parseCheckpoint(current);
+  if (!before || !now || before.moved || before.unsettled === null || !now.base?.covered) {
+    return false;
+  }
+  const strip = (cp: Checkpoint): string => {
+    const rest: Checkpoint = { ...cp };
+    delete rest.floor;
+    delete rest.cut;
+    delete rest.moved;
+    return JSON.stringify(rest);
+  };
+  return strip(before) === strip(now);
 }
 
 export function createV2Sync(db: ReadOnlyDb, opts: V2SyncOptions = {}): DistillSync {
@@ -357,7 +416,9 @@ export function createV2Sync(db: ReadOnlyDb, opts: V2SyncOptions = {}): DistillS
    * rows newest first, each as `(seq, id, time_updated, part count, newest
    * part time_updated)`, read by two bounded statements. Rows after `seq`
    * are outside it, so appended rows never change it. `newest` is the row
-   * at the top of the window, with its part state (the belt).
+   * at the top of the window, with its part state (the belt). `reaches` is
+   * the lowest `seq` the window covers: the oldest row in it, or none when
+   * the window holds every row through `seq`.
    */
   async function fingerprint(
     sessionID: string,
@@ -365,6 +426,7 @@ export function createV2Sync(db: ReadOnlyDb, opts: V2SyncOptions = {}): DistillS
   ): Promise<{
     hash: string;
     newest?: { seq: number; id: string; updated: number; parts: number; partsUpdated: number };
+    reaches: number;
   }> {
     await pause();
     const rows = db.all(
@@ -393,7 +455,11 @@ export function createV2Sync(db: ReadOnlyDb, opts: V2SyncOptions = {}): DistillS
         `${entry.seq}\t${entry.id}\t${entry.updated}\t${entry.parts}\t${entry.partsUpdated}`,
       );
     }
-    return { hash: cyrb53(lines.join("\n")), ...(newest && { newest }) };
+    const reaches =
+      rows.length < fingerprintRows
+        ? Number.NEGATIVE_INFINITY
+        : (num(rows[rows.length - 1]?.seq) ?? Number.POSITIVE_INFINITY);
+    return { hash: cyrb53(lines.join("\n")), ...(newest && { newest }), reaches };
   }
 
   async function checkpoint(sessionID: string): Promise<DistillCheckpoint | null> {
@@ -415,11 +481,16 @@ export function createV2Sync(db: ReadOnlyDb, opts: V2SyncOptions = {}): DistillS
     const unsettled = unsettledSeq(rows, now());
     const seq = num(tail?.seq) ?? 0;
     const msgId = str(tail?.id);
-    const fp = msgId === null ? { hash: cyrb53("") } : await fingerprint(sessionID, seq);
+    const fp =
+      msgId === null
+        ? { hash: cyrb53(""), reaches: Number.NEGATIVE_INFINITY }
+        : await fingerprint(sessionID, seq);
     // The belt is the tail row's own part state; a fingerprint whose newest
     // row is another one (the tail was removed between the statements) then
     // fails the next compare, as it should.
-    const belt = fp.newest?.id === msgId ? fp.newest : undefined;
+    const belt = "newest" in fp && fp.newest?.id === msgId ? fp.newest : undefined;
+    const found = unsettled === null ? undefined : await boundary(sessionID, rows, unsettled);
+    const base = found && fp.reaches <= found.seq ? { ...found, covered: true as const } : found;
     const value: Checkpoint = {
       v: 2,
       seq,
@@ -427,6 +498,7 @@ export function createV2Sync(db: ReadOnlyDb, opts: V2SyncOptions = {}): DistillS
       msgUpdated: num(tail?.time_updated) ?? 0,
       sessKey,
       unsettled,
+      ...(base && { base }),
       parts: belt?.parts ?? 0,
       partsUpdated: belt?.partsUpdated ?? 0,
       fp: fp.hash,
@@ -434,18 +506,49 @@ export function createV2Sync(db: ReadOnlyDb, opts: V2SyncOptions = {}): DistillS
     return { cursor: JSON.stringify(value), settled: unsettled === null };
   }
 
+  /**
+   * The boundary of a running tail: the newest of the inspected `rows`
+   * (newest first) below `unsettled`, the lowest running `seq`, with the
+   * fingerprint of the rows ending at it. The boundary must be a row seen
+   * not to run, so a tail whose running rows reach the oldest inspected row
+   * has none; rows older than the inspected ones count as settled, as they
+   * do for a settled checkpoint. Undefined then, or when the row is gone by
+   * the time its fingerprint is read.
+   */
+  async function boundary(
+    sessionID: string,
+    rows: Row[],
+    unsettled: number,
+  ): Promise<Checkpoint["base"]> {
+    const below = rows.find((row) => (num(row.seq) ?? Number.POSITIVE_INFINITY) < unsettled);
+    const seq = num(below?.seq);
+    const id = str(below?.id);
+    if (seq === null || id === null) return undefined;
+    const fp = await fingerprint(sessionID, seq);
+    return fp.newest?.id === id && fp.newest.seq === seq ? { seq, id, fp: fp.hash } : undefined;
+  }
+
   async function compare(
     sessionID: string,
     stored: string | null | undefined,
   ): Promise<TailChange> {
     const cp = parseCheckpoint(stored);
-    // An unsettled tail is always "rewritten": the running row changes in
-    // place, so an append from it would keep its partial text. The cost is a
-    // full re-distill of that session on every poll while a turn streams,
-    // bounded by the per-session row cap and only for sessions with a live or
-    // recently abandoned turn (see abandonAfterMs). A version 1 checkpoint
-    // (an older build's) has no part state, so it is rewritten too.
-    if (!cp || cp.unsettled !== null) return "rewritten";
+    // A version 1 checkpoint (an older build's) has no part state, so it is
+    // rewritten.
+    if (!cp) return "rewritten";
+    // An unsettled tail is never fresh or grown: the running row changes in
+    // place, so an append from it would keep its partial text. While the rows
+    // through its boundary are unchanged it is a `tail`, which re-reads only
+    // the rows past the boundary on every poll while a turn streams (only for
+    // sessions with a live or recently abandoned turn, see abandonAfterMs).
+    // Without a boundary, or with a changed one, it is rewritten.
+    if (cp.unsettled !== null) {
+      if (!cp.base) return "rewritten";
+      const fp = await fingerprint(sessionID, cp.base.seq);
+      const row = fp.newest;
+      if (!row || row.seq !== cp.base.seq || row.id !== cp.base.id) return "rewritten";
+      return fp.hash === cp.base.fp ? "tail" : "rewritten";
+    }
     const sessKey = sessionKey(sessionID);
     if (sessKey === null) return "rewritten";
     await pause();
@@ -657,7 +760,7 @@ export function createV2Sync(db: ReadOnlyDb, opts: V2SyncOptions = {}): DistillS
           sessionScanLimit,
           (lower, pos, n) =>
             db.all(
-              `SELECT id, title, directory, project_id, ${expr} AS r FROM session_v2
+              `SELECT id, title, directory, project_id, time_archived, ${expr} AS r FROM session_v2
                WHERE ${expr} > ?
                ${pos ? `AND (${expr} > ? OR (${expr} = ? AND id > ?))` : ""}
                ORDER BY r ASC, id ASC LIMIT ?`,
@@ -675,6 +778,9 @@ export function createV2Sync(db: ReadOnlyDb, opts: V2SyncOptions = {}): DistillS
               title: str(row.title) ?? "",
               ...(str(row.directory) !== null && { directory: str(row.directory) ?? "" }),
               ...(str(row.project_id) !== null && { projectId: str(row.project_id) ?? "" }),
+              // Archiving and unarchiving move the session's time_updated, so
+              // the scan sees them.
+              timeArchived: num(row.time_archived),
             },
           });
           signals.push({ type: "turn-ended", sessionID: id });
@@ -705,5 +811,6 @@ export function createV2Sync(db: ReadOnlyDb, opts: V2SyncOptions = {}): DistillS
     seqOf,
     inspect: inspectCheckpoint,
     annotate: annotateCheckpoint,
+    sameTail,
   };
 }

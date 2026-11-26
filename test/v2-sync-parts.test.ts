@@ -134,6 +134,46 @@ function setPart(messageID: string, ordinal: number, data: unknown, updated: num
   );
 }
 
+/** An assistant row still running (no completion time), its content in part
+ *  rows, written at the row's own time. */
+function addRunningReply(sessionID: string, parts: unknown[]): string {
+  const seq = nextSeq(sessionID);
+  const id = `msg_${sessionID}_${seq}`;
+  const at = T0 + seq;
+  insertMessage(t.db, {
+    id,
+    session_id: sessionID,
+    type: "assistant",
+    seq,
+    time_created: at,
+    data: {
+      agent: "build",
+      model: { id: "m", providerID: "p" },
+      content: [],
+      time: { created: at },
+    },
+  });
+  parts.forEach((data, ordinal) => {
+    insertPart(t.db, { message_id: id, session_id: sessionID, ordinal, time_created: at, data });
+  });
+  return id;
+}
+
+/** A shell row still running. */
+function addRunningShell(sessionID: string): string {
+  const seq = nextSeq(sessionID);
+  const id = `msg_${sessionID}_${seq}`;
+  insertMessage(t.db, {
+    id,
+    session_id: sessionID,
+    type: "shell",
+    seq,
+    time_created: T0 + seq,
+    data: { status: "running", command: "npm test", time: { created: T0 + seq } },
+  });
+  return id;
+}
+
 async function cursorOf(s: DistillSync, sessionID: string): Promise<string> {
   const cp = await s.checkpoint(sessionID);
   if (!cp) throw new Error(`no checkpoint for ${sessionID}`);
@@ -323,6 +363,180 @@ describe("v2 checkpoint inspect and annotate", () => {
       expect(inspectCheckpoint(stored), String(stored)).toBeNull();
     }
     expect(annotateCheckpoint("not json", { floor: 1 })).toBe("not json");
+  });
+});
+
+describe("v2 running tail boundary", () => {
+  /** Rows written at T0 are recent against this clock, so a reply without a
+   *  completion time counts as running, not abandoned. */
+  const NOW = T0 + 60_000;
+  const live = (opts: V2SyncOptions = {}): DistillSync => sync({ now: () => NOW, ...opts });
+
+  type Stored = { unsettled: number | null; base?: { seq: number; id: string; fp: string } };
+  const parsed = (cursor: string): Stored => JSON.parse(cursor) as Stored;
+
+  it("records the newest row below the running one, fingerprinted as a settled checkpoint there is", async () => {
+    addSession("ses_a");
+    addUser("ses_a", "question");
+    addReply("ses_a", [text("answer")]);
+    const boundary = addUser("ses_a", "follow-up");
+    const s = live();
+    const settledFp = (JSON.parse(await cursorOf(s, "ses_a")) as { fp: string }).fp;
+
+    addRunningReply("ses_a", [text("streaming")]);
+    const cursor = await cursorOf(s, "ses_a");
+    expect(parsed(cursor)).toMatchObject({
+      unsettled: 4,
+      base: { seq: 3, id: boundary, fp: settledFp },
+    });
+    expect(inspectCheckpoint(cursor)).toEqual({
+      version: 2,
+      seq: 4,
+      settled: false,
+      boundary: 3,
+    });
+  });
+
+  it("takes the boundary below the lowest running row when several run", async () => {
+    addSession("ses_a");
+    const below = addUser("ses_a", "question");
+    addRunningReply("ses_a", [text("still running")]);
+    addUser("ses_a", "an interjection");
+    addRunningShell("ses_a");
+    const cursor = await cursorOf(live(), "ses_a");
+    expect(parsed(cursor)).toMatchObject({ unsettled: 2, base: { seq: 1, id: below } });
+  });
+
+  it("records no boundary when no inspected row sits below the running ones, and compares it as rewritten", async () => {
+    // The only row runs.
+    addSession("ses_one");
+    addRunningReply("ses_one", [text("first words")]);
+    // Settled rows lie below the running one, but past the two rows inspected.
+    addSession("ses_deep");
+    addUser("ses_deep", "one");
+    addUser("ses_deep", "two");
+    addRunningReply("ses_deep", [text("running")]);
+    addUser("ses_deep", "queued");
+    const s = live({ tailRows: 2 });
+    for (const id of ["ses_one", "ses_deep"]) {
+      const cursor = await cursorOf(s, id);
+      expect(parsed(cursor).unsettled, id).not.toBeNull();
+      expect(parsed(cursor), id).not.toHaveProperty("base");
+      expect(inspectCheckpoint(cursor), id).not.toHaveProperty("boundary");
+      expect(await s.compare(id, cursor), id).toBe("rewritten");
+    }
+  });
+
+  it("compares as a tail while only rows past the boundary change", async () => {
+    addSession("ses_a");
+    addUser("ses_a", "question");
+    const reply = addRunningReply("ses_a", [text("draft")]);
+    const s = live();
+    const cursor = await cursorOf(s, "ses_a");
+    expect(await s.compare("ses_a", cursor)).toBe("tail");
+
+    insertPart(t.db, {
+      message_id: reply,
+      session_id: "ses_a",
+      ordinal: 1,
+      time_created: T0 + 900,
+      data: text("more"),
+    });
+    expect(await s.compare("ses_a", cursor)).toBe("tail");
+    setPart(reply, 0, text("draft, revised"), T0 + 901);
+    expect(await s.compare("ses_a", cursor)).toBe("tail");
+    // The reply completes, and rows land after it.
+    t.db.run("UPDATE session_message SET data = ?, time_updated = ? WHERE id = ?", [
+      JSON.stringify({
+        agent: "build",
+        model: { id: "m", providerID: "p" },
+        content: [],
+        time: { created: T0 + 2, completed: T0 + 902 },
+      }),
+      T0 + 902,
+      reply,
+    ]);
+    addUser("ses_a", "next question");
+    expect(await s.compare("ses_a", cursor)).toBe("tail");
+    // The session row's own recency does not matter either.
+    t.db.run("UPDATE session_v2 SET time_updated = ? WHERE id = ?", [T0 + 903, "ses_a"]);
+    expect(await s.compare("ses_a", cursor)).toBe("tail");
+    // Nor does the running reply being reverted.
+    t.db.run("DELETE FROM session_part WHERE message_id = ?", [reply]);
+    t.db.run("DELETE FROM session_message WHERE session_id = ? AND seq >= ?", ["ses_a", 2]);
+    expect(await s.compare("ses_a", cursor)).toBe("tail");
+  });
+
+  it("is rewritten when a row in the fingerprint ending at the boundary changes", async () => {
+    addSession("ses_a");
+    const oldest = addUser("ses_a", "oldest");
+    const answered = addReply("ses_a", [text("answer")]);
+    const boundary = addUser("ses_a", "follow-up");
+    addRunningReply("ses_a", [text("draft")]);
+    // Two rows end at the boundary: it and the reply below it.
+    const s = live({ fingerprintRows: 2 });
+
+    let cursor = await cursorOf(s, "ses_a");
+    t.db.run("UPDATE session_message SET time_updated = ? WHERE id = ?", [T0 + 700, oldest]);
+    expect(await s.compare("ses_a", cursor)).toBe("tail");
+    setPart(answered, 0, text("answer, revised"), T0 + 701);
+    expect(await s.compare("ses_a", cursor)).toBe("rewritten");
+
+    cursor = await cursorOf(s, "ses_a");
+    expect(await s.compare("ses_a", cursor)).toBe("tail");
+    t.db.run("UPDATE session_message SET time_updated = ? WHERE id = ?", [T0 + 702, boundary]);
+    expect(await s.compare("ses_a", cursor)).toBe("rewritten");
+  });
+
+  it("is rewritten when the boundary row is removed or another row takes its seq", async () => {
+    addSession("ses_a");
+    addUser("ses_a", "question");
+    const boundary = addUser("ses_a", "follow-up");
+    const reply = addRunningReply("ses_a", [text("draft")]);
+    const s = live();
+    const cursor = await cursorOf(s, "ses_a");
+
+    // A revert from the boundary on.
+    t.db.run("DELETE FROM session_part WHERE message_id = ?", [reply]);
+    t.db.run("DELETE FROM session_message WHERE id IN (?, ?)", [boundary, reply]);
+    expect(await s.compare("ses_a", cursor)).toBe("rewritten");
+    // A new row at the boundary's seq, written at the boundary's time.
+    insertMessage(t.db, {
+      id: "msg_ses_a_other",
+      session_id: "ses_a",
+      type: "user",
+      seq: 2,
+      time_created: T0 + 2,
+      data: { text: "follow-up", time: { created: T0 + 2 } },
+    });
+    expect(await s.compare("ses_a", cursor)).toBe("rewritten");
+  });
+
+  it("treats a checkpoint with a malformed boundary as none, and reports none for a settled one", async () => {
+    addSession("ses_a");
+    addUser("ses_a", "question");
+    addRunningReply("ses_a", [text("draft")]);
+    const s = live();
+    const cp = JSON.parse(await cursorOf(s, "ses_a")) as Record<string, unknown> & {
+      base: Record<string, unknown>;
+    };
+    expect(cp.base).toMatchObject({ seq: 1 });
+    for (const base of [
+      { ...cp.base, seq: "1" },
+      { ...cp.base, id: 7 },
+      { seq: 1, id: "msg_ses_a_1" },
+      [1, "msg_ses_a_1", "fp"],
+      null,
+    ]) {
+      const stored = JSON.stringify({ ...cp, base });
+      expect(inspectCheckpoint(stored), JSON.stringify(base)).toBeNull();
+      expect(await s.compare("ses_a", stored), JSON.stringify(base)).toBe("rewritten");
+    }
+    expect(inspectCheckpoint(JSON.stringify({ ...cp, unsettled: null }))).toEqual({
+      version: 2,
+      seq: 2,
+      settled: true,
+    });
   });
 });
 

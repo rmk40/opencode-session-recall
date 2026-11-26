@@ -13,6 +13,8 @@ import type { DistillSignal } from "../distill.js";
  * - `session.revert.committed` is a removal (the next distill is full);
  * - `session.deleted` deletes;
  * - `session.renamed` and `session.moved` patch the card's metadata;
+ * - `session.archived` and `session.unarchived` re-distill the session, which
+ *   reads its archive time from the session row (the event carries none);
  * - `session.forked` distills the new session in full.
  */
 
@@ -136,6 +138,10 @@ export function createV2EventMapper(opts: {
           });
           return;
         }
+        case "session.archived":
+        case "session.unarchived":
+          emit({ type: "meta", sessionID });
+          return;
         case "session.forked":
           // The fork is a new session: distill it in full.
           emit({ type: "removal", sessionID });
