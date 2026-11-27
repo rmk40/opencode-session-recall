@@ -809,6 +809,34 @@ describe("v2 repair sweep", () => {
     expect(h.distiller.repair()?.sweep).toMatchObject({ repairPending: 0 });
   });
 
+  it("adopts its generation again when it takes the lease back from a holder that stamped another", async () => {
+    addSession("ses_a");
+    addUser("ses_a", "a prompt");
+    addSession("ses_b");
+    addUser("ses_b", "b prompt");
+    const h = startDistiller({ leaseRetryMs: 1 });
+    await coldPassDone(h);
+    await waitFor(() => h.distiller.repair()?.sweep?.running === false);
+    expect(store.getMeta(REPAIR_GEN_KEY)).toBe(String(GEN));
+
+    // Another build takes the lease, stamps an older generation and records
+    // a reason under it.
+    storeDb.run("UPDATE meta SET value = ? WHERE key = 'distill_lease'", [
+      JSON.stringify({ holder: "older", heartbeat: Date.now(), ttl: 30_000, build: "", gen: 0 }),
+    ]);
+    expect(h.distiller.ownsLease()).toBe(false);
+    store.setMeta(REPAIR_GEN_KEY, String(GEN - 1));
+    store.markRepairPending("ses_b", "an older generation's failure");
+    expect(store.releaseLease("older")).toBe(true);
+    await waitFor(() => h.distiller.status().leaseHeld);
+
+    // Its next session write adopts the generation first.
+    addUser("ses_a", "another prompt");
+    h.distiller.onEvent({ type: "turn-ended", sessionID: "ses_a" });
+    await waitFor(() => store.getMeta(REPAIR_GEN_KEY) === String(GEN), 2_000);
+    expect(store.getCard("ses_b")?.repairReason).toBeUndefined();
+  });
+
   it("counts repair-pending cards for its progress from pages of the card table, never a whole-table read", async () => {
     addSession("ses_a", { time_updated: T0 + 200 });
     addUser("ses_a", "a prompt");

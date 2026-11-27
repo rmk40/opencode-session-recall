@@ -314,8 +314,13 @@ another connection holds frames no checkpoint can copy, its wait doubles up to t
 second. Such a reader also lets the WAL grow, and the checkpoint after it lets go
 copies all of it in one slice, so the distiller writes no session while the last
 checkpoint left more than `WAL_BACKLOG_FRAMES` (4,000) frames uncopied: about 8 to
-16 ms of copying on a warm 12,000-card store. A write waits at most 5 s for that, then
-goes ahead and logs it. The distiller gives the setting back when it
+16 ms of copying on a warm 12,000-card store. A write waits at most 5 s for that. When
+the wait runs out, the distiller stops holding session writes for the backlog until a
+checkpoint's copied-frame count moves again (the reader let go, or moved to a newer
+snapshot), then holds them again while the backlog is over the bound. It logs once
+when holding stops and once when it resumes, so a reader that never lets go costs
+one 5 s wait rather than one per write. Losing the lease ends the suspension, so the
+next holder starts by holding. The distiller gives the setting back when it
 loses the lease or stops, so a store whose lease nobody holds still checkpoints on
 SQLite's default. The cold pass examines sessions newest first, so its cursor
 (`coldpass_cursor`) moves with nearly every session; it is written at most once a

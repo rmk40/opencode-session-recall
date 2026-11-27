@@ -152,7 +152,8 @@ const LONG_WRITE_MS = 35;
  * store, so this many take 8 to 16 ms.
  */
 export const WAL_BACKLOG_FRAMES = 4_000;
-/** A session write waits for the backlog at most this long, then goes ahead. */
+/** A session write waits for the backlog at most this long; then no session
+ *  write waits for it until a checkpoint copies frames again. */
 const WAL_BACKLOG_WAIT_MS = 5_000;
 
 /** With `yieldBetween`, long store sweeps pause after this many writes. */
@@ -1621,8 +1622,13 @@ export function createDistiller(options: DistillerOptions): Distiller {
   let stuckCheckpointMs = CHECKPOINT_BUSY_MS;
   /** Session writes waiting for the backlog to fall ({@link awaitWalBacklog}). */
   const backlogWaiters = new Set<() => void>();
+  /** While set, session writes are not held for the backlog: a wait for it
+   *  ran out with the copied-frame count at this value, and no checkpoint
+   *  has moved it since ({@link suspendBacklogHold}). */
+  let backlogHoldSuspendedAt: number | undefined;
   /** This distiller's projector generation is the stored repair reasons'
-   *  ({@link adoptRepairGeneration}); the stamp only ever rises. */
+   *  ({@link adoptRepairGeneration}). Dropped whenever this process takes the
+   *  lease: the holder before it may have stamped another generation. */
   let repairGenAdopted = false;
   /** The adoption in flight, which every reason waits for. */
   let adopting: Promise<boolean> | undefined;
@@ -2363,14 +2369,21 @@ export function createDistiller(options: DistillerOptions): Distiller {
    * share a slice.
    */
   async function awaitWriteRoom(sessionId: string): Promise<void> {
-    await adoptRepairGeneration();
+    // Interrupted by a stop or a lost lease: the caller's lease check ends
+    // the write.
+    if (!(await adoptRepairGeneration())) return;
     await awaitWalBacklog(sessionId);
   }
 
   /** The last checkpoint left more than {@link WAL_BACKLOG_FRAMES} frames
-   *  uncopied while this process checkpoints the WAL. */
+   *  uncopied while this process checkpoints the WAL, and holding writes for
+   *  it is not suspended ({@link backlogHoldSuspendedAt}). */
   const backlogged = (): boolean =>
-    checkpointsHeld && !stopped && leaseHeld && walBacklog > WAL_BACKLOG_FRAMES;
+    checkpointsHeld &&
+    !stopped &&
+    leaseHeld &&
+    backlogHoldSuspendedAt === undefined &&
+    walBacklog > WAL_BACKLOG_FRAMES;
 
   /**
    * Hold a session write while {@link backlogged}: a reader on another
@@ -2378,21 +2391,23 @@ export function createDistiller(options: DistillerOptions): Distiller {
    * to what the checkpoint after the reader lets go has to copy in one go.
    * The checkpoints that run meanwhile ({@link runCheckpoint}, slice starts)
    * wake the write once one leaves the backlog under the bound, and a stop
-   * or a lost lease wakes it too. After {@link WAL_BACKLOG_WAIT_MS} the write
-   * goes ahead, logged. A woken write yields first, so it does not share the
-   * checkpoint's slice.
+   * or a lost lease wakes it too. A woken write yields first, so it does not
+   * share the checkpoint's slice.
+   *
+   * A write still held after {@link WAL_BACKLOG_WAIT_MS} suspends the
+   * holding, which lets it and every write after it through, until a
+   * checkpoint copies frames again ({@link checkpointNow}): a reader that
+   * never lets go costs one wait, not one per write.
    */
   async function awaitWalBacklog(sessionId: string): Promise<void> {
     if (!backlogged()) return;
-    const startedAt = performance.now();
-    let timedOut = false;
     let wake = (): void => {};
     const timer = setTimeout(() => {
-      timedOut = true;
+      if (backlogged()) suspendBacklogHold(sessionId);
       wake();
     }, WAL_BACKLOG_WAIT_MS);
     try {
-      while (backlogged() && !timedOut) {
+      while (backlogged()) {
         await new Promise<void>((resolve) => {
           wake = resolve;
           backlogWaiters.add(resolve);
@@ -2402,12 +2417,18 @@ export function createDistiller(options: DistillerOptions): Distiller {
     } finally {
       clearTimeout(timer);
     }
-    if (backlogged()) {
-      logMsg(
-        `WAL holds ${walBacklog} frames no checkpoint could copy after ${Math.round(performance.now() - startedAt)} ms; writing session ${sessionId}`,
-      );
-    }
     if (pause) await pause();
+  }
+
+  /** Stop holding session writes for the backlog until a checkpoint's count
+   *  of copied frames moves from the one the last checkpoint reported, and
+   *  let the held writes through. */
+  function suspendBacklogHold(sessionId: string): void {
+    backlogHoldSuspendedAt = lastWalCheckpointed;
+    logMsg(
+      `WAL holds ${walBacklog} frames no checkpoint could copy after session ${sessionId} waited ${WAL_BACKLOG_WAIT_MS} ms; session writes stop waiting for it until a checkpoint copies frames again`,
+    );
+    wakeBacklogWaiters();
   }
 
   function wakeBacklogWaiters(): void {
@@ -3840,6 +3861,8 @@ export function createDistiller(options: DistillerOptions): Distiller {
       checkpointTimer = undefined;
       walBacklog = 0;
       stuckCheckpointMs = CHECKPOINT_BUSY_MS;
+      // The next holder measures the backlog afresh, and holds writes for it.
+      backlogHoldSuspendedAt = undefined;
       wakeBacklogWaiters();
     }
     if (hold === checkpointsHeld) return;
@@ -3863,7 +3886,9 @@ export function createDistiller(options: DistillerOptions): Distiller {
 
   /**
    * One passive checkpoint now, which also measures {@link walBacklog} and
-   * wakes the writes waiting for it once it is under the bound. `moved` when
+   * wakes the writes waiting for it once it is under the bound. One whose
+   * copied-frame count moved from the count holding was suspended at ends
+   * that suspension ({@link suspendBacklogHold}). `moved` when
    * the WAL has frames the last one did not see, or frames are left and this
    * one copied some; `stuck` when frames are left and it copied none of them
    * (a reader on another connection still needs them); `idle` when nothing is
@@ -3880,6 +3905,12 @@ export function createDistiller(options: DistillerOptions): Distiller {
       lastWalFrames = result.frames;
       lastWalCheckpointed = result.checkpointed;
       walBacklog = Math.max(0, result.frames - result.checkpointed);
+      if (backlogHoldSuspendedAt !== undefined && result.checkpointed !== backlogHoldSuspendedAt) {
+        backlogHoldSuspendedAt = undefined;
+        logMsg(
+          `a WAL checkpoint copied frames again, leaving ${walBacklog} uncopied; session writes wait again while more than ${WAL_BACKLOG_FRAMES} are`,
+        );
+      }
       if (walBacklog <= WAL_BACKLOG_FRAMES) wakeBacklogWaiters();
       const left = result.busy || walBacklog > 0;
       if (grew || (left && copied)) return "moved";
@@ -4615,8 +4646,9 @@ export function createDistiller(options: DistillerOptions): Distiller {
     if (store.acquireLease(instanceId, LEASE_TTL_MS, build, gen)) {
       leaseHeld = true;
       // Whoever held the lease before may have written repair reasons this
-      // process's count does not know of.
+      // process's count does not know of, and stamped another generation.
       repairCount = undefined;
+      repairGenAdopted = false;
       holdCheckpoints(true);
       logMsg(`lease acquired (build ${build}, gen ${gen})`);
       scheduleHeartbeat();

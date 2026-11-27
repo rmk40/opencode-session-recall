@@ -1277,20 +1277,23 @@ describe("v2 session writes that held the loop", () => {
 // ── Session writes while a reader holds WAL frames ───────────────────────────
 
 describe("v2 session writes while a reader holds WAL frames", () => {
+  /** The WAL as the mocked checkpoints report it: its frames and how many of
+   *  them are copied. A test moves either. */
+  type Wal = { frames: number; checkpointed: number };
+
   /**
-   * A distiller over one new session whose checkpoints report `backlog()`
-   * frames left uncopied, with fake timers (the timed checkpoints, the wait's
-   * limit) and its yields, checkpoints and session writes in `events`. The
-   * first timed checkpoint has run, so the distiller knows the backlog; then
-   * the session's turn ends.
+   * A distiller over one new session whose checkpoints report `wal`, with
+   * fake timers (the timed checkpoints, the wait's limit) and its yields,
+   * checkpoints and session writes in `events`. The first timed checkpoint
+   * has run, so the distiller knows the backlog; then the session's turn
+   * ends.
    */
-  async function backlogged(backlog: () => number): Promise<Started & { events: string[] }> {
+  async function backlogged(wal: Wal): Promise<Started & { events: string[] }> {
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
     const events: string[] = [];
-    const frames = WAL_BACKLOG_FRAMES + 10;
     vi.spyOn(store, "checkpoint").mockImplementation(() => {
       events.push("checkpoint");
-      return { busy: false, frames, checkpointed: frames - backlog() };
+      return { busy: false, ...wal };
     });
     addSession("ses_a");
     addUser("ses_a", "openingword");
@@ -1313,36 +1316,79 @@ describe("v2 session writes while a reader holds WAL frames", () => {
     vi.useRealTimers();
   });
 
+  const stopsHolding = (logs: string[]): string[] =>
+    logs.filter((line) => line.includes("session writes stop waiting for it"));
+  const resumesHolding = (logs: string[]): string[] =>
+    logs.filter((line) => line.includes("session writes wait again"));
+
+  /** Another turn of the session, whose write is the distiller's next. */
+  function nextTurn(h: Started, n: number): void {
+    addUser("ses_a", `turn${n}word`);
+    h.distiller.onEvent({ type: "turn-ended", sessionID: "ses_a" });
+  }
+
   it(`wait while the last checkpoint left more than ${WAL_BACKLOG_FRAMES} frames uncopied, and write after a yield once one leaves no more`, async () => {
-    let backlog = WAL_BACKLOG_FRAMES + 1;
-    const h = await backlogged(() => backlog);
+    const wal = { frames: WAL_BACKLOG_FRAMES + 10, checkpointed: 9 };
+    const h = await backlogged(wal);
     await vi.advanceTimersByTimeAsync(2_000);
     expect(h.writes).toEqual([]);
 
-    backlog = WAL_BACKLOG_FRAMES;
+    wal.checkpointed = 10;
     await vi.advanceTimersByTimeAsync(1_000);
     expect(methods(h.writes)).toEqual(["replaceSessionParts"]);
     const i = h.events.indexOf("replaceSessionParts");
     expect(h.events.slice(i - 2, i)).toEqual(["checkpoint", "yield"]);
-    expect(h.logs.some((line) => line.includes("no checkpoint could copy"))).toBe(false);
+    expect(stopsHolding(h.logs)).toEqual([]);
   });
 
-  it("write after waiting five seconds for the backlog to fall, and say so", async () => {
-    const h = await backlogged(() => WAL_BACKLOG_FRAMES + 1);
+  it("wait five seconds once for a reader that never lets go, then write without waiting, saying so once", async () => {
+    const wal = { frames: WAL_BACKLOG_FRAMES + 10, checkpointed: 9 };
+    const h = await backlogged(wal);
     await vi.advanceTimersByTimeAsync(4_900);
     expect(h.writes).toEqual([]);
-
     await vi.advanceTimersByTimeAsync(200);
-    expect(methods(h.writes)).toEqual(["replaceSessionParts"]);
-    expect(
-      h.logs.filter((line) =>
-        line.includes(`WAL holds ${WAL_BACKLOG_FRAMES + 1} frames no checkpoint could copy`),
-      ),
-    ).toHaveLength(1);
+    expect(h.writes).toHaveLength(1);
+    expect(stopsHolding(h.logs)).toHaveLength(1);
+    expect(stopsHolding(h.logs)[0]).toContain(
+      `WAL holds ${WAL_BACKLOG_FRAMES + 1} frames no checkpoint could copy`,
+    );
+
+    // The reader still holds every frame its snapshot needs while the
+    // writes add more.
+    for (let n = 1; n <= 3; n++) {
+      wal.frames += 50;
+      nextTurn(h, n);
+      await vi.advanceTimersByTimeAsync(100);
+      expect(h.writes, `turn ${n}`).toHaveLength(1 + n);
+    }
+    expect(stopsHolding(h.logs)).toHaveLength(1);
+    expect(resumesHolding(h.logs)).toEqual([]);
+  });
+
+  it("hold writes again for a reader that lets go later, once a checkpoint copies frames again", async () => {
+    const wal = { frames: 10_000, checkpointed: 0 };
+    const h = await backlogged(wal);
+    await vi.advanceTimersByTimeAsync(5_100);
+    expect(h.writes).toHaveLength(1);
+    expect(stopsHolding(h.logs)).toHaveLength(1);
+
+    // A checkpoint copies some frames, leaving more than the bound.
+    wal.checkpointed = 2_000;
+    await vi.advanceTimersByTimeAsync(1_100);
+    expect(resumesHolding(h.logs)).toHaveLength(1);
+    nextTurn(h, 1);
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(h.writes).toHaveLength(1);
+
+    wal.checkpointed = wal.frames;
+    await vi.advanceTimersByTimeAsync(1_100);
+    expect(h.writes).toHaveLength(2);
+    expect(stopsHolding(h.logs)).toHaveLength(1);
+    expect(resumesHolding(h.logs)).toHaveLength(1);
   });
 
   it("stop waiting, and write nothing, when the distiller stops", async () => {
-    const h = await backlogged(() => WAL_BACKLOG_FRAMES + 1);
+    const h = await backlogged({ frames: WAL_BACKLOG_FRAMES + 10, checkpointed: 9 });
     await vi.advanceTimersByTimeAsync(100);
     let stopped = false;
     void h.distiller.stop().then(() => {
