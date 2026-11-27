@@ -1316,8 +1316,9 @@ describe("cold pass", () => {
   });
 
   it("skips a session whose fetch keeps failing, so the pass reaches older sessions", async () => {
-    // The live v1 case: the host fails every read of one session (its project
-    // directory cannot boot), and the pass used to retry it forever.
+    // The host fails every read of one session (on v1, when its project
+    // directory cannot boot). Retrying it on every pass would keep the pass
+    // from ever reaching older sessions.
     const graph: Graph = {
       sessions: [
         session("s1", "One", PROJECT_DIR, 4000),

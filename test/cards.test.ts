@@ -711,7 +711,7 @@ describe("cards semantic persistence", () => {
     expect(getCards).toHaveBeenCalledTimes(1);
 
     // Another process writes a vector, bumping vectors_rev to 2 WITHOUT touching
-    // cards_rev — the exact cross-process change that used to go unseen.
+    // cards_rev — the cross-process change a cards_rev check alone misses.
     storeA.writeCardEmbeddings(cardVectorStamp("model-x"), EMBED_REPRESENTATION, [
       { sessionId: "s1", embedding: new Uint8Array([2, 2, 2, 2]), expectedSummaryHash: "" },
     ]);

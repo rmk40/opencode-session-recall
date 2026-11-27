@@ -5,22 +5,22 @@ import { isDigestToken } from "./digest.js";
 /**
  * Natural-language projection of a card, for embedding ONLY.
  *
- * Round-4 dogfooding proved the failure was representational: cards embed
- * identifier soup (camelCase tokens, file paths, a dispatch-instruction summary
- * head, a garbage title), so a paraphrase query never lands near them in vector
- * space. This builds the text that gets embedded — identifiers split into words
+ * A card's raw fields are identifier soup (camelCase tokens, file paths, a
+ * dispatch-instruction summary head, a garbage title), and a paraphrase query
+ * never lands near them in vector space. This builds the text that gets
+ * embedded instead — identifiers split into words
  * (`launchTerminal` → "launch terminal", `GHOSTAUTH_LIVE_TUI` → "ghostauth live
  * tui", `test/tui/pty.spec.ts` → "test tui pty spec ts"), file paths split into
  * basenames + directory + segment words, fields rendered as short labeled prose,
- * global-deduped, and capped. The LEXICAL card index is unchanged — it still
- * indexes the raw fields (exact code tokens must survive for anchor hits); only
- * the embedding INPUT changes here.
+ * global-deduped, and capped. The LEXICAL card index indexes the raw fields
+ * (exact code tokens must survive for anchor hits); this projection is only the
+ * embedding INPUT.
  *
  * Splitting reuses {@link tokenizeAll} (the BM25 tokenizer: splits on `_-/.`,
  * splits camelCase, lowercases) rather than a fresh regex, so the projection
  * stays consistent with how the rest of the plugin tokenizes.
  *
- * Round-6 precision fix: IDENTITY terms (words derived from the card's title and
+ * IDENTITY terms (words derived from the card's title and
  * directory) are de-weighted — excluded from the substantive-content count,
  * placed last, and deduped so they appear once — and a card whose substantive
  * content is below a floor gets NO vector. Otherwise a content-free "Getting

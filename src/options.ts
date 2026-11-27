@@ -25,11 +25,11 @@ export type RawOptions = {
    *  layer is forced off (its embedder writes model weights to the cache dir).
    *  Anything else (including absence) is persistent mode. */
   mode?: "persistent" | "ephemeral";
-  /** Inject a system-prompt reminder to use recall (R1a). Default: true. */
+  /** Inject a system-prompt reminder to use recall. Default: true. */
   nudge?: boolean;
-  /** Run gated automatic recall on each user message (R1b). Default: false. */
+  /** Run gated automatic recall on each user message. Default: false. */
   autoRecall?: boolean;
-  /** Preserve durable findings into the compaction summary (R1c). Default: false. */
+  /** Preserve durable findings into the compaction summary. Default: false. */
   compactionRecall?: boolean;
   /** Deprecated no-op: the card store persists across processes, so there is
    *  nothing to prewarm. Retained so existing configs do not error. */

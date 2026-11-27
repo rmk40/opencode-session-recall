@@ -210,7 +210,7 @@ describe("recall_messages", () => {
 
   it("survives raw MCP-bypass args (undefined role/limit must not filter everything)", async () => {
     // The live MCP host can forward args that skip Zod defaults. With role
-    // undefined, the old code did `role !== "all"` → true → filtered everything
+    // undefined, an uncoerced `role !== "all"` is true and filters everything
     // out. Coercion restores the defaults AND still passes a limit under strict.
     const h = makeFakeHarness();
     const out = await runToolRaw<MessagesOutput>(messagesTool(h.source, gate, TEST_LIMITS), {

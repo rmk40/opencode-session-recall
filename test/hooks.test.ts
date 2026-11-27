@@ -73,7 +73,7 @@ function hit(over: Partial<Card> = {}, anchors: string[] = []): CardRecallHit {
   return { card: makeCard(over), score: 1, anchors };
 }
 
-// ── R1a system nudge ──────────────────────────────────────────────────
+// ── System nudge ──────────────────────────────────────────────────────
 
 describe("systemNudge", () => {
   it("pushes the nudge text into the system array", async () => {
@@ -117,7 +117,7 @@ describe("systemNudge", () => {
   });
 });
 
-// ── R1b auto-recall gate ──────────────────────────────────────────────
+// ── Auto-recall gate ──────────────────────────────────────────────────
 
 describe("shouldAutoRecall gate", () => {
   const textPart = (text: string) => ({ type: "text", text });
@@ -404,7 +404,7 @@ describe("partId", () => {
   });
 });
 
-// ── R1c compaction preservation ───────────────────────────────────────
+// ── Compaction preservation ───────────────────────────────────────────
 
 describe("formatPreservationBlock", () => {
   it("returns undefined when there is no card", () => {

@@ -108,12 +108,12 @@ function makeSoupCorpus(now = Date.now()): EvalCorpus {
     ],
   };
 
-  // Round-6 pollution shape: a content-free "Getting Started" card whose TITLE
-  // carries a concept trigger (quaxel → the "terminal" axis the queries hit).
-  // Pre-fix, title words entered the projection, so this card embedded to a
-  // strong concept vector despite having no substantive content and got rescued
-  // onto project-adjacent queries. Post-fix, the substantive floor denies it a
-  // vector entirely (its only content is a greeting), so it can never rescue.
+  // Pollution shape: a content-free "Getting Started" card whose TITLE carries
+  // a concept trigger (quaxel → the "terminal" axis the queries hit). If title
+  // words counted as content, this card would embed to a strong concept vector
+  // despite having no substantive content and get rescued onto
+  // project-adjacent queries. The substantive floor denies it a vector entirely
+  // (its only content is a greeting), so it can never rescue.
   // Older than every filler (recency must not surface it either — this case
   // isolates the semantic path; a newest-card GS would leak in via the recency
   // near-miss fallback and muddy the assertion).

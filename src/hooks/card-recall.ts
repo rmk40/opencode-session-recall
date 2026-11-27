@@ -7,7 +7,7 @@ import { isSummarizerTitle } from "../extract.js";
  * Card-tier query for the hooks — the whole answer, no drill, no message fetch.
  *
  * Auto-recall and compaction run on latency-sensitive paths (a user turn, a
- * compaction). Round 4 moves them entirely onto the card tier: rank cards with
+ * compaction), so both stay entirely on the card tier: rank cards with
  * the same {@link CardsRuntime.rank} the search tool uses, backfill needle
  * sessions from the slim FTS index, and derive matched anchors from each card's
  * inventory. Every input is already in memory or answered by SQLite's C engine,

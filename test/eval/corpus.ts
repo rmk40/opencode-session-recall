@@ -83,7 +83,7 @@ export function makeEvalCorpus(now = Date.now()): EvalCorpus {
   // because the user just asked for it, but contains no workflow evidence.
   const sCur = session("e-cur", "Multikey auth login debugging", PROJECT_DIR, now - 2_000);
   // e-cur-sub: a subagent spawned FROM e-cur that restates the query and
-  // "findings" — the delegation-tree leak from round-2 dogfooding.
+  // "findings", a delegation-tree echo of the query.
   const sCurSub = session(
     "e-cur-sub",
     "Evaluate recall search results",
@@ -135,7 +135,7 @@ export function makeEvalCorpus(now = Date.now()): EvalCorpus {
   // e-harbor: the earlier session that did the work.
   const sHarbor = session("e-harbor", "Upload client changes", PROJECT_DIR, now - 70_000);
 
-  // ── Distill-then-search tier probes (round-4) ────────────────────────
+  // ── Distill-then-search tier probes ──────────────────────────────────
   const HOUR = 60 * 60 * 1000;
   const DAY = 24 * HOUR;
   // e-inv: card-INVENTORY needle. A distinctive SCREAMING_CASE token lives only

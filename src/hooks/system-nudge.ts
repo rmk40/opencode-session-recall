@@ -1,7 +1,7 @@
 import type { Hooks } from "../host/opencode-v1-types.js";
 
 /**
- * R1a — system-prompt nudge.
+ * System-prompt nudge (the `nudge` option).
  *
  * Tool descriptions alone do not reliably make a model call `recall`. This hook
  * injects one short instruction into the system prompt so the model proactively

@@ -9,15 +9,11 @@ import {
 } from "./digest.js";
 
 /**
- * Session-digest derivation and the embedder surface — the two survivors of the
- * deleted in-memory CorpusCache.
+ * Session-digest derivation and the embedder surface.
  *
- * Round 4 replaced the full-corpus cache with the persistent card store plus the
- * tier-2 drill LRU (src/drill.ts); the old CorpusCache/assembleSession machinery
- * (and its unpaginated whole-session fetch) is gone. `buildSessionDigest` still
- * builds the content-derived session identity that the drill stamps onto every
- * candidate for ranking, and `CandidateEmbedder` is the narrow embedder surface
- * the card runtime consumes.
+ * `buildSessionDigest` builds the content-derived session identity that the
+ * drill (src/drill.ts) stamps onto every candidate for ranking, and
+ * `CandidateEmbedder` is the narrow embedder surface the card runtime consumes.
  */
 
 /**

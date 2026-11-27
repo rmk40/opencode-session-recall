@@ -1116,10 +1116,6 @@ describe("recall", () => {
     expect(out.results.some((r) => r.sessionID === "s-rare")).toBe(true);
   });
 
-  // (Removed "reports time degradation deterministically": the corpus-scan
-  //  ranking time budget no longer exists. Tier-2 drills a bounded shortlist, so
-  //  there is no full-corpus ranking phase to flag as time-degraded.)
-
   it("excludes recall's own tool output without hiding unrelated tool output", async () => {
     const h = makeFakeHarness();
     const tool = await recallTool(h);
@@ -1713,8 +1709,8 @@ describe("recall", () => {
         explain: true,
         excludeCurrentSession: false,
       });
-      // The plan now names the tiered pipeline: tier-1 cards, tier-2 drill, and
-      // the FTS needle lookup (the "walkthrough" anchor hits s-other's rows).
+      // The query plan names the tiered pipeline: tier-1 cards, tier-2 drill,
+      // and the FTS needle lookup (the "walkthrough" anchor hits s-other's rows).
       expect(explained.queryPlan?.variants).toContain("cards-tier1");
       expect(explained.queryPlan?.selected).toContain("cards-tier1");
       expect(explained.queryPlan?.selected).toContain("drill-tier2");
@@ -2531,8 +2527,8 @@ describe("explicit shortlist includes uncarded sessions", () => {
     ];
     seedStore(store, h);
     // Do NOT bump time / invalidate: the facade still serves the pre-seed
-    // snapshot (cards.get(id) == null) while the store already has the card —
-    // the reviewer-flagged stale-window scenario.
+    // snapshot (cards.get(id) == null) while the store already has the card,
+    // the window in which the two views disagree.
 
     const out = await runTool<SearchOutput>(recall, {
       query: "glimmerpost",

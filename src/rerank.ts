@@ -3,8 +3,8 @@ import { compareHits, MIN_RELATIVE_SCORE, type Bm25Hit } from "./bm25.js";
 /**
  * Two-stage DRILLED rerank.
  *
- * NOT the deleted round-3 corpus-wide windowing. This runs entirely within the
- * tier-2 drilled candidate pool: a BROAD pass scores every drilled candidate,
+ * This runs entirely within the tier-2 drilled candidate pool, never over the
+ * whole corpus: a BROAD pass scores every drilled candidate,
  * and a DEEP pass re-scores only the card-supported neighborhood (the sessions
  * tier-1's cards.rank shortlisted) with a fresh, shortlist-local IDF. MiniSearch
  * computes IDF at index-build time, so the deep pass needs its own index over

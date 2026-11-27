@@ -3,10 +3,10 @@ import type { SearchDeps } from "../search.js";
 import type { Card } from "../store.js";
 
 /**
- * R1c — compaction preservation.
+ * Compaction preservation (the `compactionRecall` option).
  *
- * Compaction is the moment durable context is destroyed. Round 4 makes this a
- * pure CARD-TIER read: right before the summary is generated, the current
+ * Compaction is the moment durable context is destroyed. This is a pure
+ * CARD-TIER read: right before the summary is generated, the current
  * session's own card (the distiller's mechanical summary of what it was about,
  * the errors it hit, and its key identifiers/files) is pushed onto the
  * compaction `context` array so the summarizer keeps the durable signal. No

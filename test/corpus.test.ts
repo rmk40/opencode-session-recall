@@ -16,11 +16,8 @@ import {
 import { search } from "../src/search.js";
 import type { SearchOutput } from "../src/types.js";
 
-// (CorpusCache and assembleSession describes removed: both were deleted from
-//  src/corpus.ts with the round-4 cutover — the persistent card store + tier-2
-//  drill LRU replaced the in-memory cache, and its unpaginated whole-session
-//  fetch is gone. buildSessionDigest is the surviving unit surface here; drilled
-//  ranking/coverage is covered by drill.test.ts and recall.test.ts.)
+// buildSessionDigest is the unit surface of src/corpus.ts tested here; drilled
+// ranking and coverage are covered by drill.test.ts and recall.test.ts.
 
 describe("buildSessionDigest", () => {
   function digestOf(messages: Parameters<typeof buildCandidates>[0]): string {

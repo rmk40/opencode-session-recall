@@ -17,8 +17,7 @@ export type Limits = {
   maxMessages: number;
   maxWindow: number;
   defaultWidth: number;
-  /** Raw-text budget for the tier-2 drilled-session LRU (repurposed from the
-   *  deleted full-corpus cache). */
+  /** Raw-text budget for the tier-2 drilled-session LRU. */
   cacheMaxChars: number;
   /** Sessions the distiller keeps in flight during the cold pass. */
   distillConcurrency: number;
@@ -56,7 +55,6 @@ export const DEFAULTS: Limits = {
   maxMessages: 50,
   maxWindow: 10,
   defaultWidth: 200,
-  // Repurposed as the drilled-session LRU budget (no longer the full-corpus cache).
   cacheMaxChars: 24_000_000,
   distillConcurrency: 2,
   distillDelayMs: 25,

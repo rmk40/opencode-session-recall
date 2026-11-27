@@ -91,8 +91,8 @@ export const SEMANTIC_MODEL_KEY = "semantic_model";
  *  only vector writer, and covers its own model-change clear-all). Vector writes
  *  deliberately do NOT bump `cards_rev` — vectors are invisible to the lexical
  *  layer — so this separate counter is how a cross-process vector change becomes
- *  visible to another process's in-memory card snapshot (the runtime reloads when
- *  it advances). Fixes the mixed-version incident's silently-stale snapshots. */
+ *  visible to another process's in-memory card snapshot (the runtime reloads its
+ *  vectors when it advances), which would otherwise go stale without any sign. */
 export const VECTORS_REV_KEY = "vectors_rev";
 /** Meta stamp recording the summarizer prompt-template version the persisted
  *  `nl_summary` values were produced under (see {@link Store.writeSummary}). */
