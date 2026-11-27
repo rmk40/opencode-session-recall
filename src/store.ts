@@ -531,7 +531,8 @@ export type Store = {
    * only its own rows however large the family is. A card rewritten during a
    * walk keeps its place. A card deleted or first written during the walk may
    * or may not be listed, and one deleted and written again may be listed
-   * twice, the newer listing last.
+   * twice, the newer listing last. `next` is a rowid, which `VACUUM` can
+   * renumber, so a walk assumes no `VACUUM` runs during it (the store runs none).
    */
   familyPage(rootId: string, after: number | undefined, limit: number): FamilyPage;
   /** Card counts plus the revision counters, from one statement. */
