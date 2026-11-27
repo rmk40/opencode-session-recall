@@ -1,6 +1,6 @@
 import type { Part } from "@opencode-ai/sdk/v2";
 import { distance } from "fastest-levenshtein";
-import { tokenize, normalize } from "./normalize.js";
+import { tokenize, tokenizeAll, normalize } from "./normalize.js";
 import { searchableFields, pruned, toolNameMatches, type SearchableField } from "./extract.js";
 import type { DirectoryRelevance, ResultSource, ResultWhy } from "./types.js";
 
@@ -49,11 +49,20 @@ export type Candidate = {
   /** Tri-state parentage of this candidate's session (see {@link SessionMeta}). */
   sessionParentID?: string | null;
 
-  // Deduplicated tokens for matched-term metadata checks
+  /** The distinct tokens of `rawText` (`tokenize(rawText)`), in first
+   *  occurrence order, for matched-term metadata checks. */
   tokens: string[];
+  /** Whether `rawText` holds every field text whole, joined (it was not cut at
+   *  {@link MAX_CHARS_PER_CANDIDATE}), so `tokens` holds every token of every
+   *  field. Set by {@link buildCandidates}; absent means unknown. */
+  rawComplete?: boolean;
 
   // Normalized weighted fields indexed by the BM25 ranker (populated lazily)
+  /** `normalize(rawText)`, or "" for a title candidate. */
   primaryText?: string;
+  /** The distinct tokens of `primaryText`, in first occurrence order. Set
+   *  together with it. */
+  primaryTerms?: readonly string[];
   secondaryText?: string;
   titleText?: string;
   hintText?: string;
@@ -226,10 +235,13 @@ export function buildCandidates(
 
       // Join all searchable texts so smart mode searches the same content as literal
       let rawText = fields.map((field) => field.text).join("\n\n");
-      if (rawText.length > MAX_CHARS_PER_CANDIDATE) {
-        rawText = rawText.slice(0, MAX_CHARS_PER_CANDIDATE);
-      }
+      const rawComplete = rawText.length <= MAX_CHARS_PER_CANDIDATE;
+      if (!rawComplete) rawText = rawText.slice(0, MAX_CHARS_PER_CANDIDATE);
       charsUsed += rawText.length;
+      // One tokenization gives both the distinct tokens and the normalized
+      // primary text: `normalize` is the same tokens joined by single spaces.
+      const allTokens = tokenizeAll(rawText);
+      const tokens = [...new Set(allTokens)];
 
       // Authorship part flags. The SDK declares both on TextPart only, so the
       // type narrowing carries them — no cast. A non-text part leaves them
@@ -252,7 +264,10 @@ export function buildCandidates(
         sessionParentID: session.parentID,
         rawText,
         fieldTexts: fields,
-        tokens: tokenize(rawText),
+        tokens,
+        rawComplete,
+        primaryText: allTokens.join(" "),
+        primaryTerms: tokens,
         source: part.type === "tool" ? "tool" : part.type === "reasoning" ? "reasoning" : "message",
         why: {
           matchedFields: [],
@@ -301,15 +316,40 @@ export function buildTitleCandidate(
   };
 }
 
-/** Populate stage-2 normalized fields on a candidate (mutates in place). */
+/** Bound on the labels {@link normalizedLabel} remembers. */
+const MAX_NORMALIZED_LABELS = 1_024;
+const normalizedLabels = new Map<string, string>();
+
+/** `normalize(text)` for a short label (a directory, session title or tool
+ *  name), remembered: every candidate of a session carries the same ones. */
+function normalizedLabel(text: string): string {
+  let normalized = normalizedLabels.get(text);
+  if (normalized === undefined) {
+    if (normalizedLabels.size >= MAX_NORMALIZED_LABELS) normalizedLabels.clear();
+    normalized = normalize(text);
+    normalizedLabels.set(text, normalized);
+  }
+  return normalized;
+}
+
+/** Populate stage-2 normalized fields on a candidate (mutates in place). The
+ *  primary text and its terms are computed from `rawText` unless
+ *  {@link buildCandidates} already set them. */
 export function populateNormalized(candidate: Candidate): void {
   // For title candidates, rawText IS the session title, which is already indexed
   // via titleText below. Indexing it in primaryText too would double-weight the
   // same text (primary boost + title boost). Leave primaryText empty so a title
   // candidate is scored only through its title field.
-  candidate.primaryText = candidate.partType === "title" ? "" : normalize(candidate.rawText);
+  if (candidate.partType === "title") {
+    candidate.primaryText = "";
+    candidate.primaryTerms = [];
+  } else if (candidate.primaryText === undefined || candidate.primaryTerms === undefined) {
+    const allTokens = tokenizeAll(candidate.rawText);
+    candidate.primaryText = allTokens.join(" ");
+    candidate.primaryTerms = [...new Set(allTokens)];
+  }
   // secondaryText: directory path provides cross-project search context
-  candidate.secondaryText = candidate.directory ? normalize(candidate.directory) : "";
-  candidate.titleText = candidate.sessionTitle ? normalize(candidate.sessionTitle) : "";
-  candidate.hintText = candidate.toolName ? normalize(candidate.toolName) : "";
+  candidate.secondaryText = candidate.directory ? normalizedLabel(candidate.directory) : "";
+  candidate.titleText = candidate.sessionTitle ? normalizedLabel(candidate.sessionTitle) : "";
+  candidate.hintText = candidate.toolName ? normalizedLabel(candidate.toolName) : "";
 }

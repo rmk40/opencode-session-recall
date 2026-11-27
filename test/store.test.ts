@@ -4,9 +4,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openSqlite, type SqliteDb } from "../src/sqlite.js";
 import {
+  boundWeakAnchors,
+  buildMatch,
   openStore,
   pluginBuild,
+  WEAK_MATCH_ROWS,
   type Card,
+  type FtsHit,
   type PartTextRow,
   type RangeHash,
   type SessionTail,
@@ -16,6 +20,7 @@ import {
   type StoreOptions,
   type StoreRefusal,
 } from "../src/store.js";
+import { parseQuery } from "../src/query.js";
 import { openV1Store } from "./helpers.js";
 
 // These tests run against the REAL node:sqlite driver (Node >= 22.5). Under
@@ -1471,6 +1476,389 @@ describe("fts query construction", () => {
       "short",
       "long",
     ]);
+    db.close();
+  });
+});
+
+describe("plain-word slim-index lookup", () => {
+  // Eight filler sessions whose 480 rows all hold common words ("app" in
+  // every row, "desktop", "sign" and "in" in half), and a tenth of them
+  // "inference"; three target sessions hold the rare words. Under a 100-row
+  // budget the common words are never ORed.
+  const BUDGET = 100;
+
+  async function wordStore(): Promise<{ db: SqliteDb; store: Store; scored: string[] }> {
+    const db = await openSqlite(freshDbPath());
+    if (!db) throw new Error("openSqlite returned null");
+    // The MATCH expression of every lookup statement that scores rows.
+    const scored: string[] = [];
+    const recording: SqliteDb = {
+      ...db,
+      all: (sql, params) => {
+        if (sql.includes("bm25(part_fts)")) scored.push(String(params?.[0]));
+        return db.all(sql, params);
+      },
+    };
+    const store = openV1Store(recording);
+    if (!store) throw new Error("openStore returned null");
+    for (let s = 0; s < 8; s++) {
+      const rows = Array.from({ length: 60 }, (_, r) =>
+        makePart(
+          `f${s}-${r}`,
+          `${r % 2 === 0 ? "desktop app" : "sign in to the app"} ${r % 10 === 0 ? "inference" : "notes"} ${s}`,
+        ),
+      );
+      store.replaceSessionParts(`filler-${s}`, rows, makeCard(`filler-${s}`));
+    }
+    store.replaceSessionParts(
+      "gov",
+      [makePart("g1", "the governed rollout plan")],
+      makeCard("gov"),
+    );
+    store.replaceSessionParts(
+      "launch",
+      [makePart("l1", "launcher crash on sign in")],
+      makeCard("launch"),
+    );
+    store.replaceSessionParts(
+      "both",
+      [makePart("b1", "governed inference in the desktop launcher")],
+      makeCard("both"),
+    );
+    return { db, store, scored };
+  }
+
+  const lookup = (store: Store, query: string) =>
+    new Set(
+      sessions(
+        store.ftsSearch({ strong: [], weak: parseQuery(query).tokens, weakRowBudget: BUDGET }),
+      ),
+    );
+
+  it("still finds the sessions holding a query's distinctive words", async () => {
+    const { db, store } = await wordStore();
+    const prose = lookup(store, "desktop app launcher sign in governed inference");
+    for (const target of ["gov", "launch", "both"]) expect(prose.has(target)).toBe(true);
+    expect([...lookup(store, "app launcher")].sort()).toEqual(["both", "launch"]);
+    expect([...lookup(store, "governed")].sort()).toEqual(["both", "gov"]);
+    // Every word is common: none is distinctive, so nothing is looked up.
+    expect(lookup(store, "sign in app").size).toBe(0);
+    // A strong anchor is looked up whatever its frequency.
+    expect(store.ftsSearch({ strong: ["app"], weak: [], weakRowBudget: BUDGET })).toHaveLength(200);
+    db.close();
+  });
+
+  it("scores at most the budget's rows where an OR of every word matches the index", async () => {
+    const { db, store, scored } = await wordStore();
+    const words = parseQuery("desktop app launcher sign in governed inference").tokens;
+    store.ftsSearch({ strong: [], weak: words, weakRowBudget: BUDGET });
+    const matched = (match: string): number =>
+      Number(db.get("SELECT count(*) AS n FROM part_fts WHERE part_fts MATCH ?", [match])?.n);
+    expect(scored).toHaveLength(1);
+    expect(matched(scored[0]!)).toBeLessThanOrEqual(BUDGET);
+    // The left-out words only rank: the rows are the kept words' rows.
+    expect(matched(scored[0]!)).toBe(matched('"launcher" OR "governed" OR "inference"'));
+    expect(matched(words.map((word) => `"${word}"`).join(" OR "))).toBe(483);
+    db.close();
+  });
+});
+
+describe("plain-word lookup past the budget", () => {
+  // Under a 20-row budget: "cache", "invalidation" and "pool" are in 30 rows
+  // each, and only "cache" and "invalidation" share a row (in "pair").
+  // "rollout" is in 12 rows and "canary" in 25: the one row holding both (in
+  // "both") is the oldest and as long as the 11 holding only "rollout".
+  const BUDGET = 20;
+
+  type Recorded = { scored: string[]; listed: string[] };
+
+  /** A store whose lookup statements are recorded: `scored` the MATCH of
+   *  each one ranked by `bm25()`, `listed` of each one listed by rowid. */
+  async function recordingStore(): Promise<{ db: SqliteDb; store: Store } & Recorded> {
+    const db = await openSqlite(freshDbPath());
+    if (!db) throw new Error("openSqlite returned null");
+    const scored: string[] = [];
+    const listed: string[] = [];
+    const recording: SqliteDb = {
+      ...db,
+      all: (sql, params) => {
+        if (sql.includes("bm25(part_fts)")) scored.push(String(params?.[0]));
+        else if (sql.includes("part_fts MATCH")) listed.push(String(params?.[0]));
+        return db.all(sql, params);
+      },
+    };
+    const store = openV1Store(recording);
+    if (!store) throw new Error("openStore returned null");
+    return { db, store, scored, listed };
+  }
+
+  function writer(store: Store) {
+    return (sessionId: string, texts: string[], timeCreated = 1000) =>
+      store.replaceSessionParts(
+        sessionId,
+        texts.map((text, i) =>
+          makePart(`${sessionId}-${i}`, text, { timeCreated: timeCreated + i }),
+        ),
+        makeCard(sessionId),
+      );
+  }
+
+  const many = (n: number, text: (i: number) => string) =>
+    Array.from({ length: n }, (_, i) => text(i));
+
+  async function commonStore(): Promise<{ db: SqliteDb; store: Store } & Recorded> {
+    const { db, store, scored, listed } = await recordingStore();
+    const write = writer(store);
+    write(
+      "filler",
+      many(40, (i) => `notes filler ${i}`),
+    );
+    write("pair", ["cache invalidation storm"]);
+    write(
+      "cache-only",
+      many(29, (i) => `cache warmed ${i}`),
+    );
+    write(
+      "invalidation-only",
+      many(29, (i) => `invalidation queued ${i}`),
+    );
+    write(
+      "pool-only",
+      many(30, (i) => `pool drained ${i}`),
+    );
+    write("both", ["rollout canary step"], 1);
+    write(
+      "rollout-only",
+      many(11, () => "rollout plan step"),
+    );
+    write(
+      "canary-only",
+      many(24, (i) => `canary build ${i}`),
+    );
+    scored.length = 0;
+    listed.length = 0;
+    return { db, store, scored, listed };
+  }
+
+  const lookup = (store: Store, words: string[], limit?: number, weakRowBudget = BUDGET) =>
+    store.ftsSearch({ strong: [], weak: words, weakRowBudget, limit });
+
+  it("lists the rows holding every common word without scoring them", async () => {
+    const { db, store, scored, listed } = await commonStore();
+    const hits = lookup(store, ["cache", "invalidation"]);
+    expect(sessions(hits)).toEqual(["pair"]);
+    expect(listed).toEqual(['"cache" AND "invalidation"']);
+    // bm25() would read all 59 rows of the two words to weigh them.
+    expect(scored).toEqual([]);
+    db.close();
+  });
+
+  it("skips common words that never share a row", async () => {
+    const { db, store, scored, listed } = await commonStore();
+    expect(lookup(store, ["cache", "pool"])).toEqual([]);
+    // The one statement is the list of rows holding both, which finds none.
+    expect(listed).toEqual(['"cache" AND "pool"']);
+    expect(scored).toEqual([]);
+    db.close();
+  });
+
+  it("ranks a row holding a left-out word above rows holding only the kept word", async () => {
+    const { db, store } = await commonStore();
+    // No row holds all three words. "rollout" matches 12 rows, more than the
+    // 5 returned; without "canary" in the ranking the older "both" row would
+    // tie and come last.
+    const hits = lookup(store, ["rollout", "canary", "notes"], 5);
+    expect(hits.every((hit) => Number.isFinite(hit.score))).toBe(true);
+    expect(hits).toHaveLength(5);
+    expect(hits[0]!.sessionId).toBe("both");
+    expect(new Set(sessions(hits.slice(1)))).toEqual(new Set(["rollout-only"]));
+    db.close();
+  });
+
+  it("returns the row holding every word when the other word is past the ranking cap", async () => {
+    // Under a 300-row budget "migration" (202 rows) is kept and "cache"
+    // (1,501 rows) is past the 1,500-row ranking cap, so it adds nothing to
+    // the kept lookup, where the one older "migration cache" row ties with
+    // the 201 newer "migration plan" rows and comes 202nd of 200.
+    const { db, store, scored } = await recordingStore();
+    const write = writer(store);
+    write("full", ["migration cache"], 1);
+    write(
+      "caches",
+      many(1_500, (i) => `cache warmed ${i}`),
+    );
+    write(
+      "plans",
+      many(201, () => "migration plan"),
+      2_000,
+    );
+    scored.length = 0;
+    const hits = lookup(store, ["cache", "migration"], undefined, 300);
+    expect(hits).toHaveLength(200);
+    expect(hits[0]!.partId).toBe("full-0");
+    expect(sessions(hits.slice(1))).toEqual(Array.from({ length: 199 }, () => "plans"));
+    expect(scored).toEqual(['"migration"']);
+    db.close();
+  });
+
+  it("lists the rows holding every word newest first, then the kept lookup's others once each", async () => {
+    // Both words are kept. "deploy rollback" outranks the longer, newer
+    // "deploy rollback after release" under bm25(), but the rows holding both
+    // words come first newest first, and the kept lookup does not repeat them.
+    const { db, store } = await recordingStore();
+    writer(store)("s", [
+      "deploy rollback",
+      "deploy plan",
+      "rollback plan",
+      "deploy rollback after release",
+      "deploy",
+    ]);
+    const parts = (hits: FtsHit[]) => hits.map((hit) => hit.partId);
+    const top = lookup(store, ["deploy", "rollback"], 3);
+    expect(parts(top).slice(0, 2)).toEqual(["s-3", "s-0"]);
+    expect(top[2]!.partId).not.toMatch(/^s-[03]$/);
+    expect(top.slice(0, 2).map((hit) => hit.score)).toEqual([-Infinity, -Infinity]);
+    const all = parts(lookup(store, ["deploy", "rollback"], 10));
+    expect(all.slice(0, 2)).toEqual(["s-3", "s-0"]);
+    expect([...all].sort()).toEqual(["s-0", "s-1", "s-2", "s-3", "s-4"]);
+    db.close();
+  });
+});
+
+describe("plain-word anchor selection", () => {
+  const rowsFrom =
+    (rows: Record<string, number>) =>
+    (anchor: string): number =>
+      rows[anchor] ?? 0;
+
+  it("keeps every word, in the given order, while their rows add up to at most the budget", () => {
+    expect(boundWeakAnchors(["c", "a", "b"], rowsFrom({ c: 3, a: 1, b: 6 }), 10)).toEqual([
+      "c",
+      "a",
+      "b",
+    ]);
+  });
+
+  it("keeps the rarest words while their rows fit the budget, and none after", () => {
+    // Rarest first: d (1), a (3 in all), c (7); b would make 12.
+    const rows = rowsFrom({ a: 2, b: 5, c: 4, d: 1 });
+    expect(boundWeakAnchors(["a", "b", "c", "d"], rows, 7)).toEqual(["a", "c", "d"]);
+  });
+
+  it("leaves out a word whose rows alone reach the budget", () => {
+    expect(boundWeakAnchors(["x", "y"], rowsFrom({ x: 10, y: 3 }), 10)).toEqual(["y"]);
+    expect(boundWeakAnchors(["x"], rowsFrom({ x: 9 }), 10)).toEqual(["x"]);
+    expect(boundWeakAnchors(["x", "y"], rowsFrom({ x: 10, y: 10 }), 10)).toEqual([]);
+  });
+
+  it("prefers the earlier of equally common words", () => {
+    const rows = rowsFrom({ x: 4, y: 4, z: 4 });
+    expect(boundWeakAnchors(["x", "y", "z"], rows, 10)).toEqual(["x", "y"]);
+    expect(boundWeakAnchors(["z", "y", "x"], rows, 10)).toEqual(["z", "y"]);
+  });
+
+  it("counts a repeated word once, keeping one copy when it fits and none when too common", () => {
+    const asked: string[] = [];
+    const counting = (anchor: string): number => {
+      asked.push(anchor);
+      return rowsFrom({ a: 3, b: 2 })(anchor);
+    };
+    expect(boundWeakAnchors(["a", "b", "a"], counting, 100)).toEqual(["a", "b"]);
+    expect(asked).toEqual(["a", "b"]);
+    expect(boundWeakAnchors(["a", "b", "a"], rowsFrom({ a: 10, b: 2 }), 10)).toEqual(["b"]);
+  });
+
+  // One session, written in one transaction: "common" in 12 rows, "mid" in
+  // 4, "rare" and "launcher" in r0 only.
+  async function anchorStore(): Promise<{
+    db: SqliteDb;
+    store: Store;
+    counts: Array<{ anchor: string; cap: number }>;
+    matches: string[];
+  }> {
+    const db = await openSqlite(freshDbPath());
+    if (!db) throw new Error("openSqlite returned null");
+    const counts: Array<{ anchor: string; cap: number }> = [];
+    const matches: string[] = [];
+    const recording: SqliteDb = {
+      ...db,
+      get: (sql, params) => {
+        if (sql.includes("count(*)") && sql.includes("part_fts MATCH")) {
+          counts.push({ anchor: String(params?.[0]), cap: Number(params?.[1]) });
+        }
+        return db.get(sql, params);
+      },
+      all: (sql, params) => {
+        if (sql.includes("bm25(part_fts)")) matches.push(String(params?.[0]));
+        return db.all(sql, params);
+      },
+    };
+    const store = openV1Store(recording);
+    if (!store) throw new Error("openStore returned null");
+    const text = (r: number): string =>
+      r === 0 ? "common mid rare launcher" : r < 4 ? "common mid" : "common";
+    store.replaceSessionParts(
+      "s",
+      Array.from({ length: 12 }, (_, r) => makePart(`r${r}`, text(r))),
+      makeCard("s"),
+    );
+    counts.length = 0;
+    matches.length = 0;
+    return { db, store, counts, matches };
+  }
+
+  const parts = (hits: { partId: string }[]): string[] => hits.map((h) => h.partId);
+
+  it("looks a strong anchor up without counting or ORing the plain words", async () => {
+    const { db, store, counts, matches } = await anchorStore();
+    const hits = store.ftsSearch({ strong: ["launcher"], weak: ["common", "mid"] });
+    expect(parts(hits)).toEqual(["r0"]);
+    expect(matches).toEqual(['"launcher"']);
+    expect(counts).toEqual([]);
+    db.close();
+  });
+
+  it("bounds the plain words when no strong anchor survives quoting", async () => {
+    const { db, store, matches } = await anchorStore();
+    const hits = store.ftsSearch({
+      strong: ['""', "  "],
+      weak: ["common", "rare"],
+      weakRowBudget: 5,
+    });
+    // "common" (12 rows) is past the budget but ranks with the kept "rare".
+    expect(matches).toEqual(['("rare") AND ("common" OR "rare")']);
+    expect(parts(hits)).toEqual(["r0"]);
+    db.close();
+  });
+
+  it("ORs every plain word as before when their rows fit the budget together", async () => {
+    const { db, store, matches } = await anchorStore();
+    const words = ["mid", "rare", "common", "launcher"];
+    // 4 + 1 + 12 + 1 = 18 rows.
+    expect(store.ftsSearch({ strong: [], weak: words })).toHaveLength(12);
+    store.ftsSearch({ strong: [], weak: words, weakRowBudget: 18 });
+    store.ftsSearch({ strong: [], weak: words, weakRowBudget: 17 });
+    expect(matches).toEqual([
+      buildMatch([], words),
+      buildMatch([], words),
+      `(${buildMatch([], ["mid", "rare", "launcher"])}) AND (${buildMatch([], words)})`,
+    ]);
+    db.close();
+  });
+
+  it("counts and keeps words under a positive budget rounded down, else the default", async () => {
+    const { db, store, counts } = await anchorStore();
+    const lookup = (weakRowBudget: number | undefined) => {
+      counts.length = 0;
+      const hits = store.ftsSearch({ strong: [], weak: ["common"], weakRowBudget });
+      return { hits: hits.length, caps: counts.map((c) => c.cap) };
+    };
+    // "common" is in 12 rows: a budget of 12 leaves it out, 13 keeps it.
+    expect(lookup(12.9)).toEqual({ hits: 0, caps: [12] });
+    expect(lookup(13)).toEqual({ hits: 12, caps: [13] });
+    for (const invalid of [0, -5, Number.NaN, Number.POSITIVE_INFINITY, undefined]) {
+      expect(lookup(invalid), String(invalid)).toEqual({ hits: 12, caps: [WEAK_MATCH_ROWS] });
+    }
     db.close();
   });
 });

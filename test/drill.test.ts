@@ -1381,6 +1381,44 @@ describe("drill per-target accounting", () => {
     ]);
   });
 
+  it("charges each searchable field of a message up to the per-candidate cap", async () => {
+    // a2's bash call charges 20,000 for its 25,000-char output, 1 for its
+    // title, 9 for its command and 23 for its JSON input: 20,033, though its
+    // candidate's raw text is cut at 20,000. Its recall call and step marker
+    // hold no searchable text and charge nothing.
+    const graph: Graph = {
+      messagesBySession: {
+        "s-a": [
+          note("s-a", "a1", 1000, "alpha oldest"),
+          bundle(assistantMessage("a2", "s-a", 2000), [
+            completedToolPart(
+              "a2-k",
+              "s-a",
+              "a2",
+              "bash",
+              { command: "alpha run" },
+              sized("alpha output", 25_000),
+              { title: "t" },
+            ),
+            completedToolPart("a2-r", "s-a", "a2", "recall", {}, sized("alpha recalled", 5_000)),
+            { id: "a2-s", sessionID: "s-a", messageID: "a2", type: "step-start" },
+          ]),
+        ],
+      },
+    };
+    const stats = async (budget: number) => {
+      const { source } = makeControlledSource(graph);
+      const drill = newDrill(source, { drillPageMessages: 1, drillCharsPerSession: budget });
+      return (await drill.pools(poolsInput([revised("s-a")], "alpha"))).targets;
+    };
+    expect(await stats(20_033)).toEqual([
+      { sessionId: "s-a", fetched: 1, candidate: 1, eligible: 1, stop: "sessionBudget" },
+    ]);
+    expect(await stats(20_034)).toEqual([
+      { sessionId: "s-a", fetched: 2, candidate: 2, eligible: 2, stop: "end" },
+    ]);
+  });
+
   it("reports targetsCut when the budget runs out before every point lookup, unless paging spent it", async () => {
     // Page size 1. In s-a the walk reads a5 and a4 and stops at the anchor,
     // with budget left for the a1 lookup but not the a2 one. In s-b the first
