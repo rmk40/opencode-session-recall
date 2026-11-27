@@ -84,12 +84,13 @@ describe("v2 seekPage", () => {
     // A message created exactly at the bound starts the walk.
     expect(await firstPage(source, "ses_a", 7_000)).toEqual(["ses_a-7", "ses_a-6", "ses_a-5"]);
 
-    // Three bounded statements for five later rows: the creation-time index,
-    // the newest row and one range over seqs 6 to 10. None reads row data.
+    // Two bounded statements: the creation-time index, which holds all five
+    // rows at or before the bound in one page, and the newest row. None reads
+    // row data.
     spy.statements.length = 0;
     await source.seekPage!({ sessionID: "ses_a", until: 5_500 });
     const reads = spy.statements.filter((sql) => /\bsession_message\b/.test(sql));
-    expect(reads).toHaveLength(3);
+    expect(reads).toHaveLength(2);
     for (const sql of reads) expect(sql).not.toMatch(/\bdata\b/);
   });
 
@@ -185,8 +186,9 @@ describe("v2 seekPage", () => {
         yields++;
       },
     });
-    // Later rows (whose range read is a third statement), the newest row,
-    // and nothing at or before the bound.
+    // Later rows, the newest row, and nothing at or before the bound. The
+    // creation-time index holds every row at or before each bound in one
+    // page, so no range read runs.
     const counts: Array<{ yields: number; reads: number }> = [];
     for (const until of [2_500, 4_000, 500]) {
       yields = 0;
@@ -196,7 +198,7 @@ describe("v2 seekPage", () => {
       counts.push({ yields, reads });
     }
     expect(counts).toEqual([
-      { yields: 3, reads: 3 },
+      { yields: 2, reads: 2 },
       { yields: 2, reads: 2 },
       { yields: 1, reads: 1 },
     ]);
@@ -228,23 +230,169 @@ describe("v2 seekPage over creation times out of row order", () => {
     expect(await firstPage(source, "ses_a", 3_000)).toEqual(["ses_a-17", "ses_a-16", "ses_a-15"]);
   });
 
-  it("walks a long run of later rows a range at a time, without reading row data", async () => {
+  it("walks the later rows a range at a time when more rows came before the bound, without reading row data", async () => {
+    // 6,000 rows at or before the bound and 3,000 after it: two range reads
+    // reach the highest seq the creation-time pages found before those pages
+    // could read every earlier row.
     const t = await fresh();
     session(t, "ses_a");
     t.db.exec("BEGIN");
-    row(t, "ses_a", 1, 1_000);
-    for (let seq = 2; seq <= 4_501; seq++) row(t, "ses_a", seq, 10_000 + seq);
+    for (let seq = 1; seq <= 6_000; seq++) row(t, "ses_a", seq, seq);
+    for (let seq = 6_001; seq <= 9_000; seq++) row(t, "ses_a", seq, 100_000 + seq);
     t.db.exec("COMMIT");
     const { source, spy } = await open(t);
     spy.statements.length = 0;
-    await source.seekPage!({ sessionID: "ses_a", until: 5_000 });
+    await source.seekPage!({ sessionID: "ses_a", until: 50_000 });
     const reads = spy.statements.filter((sql) => /\bsession_message\b/.test(sql));
-    // The creation-time index, the newest row and three ranges of up to
-    // 2,000 seqs.
+    // A creation-time page, the newest row, a range, a second page and the
+    // range that reaches seq 6,000.
     expect(reads).toHaveLength(5);
     for (const sql of reads) expect(sql).not.toMatch(/\bdata\b/);
-    expect(await firstPage(source, "ses_a", 5_000)).toEqual(["ses_a-1"]);
+    expect(await firstPage(source, "ses_a", 50_000)).toEqual([
+      "ses_a-6000",
+      "ses_a-5999",
+      "ses_a-5998",
+    ]);
   });
+
+  it("finds the start from the creation-time index when far more rows came after the bound", async () => {
+    // A long-running session: its newest row before the bound is seq 4,896
+    // and 60,000 rows follow it, more than the range reads alone may walk.
+    const t = await fresh();
+    session(t, "ses_a");
+    t.db.exec("BEGIN");
+    for (let seq = 1; seq <= 4_896; seq++) row(t, "ses_a", seq, seq);
+    for (let seq = 4_897; seq <= 64_896; seq++) row(t, "ses_a", seq, 100_000 + seq);
+    t.db.exec("COMMIT");
+    const { source, spy } = await open(t);
+    spy.statements.length = 0;
+    const sought = await source.seekPage!({ sessionID: "ses_a", until: 50_000 });
+    expect(sought).toMatchObject({ ok: true, value: expect.any(String) });
+    const reads = spy.statements.filter((sql) => /\bsession_message\b/.test(sql));
+    // Five creation-time pages read every row at or before the bound, with
+    // the newest row and four range reads between them.
+    expect(reads).toHaveLength(10);
+    for (const sql of reads) expect(sql).not.toMatch(/\bdata\b/);
+    expect(await firstPage(source, "ses_a", 50_000)).toEqual([
+      "ses_a-4896",
+      "ses_a-4895",
+      "ses_a-4894",
+    ]);
+  }, 30_000);
+});
+
+describe("v2 seekPage reading the creation-time index and seq ranges in turn", () => {
+  /** The `session_message` statements a seek ran. */
+  async function seek(t: V2TestDb, until: number) {
+    const { source, spy } = await open(t);
+    spy.statements.length = 0;
+    const sought = await source.seekPage!({ sessionID: "ses_a", until });
+    const reads = spy.statements.filter((sql) => /\bsession_message\b/.test(sql));
+    return { source, sought, reads };
+  }
+
+  /** The columns a statement selects. */
+  const selected = (sql: string): string[] =>
+    (/SELECT\s+([\s\S]*?)\s+FROM\b/i.exec(sql)?.[1] ?? "").split(",").map((c) => c.trim());
+
+  it("starts at the newest page when every row was created at or before the bound, without a range read", async () => {
+    // More rows than one creation-time page holds, all before the bound: the
+    // first page already holds the session's newest row.
+    const t = await fresh();
+    session(t, "ses_a");
+    t.db.exec("BEGIN");
+    for (let seq = 1; seq <= 1_200; seq++) row(t, "ses_a", seq, seq * 10);
+    t.db.exec("COMMIT");
+    const { sought, reads } = await seek(t, 100_000);
+    expect(sought).toEqual({ ok: true, value: undefined });
+    // The creation-time page and the newest row.
+    expect(reads).toHaveLength(2);
+  });
+
+  it("answers from the first range read that meets a row at or before the bound above the creation-time page", async () => {
+    // Seqs 1 to 1,500 were created at 2,001 to 3,500, so the first page of
+    // 1,000 by creation time reaches seq 1,500 and no further. Seqs 1,501 and
+    // 1,503 carry older creation times than any of them and are at or before
+    // the bound; 1,502 and 1,504 are after it.
+    const t = await fresh();
+    session(t, "ses_a");
+    t.db.exec("BEGIN");
+    for (let seq = 1; seq <= 1_500; seq++) row(t, "ses_a", seq, 2_000 + seq);
+    row(t, "ses_a", 1_501, 1_000);
+    row(t, "ses_a", 1_502, 9_000);
+    row(t, "ses_a", 1_503, 1_500);
+    row(t, "ses_a", 1_504, 9_500);
+    t.db.exec("COMMIT");
+    const { source, reads } = await seek(t, 5_000);
+    // The creation-time page, the newest row and one range read: the second
+    // creation-time page, which would also find seq 1,503, is never read.
+    expect(reads).toHaveLength(3);
+    expect(await firstPage(source, "ses_a", 5_000)).toEqual([
+      "ses_a-1503",
+      "ses_a-1502",
+      "ses_a-1501",
+    ]);
+  });
+
+  it("continues the creation-time index past rows that share the last creation time of a page", async () => {
+    // 1,500 rows created in the same millisecond, their ids descending as
+    // their seqs rise: the index's first page holds seqs 1 to 1,000 and the
+    // highest seq, 1,500, is on its second page. One row far above in seq,
+    // after the bound, keeps the range reads from reaching them first.
+    const t = await fresh();
+    session(t, "ses_a");
+    const id = (seq: number): string => `m${String(9_999 - seq).padStart(4, "0")}`;
+    t.db.exec("BEGIN");
+    for (let seq = 1; seq <= 1_500; seq++) {
+      insertMessage(t.db, {
+        id: id(seq),
+        session_id: "ses_a",
+        type: "user",
+        seq,
+        time_created: 1_000,
+        data: { text: `row ${seq}`, time: { created: 1_000 } },
+      });
+    }
+    row(t, "ses_a", 1_000_000, 9_000);
+    t.db.exec("COMMIT");
+    const { source, reads } = await seek(t, 5_000);
+    // Two creation-time pages, the newest row and one range read between
+    // them.
+    expect(reads).toHaveLength(4);
+    expect(await firstPage(source, "ses_a", 5_000)).toEqual([id(1_500), id(1_499), id(1_498)]);
+  });
+
+  it("gives up for the newest page once both sides together have examined 40,000 rows, though neither alone has", async () => {
+    // Seqs 1 to 15,000, created at their seq, then one row at seq 55,000
+    // after either bound. The range reads walk 40,000 empty seqs down to the
+    // creation-time pages' highest seq, 2,000 a read, while the pages read
+    // 1,000 rows a read, one of each in turn.
+    const t = await fresh();
+    session(t, "ses_a");
+    t.db.exec("BEGIN");
+    for (let seq = 1; seq <= 15_000; seq++) row(t, "ses_a", seq, seq);
+    row(t, "ses_a", 55_000, 1_000_000);
+    t.db.exec("COMMIT");
+
+    // 15,000 rows at or before the bound: after 14 pages (14,000 rows) and
+    // 13 range reads (26,000 seqs), neither side is done.
+    const capped = await seek(t, 15_000);
+    expect(capped.sought).toEqual({ ok: true, value: undefined });
+    expect(capped.reads).toHaveLength(28);
+    for (const sql of capped.reads) {
+      expect(["seq", "time_created", "id"]).toEqual(expect.arrayContaining(selected(sql)));
+    }
+
+    // 13,500 rows at or before the bound: the 14th page reads the last 500
+    // of them, so the pages finish before the cap.
+    const exact = await seek(t, 13_500);
+    expect(exact.reads).toHaveLength(28);
+    expect(await firstPage(exact.source, "ses_a", 13_500)).toEqual([
+      "ses_a-13500",
+      "ses_a-13499",
+      "ses_a-13498",
+    ]);
+  }, 30_000);
 });
 
 describe("v2 seqFloor", () => {

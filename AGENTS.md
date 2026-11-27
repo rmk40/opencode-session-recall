@@ -463,15 +463,30 @@ median search waiting on timers. Every long-running loop therefore awaits a
 yield point, and the default yield point (`yieldOnBudget`, one per process)
 yields to the event loop only once `SLICE_MS` (8 ms) of work has run since
 anything last yielded through it. The v2 reader, the v2 sync, the card runtime's
-chunked jobs, the distiller and discovery all default to it. A yield itself is
+chunked jobs and discovery all default to it. The hosts give the distiller its
+background twin (below). A yield itself is
 `macrotask()`, which uses `setImmediate` where the runtime has it and
 `setTimeout(0)` otherwise. **Do not use `MessageChannel` for it.** Node and Bun
 deliver a port's messages back to back without returning to the event loop, so a
 chain of such yields keeps timers from ever firing (a probe of 200 slices of 3 ms
 saw no interval tick at all). Callers past the budget wait in line on one
-pending yield, and only the first to resume takes the slice it starts: resumed
-waiters all run before any of them does its work, so a waiter cannot tell from
-the clock whether another already holds the slice. A pending yield older than
+pending yield, and only one of them takes the slice it starts. Resumed waiters
+all run before any of them does its work, so a waiter cannot tell from the
+clock whether another already holds the slice. The yield names the class that
+takes it when it resolves.
+
+One slicer has two yield points that share its slice. `yieldOnBudget` is for
+work a caller waits on, such as the card runtime's jobs behind `ready()` and the
+drill's reads. `yieldInBackground` is for upkeep. The distiller yields through
+it on both hosts. On v2 so do the history facade, the sync and the discovery
+the distiller reads through. A yield gives its slice to the first
+foreground waiter whenever one waits on it. Background waiters that have
+waited through `BACKGROUND_EVERY - 1` (7) foreground turns in a row take the
+next one, so upkeep slows down while a search runs but never stops. Within a
+class the first to wait goes first. A reader yields through the one point it
+was built with, which is why the drill and the distiller read `opencode.db`
+through separate facades. **Give new upkeep the background point, and work a
+search awaits the foreground one.** A pending yield older than
 100 ms, or from a clock that went backwards, is replaced, because a test that
 swaps fake timers in and out can drop its callback and would otherwise stall
 every later caller in the process. A test that injects `yieldBetween` gets it
@@ -493,19 +508,26 @@ Creation times rise with seq only mostly (opencode moves a retried assistant's
 `time_created` to the step's start), so **neither end of a walk may trust one
 message's time.**
 
-- With an upper bound, a walk starts at `HistorySource.seekPage`: below the
-  highest seq of any row created at or before the bound. On v2 the newest 16
-  rows down the `(session_id, time_created, id)` index give a lower bound on
-  that seq, then range reads over at most 2,000 seqs each (`SCAN_RANGE`) walk
-  down from the session's newest row to it and stop at the first row at or
-  before the bound. Past 40,000 seqs (`SCAN_ROWS_MAX`) the walk starts at the
-  newest page instead.
-- Past the lower bound, a walk ends only once it has read a message whose
-  `info.seq` is at or below `HistorySource.seqFloor`, the lowest seq of a row
-  created inside the window. On v2 one read pages the window's rows up the
-  creation-time index 1,000 at a time and range reads walk seq up from the
-  oldest row, in turn, and whichever finishes first is exact. It is asked once
-  a walk meets an older message and cached per session and window.
+- With an upper bound, a walk starts at `HistorySource.seekPage`, below the
+  highest seq of any row created at or before the bound. On v2 one read pages
+  the rows at or before the bound down the `(session_id, time_created, id)`
+  index 1,000 at a time (`SCAN_PAGE`) and range reads over at most 2,000 seqs
+  each (`SCAN_RANGE`) walk seq down from the session's newest row, in turn.
+  Whichever finishes first is exact, so a seek costs about the shorter of the
+  history before the bound and the history after it. Past 40,000 rows
+  (`SCAN_ROWS_MAX`) the walk starts at the newest page instead.
+- Past the lower bound, a walk ends only once it has met an older message and
+  read one whose `info.seq` is at or below `HistorySource.seqFloor`, the lowest
+  seq of a row created inside the window. On v2 one read pages the window's
+  rows up the creation-time index 1,000 at a time and range reads walk seq up
+  from the oldest row, in turn, and whichever finishes first is exact. With
+  both bounds a walk asks for the floor before its first read. A null floor
+  (nothing created inside the window) means the session is not read at all. A
+  deep sweep counts it covered. Under a lower bound alone the card filters, the
+  slim lane and the deep listing have already left out sessions last updated
+  before it, so a null floor is rare there and the ask, which can examine up to
+  40,000 rows, waits until the walk meets an older message. The answer is
+  cached per session and window.
 - Every one of these statements binds `LIMIT ?` and reads only `seq`,
   `time_created` and `id`, never `data`.
 - Messages outside the window stay out of the pool and charge neither the

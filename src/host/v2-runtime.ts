@@ -42,7 +42,7 @@ import type { SearchDeps, SemanticSearchConfig } from "../search.js";
 import type { SessionEnrichment } from "../sessions.js";
 import type { ResolvedOptions } from "../options.js";
 import { errmsg, settleWithin, type Limits } from "../types.js";
-import { yieldOnBudget } from "../yield.js";
+import { yieldInBackground, yieldOnBudget } from "../yield.js";
 import { loadFs, loadPath } from "../node-import.js";
 import type { V2Event } from "./opencode-v2-types.js";
 import { createIdDedupe, type ResolvedIdentity, type RuntimeFactory } from "./runtime.js";
@@ -122,7 +122,8 @@ export type V2Runtime = {
   readonly unavailable: string | undefined;
   /** The history facade scoped to one opencode project. */
   sourceFor(projectID: string): HistorySource;
-  /** The distiller's facade: no project, global listings only. */
+  /** The drill's facade: no project, global listings only. The distiller
+   *  reads through one like it whose reads yield in the background. */
   readonly globalSource: HistorySource;
   /** A session's parent id (`null` for a root), or undefined when unknown. */
   parentOf(sessionID: string): Promise<string | null | undefined>;
@@ -373,6 +374,12 @@ async function createV2Runtime(
     opencodeDb && schema && drift
       ? createV2HistorySource(opencodeDb, { schema, drift })
       : createUnavailableSource("v2-sqlite", unavailable ?? "unknown");
+  // The distiller reads through a global facade of its own whose reads yield
+  // in the background, so a search reading or building meanwhile goes first.
+  const distillSource: HistorySource =
+    opencodeDb && schema && drift
+      ? createV2HistorySource(opencodeDb, { schema, drift, yieldBetween: yieldInBackground })
+      : globalSource;
   const sourceFor = (projectID: string): HistorySource => {
     if (!opencodeDb || !schema || !drift) return globalSource;
     let facade = facades.get(projectID);
@@ -514,7 +521,7 @@ async function createV2Runtime(
     `recall-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 
   const distiller = createDistiller({
-    source: globalSource,
+    source: distillSource,
     // No history, no distilling: the distiller does not start. Nor for a
     // store opened for cards only: its source path is not canonical.
     store: opencodeDb && !cardsOnly ? store : null,
@@ -526,14 +533,19 @@ async function createV2Runtime(
     // Cards built under an older projection are rebuilt by the repair
     // sweep, and range checks catch part-only changes.
     projectorGen: V2_PROJECTOR_GEN,
-    discover,
+    discover: () => discoverSessions(distillSource, yieldInBackground),
     log,
     // The poll, checkpoints and deletion reconcile keep the store fresh with
-    // no events at all; the yields keep long passes off the shared loop.
+    // no events at all; the yields keep long passes off the shared loop and
+    // behind a search's work.
     ...(opencodeDb && {
-      sync: createV2Sync(opencodeDb, { ...inputs.sync, ...(schema && { schema }) }),
+      sync: createV2Sync(opencodeDb, {
+        yieldBetween: yieldInBackground,
+        ...inputs.sync,
+        ...(schema && { schema }),
+      }),
     }),
-    yieldBetween: yieldOnBudget,
+    yieldBetween: yieldInBackground,
     ...(inputs.idleDebounceMs !== undefined && { idleDebounceMs: inputs.idleDebounceMs }),
   });
   // What reads could not project, logged when it changes (debug log only).

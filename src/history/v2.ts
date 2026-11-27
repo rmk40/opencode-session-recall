@@ -492,18 +492,13 @@ const NO_CURSOR_SEQ = Number.MAX_SAFE_INTEGER;
 /** Page plans retried when a whole planned range turns ineligible between the
  *  size read and the body read. */
 const PAGE_ATTEMPTS = 3;
-/**
- * Rows a seek or a floor first reads down the `(session_id, time_created,
- * id)` index. Creation times rise with seq only mostly (opencode moves an
- * assistant's `time_created` to the start of a retried step), so these rows
- * give only a bound on the answer, which range reads over seq then make
- * exact.
- */
-const SEEK_ROWS = 16;
-/** Seqs one range read covers: seq is unique within a session, so a range
- *  read examines at most this many rows. */
+/** Seqs one range read of a seek or a floor covers: seq is unique within a
+ *  session, so a range read examines at most this many rows. Creation times
+ *  rise with seq only mostly (opencode moves an assistant's `time_created` to
+ *  the start of a retried step), so a seek or a floor reads both by creation
+ *  time and by seq. */
 const SCAN_RANGE = 2_000;
-/** Rows one floor read returns down the creation-time index. */
+/** Rows one seek or floor read returns from the creation-time index. */
 const SCAN_PAGE = 1_000;
 /** Rows one seek or floor examines in all before it gives up (the walk then
  *  starts at the newest page, or cannot stop at the lower bound). */
@@ -2073,28 +2068,48 @@ export function createV2HistorySource(db: ReadOnlyDb, opts: V2SourceOptions = {}
 
     /**
      * The highest seq of a row created at or before `until` (fork copies left
-     * out, as pages leave them out), read without any row's data. The newest
-     * rows by creation time give a lower bound on it; then range reads walk
-     * seq down from the session's newest row to that bound, each over at most
-     * {@link SCAN_RANGE} seqs, and the first row at or before `until` they
-     * meet is the answer. Past {@link SCAN_ROWS_MAX} seqs the walk starts at
-     * the newest page instead.
+     * out, as pages leave them out), read without any row's data, the mirror
+     * of {@link seqFloor}. One read pages the rows at or before `until` down
+     * the creation-time index, {@link SCAN_PAGE} at a time, keeping the
+     * highest seq: once they are all read, that seq is exact. In turn, range
+     * reads walk seq down from the session's newest row to the highest seq
+     * found so far, each over at most {@link SCAN_RANGE} seqs: the first row
+     * at or before `until` they meet is exact as well. Whichever finishes
+     * first answers, so the cost follows the smaller of the history up to
+     * `until` and the history after it. Past {@link SCAN_ROWS_MAX} rows the
+     * walk starts at the newest page instead.
      */
     async seekPage(o): Promise<Lookup<string | null | undefined>> {
       const invalid = timeError("seek", o.until);
       if (invalid) return invalid;
       const fork = forkBinds(o.sessionID);
       if (!fork) return sessionNotFound(o.sessionID);
-      await pause();
-      const near = read("seek", () =>
-        db.all(
-          `SELECT seq FROM session_message
-           WHERE session_id = ? AND time_created <= ? AND ${FORK_FILTER}
-           ORDER BY time_created DESC, id DESC LIMIT ?`,
-          [o.sessionID, o.until, ...fork, SEEK_ROWS],
-        ),
-      );
-      let start = extremeSeq(near, Math.max);
+      let examined = 0;
+      let last: { time: number; id: string } | undefined;
+      let start: number | undefined;
+      /** The next page of rows at or before `until`, newest by creation
+       *  time first; true once every such row was read. */
+      const pageDown = async (): Promise<boolean> => {
+        await pause();
+        const below = last
+          ? { clause: "(time_created, id) < (?, ?)", binds: [last.time, last.id] }
+          : { clause: "time_created <= ?", binds: [o.until] };
+        const rows = read("seek", () =>
+          db.all(
+            `SELECT seq, time_created, id FROM session_message
+             WHERE session_id = ? AND ${below.clause} AND ${FORK_FILTER}
+             ORDER BY time_created DESC, id DESC LIMIT ?`,
+            [o.sessionID, ...below.binds, ...fork, SCAN_PAGE],
+          ),
+        );
+        examined += rows.length;
+        const highest = extremeSeq(rows, Math.max);
+        if (highest !== undefined) start = start === undefined ? highest : Math.max(start, highest);
+        const end = rows[rows.length - 1];
+        if (end) last = { time: asNumber(end.time_created) ?? 0, id: asString(end.id) ?? "" };
+        return rows.length < SCAN_PAGE;
+      };
+      const exact = await pageDown();
       if (start === undefined) return { ok: true, value: null };
       await pause();
       const top =
@@ -2106,8 +2121,14 @@ export function createV2HistorySource(db: ReadOnlyDb, opts: V2SourceOptions = {}
             ),
           )?.seq,
         ) ?? start;
-      for (let hi = top; hi > start; ) {
-        if (top - hi >= SCAN_ROWS_MAX) return { ok: true, value: undefined };
+      // The cursor reads rows below its seq, so it names the row past `seq`.
+      const startAt = (seq: number): Lookup<string | null | undefined> =>
+        seq >= top || !Number.isSafeInteger(seq + 1) || seq + 1 < 0
+          ? { ok: true, value: undefined }
+          : { ok: true, value: encodeV2Cursor(seq + 1) };
+      if (exact) return startAt(start);
+      for (let hi = top; ; ) {
+        if (hi <= start) return startAt(start);
         const lo = Math.max(start, hi - SCAN_RANGE);
         await pause();
         const hit = read("seek range", () =>
@@ -2119,17 +2140,14 @@ export function createV2HistorySource(db: ReadOnlyDb, opts: V2SourceOptions = {}
           ),
         );
         const seq = asNumber(hit?.seq);
-        if (seq !== null) {
-          start = seq;
-          break;
-        }
+        if (seq !== null) return startAt(seq);
+        examined += hi - lo;
         hi = lo;
+        if (hi <= start) return startAt(start);
+        if (examined >= SCAN_ROWS_MAX) return { ok: true, value: undefined };
+        if (await pageDown()) return startAt(start);
+        if (examined >= SCAN_ROWS_MAX) return { ok: true, value: undefined };
       }
-      // The cursor reads rows below its seq, so it names the row past `start`.
-      if (start >= top || !Number.isSafeInteger(start + 1) || start + 1 < 0) {
-        return { ok: true, value: undefined };
-      }
-      return { ok: true, value: encodeV2Cursor(start + 1) };
     },
 
     /**

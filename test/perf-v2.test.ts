@@ -21,7 +21,10 @@
  * 12,000-card store whose root has 2,400 other children, each of which
  * recomputes the root's rollup; paged discovery of 10,501 sessions and of a
  * root's 2,400 children, through the runtime's own paging; and one range
- * check over a 500-row session. Each records its total time.
+ * check over a 500-row session. Each records its total time. The last runs
+ * the first search after a restart over 12,000 sessions through the runtime
+ * the plugin creates, once with no cold pass and once during one with more
+ * work than the search, and bounds how much the pass slows the search.
  *
  * Every gate asserts its longest slice with V8's garbage-collection pauses
  * taken out (`…MaxSliceMs`) and logs the raw stall (`…MaxStallMs`) and the
@@ -44,7 +47,7 @@
  * slice of the append is likewise its one appendSessionParts transaction,
  * which derives the merged card over every retained row.
  */
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -70,9 +73,11 @@ import {
   SESSION_WATERMARK_KEY,
   type V2SyncOptions,
 } from "../src/history/v2-sync.js";
-import { DEFAULTS, DISCOVERY_LIMIT } from "../src/types.js";
-import { discoverSessions } from "../src/host/v2-runtime.js";
+import { DEFAULTS, DISCOVERY_LIMIT, type SearchOutput } from "../src/types.js";
+import { discoverSessions, v2RuntimeFactory, type V2Runtime } from "../src/host/v2-runtime.js";
+import { search } from "../src/search.js";
 import { listAllChildren } from "../src/sessions.js";
+import { makeContext, toolResultText } from "./helpers.js";
 import { loadAverage, perfCorpus, stallProbe, type Stalls } from "./perf-helpers.js";
 import {
   insertMessage,
@@ -84,6 +89,52 @@ import {
   makeV2PartsDb,
   type V2TestDb,
 } from "./v2-db.js";
+
+/**
+ * The first-search gate opens opencode.db inside the runtime, through
+ * `openOpencodeDb`, which is wrapped here while `spied` is set so that the
+ * history readers and the sync read through the LIMIT spy. A violation would
+ * surface only as an error inside the runtime, so the spy's throws are
+ * recorded and checked after the gate. The other gates wrap the handles they
+ * open themselves.
+ */
+const history = vi.hoisted(() => ({ spied: false, reads: 0, violations: [] as string[] }));
+
+vi.mock("../src/history/v2.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../src/history/v2.js")>();
+  const { limitSpy } = await import("./v2-db.js");
+  return {
+    ...actual,
+    openOpencodeDb: async (path: string) => {
+      const opened = await actual.openOpencodeDb(path);
+      if (!opened.ok || !history.spied) return opened;
+      const spy = limitSpy(opened.db);
+      const checked = <T>(sql: string, run: () => T): T => {
+        if (/\bsession_(message|part)\b/.test(sql)) history.reads++;
+        try {
+          return run();
+        } catch (error) {
+          history.violations.push(error instanceof Error ? error.message : String(error));
+          throw error;
+        } finally {
+          // Only violations matter here, so the spy's statement log is
+          // emptied rather than kept for every statement of a cold pass.
+          spy.statements.length = 0;
+        }
+      };
+      return {
+        ...opened,
+        db: {
+          get: (sql: string, params?: unknown[]) =>
+            checked(sql, () => spy.get(sql, params as Parameters<typeof spy.get>[1])),
+          all: (sql: string, params?: unknown[]) =>
+            checked(sql, () => spy.all(sql, params as Parameters<typeof spy.all>[1])),
+          close: () => spy.close(),
+        },
+      };
+    },
+  };
+});
 
 const ENABLED = process.env.RECALL_PERF === "1";
 const BUDGET_MS = 50;
@@ -113,6 +164,10 @@ const LISTING_TOTAL_BUDGET_MS = 1_000;
 const RANGE_SESSION_ROWS = 500;
 const RANGE_CHECKS = 8;
 const RANGE_CHECK_TOTAL_BUDGET_MS = 250;
+/** Sessions the first search after a restart runs over, and how many times
+ *  as long it may take while a cold pass runs as with none running. */
+const FIRST_SEARCH_SESSIONS = 12_000;
+const FIRST_SEARCH_SLOWDOWN_MAX = 2;
 
 /** Wait for `pred`, failing after ten minutes. */
 async function until(pred: () => boolean, what: string): Promise<void> {
@@ -1281,4 +1336,166 @@ describe.skipIf(!ENABLED)("perf: v2 event-loop stalls", () => {
       rmSync(storeDir, { recursive: true, force: true });
     }
   }, 300_000);
+
+  it(`the first search after a restart over ${FIRST_SEARCH_SESSIONS} sessions takes under ${FIRST_SEARCH_SLOWDOWN_MAX} times as long during a cold pass, keeping each code slice under ${BUDGET_MS} ms excluding GC pauses`, async () => {
+    const v2 = await makeV2PartsDb();
+    v2.db.exec("PRAGMA synchronous = OFF");
+    const storeDir = mkdtempSync(join(tmpdir(), "recall-perf-v2-first-"));
+    const storePath = join(storeDir, "store.db");
+    const running: V2Runtime[] = [];
+    Object.assign(history, { spied: true, reads: 0, violations: [] });
+    try {
+      const at = Date.now();
+      const corpus = perfCorpus({ now: at });
+      const t0 = at - 30 * 86_400_000;
+      const w = v2.db;
+      // Each session's text holds a perfCorpus card's, so the distiller
+      // derives cards of realistic size and the first search builds an index
+      // over them.
+      w.tx(() => {
+        insertProject(w, { id: "prj", worktree: "/workspace/perf" });
+        for (let i = 0; i < FIRST_SEARCH_SESSIONS; i++) {
+          const sid = corpus.id(i);
+          const card = corpus.card(i);
+          const t = t0 + i * 10;
+          insertSession(w, {
+            id: sid,
+            project_id: "prj",
+            directory: "/workspace/perf",
+            title: card.title,
+            time_created: t,
+            time_updated: t + 5,
+          });
+          insertMessage(w, {
+            id: `msg_${sid}_1`,
+            session_id: sid,
+            type: "user",
+            seq: 1,
+            time_created: t + 1,
+            data: userData(`${card.summaryHead} ${card.files.join(" ")}`, t + 1),
+          });
+          insertMessage(w, {
+            id: `msg_${sid}_2`,
+            session_id: sid,
+            type: "assistant",
+            seq: 2,
+            time_created: t + 2,
+            data: replyData([textItem(`${card.outcomeHead} ${card.inventory}`)], t + 2),
+          });
+        }
+      });
+      /** A runtime as the plugin creates it, with the cold pass on or off. */
+      const open = async (coldPass: boolean): Promise<V2Runtime> => {
+        const factory = v2RuntimeFactory({
+          options: {
+            ephemeral: false,
+            storePath,
+            opencodeDbPath: v2.path,
+            semantic: undefined,
+            limits: { ...DEFAULTS, coldPass },
+            summaries: false,
+          },
+          channel: "latest",
+          log: () => {},
+        });
+        const runtime = await factory.create(await factory.resolve());
+        running.push(runtime);
+        return runtime;
+      };
+      const close = async (runtime: V2Runtime): Promise<void> => {
+        running.splice(running.indexOf(runtime), 1);
+        await runtime.dispose();
+      };
+      const firstSearch = async (runtime: V2Runtime): Promise<SearchOutput> => {
+        const tool = search(runtime.sourceFor("prj"), true, runtime.options.limits, runtime.deps);
+        const text = toolResultText(
+          await tool.execute(
+            { query: corpus.query(0), scope: "global" } as never,
+            makeContext().ctx,
+          ),
+        );
+        return JSON.parse(text) as SearchOutput;
+      };
+
+      // 1. Every session indexed.
+      const results: Record<string, number> = {};
+      let start = performance.now();
+      const builder = await open(true);
+      await until(
+        () =>
+          builder.distiller.status().coldPass === "done" &&
+          builder.repair()?.sweep?.running !== true,
+        "the first build",
+      );
+      results.buildMs = performance.now() - start;
+      await close(builder);
+
+      // 2. Every checkpoint cleared, so the next cold pass re-reads and
+      // re-derives each session: more work than the search's card build, as
+      // a long-used store's pass over thousands of real sessions is.
+      const raw = await openSqlite(storePath);
+      if (!raw) throw new Error("no sqlite");
+      raw.run("UPDATE card SET distill_cursor = NULL", []);
+      raw.close();
+
+      const probe = stallProbe();
+      const load = loadAverage();
+      try {
+        // 3. The first search of a runtime that runs no cold pass.
+        const quiet = await open(false);
+        probe.reset();
+        start = performance.now();
+        const alone = await firstSearch(quiet);
+        results.aloneMs = performance.now() - start;
+        Object.assign(results, stallFields("alone", await probe.stalls()));
+        results.aloneOk = alone.ok ? 1 : 0;
+        await close(quiet);
+
+        // 4. The first search of a runtime whose cold pass is under way.
+        start = performance.now();
+        const busy = await open(true);
+        await until(
+          () =>
+            busy.distiller.status().coldPass === "running" &&
+            busy.distiller.status().examinedCount > 0,
+          "the cold pass",
+        );
+        results.coldPassStartMs = performance.now() - start;
+        const examinedBefore = busy.distiller.status().examinedCount;
+        probe.reset();
+        start = performance.now();
+        const during = await firstSearch(busy);
+        results.duringMs = performance.now() - start;
+        Object.assign(results, stallFields("during", await probe.stalls()));
+        results.duringOk = during.ok ? 1 : 0;
+        results.examinedDuring = busy.distiller.status().examinedCount - examinedBefore;
+        start = performance.now();
+        await until(() => busy.distiller.status().coldPass === "done", "the cold pass");
+        results.coldPassRestMs = performance.now() - start;
+        results.examined = busy.distiller.status().examinedCount;
+        results.slowdown = results.duringMs / results.aloneMs;
+      } finally {
+        probe.stop();
+      }
+
+      console.log(`v2 first search perf (load ${load}):`, JSON.stringify(rounded(results)));
+
+      // Every history statement the runtimes ran passed the LIMIT spy.
+      expect(history.reads).toBeGreaterThan(0);
+      expect(history.violations).toEqual([]);
+      expect(results.aloneOk).toBe(1);
+      expect(results.duringOk).toBe(1);
+      // The pass slowed down during the search but kept going, then finished.
+      expect(results.examinedDuring).toBeGreaterThan(0);
+      expect(results.examined).toBe(FIRST_SEARCH_SESSIONS);
+      expect(results.slowdown).toBeLessThan(FIRST_SEARCH_SLOWDOWN_MAX);
+      expect(results.aloneMaxSliceMs).toBeLessThan(BUDGET_MS);
+      expect(results.duringMaxSliceMs).toBeLessThan(BUDGET_MS);
+    } finally {
+      await Promise.all(running.map((runtime) => runtime.dispose()));
+      history.spied = false;
+      v2.cleanup();
+      rmSync(storeDir, { recursive: true, force: true });
+    }
+  }, 900_000);
 });

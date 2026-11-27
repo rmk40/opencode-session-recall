@@ -1,6 +1,14 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createV2HistorySource, openOpencodeDb } from "../src/history/v2.js";
-import { macrotask, SLICE_MS, timeSlicer, yieldOnBudget } from "../src/yield.js";
+import {
+  BACKGROUND_EVERY,
+  macrotask,
+  prioritySlicer,
+  SLICE_MS,
+  timeSlicer,
+  yieldInBackground,
+  yieldOnBudget,
+} from "../src/yield.js";
 import { insertProject, insertSession, makeV2PartsDb } from "./v2-db.js";
 
 /** A clock the test advances by hand, and a yield that records each call. */
@@ -189,6 +197,207 @@ describe("timeSlicer", () => {
   });
 });
 
+describe("prioritySlicer", () => {
+  it("gives a slice to a waiting foreground caller before background callers that came first, and one turn in every backgroundEvery to the background", async () => {
+    let now = 0;
+    const turns: Array<() => void> = [];
+    const slicer = prioritySlicer({
+      budgetMs: 8,
+      backgroundEvery: 3,
+      now: () => now,
+      yieldNow: () => new Promise<void>((resolve) => turns.push(resolve)),
+    });
+    const ran: string[] = [];
+    // Each time a worker resumes it does a whole slice of work.
+    const worker = async (name: string, at: () => Promise<void>, slices: number): Promise<void> => {
+      for (let i = 0; i < slices; i++) {
+        await at();
+        ran.push(name);
+        now += 8;
+      }
+    };
+    const settle = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0));
+    now = 8;
+    const workers = [
+      worker("b1", slicer.background, 2),
+      worker("b2", slicer.background, 2),
+      worker("f", slicer.foreground, 5),
+    ];
+    await settle();
+    for (let turn = 0; turn < 9; turn++) {
+      turns.shift()!();
+      await settle();
+    }
+    expect(ran).toEqual(["f", "f", "b1", "f", "f", "b2", "f", "b1", "b2"]);
+    expect(turns).toEqual([]);
+    await Promise.all(workers);
+  });
+
+  /** A slicer whose yields resolve only when the test releases them, as a
+   *  turn of the event loop would, and workers that each do a whole slice of
+   *  work every time they resume. */
+  function contested(opts: { backgroundEvery?: number } = {}) {
+    let now = 0;
+    const turns: Array<() => void> = [];
+    const slicer = prioritySlicer({
+      budgetMs: 8,
+      ...opts,
+      now: () => now,
+      yieldNow: () => new Promise<void>((resolve) => turns.push(resolve)),
+    });
+    const ran: string[] = [];
+    const workers: Array<Promise<void>> = [];
+    const settle = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0));
+    now = 8;
+    return {
+      slicer,
+      ran,
+      turns,
+      start(name: string, at: () => Promise<void>, slices: number): void {
+        workers.push(
+          (async () => {
+            for (let i = 0; i < slices; i++) {
+              await at();
+              ran.push(name);
+              now += 8;
+            }
+          })(),
+        );
+      },
+      /** Release the pending yields one at a time, `count` of them. */
+      async release(count: number): Promise<void> {
+        await settle();
+        for (let turn = 0; turn < count; turn++) {
+          turns.shift()!();
+          await settle();
+        }
+      },
+      /** Release yields until every worker has finished. */
+      async drain(): Promise<void> {
+        await settle();
+        while (turns.length > 0) {
+          turns.shift()!();
+          await settle();
+        }
+        await Promise.all(workers);
+      },
+    };
+  }
+
+  it("gives background callers one turn in BACKGROUND_EVERY by default, and foreground callers theirs in the order they waited", async () => {
+    // The background caller waits first; both foreground callers keep
+    // waiting past the 2 * BACKGROUND_EVERY turns observed.
+    const c = contested();
+    c.start("b", c.slicer.background, 2);
+    c.start("f1", c.slicer.foreground, 2 * BACKGROUND_EVERY);
+    c.start("f2", c.slicer.foreground, 2 * BACKGROUND_EVERY);
+    await c.release(2 * BACKGROUND_EVERY);
+    // Every BACKGROUND_EVERY-th turn is the background's; the foreground
+    // callers alternate through the rest, the one that waited longer first.
+    const expected: string[] = [];
+    let next = "f1";
+    for (let turn = 1; turn <= 2 * BACKGROUND_EVERY; turn++) {
+      if (turn % BACKGROUND_EVERY === 0) {
+        expected.push("b");
+        continue;
+      }
+      expected.push(next);
+      next = next === "f1" ? "f2" : "f1";
+    }
+    expect(c.ran).toEqual(expected);
+    await c.drain();
+  });
+
+  it("hands each yield to the next background caller in line when no foreground caller waits", async () => {
+    const c = contested({ backgroundEvery: 3 });
+    for (const name of ["b1", "b2", "b3"]) c.start(name, c.slicer.background, 2);
+    await c.release(6);
+    expect(c.ran).toEqual(["b1", "b2", "b3", "b1", "b2", "b3"]);
+    expect(c.turns).toEqual([]);
+    await c.drain();
+  });
+
+  it("shares one slice between its foreground and background yield points", async () => {
+    let now = 0;
+    const yields: string[] = [];
+    let caller = "";
+    const slicer = prioritySlicer({
+      budgetMs: 8,
+      now: () => now,
+      yieldNow: async () => {
+        yields.push(caller);
+      },
+    });
+    const step = async (name: "foreground" | "background"): Promise<void> => {
+      now += 5;
+      caller = name;
+      await slicer[name]();
+    };
+    // 5 ms a step: within the budget for one step, past it for two
+    // together, whichever points they go through.
+    await step("foreground");
+    await step("background");
+    await step("foreground");
+    await step("background");
+    expect(yields).toEqual(["background", "background"]);
+  });
+
+  it("lets the first waiter on a yield replaced as stale take a slice when it resolves, whatever its class", async () => {
+    let now = 0;
+    const turns: Array<() => void> = [];
+    const slicer = prioritySlicer({
+      budgetMs: 8,
+      now: () => now,
+      yieldNow: () => new Promise<void>((resolve) => turns.push(resolve)),
+    });
+    const ran: string[] = [];
+    const call = (name: string, at: () => Promise<void>): Promise<void> =>
+      at().then(() => {
+        ran.push(name);
+      });
+    const settle = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0));
+    now = 8;
+    // A background and a foreground caller wait on the first yield, which
+    // stays pending past 100 ms, so a later caller starts another.
+    const waiting = [call("b", slicer.background), call("f1", slicer.foreground)];
+    await settle();
+    now += 101;
+    waiting.push(call("f2", slicer.foreground));
+    await settle();
+    expect(turns).toHaveLength(2);
+
+    // The replaced yield resolves late: its first waiter takes the slice,
+    // though a foreground caller waited on it too, and the newer yield still
+    // holds its own waiter.
+    turns.shift()!();
+    await settle();
+    expect(ran).toEqual(["b"]);
+    turns.shift()!();
+    await settle();
+    expect(ran).toEqual(["b", "f2"]);
+    turns.shift()!();
+    await settle();
+    expect(ran).toEqual(["b", "f2", "f1"]);
+    expect(turns).toEqual([]);
+    await Promise.all(waiting);
+  });
+
+  it("yields at every call of either point with a budget of zero", async () => {
+    let yields = 0;
+    const slicer = prioritySlicer({
+      budgetMs: 0,
+      now: () => 0,
+      yieldNow: async () => {
+        yields++;
+      },
+    });
+    await slicer.foreground();
+    await slicer.background();
+    await slicer.background();
+    expect(yields).toBe(3);
+  });
+});
+
 describe("yieldOnBudget", () => {
   // `performance.now`, which the shared slicer reads, moved by hand from a
   // second past the real clock, so the first yield point is past any slice
@@ -252,6 +461,28 @@ describe("yieldOnBudget", () => {
     } finally {
       t.cleanup();
     }
+  });
+
+  it("shares its slice with yieldInBackground, and goes ahead of it on a yield both wait on", async () => {
+    // Well past the slice the tests before this one left, which moved the
+    // clock ahead of their own start.
+    clock += 10_000;
+    expect(await yielded(yieldOnBudget)).toBe(true);
+    clock += SLICE_MS - 1;
+    expect(await yielded(yieldInBackground)).toBe(false);
+    clock += 1;
+    expect(await yielded(yieldInBackground)).toBe(true);
+    expect(await yielded(yieldOnBudget)).toBe(false);
+
+    // Past the budget, a background caller waits first and a foreground one
+    // after it.
+    clock += SLICE_MS;
+    const order: string[] = [];
+    await Promise.all([
+      yieldInBackground().then(() => order.push("background")),
+      yieldOnBudget().then(() => order.push("foreground")),
+    ]);
+    expect(order).toEqual(["foreground", "background"]);
   });
 });
 
