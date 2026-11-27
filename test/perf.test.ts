@@ -24,6 +24,9 @@
  *     lexical and the reused build under 600MB.
  *   - 400 changed cards applied through ready({ index: true }): no full load,
  *     no code slice over 50ms with GC pauses excluded, under 3s in total.
+ *   - The store read a refresh check makes, on a freshly opened copy, idle and
+ *     before an apply: each under 2ms. The 400-card apply that follows it: no
+ *     code slice over 35ms, that read included.
  *   - 24 `recall` searches with card writes between them: card tier p50 <
  *     250ms, whole search p50 < 1s, no full load.
  * The slice budgets leave out V8's garbage-collection pauses, logged beside
@@ -96,6 +99,10 @@ const BIG_CARDS = 12_000;
 /** Longest synchronous slice a card-runtime build or update may take, GC
  *  pauses excluded. */
 const SLICE_BUDGET_MS = 50;
+/** One store read the card runtime's refresh check makes, on the large store. */
+const REFRESH_READ_BUDGET_MS = 2;
+/** Longest code slice of a 400-card apply, its refresh check included. */
+const APPLY_SLICE_BUDGET_MS = 35;
 /** Card-tier time of one `recall` search (median) on the large store. */
 const CARD_TIER_P50_BUDGET_MS = 250;
 /** Applying 400 changed cards through `ready({ index: true })`. A full
@@ -1083,6 +1090,84 @@ describe.skipIf(!ENABLED)(`perf: card runtime on a ${BIG_CARDS}-card store`, () 
       expect(marked).toBe(changed.length);
       expect(applied.maxOutsideGcMs).toBeLessThan(SLICE_BUDGET_MS);
       expect(applied.totalMs).toBeLessThan(APPLY_TOTAL_BUDGET_MS);
+    } finally {
+      runtime.dispose();
+    }
+  }, 300_000);
+
+  it(`a refresh check reads the store in under ${REFRESH_READ_BUDGET_MS} ms, and 400 changed cards apply with no code slice over ${APPLY_SLICE_BUDGET_MS} ms including that read`, async () => {
+    // A copy opened afresh: none of its card pages are in SQLite's cache yet.
+    const store = await copyStore();
+    const counted = countingSource(store);
+    const reads = counted.source.store!;
+    /** How long each refresh-check read of the store took. */
+    const checks: number[] = [];
+    let clock = Date.now();
+    const runtime = createCardsRuntime({
+      source: {
+        ...counted.source,
+        store: {
+          ...reads,
+          stats: () => {
+            const start = performance.now();
+            try {
+              return reads.stats();
+            } finally {
+              checks.push(performance.now() - start);
+            }
+          },
+        },
+      },
+      refreshIntervalMs: REFRESH_MS,
+      now: () => clock,
+    });
+    try {
+      const load = loadAverage();
+      await runtime.ready({ index: true });
+      // The cold load reads the counters before anything else touches the cards.
+      const firstRead = checks[0] ?? Number.NaN;
+
+      // Refresh checks that find nothing to apply.
+      checks.length = 0;
+      for (let i = 0; i < 20; i++) {
+        clock += REFRESH_MS;
+        await runtime.ready();
+      }
+      const idle = [...checks];
+
+      const changed = Array.from({ length: 400 }, (_, k) => k * 29 + 3);
+      for (const i of changed) {
+        const card = corpus.card(i, 1);
+        store.replaceSessionParts(card.sessionId, [], {
+          ...card,
+          inventory: `${card.inventory} applymarker`,
+        });
+      }
+      const loadsBefore = counted.fullLoads();
+      checks.length = 0;
+      clock += REFRESH_MS;
+      const applied = await measured(() => runtime.ready({ index: true }));
+      const applyRead = checks[0] ?? Number.NaN;
+      const fullLoads = counted.fullLoads() - loadsBefore;
+      const marked = runtime
+        .rank(parseQuery("applymarker"), {})
+        .filter((hit) => hit.card.inventory.endsWith(" applymarker")).length;
+
+      console.log(
+        `[perf] refresh check on ${BIG_CARDS} cards: first read ${firstRead.toFixed(2)}ms, ` +
+          `idle checks p50=${percentile(idle, 0.5).toFixed(3)}ms max=${Math.max(...idle).toFixed(3)}ms ` +
+          `(n=${idle.length}), before the apply ${applyRead.toFixed(3)}ms; apply of ${changed.length} cards: ` +
+          `total=${applied.totalMs.toFixed(1)}ms maxSlice=${applied.maxOutsideGcMs.toFixed(1)}ms ` +
+          `(stall ${applied.maxMs.toFixed(1)}ms, GC pause max ${applied.maxGcMs.toFixed(1)}ms), ` +
+          `full loads ${fullLoads}, marked hits ${marked} (load ${load} before, ${loadAverage()} after)`,
+      );
+      expect(idle).toHaveLength(20);
+      expect(firstRead).toBeLessThan(REFRESH_READ_BUDGET_MS);
+      expect(Math.max(...idle)).toBeLessThan(REFRESH_READ_BUDGET_MS);
+      expect(applyRead).toBeLessThan(REFRESH_READ_BUDGET_MS);
+      expect(fullLoads).toBe(0);
+      expect(marked).toBe(changed.length);
+      expect(applied.maxOutsideGcMs).toBeLessThan(APPLY_SLICE_BUDGET_MS);
     } finally {
       runtime.dispose();
     }

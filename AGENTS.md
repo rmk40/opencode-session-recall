@@ -330,7 +330,14 @@ advances the `cards_stamped` meta counter with it.
 `deleteSession` allocates a revision too, with no row left to stamp, advances
 `cards_deleted` and clears the session's range hashes. An older build bumps
 `cards_rev` alone, so the gap between `cards_rev` and `cards_stamped` grows with each
-of its writes and never closes. `cardStats()` reads every counter in one statement.
+of its writes and never closes. `cardCounters()` reads every counter in one
+statement over `meta` alone, and it is what anything polling for changes reads.
+`cardStats()` adds card counts that read the whole card table (16 to 20 ms on a
+12,000-card store, over a second on a cold file), so no runtime path calls it.
+`repairPendingCount()` counts through `card_repair_pending`, a partial index over
+the cards with a repair reason, which SQLite keeps exact whichever build writes.
+The index is no part of a schema version: every accepted open except an
+`existingOnly` one creates it when missing.
 **A new lexical write path allocates through `nextRev()` in its own transaction**,
 never by bumping `cards_rev` from outside the store.
 
@@ -369,7 +376,7 @@ card and serves `list`, `get`, `exclusionFamily`, `familyOf`, `coverage` and
 brought up to date only by `rank()` and `ready({ index: true })`, so a call that
 reads only the map never waits on index work. Both hosts build the card source
 with `storeCardSource(store)`, which adds the reads an incremental refresh needs
-(`cardStats`, `cardsSince`, `cardSessionIds`, `cardsPage`, `cardVectorsPage`). A
+(`cardCounters`, `cardsSince`, `cardSessionIds`, `cardsPage`, `cardVectorsPage`). A
 source without them (cards-lite, the static sources in tests) reloads every card
 whenever its revision changes.
 

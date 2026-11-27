@@ -140,6 +140,18 @@ const ACCEPTED_PRAGMAS = "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;";
  *  migration. */
 const WRITE_REV_INDEX_DDL = "CREATE INDEX card_write_rev ON card(write_rev);";
 
+/**
+ * Index behind {@link Store.repairPendingCount}: only the cards with a repair
+ * reason, so counting them reads none of the others. SQLite keeps it in step
+ * with every write to the table, whichever build makes it, so the count stays
+ * exact while older builds write. It is no part of a schema version and
+ * changes nothing a card means: a build that does not know it writes around
+ * it, and an accepted open creates it wherever it is missing (an older
+ * build's rebuild, or a store from before it existed).
+ */
+const REPAIR_PENDING_INDEX_DDL =
+  "CREATE INDEX IF NOT EXISTS card_repair_pending ON card(session_id) WHERE repair_reason IS NOT NULL;";
+
 /** Per-session hashes of source row ranges, keyed by the range's first `seq`
  *  ({@link RangeHash}). Shared by the fresh DDL and the v4 -> v5 migration. */
 const RANGE_HASH_DDL = `
@@ -370,16 +382,21 @@ export type RangeHash = {
 /** One card {@link Store.staleCards} returns. */
 export type StaleCard = { sessionId: string; timeUpdated: number };
 
-/** Card counts and revision counters from {@link Store.cardStats}, read in one
+/** The revision counters from {@link Store.cardCounters}, read in one
  *  statement so they describe the same moment. Counters read 0 when unset. */
-export type CardStats = {
-  cards: number;
-  fullCards: number;
-  repairPending: number;
+export type CardCounters = {
   cardsRev: number;
   cardsStamped: number;
   cardsDeleted: number;
   vectorsRev: number;
+};
+
+/** Card counts and revision counters from {@link Store.cardStats}, read in one
+ *  statement so they describe the same moment. Counters read 0 when unset. */
+export type CardStats = CardCounters & {
+  cards: number;
+  fullCards: number;
+  repairPending: number;
 };
 
 /** One card's persisted vector from {@link Store.cardVectorsPage}: the
@@ -522,7 +539,7 @@ export type Store = {
    * revision first, at most `limit` of them (a positive integer; anything else
    * reads as 1). Each revision stamps one card, so paging continues from the
    * last card's {@link Card.writeRev}. A write that stamped nothing (an older
-   * build's, or a delete) is not listed; {@link cardStats} exposes the
+   * build's, or a delete) is not listed; {@link cardCounters} exposes the
    * counters that reveal it.
    */
   cardsSince(rev: number, limit: number, opts?: { withEmbeddings?: boolean }): Card[];
@@ -558,7 +575,24 @@ export type Store = {
    * renumber, so a walk assumes no `VACUUM` runs during it (the store runs none).
    */
   familyPage(rootId: string, after: number | undefined, limit: number): FamilyPage;
-  /** Card counts plus the revision counters, from one statement. */
+  /**
+   * The revision counters, from one statement over `meta` alone: a few key
+   * lookups, whatever the size of the card table. What a reader polls to
+   * learn whether cards changed.
+   */
+  cardCounters(): CardCounters;
+  /**
+   * How many cards carry a {@link Card.repairReason}. Counted through an index
+   * over those cards alone, so it reads as many index entries as there are
+   * such cards (every accepted open but an `existingOnly` one creates the
+   * index when missing; without it the count reads every card instead).
+   */
+  repairPendingCount(): number;
+  /**
+   * Card counts plus the revision counters, from one statement. The counts
+   * read every card, so no path polls this: {@link cardCounters} and
+   * {@link repairPendingCount} serve those.
+   */
   cardStats(): CardStats;
   /** The store file's page count, free-list pages and page size. Read-only. */
   spaceStats(): SpaceStats;
@@ -1537,11 +1571,13 @@ export function openStore(
         if (current === 1 || current === 2) migrateV2ToV3(db);
         if (isPreFence(current)) migrateV3ToV4(db);
         if (migratable) migrateV4ToV5(db);
-        return;
+      } else {
+        // Anything else older (absent stamp or a foreign layout) is dropped
+        // and rebuilt fresh for this host.
+        rebuild(db, host, source);
       }
-      // Anything else older (absent stamp or a foreign layout) is dropped and
-      // rebuilt fresh for this host.
-      rebuild(db, host, source);
+      // A caller that must not write keeps counting without it.
+      if (!opts?.existingOnly) db.exec(REPAIR_PENDING_INDEX_DDL);
     });
     let warning: string | undefined;
     try {
@@ -1735,6 +1771,28 @@ class SqliteStore implements Store {
     const cards = rows.map(rowToRollupFields);
     const next = rows.length === take ? asNullableNumber(rows[rows.length - 1]!.row_key) : null;
     return next === null ? { cards } : { cards, next };
+  }
+
+  cardCounters(): CardCounters {
+    const row = this.db.get(
+      `SELECT (SELECT value FROM meta WHERE key=?) AS cards_rev,
+              (SELECT value FROM meta WHERE key=?) AS cards_stamped,
+              (SELECT value FROM meta WHERE key=?) AS cards_deleted,
+              (SELECT value FROM meta WHERE key=?) AS vectors_rev`,
+      [CARDS_REV_KEY, CARDS_STAMPED_KEY, CARDS_DELETED_KEY, VECTORS_REV_KEY],
+    );
+    return {
+      cardsRev: asCount(row?.cards_rev),
+      cardsStamped: asCount(row?.cards_stamped),
+      cardsDeleted: asCount(row?.cards_deleted),
+      vectorsRev: asCount(row?.vectors_rev),
+    };
+  }
+
+  repairPendingCount(): number {
+    return asCount(
+      this.db.get("SELECT count(*) AS n FROM card WHERE repair_reason IS NOT NULL")?.n,
+    );
   }
 
   cardStats(): CardStats {
