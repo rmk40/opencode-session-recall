@@ -71,6 +71,7 @@ import {
   createDistiller,
   deriveCard,
   readRepairState,
+  WAL_BACKLOG_FRAMES,
   type DistillSessionMeta,
 } from "../src/distill.js";
 import { macrotask } from "../src/yield.js";
@@ -130,6 +131,12 @@ const BACKGROUND_SLICE_BUDGET_MS = 35;
 /** Stale and repair-pending cards the repair-state gate seeds. */
 const STALE_CARDS = 400;
 const REPAIR_PENDING_CARDS = 30;
+/** Sessions changed since their cards in the WAL backlog gate, each written
+ *  in full by its cold pass. */
+const BACKLOG_BURST_SESSIONS = 600;
+/** How long that gate's reader holds its snapshot once the backlog is over
+ *  the bound, which session writes wait through. */
+const BACKLOG_HOLD_MS = 1_000;
 /** Card-tier time of one `recall` search (median) on the large store. */
 const CARD_TIER_P50_BUDGET_MS = 250;
 /** Applying 400 changed cards through `ready({ index: true })`. A full
@@ -932,13 +939,14 @@ describe.skipIf(!ENABLED)(`perf: card runtime on a ${BIG_CARDS}-card store`, () 
     return (await copyStoreWith()).store;
   }
 
-  /** A copy of the built store and its raw connection, after `prepare` has
-   *  run over another connection to the copy (as an older build would leave
-   *  the file); closed after the gate. `open` is how long the store's open
-   *  took, with its CPU time. */
+  /** A copy of the built store, its path and its raw connection, after
+   *  `prepare` has run over another connection to the copy (as an older build
+   *  would leave the file); closed after the gate. `open` is how long the
+   *  store's open took, with its CPU time. */
   async function copyStoreWith(prepare?: (db: SqliteDb) => void): Promise<{
     store: Store;
     db: SqliteDb;
+    path: string;
     open: { ms: number; cpuMs: number };
   }> {
     const dir = mkdtempSync(join(tmpdir(), "perf-cards-copy-"));
@@ -959,7 +967,12 @@ describe.skipIf(!ENABLED)(`perf: card runtime on a ${BIG_CARDS}-card store`, () 
     const ms = performance.now() - start;
     const used = cpuUsage(cpu);
     if (!result.ok) throw new Error(result.reason);
-    return { store: result.store, db, open: { ms, cpuMs: (used.user + used.system) / 1000 } };
+    return {
+      store: result.store,
+      db,
+      path,
+      open: { ms, cpuMs: (used.user + used.system) / 1000 },
+    };
   }
 
   /**
@@ -1348,7 +1361,8 @@ describe.skipIf(!ENABLED)(`perf: card runtime on a ${BIG_CARDS}-card store`, () 
         `UPDATE card SET repair_reason = 'malformed' WHERE rowid % ${BIG_CARDS / REPAIR_PENDING_CARDS} = 1`,
       );
     });
-    // What the sweep read in one statement before it paged.
+    // The reference the paged walk must equal: the stale cards and the
+    // repair-pending count, each read by one statement over the whole table.
     const expected = db
       .all(
         `SELECT session_id, time_updated FROM card
@@ -1499,6 +1513,131 @@ describe.skipIf(!ENABLED)(`perf: card runtime on a ${BIG_CARDS}-card store`, () 
       expect(done.at(-1)?.checkpointed, name).toBe(done.at(-1)?.frames);
       expect(pass.maxOutsideGcMs, name).toBeLessThan(BACKGROUND_SLICE_BUDGET_MS);
       expect(Number(db.get("PRAGMA wal_autocheckpoint")?.wal_autocheckpoint), name).toBe(1000);
+    }
+  }, 300_000);
+
+  it(`a reader on another connection holding WAL frames through a burst of session writes leaves at most ${WAL_BACKLOG_FRAMES} frames, and what one checkpoint interval writes, for the checkpoint after it lets go, with no slice over ${BACKGROUND_SLICE_BUDGET_MS} ms`, async () => {
+    const { store: inner, path } = await copyStoreWith();
+    const reader = await openSqlite(path);
+    if (!reader) throw new Error("no sqlite");
+    const checkpoints: Array<WalCheckpoint & { ms: number }> = [];
+    let sessionWrites = 0;
+    // The distiller's store, with its checkpoints timed and its full writes
+    // counted.
+    const store = new Proxy(inner, {
+      get(target, prop, receiver) {
+        const value = Reflect.get(target, prop, receiver) as unknown;
+        if (typeof value !== "function") return value;
+        const call = (...args: unknown[]): unknown =>
+          (value as (...a: unknown[]) => unknown).apply(target, args);
+        if (prop === "checkpoint") {
+          return () => {
+            const start = performance.now();
+            const result = call() as WalCheckpoint;
+            checkpoints.push({ ...result, ms: performance.now() - start });
+            return result;
+          };
+        }
+        if (prop === "replaceSessionParts") {
+          return (...args: unknown[]) => {
+            sessionWrites++;
+            return call(...args);
+          };
+        }
+        return call;
+      },
+    });
+    // Every session as its card has it, the first of them changed since: the
+    // cold pass reads each of those in full and writes it.
+    const sessions = Array.from({ length: BIG_CARDS }, (_, i) => {
+      const card = corpus.card(i);
+      return {
+        id: card.sessionId,
+        ...(card.parentId && { parentID: card.parentId }),
+        title: card.title,
+        slug: card.slug,
+        directory: card.directory,
+        projectID: card.projectId,
+        time: {
+          created: card.timeCreated,
+          updated: card.timeUpdated + (i < BACKLOG_BURST_SESSIONS ? 1 : 0),
+        },
+      };
+    });
+    const { client, unscoped } = corpusClient(corpus);
+    const logs: string[] = [];
+    let done = false;
+    const distiller = createDistiller({
+      source: createV1HistorySource({ scoped: client, unscoped }),
+      store,
+      gate: createFetchGate({ concurrency: DEFAULTS.concurrency }),
+      limits: { ...DEFAULTS, distillDelayMs: 0 },
+      instanceId: "perf-wal-backlog",
+      discover: async () => sessions as never,
+      yieldBetween: macrotask,
+      log: (line) => {
+        logs.push(line);
+        if (line.includes("cold pass done")) done = true;
+      },
+    });
+    const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+    const waitUntil = async (pred: () => boolean, what: string): Promise<void> => {
+      const deadline = performance.now() + 120_000;
+      while (!pred()) {
+        if (performance.now() > deadline) throw new Error(`timed out waiting for ${what}`);
+        await sleep(5);
+      }
+    };
+    const backlogOf = (c: WalCheckpoint): number => Math.max(0, c.frames - c.checkpointed);
+    // The reader's snapshot, which no checkpoint may copy past until it ends.
+    reader.exec("BEGIN");
+    reader.get("SELECT count(*) AS n FROM card");
+    let held: typeof checkpoints = [];
+    let writesHeld = 0;
+    const load = loadAverage();
+    try {
+      const run = await measured(async () => {
+        distiller.start();
+        await waitUntil(
+          () => checkpoints.some((c) => backlogOf(c) > WAL_BACKLOG_FRAMES),
+          "the backlog to pass the bound",
+        );
+        await sleep(BACKLOG_HOLD_MS);
+        held = [...checkpoints];
+        writesHeld = sessionWrites;
+        reader.exec("COMMIT");
+        await waitUntil(() => done, "the cold pass");
+        await sleep(1_500);
+      });
+      const after = checkpoints.slice(held.length);
+      const release = after[0];
+      const maxBacklog = Math.max(...held.map(backlogOf));
+      // The most frames written between two checkpoints while the reader held
+      // its snapshot: what a write admitted under the bound can add before
+      // the next checkpoint measures it.
+      let interval = 0;
+      for (let i = 1; i < held.length; i++) {
+        interval = Math.max(interval, held[i]!.frames - held[i - 1]!.frames);
+      }
+      console.log(
+        `[perf] WAL backlog of a reader held ${BACKLOG_HOLD_MS}ms through ${BACKLOG_BURST_SESSIONS} session writes ` +
+          `(load ${load}): backlog max ${maxBacklog} frames (bound ${WAL_BACKLOG_FRAMES}, most frames between two checkpoints ${interval}), ` +
+          `${writesHeld} writes before the reader let go; the checkpoint after it copied ${release ? backlogOf(held.at(-1)!) : -1} frames in ` +
+          `${release?.ms.toFixed(2)}ms; total=${run.totalMs.toFixed(0)}ms maxSlice=${run.maxOutsideGcMs.toFixed(1)}ms ` +
+          `(stall ${run.maxMs.toFixed(1)}ms, GC pause max ${run.maxGcMs.toFixed(1)}ms), ${sessionWrites} session writes, ` +
+          `slowest checkpoint ${Math.max(...checkpoints.map((c) => c.ms)).toFixed(2)}ms`,
+      );
+      expect(maxBacklog).toBeGreaterThan(WAL_BACKLOG_FRAMES);
+      expect(maxBacklog).toBeLessThanOrEqual(WAL_BACKLOG_FRAMES + interval);
+      expect(writesHeld).toBeLessThan(BACKLOG_BURST_SESSIONS);
+      expect(sessionWrites).toBeGreaterThanOrEqual(BACKLOG_BURST_SESSIONS);
+      expect(release?.checkpointed).toBe(release?.frames);
+      expect(release?.ms).toBeLessThan(BACKGROUND_SLICE_BUDGET_MS);
+      expect(run.maxOutsideGcMs).toBeLessThan(BACKGROUND_SLICE_BUDGET_MS);
+      expect(logs.filter((line) => line.includes("no checkpoint could copy"))).toEqual([]);
+    } finally {
+      await distiller.stop();
+      reader.close();
     }
   }, 300_000);
 });
