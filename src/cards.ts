@@ -35,13 +35,15 @@ import type { DirectoryRelevance } from "./types.js";
  * `semanticStatus` read. The index layer (the MiniSearch index and the card
  * vectors) is brought up to date only by `rank` and `ready({ index: true })`.
  * With a store-backed source ({@link CardSource.store}) a refresh reads the
- * revision counters and applies only the cards stamped since the last refresh;
- * the index then swaps each changed card's document (`remove` then `add`, which
- * keeps term frequencies exact). A full load runs on a cold start, when
- * `cards_rev` goes backwards, when an older build's unstamped writes widen the
- * gap between `cards_rev` and `cards_stamped`, and when too many cards changed
- * at once; it reads in keyset pages and indexes in chunks with a macrotask
- * between them, so it never holds the event loop for long.
+ * revision counters and applies only the cards stamped since the last refresh.
+ * The index then swaps each changed card's document (`remove` then `add`, which
+ * keeps term frequencies exact). The map is loaded in full on a cold start,
+ * when a revision counter goes backwards and when an older build's unstamped
+ * writes widen the gap between `cards_rev` and `cards_stamped`. The index is
+ * built in full when there is none yet or when more cards changed than
+ * swapping them one by one is worth (more than 64 and more than half the
+ * index). A full load reads in keyset pages and a build indexes in chunks,
+ * with a macrotask between them, so neither holds the event loop for long.
  *
  * This layer only SHORTLISTS which sessions to drill; final result ranking is
  * tier-2's job over the drilled parts. So generous recall here is correct: a

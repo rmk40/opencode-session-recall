@@ -127,8 +127,9 @@ most of them on a store of 12,000 cards.
   full. The distiller now re-reads only the messages past the newest settled
   one and merges them with what the card already holds. It skips the read
   when nothing past that point changed and reads in full when a message up
-  to that point changed. In the gates, the tail of a 5,000-message session
-  took about 180 ms, against about 1.6 s for the full read.
+  to that point changed. In the gates, a tail write to a card of 5,000
+  indexed rows took about 180 ms, against about 1.6 s for the session's
+  first write, which read it in full.
 - **`recall_get` continuations read on from where the output stopped.** On
   opencode v2 a continuation into a message's part rows reads from the row
   of the part where the previous output stopped, about two outputs' worth at
