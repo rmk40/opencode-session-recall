@@ -65,6 +65,7 @@ import {
 } from "../src/store.js";
 import {
   createCardsRuntime,
+  inlineVectorWriter,
   storeCardSource,
   type CardSource,
   type CardsRuntime,
@@ -433,7 +434,7 @@ function perfContext(): ToolContext {
 /** {@link storeCardSource}, counting the full loads a runtime makes: each
  *  `getCards` call and each keyset walk that starts at the first card. */
 function countingSource(store: Store): { source: CardSource; fullLoads: () => number } {
-  const base = storeCardSource(store);
+  const base = storeCardSource(store, inlineVectorWriter(store));
   const reads = base.store!;
   let loads = 0;
   return {
@@ -497,6 +498,7 @@ function timedCards(inner: CardsRuntime): CardsRuntime & {
     semanticStatus: sync("semanticStatus", inner.semanticStatus),
     invalidate: () => inner.invalidate(),
     dispose: () => inner.dispose(),
+    flushVectorWrites: (deadlineMs) => inner.flushVectorWrites(deadlineMs),
     spent: () => spent,
     reset: () => {
       spent = 0;
@@ -1030,7 +1032,7 @@ describe.skipIf(!ENABLED)(`perf: card runtime on a ${BIG_CARDS}-card store`, () 
     // long slice can be put down to one.
     const writes = { count: 0, maxMs: 0 };
     const semantic = (embedder: ReturnType<typeof hashingEmbedder>): CardsRuntime => {
-      const base = storeCardSource(store);
+      const base = storeCardSource(store, inlineVectorWriter(store));
       writes.count = 0;
       writes.maxMs = 0;
       return createCardsRuntime({
@@ -1054,7 +1056,9 @@ describe.skipIf(!ENABLED)(`perf: card runtime on a ${BIG_CARDS}-card store`, () 
 
     // Semantic off: the card map and the index, built in chunks.
     {
-      const runtime = createCardsRuntime({ source: storeCardSource(store) });
+      const runtime = createCardsRuntime({
+        source: storeCardSource(store, inlineVectorWriter(store)),
+      });
       try {
         record(results, "lexical", await measured(() => runtime.ready({ index: true })));
         results.lexicalHeapMB = heapMB();
@@ -1070,7 +1074,16 @@ describe.skipIf(!ENABLED)(`perf: card runtime on a ${BIG_CARDS}-card store`, () 
       const embedder = hashingEmbedder();
       const runtime = semantic(embedder);
       try {
-        record(results, "embed", await measured(() => runtime.ready({ index: true })));
+        // Persisting the vectors runs after ready() resolves; it is measured
+        // with the build, since its writes are slices on the loop too.
+        record(
+          results,
+          "embed",
+          await measured(async () => {
+            await runtime.ready({ index: true });
+            await runtime.flushVectorWrites();
+          }),
+        );
         results.embedWrites = writes.count;
         results.embedWriteMaxMs = writes.maxMs;
         results.embedCalls = embedder.calls();
@@ -1085,7 +1098,14 @@ describe.skipIf(!ENABLED)(`perf: card runtime on a ${BIG_CARDS}-card store`, () 
       const embedder = hashingEmbedder();
       const runtime = semantic(embedder);
       try {
-        record(results, "reuse", await measured(() => runtime.ready({ index: true })));
+        record(
+          results,
+          "reuse",
+          await measured(async () => {
+            await runtime.ready({ index: true });
+            await runtime.flushVectorWrites();
+          }),
+        );
         results.reuseWrites = writes.count;
         results.reuseHeapMB = heapMB();
         results.reuseEmbedCalls = embedder.calls();

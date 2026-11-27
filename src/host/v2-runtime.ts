@@ -13,6 +13,7 @@ import { EMBED_REPRESENTATION } from "../embedding-text.js";
 import {
   createCardsRuntime,
   cardsLiteFromSessions,
+  inlineVectorWriter,
   storeCardSource,
   type CardSource,
   type CardsRuntime,
@@ -470,7 +471,7 @@ async function createV2Runtime(
 
   let liteCards: Card[] = [];
   const cardSource: CardSource = store
-    ? storeCardSource(store)
+    ? storeCardSource(store, inlineVectorWriter(store))
     : { getCards: () => liteCards, revision: () => undefined, degraded: true };
 
   const cards = createCardsRuntime({
@@ -480,6 +481,7 @@ async function createV2Runtime(
     semanticModel: options.semantic?.model,
     semanticReady,
     pluginVersion: V2_PLUGIN_BUILD,
+    log,
   });
 
   let liteRefresh: LiteRefreshController | undefined;

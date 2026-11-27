@@ -18,7 +18,12 @@ import { openSqlite, type SqliteDb } from "../src/sqlite.js";
 import { openStore, type Store, type StoreOptions } from "../src/store.js";
 import { deriveCard, type DistillSessionMeta } from "../src/distill.js";
 import { createFetchGate, type FetchGate } from "../src/fetch-gate.js";
-import { createCardsRuntime, cardsLiteFromSessions, storeCardSource } from "../src/cards.js";
+import {
+  createCardsRuntime,
+  cardsLiteFromSessions,
+  inlineVectorWriter,
+  storeCardSource,
+} from "../src/cards.js";
 import { createDrill } from "../src/drill.js";
 import type { SearchDeps, SemanticSearchConfig } from "../src/search.js";
 import type { HistorySource } from "../src/history/source.js";
@@ -912,7 +917,7 @@ export async function makeRecallDeps(
 
   const gate = opts.gate ?? createFetchGate({ concurrency: limits.concurrency });
   const cards = createCardsRuntime({
-    source: storeCardSource(store),
+    source: storeCardSource(store, inlineVectorWriter(store)),
     embedder: opts.semantic?.embedder,
     semanticWeight: opts.semantic?.weight,
     now: opts.cardsNow,
