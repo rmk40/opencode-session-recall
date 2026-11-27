@@ -6,19 +6,40 @@ All notable changes to this project are documented here. This project follows
 
 ## Unreleased
 
-The store stays at schema 5, so upgrading needs no migration. Restart every
-OpenCode process after upgrading, the opencode v2 background service included
-(`opencode service restart`), since a running process keeps the version it
-loaded.
+Upgrading needs no migration, since the store stays at schema 5. Restart
+every OpenCode process after upgrading, because a running process keeps the
+version it loaded. On opencode v2 that includes the background service
+(`opencode service restart`).
 
-### Changed
+Project and global searches now find the calling session's own subagents. By
+default they leave out only the current session (see Changed defaults). A
+time bound keeps every session that overlaps its window, such as a subagent
+that kept running past it, while the evidence a search returns still comes
+only from messages inside the window.
+
+Searches are faster and stall other sessions less. On a busy machine with
+about 12,000 sessions and a 26 GB `opencode.db`, the median search took 262
+to 357 ms against 2,663 ms on 3.0.1. The first search during the indexing
+pass that runs at startup took a median of 1.13 times as long as the same
+search with no pass running. The longest any of these searches held
+OpenCode's event loop, which every session in the process shares, was
+129 ms. The Performance section gives the numbers for each speedup, most of
+them from synthetic benchmarks.
+
+`recall_messages` with `role` or `query` reads page after page until `limit`
+messages match, where it used to filter only the one page it read. On
+opencode v2, `order: "oldest"` browses a session forward from its first
+message.
+
+### Changed defaults
 
 - **`recall` excludes only the current session by default.** Project- and
   global-scope searches used to leave out the current session's whole
   family, its parent, siblings and subagents. They now leave out the current
   session alone, so an orchestrator can find what its own subagents found.
-  `excludeFamily: true` leaves out the whole family again. It is refused
-  with `scope: "session"`, with `excludeCurrentSession: false` and with a
+  A caller that relied on leaving out the family adds `excludeFamily: true`,
+  which leaves out the whole family again. The flag is refused with
+  `scope: "session"`, with `excludeCurrentSession: false` and with a
   `sessionID` in the family, since each of those asks for a session the flag
   excludes. Under `excludeFamily: true` a `sessions` list (with or without
   `deep`) and a deep cursor drop the relatives they name and count each one
@@ -57,7 +78,8 @@ loaded.
   `from`, `after`). Results still come only from messages inside the
   window. Card ranking, the slim index, the deep listing and named sessions
   without a card all apply the rule. `recall_sessions` still filters by
-  last update.
+  last update, so its `since` and `until` can list fewer sessions than
+  `recall` searches over the same window.
 - **The drill reads toward the window.** On opencode v2 a search with an
   upper bound starts reading each session at the last message created at or
   before it. A search with a lower bound stops once it has read every
@@ -74,6 +96,23 @@ loaded.
   window too and `candidate` counts only those inside it. A deep sweep reads
   the same way and returns a continuation once it has read past four times
   its budget outside the window.
+- **A plain-word lookup in the slim index reads a bounded set of rows.** On
+  a very large store it can hand a search different candidate sessions than
+  3.0.1 did. The bound is described under Performance.
+
+### Known issues
+
+- On a busy or cold disk, background indexing can still hold OpenCode's
+  event loop for up to about 2 s at a time, where 3.0.1 held it for about
+  53 s under the same conditions. The long stretches come from SQLite WAL
+  checkpoints, commits to the derived store and reads of history pages of up
+  to 4 MiB that are not in the disk cache. Moving that work to a worker
+  thread is planned for 3.1.1.
+- Scoring in the slim index can hold the event loop for about 100 to 250 ms
+  at one stretch.
+- On a busy disk, the first search after a restart can take up to about 1.9
+  times as long as the same search alone while the startup indexing pass
+  catches up.
 
 ### Added
 
@@ -118,9 +157,9 @@ loaded.
 
 ### Performance
 
-The measured numbers below come from the `RECALL_PERF=1` gates
-(`test/perf.test.ts`, `test/perf-v2.test.ts`), which run on synthetic data,
-most of them on a store of 12,000 cards.
+Unless a bullet names a real session, the numbers below were measured on
+synthetic data, most of them by the `RECALL_PERF=1` gates
+(`test/perf.test.ts`, `test/perf-v2.test.ts`) on a store of 12,000 cards.
 
 - **The card index is updated in place.** A process used to reload every
   card and rebuild the whole card index on the event loop at its first
@@ -234,11 +273,11 @@ most of them on a store of 12,000 cards.
   history reads they make, the v2 sync and discovery yield through a
   background yield point that shares the time slice with a search's reads
   and card build. While a search waits, the background takes one turn in
-  eight, so a cold pass slows down during the search but keeps going. Over
-  12,000 sessions the first search after a restart took 32.5 s during a
-  cold pass against 7.0 s with none running. Over six runs since, it took
-  3.9 to 7.9 s against 3.4 to 6.8 s, at most 1.2 times as long. The pass
-  finished 7 to 13 s after it.
+  eight, so a cold pass slows down during the search but keeps going.
+  Without the background yield point, the first search after a restart over
+  12,000 sessions took 32.5 s during a cold pass against 7.0 s with none
+  running. With it, six runs took 3.9 to 7.9 s against 3.4 to 6.8 s, at most
+  1.2 times as long. The pass finished 7 to 13 s after the search.
 - **Time-bounded searches read less.** Over 12 subagents that each wrote
   40 messages inside a window and 600 after it, a drill read 480 messages
   in 26 ms instead of 7,680 in 358 ms. With a lower bound near the end of 12
