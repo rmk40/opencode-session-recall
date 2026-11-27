@@ -493,19 +493,22 @@ Creation times rise with seq only mostly (opencode moves a retried assistant's
 `time_created` to the step's start), so **neither end of a walk may trust one
 message's time.**
 
-- With an upper bound, a walk starts at `HistorySource.seekPage`: below the
-  highest seq of any row created at or before the bound. On v2 the newest 16
-  rows down the `(session_id, time_created, id)` index give a lower bound on
-  that seq, then range reads over at most 2,000 seqs each (`SCAN_RANGE`) walk
-  down from the session's newest row to it and stop at the first row at or
-  before the bound. Past 40,000 seqs (`SCAN_ROWS_MAX`) the walk starts at the
-  newest page instead.
-- Past the lower bound, a walk ends only once it has read a message whose
-  `info.seq` is at or below `HistorySource.seqFloor`, the lowest seq of a row
-  created inside the window. On v2 one read pages the window's rows up the
-  creation-time index 1,000 at a time and range reads walk seq up from the
-  oldest row, in turn, and whichever finishes first is exact. It is asked once
-  a walk meets an older message and cached per session and window.
+- With an upper bound, a walk starts at `HistorySource.seekPage`, below the
+  highest seq of any row created at or before the bound. On v2 one read pages
+  the rows at or before the bound down the `(session_id, time_created, id)`
+  index 1,000 at a time (`SCAN_PAGE`) and range reads over at most 2,000 seqs
+  each (`SCAN_RANGE`) walk seq down from the session's newest row, in turn.
+  Whichever finishes first is exact, so a seek costs about the shorter of the
+  history before the bound and the history after it. Past 40,000 rows
+  (`SCAN_ROWS_MAX`) the walk starts at the newest page instead.
+- Past the lower bound, a walk ends only once it has met an older message and
+  read one whose `info.seq` is at or below `HistorySource.seqFloor`, the lowest
+  seq of a row created inside the window. On v2 one read pages the window's
+  rows up the creation-time index 1,000 at a time and range reads walk seq up
+  from the oldest row, in turn, and whichever finishes first is exact. A walk
+  asks for the floor before its first read. A null floor (nothing created
+  inside the window) means the session is not read at all. A deep sweep counts
+  it covered. The answer is cached per session and window.
 - Every one of these statements binds `LIMIT ?` and reads only `seq`,
   `time_created` and `id`, never `data`.
 - Messages outside the window stay out of the pool and charge neither the

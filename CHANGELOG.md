@@ -205,6 +205,11 @@ most of them on a store of 12,000 cards.
   in 26 ms instead of 7,680 in 358 ms. With a lower bound near the end of 12
   sessions of 2,000 messages, it read 600 in 25 ms instead of 14,700 in
   563 ms.
+  - A session that kept running long past the upper bound is read from the
+    bound. Finding where to start in a session of 4,896 messages before the
+    bound and 60,000 after it took 12 ms, in ten statements that read no
+    message bodies.
+  - A session that wrote nothing inside the window is not read at all.
 
 ## 3.0.1
 
