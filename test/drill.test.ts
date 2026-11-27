@@ -2486,4 +2486,60 @@ describe("drill time window order and outside bounds", () => {
     await drill.pools(windowed(sessions, "alpha", { after: 4500 }));
     expect(asked).toEqual({ seek: 1, floor: 1 });
   });
+
+  it("fetches no FTS hit once a newer tail has spent the walk's outside bound, though its budget is untouched", async () => {
+    // A 100-char budget gives the walk 400 chars outside the window: two
+    // newer messages of 200 spend them before anything inside is read.
+    const { source, ctl } = makeControlledSource({
+      messagesBySession: {
+        "s-a": [
+          note("s-a", "a1", 1000, "alpha needle"),
+          note("s-a", "a2", 2000, "alpha inside"),
+          ...[4000, 5000, 6000].map((created, i) =>
+            note("s-a", `n${i}`, created, sized(`alpha newer ${i}`, 200)),
+          ),
+        ],
+      },
+    });
+    const drill = newDrill(source, { drillPageMessages: 1, drillCharsPerSession: 100 });
+    const out = await drill.pools({
+      ...windowed([revised("s-a")], "alpha", { before: 3000 }),
+      ftsBySession: new Map([["s-a", [ftsHit("s-a", "a1"), ftsHit("s-a", "a2")]]]),
+    });
+    expect(ctl.lookups).toEqual([]);
+    expect(out.targets).toEqual([
+      { sessionId: "s-a", fetched: 2, candidate: 0, eligible: 0, stop: "sessionBudget" },
+    ]);
+  });
+
+  it("charges an FTS hit found outside the window to the drill's outside bound and stops its lookups there as queryBudget", async () => {
+    // A 100-char query budget gives the drill 400 chars outside the window.
+    // The walk reads a3 (300 chars) on its way to the floor, and looking up
+    // a1 adds 300 more, so a2 is never fetched.
+    const { source, ctl } = makeControlledSource(
+      {
+        messagesBySession: {
+          "s-a": [
+            note("s-a", "a1", 1000, sized("alpha one", 300)),
+            note("s-a", "a2", 2000, sized("alpha two", 300)),
+            note("s-a", "a3", 3000, sized("alpha three", 300)),
+            note("s-a", "a5", 5000, "alpha five"),
+            note("s-a", "a6", 6000, "alpha six"),
+          ],
+        },
+      },
+      { floor: true },
+    );
+    const drill = newDrill(source, { drillPageMessages: 1, drillCharsPerQuery: 100 });
+    const out = await drill.pools({
+      ...windowed([revised("s-a")], "alpha", { after: 4500 }),
+      ftsBySession: new Map([["s-a", [ftsHit("s-a", "a1"), ftsHit("s-a", "a2")]]]),
+    });
+    expect(ctl.lookups.map((l) => l.messageID)).toEqual(["a1"]);
+    expect(poolTexts(out, "s-a")).toEqual(["alpha six", "alpha five"]);
+    expect(out.budgetExhausted).toBe(true);
+    expect(out.targets).toEqual([
+      { sessionId: "s-a", fetched: 4, candidate: 2, eligible: 2, stop: "queryBudget" },
+    ]);
+  });
 });

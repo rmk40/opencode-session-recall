@@ -510,7 +510,11 @@ message's time.**
   `OUT_OF_WINDOW_MESSAGES` (2,000) messages a walk, four times that for a drill
   or a deep sweep, a page with nothing inside counting as at least one. A drill
   stops as `sessionBudget` or `queryBudget` on them and a deep sweep returns a
-  continuation.
+  continuation. A slim-index point lookup checks the same bounds before it
+  fetches and charges a message it finds outside the window to them, so a
+  drill's lookups stop there too (`targetsCut` for the walk's bound,
+  `queryBudget` for the drill's). **Any new read in a walk charges and checks
+  them the same way.**
 - v1 cannot seek or find a floor and answers `unsupported`, which the drill
   remembers for the rest of its life. So a v1 walk reads every newer message
   first and, past the lower bound, reads on until a page holds nothing inside

@@ -64,11 +64,13 @@ loaded.
   message created inside the window, even where a retried step left
   creation times out of order. Messages outside the window no longer count
   against `drillCharsPerSession` or `drillCharsPerQuery`. Reading past them
-  has bounds of its own, four times each of those budgets and 2,000 messages
-  a session. A search that reaches one reports `sessionBudget` or
-  `queryBudget`. On opencode v1, which cannot start mid-session, the drill
-  reads past the newer messages from the newest one. In
-  `coverage.sessionStops`, `fetched` counts the messages read outside the
+  has bounds of its own, four times each of those budgets in chars, 2,000
+  messages a session and 8,000 messages a search. Messages looked up from
+  the slim index count toward them as well. The session where a search
+  reaches one reports `sessionBudget` or `queryBudget`, or `targetsCut` when
+  only its slim-index lookups were left. On opencode v1, which cannot start
+  mid-session, the drill reads past the newer messages from the newest one.
+  In `coverage.sessionStops`, `fetched` counts the messages read outside the
   window too and `candidate` counts only those inside it. A deep sweep reads
   the same way and returns a continuation once it has read past four times
   its budget outside the window.

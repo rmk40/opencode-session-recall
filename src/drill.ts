@@ -855,7 +855,10 @@ export function createDrill(deps: DrillDeps): Drill {
    * They count against bounds of their own, for this walk and, through
    * `outsideQuery`, for the whole drill: {@link OUT_OF_WINDOW_FACTOR} times
    * the budget in chars and {@link OUT_OF_WINDOW_MESSAGES} in messages,
-   * ending the walk as `sessionBudget` or `queryBudget`. Pages before the
+   * ending the walk as `sessionBudget` or `queryBudget`. A point lookup that
+   * finds a message outside the window is charged to the same bounds, and
+   * each lookup checks them first: the walk's bound leaves the rest unread
+   * as `targetsCut` and the drill's as `queryBudget`. Pages before the
    * first one holding a message in the window do not count for the anchor
    * stop; after it, a page holding none counts as one that matched no
    * anchor. Past the lower bound the walk ends as `end` only once it has read
@@ -880,10 +883,18 @@ export function createDrill(deps: DrillDeps): Drill {
     const reads: SliceReads = { fetches: 0 };
     let retained = 0;
     const outside: OutsideRead = { chars: 0, messages: 0 };
-    const withinSession = (): boolean =>
-      retained < limits.drillCharsPerSession &&
+    /** Whether this walk's reading outside the window is within its bounds. */
+    const outsideOpen = (): boolean =>
       outside.chars < limits.drillCharsPerSession * OUT_OF_WINDOW_FACTOR &&
       outside.messages < OUT_OF_WINDOW_MESSAGES;
+    const withinSession = (): boolean => retained < limits.drillCharsPerSession && outsideOpen();
+    /** Count one message read outside the window against both bounds. */
+    const passOutside = (msg: DrilledMessage): void => {
+      outside.chars += msg.retained;
+      outsideQuery.chars += msg.retained;
+      outside.messages++;
+      outsideQuery.messages++;
+    };
 
     // Untargeted: bounded newest-first paging, from the window's upper bound.
     const start = await seekAt(entry, target, window?.before, reads);
@@ -944,7 +955,9 @@ export function createDrill(deps: DrillDeps): Drill {
         }
         if (inside.length > 0) windowPages++;
         // Stop once a non-first page of the window stops matching any anchor
-        // (nothing more to gain).
+        // (nothing more to gain). Ending as `anchor` on a page with nothing
+        // inside the window, before the floor is reached, is deliberate: the
+        // drill is a bounded read, and the deep sweep has no anchor rule.
         if (
           windowPages > 0 &&
           needles.length > 0 &&
@@ -968,8 +981,10 @@ export function createDrill(deps: DrillDeps): Drill {
     // charging their retained chars against the SAME per-session budget as the
     // untargeted paging — once the session's budget is exhausted, stop fetching
     // further point targets (matching the documented per-session bound). A
-    // session with nothing at or before the upper bound has none to fetch,
-    // and an aborted walk fetches nothing more.
+    // message outside the window is charged to the out-of-window bounds
+    // instead, which each fetch checks too. A session with nothing at or
+    // before the upper bound has none to fetch, and an aborted walk fetches
+    // nothing more.
     const points: Array<[string, DrilledMessage]> = [];
     if (start !== null && stop !== "aborted" && ftsHits && ftsHits.length > 0) {
       const wanted = new Set<string>();
@@ -983,7 +998,12 @@ export function createDrill(deps: DrillDeps): Drill {
         // A message the walk read is in the slice already, or outside the
         // window.
         if (read.has(messageID)) continue;
-        if (retained >= limits.drillCharsPerSession) {
+        // A walk that already stopped on one of these keeps its reason.
+        if (!outsideWithin(outsideQuery, limits.drillCharsPerQuery)) {
+          if (stop === "end" || stop === "anchor") stop = "queryBudget";
+          break;
+        }
+        if (!withinSession()) {
           if (stop === "end" || stop === "anchor") stop = "targetsCut";
           break;
         }
@@ -991,8 +1011,12 @@ export function createDrill(deps: DrillDeps): Drill {
         const msg = await pointAt(entry, target, messageID, asked, reads);
         if (!msg) continue;
         const id = msg.message.info.id;
+        if (sideOf(window, msg.message.info.time.created) !== "inside") {
+          if (!read.has(id)) passOutside(msg);
+          read.add(id);
+          continue;
+        }
         read.add(id);
-        if (sideOf(window, msg.message.info.time.created) !== "inside") continue;
         byId.set(id, msg);
         retained += msg.retained;
         points.push([messageID, msg]);
