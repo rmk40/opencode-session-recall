@@ -18,6 +18,7 @@ import { sessions as sessionsTool } from "../src/sessions.js";
 import {
   createV2Sync,
   POLL_CURSOR_KEY,
+  POLL_ROW_CURSOR_KEY,
   POLL_WATERMARK_KEY,
   SESSION_WATERMARK_KEY,
   type V2SyncOptions,
@@ -425,11 +426,11 @@ describe("v2 poll queries", () => {
     ]);
   });
 
-  it("pages a window by (time, session) and moves the watermark once it drains", async () => {
+  it("pages a window by (time, message) and moves the watermark once it drains", async () => {
     const at = Date.now();
     addSession("ses_a", at - 10_000);
     addSession("ses_b", at - 10_000);
-    addRow("ses_a", "user", user("a", at - 3_000), at - 3_000);
+    const fromA = addRow("ses_a", "user", user("a", at - 3_000), at - 3_000);
     addRow("ses_b", "user", user("b", at - 1_000), at - 1_000);
     const sync = createV2Sync(reader, {
       pollSessionLimit: 1,
@@ -441,13 +442,13 @@ describe("v2 poll queries", () => {
     meta.set(POLL_WATERMARK_KEY, String(at - 5_000));
     const first = await pollOnce(sync, meta);
     expect(first.map((s) => s.sessionID)).toEqual(["ses_a"]);
-    // A full page keeps the watermark and records its position.
+    // A full poll keeps the watermark and records the last row it read.
     expect(meta.values.get(POLL_WATERMARK_KEY)).toBe(String(at - 5_000));
-    expect(meta.values.get(POLL_CURSOR_KEY)).toBe(JSON.stringify([at - 3_000, "ses_a"]));
+    expect(meta.values.get(POLL_ROW_CURSOR_KEY)).toBe(JSON.stringify([at - 3_000, fromA]));
     const second = await pollOnce(sync, meta);
     expect(second.map((s) => s.sessionID)).toEqual(["ses_b"]);
     expect(meta.values.get(POLL_WATERMARK_KEY)).toBe(String(at - 1_000));
-    expect(meta.values.get(POLL_CURSOR_KEY)).toBe("");
+    expect(meta.values.get(POLL_ROW_CURSOR_KEY)).toBe("");
   });
 
   /** Poll until every id in `want` has been signalled, or give up after `max`. */
@@ -518,13 +519,13 @@ describe("v2 poll queries", () => {
   it("keeps draining a window from its position after downtime clamps the watermark", async () => {
     const at = Date.now();
     for (const id of ["ses_a", "ses_a2", "ses_b", "ses_c"]) addSession(id, at - 120_000);
-    addRow("ses_a", "user", user("a", at - 60_000), at - 60_000);
+    addRow("ses_a", "user", user("a", at - 60_000), at - 60_000, "msg_a");
     // Shares the cursor's timestamp but sorts after it: not yet processed.
-    addRow("ses_a2", "user", user("a2", at - 60_000), at - 60_000);
+    addRow("ses_a2", "user", user("a2", at - 60_000), at - 60_000, "msg_a2");
     addRow("ses_b", "user", user("b", at - 40_000), at - 40_000);
     addRow("ses_c", "user", user("c", at - 1_000), at - 1_000);
-    // A window was mid-drain (after ses_a) when the service went down; the
-    // lookback now clamps the watermark past ses_b.
+    // A window was mid-drain (after ses_a's row) when the service went down;
+    // the lookback now clamps the watermark past ses_b.
     const sync = createV2Sync(reader, {
       maxLookbackMs: 10_000,
       overlapMs: 0,
@@ -534,9 +535,17 @@ describe("v2 poll queries", () => {
     });
     const meta = memoryMeta();
     meta.set(POLL_WATERMARK_KEY, String(at - 90_000));
-    meta.set(POLL_CURSOR_KEY, JSON.stringify([at - 60_000, "ses_a"]));
+    meta.set(POLL_ROW_CURSOR_KEY, JSON.stringify([at - 60_000, "msg_a"]));
     const signals = await pollOnce(sync, meta);
     expect(signals.map((s) => s.sessionID)).toEqual(["ses_a2", "ses_b", "ses_c"]);
+
+    // An older build's position by session is read again from its time.
+    const older = memoryMeta();
+    older.set(POLL_WATERMARK_KEY, String(at - 90_000));
+    older.set(POLL_CURSOR_KEY, JSON.stringify([at - 60_000, "ses_a"]));
+    const again = await pollOnce(sync, older);
+    expect(again.map((s) => s.sessionID)).toEqual(["ses_a", "ses_a2", "ses_b", "ses_c"]);
+    expect(older.values.get(POLL_CURSOR_KEY)).toBe("");
   });
 
   it("commits nothing until told to, and isolates a failing session scan", async () => {
@@ -571,15 +580,15 @@ describe("v2 poll queries", () => {
     expect(meta.values.get(SESSION_WATERMARK_KEY)).toBe(String(at - 5_000));
   });
 
-  it("fails a full page that ends on a row without a key instead of repeating it", async () => {
+  it("fails a page holding a row without a key instead of repeating or skipping it", async () => {
     // Unreachable with the real schema; forced here through the reader.
     const keyless: ReadOnlyDb = {
       ...reader,
       all: (sql, params) =>
-        /FROM session_message/.test(sql) && /GROUP BY session_id/.test(sql)
+        /FROM session_message/.test(sql) && /ORDER BY time_created ASC, id ASC/.test(sql)
           ? [
-              { session_id: null, t: null },
-              { session_id: "ses_x", t: 1 },
+              { id: null, session_id: null, time_created: null },
+              { id: "msg_x", session_id: "ses_x", time_created: 1 },
             ]
           : reader.all(sql, params),
     };
@@ -595,7 +604,7 @@ describe("v2 poll queries", () => {
     expect(result.failures[0]).toMatch(/ended on a row without a key/);
     result.commit();
     expect(meta.values.get(POLL_WATERMARK_KEY)).toBe("1000");
-    expect(meta.values.get(POLL_CURSOR_KEY)).toBeUndefined();
+    expect(meta.values.get(POLL_ROW_CURSOR_KEY)).toBeUndefined();
   });
 
   it("applies the overlap once on a first poll with no watermark", async () => {

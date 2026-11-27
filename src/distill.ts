@@ -496,8 +496,11 @@ export type DistillSync = {
   compare(sessionID: string, stored: string | null | undefined): Promise<TailChange>;
   /** Of `ids`, those the host no longer has. */
   missing(ids: string[]): Promise<string[]>;
-  /** One poll: signals for sessions that changed since its watermarks. */
-  poll(meta: PollMeta): Promise<PollResult>;
+  /** One poll: signals for sessions that changed since its watermarks. A
+   *  poll that reads in several statements checks `live` after each yield
+   *  between them and, once it is false, returns no signals and commits
+   *  nothing. */
+  poll(meta: PollMeta, live?: () => boolean): Promise<PollResult>;
   readonly pollIntervalMs: number;
   /** How often the lease holder's poll also drops cards of sessions the host
    *  no longer has ({@link DistillSync.missing}); the cold pass does it too. */
@@ -4543,7 +4546,7 @@ export function createDistiller(options: DistillerOptions): Distiller {
     try {
       const result = await gate.runBackground(() => {
         if (stopped || !leaseHeld) return Promise.resolve<PollResult | null>(null);
-        return sync.poll(meta);
+        return sync.poll(meta, () => !stopped && leaseHeld);
       });
       if (!result || stopped || !leaseHeld) return;
       // Metadata signals each run a patchCardMeta transaction: yield every

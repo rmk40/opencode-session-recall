@@ -40,23 +40,25 @@ import { inspectV2Schema, type V2SchemaInfo } from "./v2.js";
  *   row below the running ones, with a fingerprint of the rows ending at it:
  *   while those rows are unchanged, only the rows past the boundary need
  *   reading again (`tail`).
- * - **The poll** (lease holder only): every 30 s the indexed
- *   `session_message_time_created_idx` finds sessions with new rows past a
- *   persisted watermark; every 5 minutes a bounded scan of `session_v2`
- *   catches renames, moves, archiving and other metadata-only changes. Both watermarks
- *   carry an overlap for late commits. Each window is read in bounded pages
- *   keyed by `(time, session id)`, with the key persisted between polls, and
- *   the watermark moves only once the window is drained. So a page that
- *   fills up (more changed sessions than the page limit, or many sharing one
- *   timestamp inside the overlap) always moves forward on the next poll.
- *   Every `reconcileEveryMs` the poll also drops cards of sessions that are
- *   gone from `session_v2`, so a deletion with no event is caught without a
- *   new cold pass. Each window reads one page per turn: the message window one page per
- *   poll, the session scan one page per `sessionScanEveryMs`. A poll returns
- *   its watermark updates for the distiller to commit after it dispatched
- *   the signals, and a failing window is isolated from the other. A
- *   part-only change in a settled session moves neither window; the
- *   distiller's range check finds it ({@link DistillSync.rangeDigest}).
+ * - **The poll** (lease holder only): every 30 s the message window reads
+ *   the rows created past a persisted watermark through the indexed
+ *   `session_message_time_created_idx`, in pages of `pollPageRows` rows keyed
+ *   by `(time_created, id)` with a yield before each, and signals the
+ *   sessions they belong to, at most `pollSessionLimit` per poll. Every 5
+ *   minutes a bounded scan of `session_v2`, one page keyed by `(time,
+ *   session id)`, catches renames, moves, archiving and other metadata-only
+ *   changes. Both watermarks carry an overlap for late commits. A window
+ *   with more in it than one poll takes keeps its position between polls,
+ *   and its watermark moves only once it is drained. So a window that fills
+ *   up (more changed sessions than the limit, or many sharing one timestamp
+ *   inside the overlap) always moves forward on the next poll. Every
+ *   `reconcileEveryMs` the poll also drops cards of sessions that are gone
+ *   from `session_v2`, so a deletion with no event is caught without a new
+ *   cold pass. A poll returns its watermark updates for the distiller to
+ *   commit after it dispatched the signals, and a failing window is
+ *   isolated from the other. A part-only change in a settled session moves
+ *   neither window; the distiller's range check finds it
+ *   ({@link DistillSync.rangeDigest}).
  * - **Range digests.** A session's rows in `seq` order with the state of
  *   their part rows, for the distiller's range hashes, and which sessions
  *   have part rows at all ({@link DistillSync.withParts}).
@@ -69,10 +71,16 @@ import { inspectV2Schema, type V2SchemaInfo } from "./v2.js";
 
 export const POLL_WATERMARK_KEY = "v2_poll_watermark";
 export const SESSION_WATERMARK_KEY = "v2_session_watermark";
-/** The keyset position `[time, sessionId]` inside a window being drained;
- *  empty when the window starts fresh. */
+/** The message poll's position `[time, sessionId]` as older builds keep it,
+ *  by session. Read only as a lower bound, so a window an older build left
+ *  half drained is read again from there, and cleared once a window drains. */
 export const POLL_CURSOR_KEY = "v2_poll_cursor";
+/** The session scan's keyset position `[time, sessionId]` inside a window
+ *  being drained; empty when the window starts fresh. */
 export const SESSION_CURSOR_KEY = "v2_session_cursor";
+/** The message poll's position `[time_created, messageId]`, the last row it
+ *  read inside a window being drained; empty when the window starts fresh. */
+export const POLL_ROW_CURSOR_KEY = "v2_poll_row_cursor";
 
 export type V2SyncOptions = {
   /** Message poll interval. Default 30 s. */
@@ -87,9 +95,10 @@ export type V2SyncOptions = {
   /** A watermark older than this is clamped (the cold pass covers the rest).
    *  Default 1 hour. */
   maxLookbackMs?: number;
-  /** Sessions returned by one message poll (one page of its window).
-   *  Default 500. */
+  /** Sessions returned by one message poll. Default 500. */
   pollSessionLimit?: number;
+  /** Message rows one statement of the message poll reads. Default 2,000. */
+  pollPageRows?: number;
   /** Sessions returned by one `session_v2` scan (one page). Default 2,000. */
   sessionScanLimit?: number;
   /** Rows inspected for an unsettled tail. Default 20. */
@@ -321,7 +330,8 @@ export function createV2Sync(db: ReadOnlyDb, opts: V2SyncOptions = {}): DistillS
   const reconcileEveryMs = opts.reconcileEveryMs ?? 300_000;
   const overlapMs = opts.overlapMs ?? 5_000;
   const maxLookbackMs = opts.maxLookbackMs ?? 3_600_000;
-  const pollSessionLimit = opts.pollSessionLimit ?? 500;
+  const pollSessionLimit = Math.max(1, Math.floor(opts.pollSessionLimit ?? 500));
+  const pollPageRows = Math.max(1, Math.floor(opts.pollPageRows ?? 2_000));
   const sessionScanLimit = opts.sessionScanLimit ?? 2_000;
   const tailRows = opts.tailRows ?? 20;
   const abandonAfterMs = opts.abandonAfterMs ?? 3_600_000;
@@ -697,11 +707,9 @@ export function createV2Sync(db: ReadOnlyDb, opts: V2SyncOptions = {}): DistillS
     const rows = fetched.slice(0, limit);
     const last = rows.length > 0 ? keyOf(rows[rows.length - 1]!) : undefined;
     if (fetched.length > limit) {
-      // Unreachable: the message key is max(time_created) of a non-empty group
-      // (NOT NULL column) with a NOT NULL session_id, and the scan key is
-      // coalesced with a primary-key id. Should it ever happen, the window
-      // cannot be resumed or declared drained, so fail it rather than repeat
-      // or skip rows.
+      // Unreachable: the scan key is coalesced with a primary-key id. Should
+      // it ever happen, the window cannot be resumed or declared drained, so
+      // fail it rather than repeat or skip rows.
       if (!last || last.t === null || last.id === null) {
         throw new Error(`poll page for ${keys.mark} ended on a row without a key`);
       }
@@ -717,37 +725,100 @@ export function createV2Sync(db: ReadOnlyDb, opts: V2SyncOptions = {}): DistillS
     };
   }
 
-  async function poll(meta: PollMeta): Promise<PollResult> {
+  /**
+   * The message window: sessions with rows created past `mark - overlap`,
+   * found by reading those rows in `(time_created, id)` order through the
+   * `time_created` index, {@link pollPageRows} per statement with a yield
+   * before each. It stops once it holds {@link pollSessionLimit} sessions
+   * and the next row would add another, recording that row's predecessor as
+   * its position, or once a short page shows the window drained, moving the
+   * watermark to the newest row read. Each session is listed once, where its
+   * first row in the window is. Null when `live` turned false at a yield.
+   */
+  async function messageWindow(
+    meta: PollMeta,
+    at: number,
+    live: () => boolean,
+  ): Promise<{ sessions: string[]; commit: Array<[string, string]> } | null> {
+    const mark = watermark(meta, POLL_WATERMARK_KEY, at);
+    // A clamped watermark (after long downtime) must not outrun a window that
+    // is still being drained: reading resumes strictly past the persisted
+    // row. An older build's position by session bounds the window from below
+    // only, so everything from its time on is read again (keys are integer
+    // milliseconds, so `older.t - 1` admits rows at exactly older.t).
+    let after = parsePos(meta.get(POLL_ROW_CURSOR_KEY));
+    const older = parsePos(meta.get(POLL_CURSOR_KEY));
+    const lower = older ? Math.min(mark - overlapMs, older.t - 1) : mark - overlapMs;
+    const sessions: string[] = [];
+    const seen = new Set<string>();
+    let newest: number | null = null;
+    const drained = (): Array<[string, string]> => [
+      [POLL_WATERMARK_KEY, String(Math.max(mark, newest ?? after?.t ?? mark))],
+      [POLL_ROW_CURSOR_KEY, ""],
+      [POLL_CURSOR_KEY, ""],
+    ];
+    for (;;) {
+      await pause();
+      if (!live()) return null;
+      const position = after;
+      const rows = position
+        ? db.all(
+            `SELECT id, session_id, time_created FROM session_message
+             WHERE time_created >= ? AND (time_created > ? OR id > ?)
+             ORDER BY time_created ASC, id ASC LIMIT ?`,
+            [position.t, position.t, position.id, pollPageRows],
+          )
+        : db.all(
+            `SELECT id, session_id, time_created FROM session_message
+             WHERE time_created > ? ORDER BY time_created ASC, id ASC LIMIT ?`,
+            [lower, pollPageRows],
+          );
+      for (const row of rows) {
+        const t = num(row.time_created);
+        const id = str(row.id);
+        const sessionID = str(row.session_id);
+        // Unreachable: all three columns are NOT NULL. Should it ever happen,
+        // the window cannot be resumed past the row, so fail it rather than
+        // repeat or skip rows.
+        if (t === null || id === null || sessionID === null) {
+          throw new Error("poll page ended on a row without a key");
+        }
+        if (!seen.has(sessionID)) {
+          if (seen.size >= pollSessionLimit) {
+            return {
+              sessions,
+              commit: [[POLL_ROW_CURSOR_KEY, JSON.stringify([after!.t, after!.id])]],
+            };
+          }
+          seen.add(sessionID);
+          sessions.push(sessionID);
+        }
+        after = { t, id };
+        newest = t;
+      }
+      if (rows.length < pollPageRows) return { sessions, commit: drained() };
+    }
+  }
+
+  async function poll(meta: PollMeta, live: () => boolean = () => true): Promise<PollResult> {
     const signals: DistillSignal[] = [];
     const updates: Array<[string, string]> = [];
     const failures: string[] = [];
     const at = now();
+    const stopped: PollResult = { signals: [], failures: [], commit: () => {} };
 
     // New messages, through the time_created index.
     try {
-      const changed = await page(
-        meta,
-        { mark: POLL_WATERMARK_KEY, pos: POLL_CURSOR_KEY },
-        at,
-        pollSessionLimit,
-        (lower, pos, n) =>
-          db.all(
-            `SELECT session_id, max(time_created) AS t FROM session_message
-             WHERE time_created > ? GROUP BY session_id
-             ${pos ? "HAVING max(time_created) > ? OR (max(time_created) = ? AND session_id > ?)" : ""}
-             ORDER BY t ASC, session_id ASC LIMIT ?`,
-            pos ? [lower, pos.t, pos.t, pos.id, n] : [lower, n],
-          ),
-        (row) => ({ t: num(row.t), id: str(row.session_id) }),
-      );
-      for (const row of changed.rows) {
-        const id = str(row.session_id);
-        if (id) signals.push({ type: "turn-ended", sessionID: id });
+      const changed = await messageWindow(meta, at, live);
+      if (!changed) return stopped;
+      for (const sessionID of changed.sessions) {
+        signals.push({ type: "turn-ended", sessionID });
       }
       updates.push(...changed.commit);
     } catch (error) {
       failures.push(`message poll: ${error instanceof Error ? error.message : String(error)}`);
     }
+    if (!live()) return stopped;
 
     // Metadata-only changes, through a bounded scan of session_v2.
     if (at - lastScanAt >= sessionScanEveryMs) {
