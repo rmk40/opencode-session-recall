@@ -2522,9 +2522,24 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
         .union([tool.schema.number(), tool.schema.string()])
         .optional()
         .describe("Only messages after ms epoch or date"),
-      since: tool.schema.string().optional().describe("Compatibility alias for last: 2h, 7d, 3w"),
-      until: tool.schema.string().optional().describe("Older-than relative filter: 2h, 7d, 3w"),
-      last: tool.schema.string().optional().describe("Recent-history lower bound: 2h, 7d, 3w"),
+      since: tool.schema
+        .string()
+        .optional()
+        .describe(
+          "Alias for last (2h, 7d, 3w). Keeps sessions active since then and reads only their messages after it",
+        ),
+      until: tool.schema
+        .string()
+        .optional()
+        .describe(
+          "Upper bound as an age (2h, 7d, 3w). Keeps sessions started before it, still-running ones too, and reads their messages from the bound down",
+        ),
+      last: tool.schema
+        .string()
+        .optional()
+        .describe(
+          "Lower bound (2h, 7d, 3w). Keeps sessions active since then and reads only their messages after it",
+        ),
       from: tool.schema.string().optional().describe("Lower bound like '365d ago' or date"),
       to: tool.schema.string().optional().describe("Upper bound like 'now' or date"),
       directory: tool.schema.string().optional().describe("Exact or descendant session dir"),

@@ -464,10 +464,16 @@ chunked jobs, the distiller and discovery all default to it. A yield itself is
 `setTimeout(0)` otherwise. **Do not use `MessageChannel` for it.** Node and Bun
 deliver a port's messages back to back without returning to the event loop, so a
 chain of such yields keeps timers from ever firing (a probe of 200 slices of 3 ms
-saw no interval tick at all). A test that injects `yieldBetween` gets it called
-at every yield point, so tests that interleave writes between statements keep
-working. **Do not add a per-statement `setTimeout(0)`**; await the component's
-yield point instead.
+saw no interval tick at all). Callers past the budget wait in line on one
+pending yield, and only the first to resume takes the slice it starts: resumed
+waiters all run before any of them does its work, so a waiter cannot tell from
+the clock whether another already holds the slice. A pending yield older than
+100 ms, or from a clock that went backwards, is replaced, because a test that
+swaps fake timers in and out can drop its callback and would otherwise stall
+every later caller in the process. A test that injects `yieldBetween` gets it
+called at every yield point, so tests that interleave writes between statements
+keep working. **Do not add a per-statement `setTimeout(0)`**; await the
+component's yield point instead.
 
 ## Time windows: sessions overlap, reads go toward the window
 
@@ -478,19 +484,40 @@ of uncarded ids and the hooks' FTS backfill all apply the same rule). A subagent
 that kept running for hours past the bound stays findable. The per-message
 filters still apply the exact window, so results never leave it.
 
-The drill and the deep sweep read toward the window (`DrillInput.window`). With
-an upper bound, a walk starts at `HistorySource.seekPage`, the newest message
-created at or before it. On v2 that is two point reads, one down the
-`(session_id, time_created, id)` index (the highest seq among its first 16 rows,
-so a row whose creation time a retried step moved later stays on the walk's
-side) and one down `(session_id, seq)`. Both bind `LIMIT ?`. A walk ends at the
-first page that reaches the lower bound. Messages outside the window stay out of
-the pool and charge neither the per-session nor the per-query budget. v1 cannot
-seek and answers `unsupported`, so its walk reads every newer message first,
-bounded by `OUT_OF_WINDOW_FACTOR` (4) times the per-session budget in their own
-count. The drill cache keys pages by cursor, which no window changes, and keeps
-seek answers per bound. A slice's signature names its start and its window, so a
-build is reused only for the same window.
+The drill and the deep sweep read toward the window (`DrillInput.window`).
+Creation times rise with seq only mostly (opencode moves a retried assistant's
+`time_created` to the step's start), so **neither end of a walk may trust one
+message's time.**
+
+- With an upper bound, a walk starts at `HistorySource.seekPage`: below the
+  highest seq of any row created at or before the bound. On v2 the newest 16
+  rows down the `(session_id, time_created, id)` index give a lower bound on
+  that seq, then range reads over at most 2,000 seqs each (`SCAN_RANGE`) walk
+  down from the session's newest row to it and stop at the first row at or
+  before the bound. Past 40,000 seqs (`SCAN_ROWS_MAX`) the walk starts at the
+  newest page instead.
+- Past the lower bound, a walk ends only once it has read a message whose
+  `info.seq` is at or below `HistorySource.seqFloor`, the lowest seq of a row
+  created inside the window. On v2 one read pages the window's rows up the
+  creation-time index 1,000 at a time and range reads walk seq up from the
+  oldest row, in turn, and whichever finishes first is exact. It is asked once
+  a walk meets an older message and cached per session and window.
+- Every one of these statements binds `LIMIT ?` and reads only `seq`,
+  `time_created` and `id`, never `data`.
+- Messages outside the window stay out of the pool and charge neither the
+  per-session nor the per-query budget. Reading past them has its own bounds,
+  `OUT_OF_WINDOW_FACTOR` (4) times each budget in chars and
+  `OUT_OF_WINDOW_MESSAGES` (2,000) messages a walk, four times that for a drill
+  or a deep sweep, a page with nothing inside counting as at least one. A drill
+  stops as `sessionBudget` or `queryBudget` on them and a deep sweep returns a
+  continuation.
+- v1 cannot seek or find a floor and answers `unsupported`, which the drill
+  remembers for the rest of its life. So a v1 walk reads every newer message
+  first and, past the lower bound, reads on until a page holds nothing inside
+  the window (the anchor stop) or a bound ends it.
+- The drill cache keys pages by cursor, which no window changes, and keeps seek
+  and floor answers per bound. A slice's signature names its start and its
+  window, so a build is reused only for the same window.
 
 ## Embedding representation changes MUST ride a schema bump
 
