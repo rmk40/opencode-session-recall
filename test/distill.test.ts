@@ -4,7 +4,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Event, OpencodeClient, Part, Session } from "@opencode-ai/sdk/v2";
 import { openSqlite, type Row, type SqliteDb } from "../src/sqlite.js";
-import { openStore, type Card, type FamilyRollup, type Store } from "../src/store.js";
+import {
+  openStore,
+  REPAIR_STATE_PAGE,
+  type Card,
+  type FamilyRollup,
+  type Store,
+} from "../src/store.js";
 import { createFetchGate, type FetchGate } from "../src/fetch-gate.js";
 import {
   COLD_PASS_COMPLETE_KEY,
@@ -16,6 +22,7 @@ import {
   deriveCardCooperative,
   DERIVE_YIELD_EVERY,
   distillFields,
+  readRepairState,
   resolveRootId,
   topByFrequency,
   type DeriveCardInput,
@@ -1939,6 +1946,276 @@ describe("cold pass", () => {
     feed(distiller, idleEvent("s1"));
     await waitFor(() => Number(store.getMeta("cards_rev")) > afterCold);
     distiller.stop();
+    db.close();
+  });
+});
+
+// ── Cold pass cursor ─────────────────────────────────────────────────────────
+
+describe("cold pass cursor", () => {
+  const T = 1_000_000;
+
+  /** One session to examine: updated at `updated`, its messages read when
+   *  the distiller's clock reads `T + at`. */
+  type Step = { id: string; updated: number; at: number };
+
+  /**
+   * A one-at-a-time cold pass over `steps`, newest first, whose distiller
+   * clock moves to each session's `at` while its messages are read. `trap`
+   * makes that session's message throw inside the derivation (a failure the
+   * pass aborts on); `takeOver` hands the lease to a rival while that
+   * session's messages are read.
+   */
+  async function pass(steps: Step[], o: { trap?: string; takeOver?: string } = {}) {
+    const bundles = (id: string): MessageBundle[] =>
+      id === o.trap
+        ? [
+            {
+              info: {
+                id: `m-${id}`,
+                role: "user",
+                get time(): { created: number } {
+                  throw new Error("synthetic deriveCard regression");
+                },
+              },
+              parts: [textPart(`p-${id}`, id, `m-${id}`, "content")],
+            } as unknown as MessageBundle,
+          ]
+        : [bundle(userMessage(`m-${id}`, id, 100), [textPart(`p-${id}`, id, `m-${id}`, id)])];
+    const graph: Graph = {
+      sessions: steps.map((s) => session(s.id, s.id, PROJECT_DIR, s.updated)),
+      messagesBySession: Object.fromEntries(steps.map((s) => [s.id, bundles(s.id)])),
+    };
+    const { source: inner } = makeDistillFake(graph);
+    let clock = T;
+    let leaseClock = T;
+    const { db, store } = await freshStore(() => leaseClock);
+    const source: HistorySource = {
+      ...inner,
+      messagePage: async (page) => {
+        const step = steps.find((s) => s.id === page.sessionID);
+        if (step) clock = T + step.at;
+        if (page.sessionID === o.takeOver) {
+          leaseClock += 31_000;
+          expect(store.acquireLease("rival", 30_000, "rivalbuild", 4)).toBe(true);
+        }
+        return inner.messagePage(page);
+      },
+    };
+    const setMeta = vi.spyOn(store, "setMeta");
+    const logs: string[] = [];
+    const distiller = createDistiller({
+      source,
+      store,
+      gate: makeSpyGate().gate,
+      limits: { ...TEST_LIMITS, distillConcurrency: 1, distillDelayMs: 0 },
+      instanceId: "cursor",
+      now: () => clock,
+      leaseRetryMs: 600_000,
+      coldPassRetryMs: 600_000,
+      log: (line) => logs.push(line),
+    });
+    distiller.start();
+    await waitFor(
+      () =>
+        logs.some((line) => /cold pass (done|aborted)/.test(line)) || !distiller.status().leaseHeld,
+    );
+    await waitFor(() => distiller.status().coldPass !== "running");
+    const writes = setMeta.mock.calls
+      .filter(([key]) => key === "coldpass_cursor")
+      .map(([, value]) => value);
+    const stored = store.getMeta("coldpass_cursor");
+    const status = distiller.status();
+    await distiller.stop();
+    db.close();
+    return { writes, stored, status };
+  }
+
+  it.each<{ name: string; steps: Step[]; writes: string[] }>([
+    {
+      name: "writes the first floor at once, then at most once a second, and the floor it reached when its sessions are done",
+      steps: [
+        { id: "s5", updated: 5000, at: 0 },
+        { id: "s4", updated: 4000, at: 999 },
+        { id: "s3", updated: 3000, at: 1000 },
+        { id: "s2", updated: 2000, at: 1500 },
+        { id: "s1", updated: 1000, at: 1999 },
+      ],
+      writes: ["5000", "3000", "1000"],
+    },
+    {
+      name: "writes nothing more when its sessions are done if the floor is already written",
+      steps: [
+        { id: "s2", updated: 2000, at: 0 },
+        { id: "s1", updated: 1000, at: 1000 },
+      ],
+      writes: ["2000", "1000"],
+    },
+    {
+      name: "does not write a floor again, however long since it was written",
+      steps: [
+        { id: "a", updated: 1000, at: 0 },
+        { id: "b", updated: 1000, at: 5000 },
+      ],
+      writes: ["1000"],
+    },
+  ])("$name", async ({ steps, writes }) => {
+    const result = await pass(steps);
+    expect(result.status.coldPass).toBe("done");
+    expect(result.writes).toEqual(writes);
+    expect(result.stored).toBe(writes.at(-1));
+  });
+
+  it("writes the floor a pass reached when it aborts", async () => {
+    const result = await pass(
+      [
+        { id: "s3", updated: 3000, at: 0 },
+        { id: "s2", updated: 2000, at: 10 },
+        { id: "boom", updated: 1000, at: 20 },
+      ],
+      { trap: "boom" },
+    );
+    expect(result.status.lastError).toContain("synthetic deriveCard regression");
+    expect(result.writes).toEqual(["3000", "2000"]);
+  });
+
+  it("writes no floor once the lease is lost, not even when the pass's sessions are done", async () => {
+    const result = await pass(
+      [
+        { id: "s3", updated: 3000, at: 0 },
+        { id: "s2", updated: 2000, at: 10 },
+        { id: "s1", updated: 1000, at: 20 },
+      ],
+      { takeOver: "s1" },
+    );
+    expect(result.status.leaseHeld).toBe(false);
+    expect(result.writes).toEqual(["3000"]);
+    expect(result.stored).toBe("3000");
+  });
+});
+
+// ── Repair state ─────────────────────────────────────────────────────────────
+
+describe("readRepairState", () => {
+  /** Characters whose order differs between UTF-8 bytes, UTF-16 code units
+   *  and locale collation. */
+  const ID_CHARS = ["A", "Z", "_", "a", "z", "0", "\uE000", "\uFF5E", "\u{10000}", "\u{1F600}"];
+
+  /** A store of `n` cards with distinct ids of one to four {@link ID_CHARS},
+   *  few distinct update times, about 70% of them below generation 2 and 20%
+   *  of all of them repair-pending. */
+  async function cardsStore(n: number, seed: number): Promise<{ db: SqliteDb; store: Store }> {
+    const { db, store } = await freshStore();
+    const rand = mulberry32(seed);
+    const ids = new Set<string>();
+    while (ids.size < n) {
+      let id = "";
+      const length = 1 + Math.floor(rand() * 4);
+      for (let i = 0; i < length; i++) id += ID_CHARS[Math.floor(rand() * ID_CHARS.length)];
+      ids.add(id);
+    }
+    // One transaction: a commit per card is slow on a busy disk.
+    db.tx(() => {
+      for (const id of ids) {
+        const roll = rand();
+        store.upsertCard({
+          ...fullCard(id, 1000 * (1 + Math.floor(rand() * 3))),
+          ...(roll < 0.3 && { projectorGen: 2, distillCursor: '{"v":2}' }),
+          ...(roll >= 0.3 && roll < 0.7 && { projectorGen: 1 }),
+        });
+        if (rand() < 0.2) {
+          db.run("UPDATE card SET repair_reason = 'malformed' WHERE session_id = ?", [id]);
+        }
+      }
+    });
+    return { db, store };
+  }
+
+  it.each([
+    { name: "no cards", cards: 0, pauses: 0 },
+    { name: "a page less one", cards: REPAIR_STATE_PAGE - 1, pauses: 0 },
+    { name: "a full page", cards: REPAIR_STATE_PAGE, pauses: 1 },
+    { name: "two pages and one card", cards: REPAIR_STATE_PAGE * 2 + 1, pauses: 2 },
+  ])(
+    "walks $name, pausing between pages, to what staleCards and repairPendingCount return",
+    async ({ cards, pauses }) => {
+      const { db, store } = await cardsStore(cards, cards + 1);
+      let paused = 0;
+      const state = await readRepairState(store, 2, async () => {
+        paused++;
+      });
+      expect(paused).toBe(pauses);
+      expect(state).toEqual({
+        stale: store.staleCards(2),
+        repairPending: store.repairPendingCount(),
+      });
+      // Without a pause the walk reads the same pages back to back.
+      expect(await readRepairState(store, 2)).toEqual(state);
+      // Without a generation nothing is stale; the count is the same.
+      expect(await readRepairState(store, undefined)).toEqual({
+        stale: [],
+        repairPending: state?.repairPending,
+      });
+      db.close();
+    },
+  );
+
+  it("stops between pages once halted, but finishes a walk of one page", async () => {
+    const { db, store } = await cardsStore(REPAIR_STATE_PAGE + 5, 11);
+    const pages = vi.spyOn(store, "repairStatePage");
+    let halted = false;
+    const stopped = await readRepairState(
+      store,
+      2,
+      async () => {
+        halted = true;
+      },
+      () => halted,
+    );
+    expect(stopped).toBeUndefined();
+    expect(pages).toHaveBeenCalledTimes(1);
+
+    const small = await cardsStore(3, 12);
+    expect(
+      await readRepairState(
+        small.store,
+        2,
+        async () => {},
+        () => true,
+      ),
+    ).toEqual({
+      stale: small.store.staleCards(2),
+      repairPending: small.store.repairPendingCount(),
+    });
+    small.db.close();
+    db.close();
+  });
+
+  it("reads each card as it was when its page was read", async () => {
+    const { db, store } = await freshStore();
+    const ids = Array.from(
+      { length: REPAIR_STATE_PAGE + 2 },
+      (_, i) => `c${String(i).padStart(4, "0")}`,
+    );
+    const current = (id: string): Card => ({
+      ...fullCard(id, 1000),
+      projectorGen: 2,
+      distillCursor: '{"v":2}',
+    });
+    db.tx(() => {
+      for (const id of ids) store.upsertCard(current(id));
+    });
+    const [read0, read1] = ids as [string, string];
+    const [unread0, unread1] = ids.slice(-2) as [string, string];
+    let changed = false;
+    const state = await readRepairState(store, 2, async () => {
+      if (changed) return;
+      changed = true;
+      for (const id of [read0, unread0]) store.upsertCard({ ...current(id), projectorGen: 1 });
+      for (const id of [read1, unread1]) store.markRepairPending(id, "malformed");
+    });
+    expect(changed).toBe(true);
+    expect(state).toEqual({ stale: [{ sessionId: unread0, timeUpdated: 1000 }], repairPending: 1 });
     db.close();
   });
 });

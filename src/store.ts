@@ -142,16 +142,29 @@ const ACCEPTED_PRAGMAS = "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;";
 const WRITE_REV_INDEX_DDL = "CREATE INDEX card_write_rev ON card(write_rev);";
 
 /**
- * Index behind {@link Store.repairPendingCount}: only the cards with a repair
- * reason, so counting them reads none of the others. SQLite keeps it in step
- * with every write to the table, whichever build makes it, so the count stays
- * exact while older builds write. It is no part of a schema version and
- * changes nothing a card means: a build that does not know it writes around
- * it, and an accepted open creates it wherever it is missing (an older
- * build's rebuild, or a store from before it existed).
+ * Drops `card_repair_pending`, a partial index over the cards with a repair
+ * reason that some builds of this schema create when they open a store.
+ * Creating it reads every card inside the open transaction, which takes most
+ * of a second on a file nothing has read yet, so the count it served is read
+ * in pages instead ({@link Store.repairStatePage}). Dropping it is bounded:
+ * the index holds an entry for each repair-pending card only, usually none,
+ * and freeing its pages touches nothing else. It is no part of a schema
+ * version and changes nothing a card means, so a build that creates it and
+ * one that drops it can share a store; counts never depended on it.
  */
-const REPAIR_PENDING_INDEX_DDL =
-  "CREATE INDEX IF NOT EXISTS card_repair_pending ON card(session_id) WHERE repair_reason IS NOT NULL;";
+const REPAIR_PENDING_INDEX_DROP = "DROP INDEX IF EXISTS card_repair_pending;";
+
+/** Meta counter advanced by every write of this build that sets or clears a
+ *  card's repair reason, in that write's transaction. The repair reason is
+ *  invisible to readers and moves no card revision, so a cached count of
+ *  repair-pending cards needs this counter beside the revisions to know it is
+ *  still current. An older build writes reasons without it, which only the
+ *  lease holder does: a holder drops its cached count when it takes the lease. */
+export const REPAIR_REV_KEY = "repair_rev";
+
+/** SQLite's default `wal_autocheckpoint`, which a connection returns to once
+ *  it stops checkpointing on its own schedule ({@link Store.setAutoCheckpoint}). */
+export const DEFAULT_AUTOCHECKPOINT_PAGES = 1000;
 
 /** Per-session hashes of source row ranges, keyed by the range's first `seq`
  *  ({@link RangeHash}). Shared by the fresh DDL and the v4 -> v5 migration. */
@@ -453,6 +466,27 @@ export type RangeHash = {
 /** One card {@link Store.staleCards} returns. */
 export type StaleCard = { sessionId: string; timeUpdated: number };
 
+/** One page of {@link Store.repairStatePage}: how many cards it read, the last
+ *  one's session id (where the next page starts; absent when it read none),
+ *  the stale cards among them in the order read, and how many of them carry a
+ *  repair reason. */
+export type RepairStatePage = {
+  read: number;
+  last?: string;
+  stale: StaleCard[];
+  repairPending: number;
+};
+
+/** One page of {@link Store.clearRepairReasonsPage}: how many cards it read,
+ *  the last one's session id (absent when it read none) and how many repair
+ *  reasons it cleared. */
+export type RepairClearPage = { read: number; last?: string; cleared: number };
+
+/** What a passive WAL checkpoint reported ({@link Store.checkpoint}): whether
+ *  it could not finish, the frames in the WAL and how many of them are now in
+ *  the database file. Both counts read -1 when the store is not in WAL mode. */
+export type WalCheckpoint = { busy: boolean; frames: number; checkpointed: number };
+
 /** The revision counters from {@link Store.cardCounters}, read in one
  *  statement so they describe the same moment. Counters read 0 when unset. */
 export type CardCounters = {
@@ -653,16 +687,14 @@ export type Store = {
    */
   cardCounters(): CardCounters;
   /**
-   * How many cards carry a {@link Card.repairReason}. Counted through an index
-   * over those cards alone, so it reads as many index entries as there are
-   * such cards (every accepted open but an `existingOnly` one creates the
-   * index when missing; without it the count reads every card instead).
+   * How many cards carry a {@link Card.repairReason}: every
+   * {@link repairStatePage} page, read in one call. It reads every card, so
+   * the distiller walks the pages itself with yields between them.
    */
   repairPendingCount(): number;
   /**
    * Card counts plus the revision counters, from one statement. The counts
-   * read every card, so no path polls this: {@link cardCounters} and
-   * {@link repairPendingCount} serve those.
+   * read every card, so no path polls this: {@link cardCounters} serves that.
    */
   cardStats(): CardStats;
   /** The store file's page count, free-list pages and page size. Read-only. */
@@ -673,19 +705,63 @@ export type Store = {
    * whose checkpoint is `v: 1`. A host that passes `gen` writes later
    * checkpoint versions, so a `v: 1` checkpoint marks a card an older build
    * overwrote. Cards with a {@link Card.repairReason} are left out. Newest
-   * first. Returns nothing when `gen` is undefined, so a host without
-   * generations never sees stale cards.
+   * first, then by session id. Returns nothing when `gen` is undefined, so a
+   * host without generations never sees stale cards. Every
+   * {@link repairStatePage} page, read in one call and sorted: it reads every
+   * card, so the distiller walks the pages itself with yields between them.
    */
   staleCards(gen?: number): StaleCard[];
   /**
+   * The repair state of up to `limit` cards (rounded down to a whole number;
+   * anything below 1, or not finite, reads as 1), in session-id order after
+   * `after` (from the first card when undefined): which of them
+   * {@link staleCards} lists for `gen` (none when `gen` is undefined) and how
+   * many carry a {@link Card.repairReason}.
+   * Paging continues from `last`, by the immutable session id, so a walk
+   * reads each card once however the cards change during it; it ends at a
+   * page that read fewer than `limit` cards. Every card of a page is read
+   * whole, which is what a page's size bounds.
+   */
+  repairStatePage(
+    gen: number | undefined,
+    after: string | undefined,
+    limit: number,
+  ): RepairStatePage;
+  /**
    * Record why a card could not be rebuilt, which takes it out of
    * {@link staleCards} until an accepted replace or {@link clearRepairReasons}
-   * clears it. Allocates no revision: readers do not see the reason.
-   * `changed` is false when the card is unknown or already has this reason.
+   * clears it. Allocates no revision: readers do not see the reason. It does
+   * advance {@link REPAIR_REV_KEY}. `changed` is false when the card is
+   * unknown or already has this reason.
    */
   markRepairPending(sessionId: string, reason: string): CardWrite;
-  /** Clear every card's repair reason, returning how many were set. */
+  /** Clear every card's repair reason, returning how many were set, and
+   *  advance {@link REPAIR_REV_KEY} when there were any. One statement over
+   *  the whole card table: the distiller clears reasons with
+   *  {@link clearRepairReasonsPage}. */
   clearRepairReasons(): number;
+  /**
+   * Clear the repair reasons of up to `limit` cards (read as
+   * {@link repairStatePage} reads it) in session-id order after `after`
+   * (from the first card when undefined). Paging continues from `last` and
+   * ends at a page that read fewer than `limit` cards. Only a page that
+   * cleared a reason writes, in one transaction that also advances
+   * {@link REPAIR_REV_KEY}.
+   */
+  clearRepairReasonsPage(after: string | undefined, limit: number): RepairClearPage;
+  /**
+   * Run a passive WAL checkpoint on this connection: copy into the database
+   * file every WAL frame no reader still needs, without waiting for readers
+   * or writers. Its work grows with the frames written since the last
+   * checkpoint.
+   */
+  checkpoint(): WalCheckpoint;
+  /**
+   * Set how many WAL pages make this connection's commits checkpoint on their
+   * own (`wal_autocheckpoint`); 0 turns that off, which leaves every
+   * checkpoint to {@link checkpoint}. A connection setting, written nowhere.
+   */
+  setAutoCheckpoint(pages: number): void;
   /** A session's stored range hashes, by ascending `startSeq`. */
   getRangeHashes(sessionId: string): RangeHash[];
   /** Store range hashes for a session in one transaction, replacing any stored
@@ -1441,6 +1517,32 @@ function pageLimit(limit: number): number {
   return Number.isFinite(limit) && limit >= 1 ? Math.floor(limit) : 1;
 }
 
+/** Cards per {@link Store.repairStatePage} page: each is read whole, so a
+ *  page of a long-used store's cards takes a few milliseconds. */
+export const REPAIR_STATE_PAGE = 500;
+
+/** SQLite's BINARY order of two strings, the order of their UTF-8 bytes, which
+ *  is the order of their code points (UTF-16 code units order differently past
+ *  U+FFFF). */
+function compareBinary(a: string, b: string): number {
+  if (a === b) return 0;
+  for (let i = 0, j = 0; i < a.length && j < b.length; ) {
+    const x = a.codePointAt(i)!;
+    const y = b.codePointAt(j)!;
+    if (x !== y) return x - y;
+    i += x > 0xffff ? 2 : 1;
+    j += y > 0xffff ? 2 : 1;
+  }
+  return a.length - b.length;
+}
+
+/** The order {@link Store.staleCards} lists stale cards in: newest first, then
+ *  by session id in SQLite's order, as `ORDER BY time_updated DESC,
+ *  session_id` would. */
+export function compareStaleCards(a: StaleCard, b: StaleCard): number {
+  return b.timeUpdated - a.timeUpdated || compareBinary(a.sessionId, b.sessionId);
+}
+
 /** A count from a SQL value or a meta counter string; 0 when absent. */
 function asCount(value: SqlValue | undefined): number {
   if (typeof value === "string") return Number(value) || 0;
@@ -1747,8 +1849,8 @@ export function openStore(
         // and rebuilt fresh for this host.
         rebuild(db, host, source);
       }
-      // A caller that must not write keeps counting without it.
-      if (!opts?.existingOnly) db.exec(REPAIR_PENDING_INDEX_DDL);
+      // A caller that must not write leaves it: it changes no read's result.
+      if (!opts?.existingOnly) db.exec(REPAIR_PENDING_INDEX_DROP);
     });
     let warning: string | undefined;
     try {
@@ -1961,9 +2063,14 @@ class SqliteStore implements Store {
   }
 
   repairPendingCount(): number {
-    return asCount(
-      this.db.get("SELECT count(*) AS n FROM card WHERE repair_reason IS NOT NULL")?.n,
-    );
+    let pending = 0;
+    let after: string | undefined;
+    for (;;) {
+      const page = this.repairStatePage(undefined, after, REPAIR_STATE_PAGE);
+      pending += page.repairPending;
+      if (page.read < REPAIR_STATE_PAGE) return pending;
+      after = page.last;
+    }
   }
 
   cardStats(): CardStats {
@@ -2000,33 +2107,119 @@ class SqliteStore implements Store {
 
   staleCards(gen?: number): StaleCard[] {
     if (gen === undefined || !Number.isFinite(gen)) return [];
+    const stale: StaleCard[] = [];
+    let after: string | undefined;
+    for (;;) {
+      const page = this.repairStatePage(gen, after, REPAIR_STATE_PAGE);
+      stale.push(...page.stale);
+      if (page.read < REPAIR_STATE_PAGE) return stale.sort(compareStaleCards);
+      after = page.last;
+    }
+  }
+
+  repairStatePage(
+    gen: number | undefined,
+    after: string | undefined,
+    limit: number,
+  ): RepairStatePage {
+    const g = gen !== undefined && Number.isFinite(gen) ? gen : null;
     // CASE, not AND: SQLite does not promise to skip json_extract on a
     // malformed checkpoint, and json_extract throws on one.
-    const rows = this.db.all(
-      `SELECT session_id, time_updated FROM card
-       WHERE repair_reason IS NULL
+    const columns = `session_id, time_updated, repair_reason IS NOT NULL AS pending,
+       (? IS NOT NULL AND repair_reason IS NULL
          AND (projector_gen IS NULL OR projector_gen < ?
-              OR (CASE WHEN json_valid(distill_cursor) THEN json_extract(distill_cursor, '$.v') END) = 1)
-       ORDER BY time_updated DESC, session_id`,
-      [gen],
-    );
-    return rows.map((row) => ({
-      sessionId: asString(row.session_id),
-      timeUpdated: asNumber(row.time_updated),
-    }));
+              OR (CASE WHEN json_valid(distill_cursor) THEN json_extract(distill_cursor, '$.v') END) = 1)) AS stale`;
+    const rows =
+      after === undefined
+        ? this.db.all(`SELECT ${columns} FROM card ORDER BY session_id LIMIT ?`, [
+            g,
+            g,
+            pageLimit(limit),
+          ])
+        : this.db.all(
+            `SELECT ${columns} FROM card WHERE session_id > ? ORDER BY session_id LIMIT ?`,
+            [g, g, after, pageLimit(limit)],
+          );
+    const stale: StaleCard[] = [];
+    let repairPending = 0;
+    for (const row of rows) {
+      if (asNumber(row.pending) !== 0) repairPending++;
+      if (asNumber(row.stale) !== 0) {
+        stale.push({
+          sessionId: asString(row.session_id),
+          timeUpdated: asNumber(row.time_updated),
+        });
+      }
+    }
+    const last = rows.length > 0 ? asString(rows[rows.length - 1]!.session_id) : undefined;
+    return last === undefined
+      ? { read: 0, stale, repairPending }
+      : { read: rows.length, last, stale, repairPending };
   }
 
   markRepairPending(sessionId: string, reason: string): CardWrite {
-    const { changes } = this.db.run(
-      "UPDATE card SET repair_reason=? WHERE session_id=? AND repair_reason IS NOT ?",
-      [reason, sessionId, reason],
-    );
-    return { changed: changes > 0 };
+    return this.db.tx((): CardWrite => {
+      const { changes } = this.db.run(
+        "UPDATE card SET repair_reason=? WHERE session_id=? AND repair_reason IS NOT ?",
+        [reason, sessionId, reason],
+      );
+      if (changes > 0) this.bumpCounter(REPAIR_REV_KEY);
+      return { changed: changes > 0 };
+    });
   }
 
   clearRepairReasons(): number {
-    return this.db.run("UPDATE card SET repair_reason=NULL WHERE repair_reason IS NOT NULL")
-      .changes;
+    return this.db.tx((): number => {
+      const { changes } = this.db.run(
+        "UPDATE card SET repair_reason=NULL WHERE repair_reason IS NOT NULL",
+      );
+      if (changes > 0) this.bumpCounter(REPAIR_REV_KEY);
+      return changes;
+    });
+  }
+
+  clearRepairReasonsPage(after: string | undefined, limit: number): RepairClearPage {
+    const columns = "session_id, repair_reason IS NOT NULL AS pending";
+    const rows =
+      after === undefined
+        ? this.db.all(`SELECT ${columns} FROM card ORDER BY session_id LIMIT ?`, [pageLimit(limit)])
+        : this.db.all(
+            `SELECT ${columns} FROM card WHERE session_id > ? ORDER BY session_id LIMIT ?`,
+            [after, pageLimit(limit)],
+          );
+    if (rows.length === 0) return { read: 0, cleared: 0 };
+    const last = asString(rows[rows.length - 1]!.session_id);
+    const pending = rows
+      .filter((row) => asNumber(row.pending) !== 0)
+      .map((row) => asString(row.session_id));
+    if (pending.length === 0) return { read: rows.length, last, cleared: 0 };
+    const cleared = this.db.tx((): number => {
+      let changes = 0;
+      for (const sessionId of pending) {
+        changes += this.db.run(
+          "UPDATE card SET repair_reason=NULL WHERE session_id=? AND repair_reason IS NOT NULL",
+          [sessionId],
+        ).changes;
+      }
+      if (changes > 0) this.bumpCounter(REPAIR_REV_KEY);
+      return changes;
+    });
+    return { read: rows.length, last, cleared };
+  }
+
+  checkpoint(): WalCheckpoint {
+    const row = this.db.get("PRAGMA wal_checkpoint(PASSIVE)");
+    return {
+      busy: asNumber(row?.busy) !== 0,
+      frames: asNumber(row?.log, -1),
+      checkpointed: asNumber(row?.checkpointed, -1),
+    };
+  }
+
+  setAutoCheckpoint(pages: number): void {
+    const n =
+      Number.isFinite(pages) && pages >= 0 ? Math.floor(pages) : DEFAULT_AUTOCHECKPOINT_PAGES;
+    this.db.exec(`PRAGMA wal_autocheckpoint=${n}`);
   }
 
   getRangeHashes(sessionId: string): RangeHash[] {
@@ -2344,10 +2537,11 @@ class SqliteStore implements Store {
       } else {
         this.writeCheckpoint(sessionId, card);
       }
-      this.db.run(
+      const cleared = this.db.run(
         "UPDATE card SET repair_reason=NULL WHERE session_id=? AND repair_reason IS NOT NULL",
         [sessionId],
-      );
+      ).changes;
+      if (cleared > 0) this.bumpCounter(REPAIR_REV_KEY);
       this.writeRangeHashes(sessionId, opts?.rangeHashes);
       return { changed };
     });

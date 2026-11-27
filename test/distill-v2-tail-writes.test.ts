@@ -1,8 +1,13 @@
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createDistiller, type Distiller, type DistillSync } from "../src/distill.js";
+import {
+  createDistiller,
+  WAL_BACKLOG_FRAMES,
+  type Distiller,
+  type DistillSync,
+} from "../src/distill.js";
 import { createFetchGate } from "../src/fetch-gate.js";
 import type { HistorySource } from "../src/history/source.js";
 import { createV2HistorySource, openOpencodeDb } from "../src/history/v2.js";
@@ -74,6 +79,7 @@ beforeEach(async () => {
 
 afterEach(async () => {
   await Promise.all(distillers.splice(0).map((d) => d.stop()));
+  vi.restoreAllMocks();
   storeDb.close();
   reader.close();
   v2db.cleanup();
@@ -220,6 +226,8 @@ type StartOptions = {
   wrapSource?: (inner: HistorySource) => HistorySource;
   /** Runs before each tail write reaches the store. */
   beforeTail?: () => void;
+  /** Runs each card write (`write`) in its place, returning its result. */
+  aroundWrite?: (method: string, write: () => unknown) => unknown;
   /** The distiller's yield (`yieldBetween`); none by default. */
   pause?: () => Promise<void>;
 };
@@ -272,7 +280,8 @@ function start(o: StartOptions = {}): Started {
       if (typeof prop === "string" && WRITES.has(prop)) {
         return (...args: unknown[]) => {
           if (prop === "replaceSessionTail") o.beforeTail?.();
-          const result = method.apply(target, args);
+          const write = (): unknown => method.apply(target, args);
+          const result = o.aroundWrite ? o.aroundWrite(prop, write) : write();
           writes.push({ method: prop, result });
           return result;
         };
@@ -1211,4 +1220,182 @@ describe("v2 reads of the stored rows before a write", () => {
     expect(now[1]).toEqual(hashes[1]);
     storeDb.run("INSERT INTO part_fts(part_fts, rank) VALUES('integrity-check', 1)");
   }, 20_000);
+});
+
+// ── WAL checkpoints after long writes ────────────────────────────────────────
+
+describe("v2 session writes that held the loop", () => {
+  const SESSION_WRITES = ["replaceSessionParts", "appendSessionParts", "replaceSessionTail"];
+
+  it.each([
+    {
+      took: 35,
+      name: "yield, and the slice after it starts with a WAL checkpoint",
+      after: ["yield", "checkpoint"],
+    },
+    { took: 34, name: "yield, leaving the checkpoint to a later slice", after: ["yield"] },
+  ])("for $took ms (a full write, an append and a tail write) $name", async ({ took, after }) => {
+    // `performance.now` moves only while a session write runs.
+    let perf = 10_000;
+    vi.spyOn(performance, "now").mockImplementation(() => perf);
+    const events: string[] = [];
+    const checkpoint = store.checkpoint.bind(store);
+    vi.spyOn(store, "checkpoint").mockImplementation(() => {
+      events.push("checkpoint");
+      return checkpoint();
+    });
+    addSession("ses_a");
+    addUser("ses_a", "openingword");
+    addReply("ses_a", ["answerword"]);
+    const h = start({
+      appendThresholdParts: 0,
+      pause: async () => {
+        events.push("yield");
+      },
+      aroundWrite: (method, write) => {
+        if (SESSION_WRITES.includes(method)) perf += took;
+        const result = write();
+        events.push(method);
+        return result;
+      },
+    });
+    await redistill(h, "ses_a");
+    addUser("ses_a", "followword");
+    const reply = addReply("ses_a", ["draftword"], { running: true });
+    expect(methods(await redistill(h, "ses_a"))).toEqual(["appendSessionParts"]);
+    addPart(reply, "ses_a", 1, "grownword");
+    expect(methods(await redistill(h, "ses_a"))).toEqual(["replaceSessionTail"]);
+
+    for (const method of SESSION_WRITES) {
+      const i = events.indexOf(method);
+      expect(i, method).toBeGreaterThanOrEqual(0);
+      expect(events.slice(i + 1, i + 1 + after.length), method).toEqual(after);
+    }
+  });
+});
+
+// ── Session writes while a reader holds WAL frames ───────────────────────────
+
+describe("v2 session writes while a reader holds WAL frames", () => {
+  /** The WAL as the mocked checkpoints report it: its frames and how many of
+   *  them are copied. A test moves either. */
+  type Wal = { frames: number; checkpointed: number };
+
+  /**
+   * A distiller over one new session whose checkpoints report `wal`, with
+   * fake timers (the timed checkpoints, the wait's limit) and its yields,
+   * checkpoints and session writes in `events`. The first timed checkpoint
+   * has run, so the distiller knows the backlog; then the session's turn
+   * ends.
+   */
+  async function backlogged(wal: Wal): Promise<Started & { events: string[] }> {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const events: string[] = [];
+    vi.spyOn(store, "checkpoint").mockImplementation(() => {
+      events.push("checkpoint");
+      return { busy: false, ...wal };
+    });
+    addSession("ses_a");
+    addUser("ses_a", "openingword");
+    const h = start({
+      pause: async () => {
+        events.push("yield");
+      },
+      aroundWrite: (method, write) => {
+        const result = write();
+        events.push(method);
+        return result;
+      },
+    });
+    await vi.advanceTimersByTimeAsync(10);
+    h.distiller.onEvent({ type: "turn-ended", sessionID: "ses_a" });
+    return { ...h, events };
+  }
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  const stopsHolding = (logs: string[]): string[] =>
+    logs.filter((line) => line.includes("session writes stop waiting for it"));
+  const resumesHolding = (logs: string[]): string[] =>
+    logs.filter((line) => line.includes("session writes wait again"));
+
+  /** Another turn of the session, whose write is the distiller's next. */
+  function nextTurn(h: Started, n: number): void {
+    addUser("ses_a", `turn${n}word`);
+    h.distiller.onEvent({ type: "turn-ended", sessionID: "ses_a" });
+  }
+
+  it(`wait while the last checkpoint left more than ${WAL_BACKLOG_FRAMES} frames uncopied, and write after a yield once one leaves no more`, async () => {
+    const wal = { frames: WAL_BACKLOG_FRAMES + 10, checkpointed: 9 };
+    const h = await backlogged(wal);
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(h.writes).toEqual([]);
+
+    wal.checkpointed = 10;
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(methods(h.writes)).toEqual(["replaceSessionParts"]);
+    const i = h.events.indexOf("replaceSessionParts");
+    expect(h.events.slice(i - 2, i)).toEqual(["checkpoint", "yield"]);
+    expect(stopsHolding(h.logs)).toEqual([]);
+  });
+
+  it("wait five seconds once for a reader that never lets go, then write without waiting, saying so once", async () => {
+    const wal = { frames: WAL_BACKLOG_FRAMES + 10, checkpointed: 9 };
+    const h = await backlogged(wal);
+    await vi.advanceTimersByTimeAsync(4_900);
+    expect(h.writes).toEqual([]);
+    await vi.advanceTimersByTimeAsync(200);
+    expect(h.writes).toHaveLength(1);
+    expect(stopsHolding(h.logs)).toHaveLength(1);
+    expect(stopsHolding(h.logs)[0]).toContain(
+      `WAL holds ${WAL_BACKLOG_FRAMES + 1} frames no checkpoint could copy`,
+    );
+
+    // The reader still holds every frame its snapshot needs while the
+    // writes add more.
+    for (let n = 1; n <= 3; n++) {
+      wal.frames += 50;
+      nextTurn(h, n);
+      await vi.advanceTimersByTimeAsync(100);
+      expect(h.writes, `turn ${n}`).toHaveLength(1 + n);
+    }
+    expect(stopsHolding(h.logs)).toHaveLength(1);
+    expect(resumesHolding(h.logs)).toEqual([]);
+  });
+
+  it("hold writes again for a reader that lets go later, once a checkpoint copies frames again", async () => {
+    const wal = { frames: 10_000, checkpointed: 0 };
+    const h = await backlogged(wal);
+    await vi.advanceTimersByTimeAsync(5_100);
+    expect(h.writes).toHaveLength(1);
+    expect(stopsHolding(h.logs)).toHaveLength(1);
+
+    // A checkpoint copies some frames, leaving more than the bound.
+    wal.checkpointed = 2_000;
+    await vi.advanceTimersByTimeAsync(1_100);
+    expect(resumesHolding(h.logs)).toHaveLength(1);
+    nextTurn(h, 1);
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(h.writes).toHaveLength(1);
+
+    wal.checkpointed = wal.frames;
+    await vi.advanceTimersByTimeAsync(1_100);
+    expect(h.writes).toHaveLength(2);
+    expect(stopsHolding(h.logs)).toHaveLength(1);
+    expect(resumesHolding(h.logs)).toHaveLength(1);
+  });
+
+  it("stop waiting, and write nothing, when the distiller stops", async () => {
+    const h = await backlogged({ frames: WAL_BACKLOG_FRAMES + 10, checkpointed: 9 });
+    await vi.advanceTimersByTimeAsync(100);
+    let stopped = false;
+    void h.distiller.stop().then(() => {
+      stopped = true;
+    });
+    await vi.advanceTimersByTimeAsync(10);
+    expect(stopped).toBe(true);
+    expect(h.writes).toEqual([]);
+  });
 });

@@ -27,6 +27,12 @@
  *   - The store read a refresh check makes, on a freshly opened copy, idle and
  *     before an apply: each under 2ms. The 400-card apply that follows it: no
  *     code slice over 35ms, that read included.
+ *   - Background work, every slice under 35ms with its SQLite time: an open of
+ *     a store with and without the repair-pending index an earlier build made;
+ *     the repair sweep's read of stale cards and the repair-pending count,
+ *     equal to what one statement reads; a first and a second cold pass over
+ *     12,000 up-to-date sessions, with at most one cursor write a second and
+ *     every WAL checkpoint taken by the lease holder rather than a commit.
  *   - 24 `recall` searches with card writes between them: card tier p50 <
  *     250ms, whole search p50 < 1s, no full load.
  * A search call's own slices, SQLite included:
@@ -49,7 +55,14 @@ import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import type { OpencodeClient, Message, Part, Session } from "@opencode-ai/sdk/v2";
 import type { ToolContext, ToolDefinition } from "../src/host/opencode-v1-types.js";
 import { openSqlite, type SqliteDb } from "../src/sqlite.js";
-import { type Card, type PartTextRow, type Store } from "../src/store.js";
+import {
+  openStore,
+  type Card,
+  type PartTextRow,
+  type StaleCard,
+  type Store,
+  type WalCheckpoint,
+} from "../src/store.js";
 import {
   createCardsRuntime,
   storeCardSource,
@@ -59,12 +72,20 @@ import {
 import { createFetchGate } from "../src/fetch-gate.js";
 import { createDrill } from "../src/drill.js";
 import { createV1HistorySource } from "../src/history/v1.js";
-import { deriveCard, type DistillSessionMeta } from "../src/distill.js";
+import {
+  createDistiller,
+  deriveCard,
+  readRepairState,
+  WAL_BACKLOG_FRAMES,
+  type DistillSessionMeta,
+} from "../src/distill.js";
+import { macrotask } from "../src/yield.js";
 import { parseQuery } from "../src/query.js";
 import { normalize } from "../src/normalize.js";
 import { search } from "../src/search.js";
 import { DEFAULTS, type Limits, type SearchOutput } from "../src/types.js";
 import { copyFileSync, mkdtempSync, rmSync } from "node:fs";
+import { cpuUsage } from "node:process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import v8 from "node:v8";
@@ -112,6 +133,19 @@ const SLICE_BUDGET_MS = 50;
 const REFRESH_READ_BUDGET_MS = 2;
 /** Longest code slice of a 400-card apply, its refresh check included. */
 const APPLY_SLICE_BUDGET_MS = 35;
+/** Longest slice of background work (an open, the repair sweep's start, a
+ *  cold pass and its checkpoints) on the large store, its SQLite time
+ *  included. */
+const BACKGROUND_SLICE_BUDGET_MS = 35;
+/** Stale and repair-pending cards the repair-state gate seeds. */
+const STALE_CARDS = 400;
+const REPAIR_PENDING_CARDS = 30;
+/** Sessions changed since their cards in the WAL backlog gate, each written
+ *  in full by its cold pass. */
+const BACKLOG_BURST_SESSIONS = 600;
+/** How long that gate's reader holds its snapshot once the backlog is over
+ *  the bound, which session writes wait through. */
+const BACKLOG_HOLD_MS = 1_000;
 /** Card-tier time of one `recall` search (median) on the large store. */
 const CARD_TIER_P50_BUDGET_MS = 250;
 /** Applying 400 changed cards through `ready({ index: true })`. A full
@@ -911,13 +945,43 @@ describe.skipIf(!ENABLED)(`perf: card runtime on a ${BIG_CARDS}-card store`, () 
 
   /** A copy of the built store, closed after the gate. */
   async function copyStore(): Promise<Store> {
+    return (await copyStoreWith()).store;
+  }
+
+  /** A copy of the built store, its path and its raw connection, after
+   *  `prepare` has run over another connection to the copy (as an older build
+   *  would leave the file); closed after the gate. `open` is how long the
+   *  store's open took, with its CPU time. */
+  async function copyStoreWith(prepare?: (db: SqliteDb) => void): Promise<{
+    store: Store;
+    db: SqliteDb;
+    path: string;
+    open: { ms: number; cpuMs: number };
+  }> {
     const dir = mkdtempSync(join(tmpdir(), "perf-cards-copy-"));
     const path = join(dir, "store.db");
     copyFileSync(templatePath, path);
+    if (prepare) {
+      const raw = await openSqlite(path);
+      if (!raw) throw new Error("no sqlite");
+      prepare(raw);
+      raw.close();
+    }
     const db = await openSqlite(path);
     if (!db) throw new Error("no sqlite");
     opened.push({ db, dir });
-    return openV1Store(db)!;
+    const cpu = cpuUsage();
+    const start = performance.now();
+    const result = openStore(db, { host: "opencode-v1" });
+    const ms = performance.now() - start;
+    const used = cpuUsage(cpu);
+    if (!result.ok) throw new Error(result.reason);
+    return {
+      store: result.store,
+      db,
+      path,
+      open: { ms, cpuMs: (used.user + used.system) / 1000 },
+    };
   }
 
   /**
@@ -1271,6 +1335,319 @@ describe.skipIf(!ENABLED)(`perf: card runtime on a ${BIG_CARDS}-card store`, () 
     expect(withResults).toBeGreaterThan(SEARCHES / 2);
     expect(p50).toBeLessThan(CARD_TIER_P50_BUDGET_MS);
     expect(percentile(totals, 0.5)).toBeLessThan(SEARCH_P50_BUDGET_MS);
+  }, 300_000);
+
+  it(`an open builds no index over the cards, and drops the repair-pending index an earlier build made, in under ${BACKGROUND_SLICE_BUDGET_MS} ms`, async () => {
+    const load = loadAverage();
+    const index = "card_repair_pending";
+    const has = (db: SqliteDb): boolean =>
+      db.get("SELECT 1 AS x FROM sqlite_master WHERE type='index' AND name=?", [index]) !==
+      undefined;
+    // As 3.0.1 left the file, and as a build that created the index did.
+    const without = await copyStoreWith((db) => db.exec(`DROP INDEX IF EXISTS ${index}`));
+    const withIndex = await copyStoreWith((db) =>
+      db.exec(
+        `CREATE INDEX IF NOT EXISTS ${index} ON card(session_id) WHERE repair_reason IS NOT NULL`,
+      ),
+    );
+    console.log(
+      `[perf] open of a ${BIG_CARDS}-card store (load ${load}): without the index ` +
+        `${without.open.ms.toFixed(1)}ms (cpu ${without.open.cpuMs.toFixed(1)}ms), with it ` +
+        `${withIndex.open.ms.toFixed(1)}ms (cpu ${withIndex.open.cpuMs.toFixed(1)}ms)`,
+    );
+    expect(has(without.db)).toBe(false);
+    expect(has(withIndex.db)).toBe(false);
+    expect(without.store.cardCount()).toBe(BIG_CARDS);
+    expect(without.open.ms).toBeLessThan(BACKGROUND_SLICE_BUDGET_MS);
+    expect(withIndex.open.ms).toBeLessThan(BACKGROUND_SLICE_BUDGET_MS);
+  }, 300_000);
+
+  it(`the repair sweep's start reads the stale cards and the repair-pending count with no slice over ${BACKGROUND_SLICE_BUDGET_MS} ms, as one statement would`, async () => {
+    const { store, db } = await copyStoreWith((raw) => {
+      raw.run("UPDATE card SET projector_gen = 1");
+      raw.run(`UPDATE card SET projector_gen = NULL WHERE rowid % ${BIG_CARDS / STALE_CARDS} = 0`);
+      raw.run(
+        `UPDATE card SET repair_reason = 'malformed' WHERE rowid % ${BIG_CARDS / REPAIR_PENDING_CARDS} = 1`,
+      );
+    });
+    // The reference the paged walk must equal: the stale cards and the
+    // repair-pending count, each read by one statement over the whole table.
+    const expected = db
+      .all(
+        `SELECT session_id, time_updated FROM card
+         WHERE repair_reason IS NULL
+           AND (projector_gen IS NULL OR projector_gen < ?
+                OR (CASE WHEN json_valid(distill_cursor) THEN json_extract(distill_cursor, '$.v') END) = 1)
+         ORDER BY time_updated DESC, session_id`,
+        [1],
+      )
+      .map(
+        (row): StaleCard => ({
+          sessionId: String(row.session_id),
+          timeUpdated: Number(row.time_updated),
+        }),
+      );
+    const expectedPending = Number(
+      db.get("SELECT count(*) AS n FROM card WHERE repair_reason IS NOT NULL")?.n,
+    );
+    const load = loadAverage();
+    const states: Array<Awaited<ReturnType<typeof readRepairState>>> = [];
+    const read = await measured(async () => {
+      states.push(await readRepairState(store, 1, macrotask));
+    });
+    const state = states[0];
+    console.log(
+      `[perf] repair state of ${BIG_CARDS} cards (load ${load}): total=${read.totalMs.toFixed(1)}ms ` +
+        `maxSlice=${read.maxOutsideGcMs.toFixed(1)}ms (stall ${read.maxMs.toFixed(1)}ms), ` +
+        `${state?.stale.length} stale, ${state?.repairPending} repair-pending`,
+    );
+    expect(expected).toHaveLength(STALE_CARDS);
+    expect(state?.stale).toEqual(expected);
+    expect(state?.repairPending).toBe(expectedPending);
+    expect(expectedPending).toBe(REPAIR_PENDING_CARDS);
+    expect(read.maxOutsideGcMs).toBeLessThan(BACKGROUND_SLICE_BUDGET_MS);
+  }, 300_000);
+
+  it(`a cold pass over ${BIG_CARDS} up-to-date sessions writes its cursor at most once a second and checkpoints the WAL in slices under ${BACKGROUND_SLICE_BUDGET_MS} ms`, async () => {
+    const { store: inner, db } = await copyStoreWith();
+    const cursorWrites: number[] = [];
+    const checkpoints: Array<WalCheckpoint & { ms: number }> = [];
+    let slowestWrite = 0;
+    const autoCheckpoint: number[] = [];
+    // The distiller's store, with its progress writes and checkpoints timed.
+    const store = new Proxy(inner, {
+      get(target, prop, receiver) {
+        const value = Reflect.get(target, prop, receiver) as unknown;
+        if (typeof value !== "function") return value;
+        const call = (...args: unknown[]): unknown =>
+          (value as (...a: unknown[]) => unknown).apply(target, args);
+        if (prop === "setMeta") {
+          return (...args: unknown[]) => {
+            const start = performance.now();
+            try {
+              return call(...args);
+            } finally {
+              slowestWrite = Math.max(slowestWrite, performance.now() - start);
+              if (args[0] === "coldpass_cursor") cursorWrites.push(performance.now());
+            }
+          };
+        }
+        if (prop === "checkpoint") {
+          return () => {
+            const start = performance.now();
+            const result = call() as WalCheckpoint;
+            checkpoints.push({ ...result, ms: performance.now() - start });
+            autoCheckpoint.push(Number(db.get("PRAGMA wal_autocheckpoint")?.wal_autocheckpoint));
+            return result;
+          };
+        }
+        return call;
+      },
+    });
+    // The listing the pass walks: every session as its card has it.
+    const sessions = Array.from({ length: BIG_CARDS }, (_, i) => {
+      const card = corpus.card(i);
+      return {
+        id: card.sessionId,
+        ...(card.parentId && { parentID: card.parentId }),
+        title: card.title,
+        slug: card.slug,
+        directory: card.directory,
+        projectID: card.projectId,
+        time: { created: card.timeCreated, updated: card.timeUpdated },
+      };
+    });
+    const unused = {} as unknown as OpencodeClient;
+    /** One cold pass by a distiller of its own, measured from its start to
+     *  the checkpoints that follow its last writes. */
+    const coldPass = async (name: string) => {
+      cursorWrites.length = 0;
+      checkpoints.length = 0;
+      autoCheckpoint.length = 0;
+      slowestWrite = 0;
+      let done = false;
+      const distiller = createDistiller({
+        source: createV1HistorySource({ scoped: unused, unscoped: unused }),
+        store,
+        gate: createFetchGate({ concurrency: DEFAULTS.concurrency }),
+        limits: { ...DEFAULTS, distillDelayMs: 0 },
+        instanceId: `perf-cold-pass-${name}`,
+        discover: async () => sessions as never,
+        yieldBetween: macrotask,
+        log: (line) => {
+          if (line.includes("cold pass done")) done = true;
+        },
+      });
+      const load = loadAverage();
+      try {
+        const pass = await measured(async () => {
+          distiller.start();
+          while (!done) await new Promise((resolve) => setTimeout(resolve, 5));
+          await new Promise((resolve) => setTimeout(resolve, 1_500));
+        });
+        const frames = checkpoints.map((c) => c.frames);
+        console.log(
+          `[perf] ${name} cold pass over ${BIG_CARDS} up-to-date sessions (load ${load}): ` +
+            `total=${pass.totalMs.toFixed(0)}ms maxSlice=${pass.maxOutsideGcMs.toFixed(1)}ms ` +
+            `(stall ${pass.maxMs.toFixed(1)}ms, GC pause max ${pass.maxGcMs.toFixed(1)}ms); ` +
+            `${cursorWrites.length} cursor writes, slowest meta write ${slowestWrite.toFixed(2)}ms; ` +
+            `${checkpoints.length} checkpoints, slowest ${Math.max(0, ...checkpoints.map((c) => c.ms)).toFixed(2)}ms, ` +
+            `WAL frames at a checkpoint max ${Math.max(0, ...frames)}`,
+        );
+        return {
+          pass,
+          cursorWrites: cursorWrites.length,
+          checkpoints: [...checkpoints],
+          autoCheckpoint: new Set(autoCheckpoint),
+        };
+      } finally {
+        await distiller.stop();
+      }
+    };
+
+    // The first pass writes every root's family rollup, a burst of writes;
+    // the second finds everything current, as a restart over a built store.
+    for (const name of ["first", "second"]) {
+      const {
+        pass,
+        cursorWrites: writes,
+        checkpoints: done,
+        autoCheckpoint: auto,
+      } = await coldPass(name);
+      expect(writes, name).toBeGreaterThan(0);
+      expect(writes, name).toBeLessThanOrEqual(Math.ceil(pass.totalMs / 1000) + 1);
+      expect(done.length, name).toBeGreaterThan(0);
+      // The holder's commits never checkpointed on their own.
+      expect(auto, name).toEqual(new Set([0]));
+      expect(done.at(-1)?.checkpointed, name).toBe(done.at(-1)?.frames);
+      expect(pass.maxOutsideGcMs, name).toBeLessThan(BACKGROUND_SLICE_BUDGET_MS);
+      expect(Number(db.get("PRAGMA wal_autocheckpoint")?.wal_autocheckpoint), name).toBe(1000);
+    }
+  }, 300_000);
+
+  it(`a reader on another connection holding WAL frames through a burst of session writes leaves at most ${WAL_BACKLOG_FRAMES} frames, and what one checkpoint interval writes, for the checkpoint after it lets go, with no slice over ${BACKGROUND_SLICE_BUDGET_MS} ms`, async () => {
+    const { store: inner, path } = await copyStoreWith();
+    const reader = await openSqlite(path);
+    if (!reader) throw new Error("no sqlite");
+    const checkpoints: Array<WalCheckpoint & { ms: number }> = [];
+    let sessionWrites = 0;
+    // The distiller's store, with its checkpoints timed and its full writes
+    // counted.
+    const store = new Proxy(inner, {
+      get(target, prop, receiver) {
+        const value = Reflect.get(target, prop, receiver) as unknown;
+        if (typeof value !== "function") return value;
+        const call = (...args: unknown[]): unknown =>
+          (value as (...a: unknown[]) => unknown).apply(target, args);
+        if (prop === "checkpoint") {
+          return () => {
+            const start = performance.now();
+            const result = call() as WalCheckpoint;
+            checkpoints.push({ ...result, ms: performance.now() - start });
+            return result;
+          };
+        }
+        if (prop === "replaceSessionParts") {
+          return (...args: unknown[]) => {
+            sessionWrites++;
+            return call(...args);
+          };
+        }
+        return call;
+      },
+    });
+    // Every session as its card has it, the first of them changed since: the
+    // cold pass reads each of those in full and writes it.
+    const sessions = Array.from({ length: BIG_CARDS }, (_, i) => {
+      const card = corpus.card(i);
+      return {
+        id: card.sessionId,
+        ...(card.parentId && { parentID: card.parentId }),
+        title: card.title,
+        slug: card.slug,
+        directory: card.directory,
+        projectID: card.projectId,
+        time: {
+          created: card.timeCreated,
+          updated: card.timeUpdated + (i < BACKLOG_BURST_SESSIONS ? 1 : 0),
+        },
+      };
+    });
+    const { client, unscoped } = corpusClient(corpus);
+    const logs: string[] = [];
+    let done = false;
+    const distiller = createDistiller({
+      source: createV1HistorySource({ scoped: client, unscoped }),
+      store,
+      gate: createFetchGate({ concurrency: DEFAULTS.concurrency }),
+      limits: { ...DEFAULTS, distillDelayMs: 0 },
+      instanceId: "perf-wal-backlog",
+      discover: async () => sessions as never,
+      yieldBetween: macrotask,
+      log: (line) => {
+        logs.push(line);
+        if (line.includes("cold pass done")) done = true;
+      },
+    });
+    const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+    const waitUntil = async (pred: () => boolean, what: string): Promise<void> => {
+      const deadline = performance.now() + 120_000;
+      while (!pred()) {
+        if (performance.now() > deadline) throw new Error(`timed out waiting for ${what}`);
+        await sleep(5);
+      }
+    };
+    const backlogOf = (c: WalCheckpoint): number => Math.max(0, c.frames - c.checkpointed);
+    // The reader's snapshot, which no checkpoint may copy past until it ends.
+    reader.exec("BEGIN");
+    reader.get("SELECT count(*) AS n FROM card");
+    let held: typeof checkpoints = [];
+    let writesHeld = 0;
+    const load = loadAverage();
+    try {
+      const run = await measured(async () => {
+        distiller.start();
+        await waitUntil(
+          () => checkpoints.some((c) => backlogOf(c) > WAL_BACKLOG_FRAMES),
+          "the backlog to pass the bound",
+        );
+        await sleep(BACKLOG_HOLD_MS);
+        held = [...checkpoints];
+        writesHeld = sessionWrites;
+        reader.exec("COMMIT");
+        await waitUntil(() => done, "the cold pass");
+        await sleep(1_500);
+      });
+      const after = checkpoints.slice(held.length);
+      const release = after[0];
+      const maxBacklog = Math.max(...held.map(backlogOf));
+      // The most frames written between two checkpoints while the reader held
+      // its snapshot: what a write admitted under the bound can add before
+      // the next checkpoint measures it.
+      let interval = 0;
+      for (let i = 1; i < held.length; i++) {
+        interval = Math.max(interval, held[i]!.frames - held[i - 1]!.frames);
+      }
+      console.log(
+        `[perf] WAL backlog of a reader held ${BACKLOG_HOLD_MS}ms through ${BACKLOG_BURST_SESSIONS} session writes ` +
+          `(load ${load}): backlog max ${maxBacklog} frames (bound ${WAL_BACKLOG_FRAMES}, most frames between two checkpoints ${interval}), ` +
+          `${writesHeld} writes before the reader let go; the checkpoint after it copied ${release ? backlogOf(held.at(-1)!) : -1} frames in ` +
+          `${release?.ms.toFixed(2)}ms; total=${run.totalMs.toFixed(0)}ms maxSlice=${run.maxOutsideGcMs.toFixed(1)}ms ` +
+          `(stall ${run.maxMs.toFixed(1)}ms, GC pause max ${run.maxGcMs.toFixed(1)}ms), ${sessionWrites} session writes, ` +
+          `slowest checkpoint ${Math.max(...checkpoints.map((c) => c.ms)).toFixed(2)}ms`,
+      );
+      expect(maxBacklog).toBeGreaterThan(WAL_BACKLOG_FRAMES);
+      expect(maxBacklog).toBeLessThanOrEqual(WAL_BACKLOG_FRAMES + interval);
+      expect(writesHeld).toBeLessThan(BACKLOG_BURST_SESSIONS);
+      expect(sessionWrites).toBeGreaterThanOrEqual(BACKLOG_BURST_SESSIONS);
+      expect(release?.checkpointed).toBe(release?.frames);
+      expect(release?.ms).toBeLessThan(BACKGROUND_SLICE_BUDGET_MS);
+      expect(run.maxOutsideGcMs).toBeLessThan(BACKGROUND_SLICE_BUDGET_MS);
+      expect(logs.filter((line) => line.includes("no checkpoint could copy"))).toEqual([]);
+    } finally {
+      await distiller.stop();
+      reader.close();
+    }
   }, 300_000);
 });
 
