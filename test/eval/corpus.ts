@@ -135,6 +135,42 @@ export function makeEvalCorpus(now = Date.now()): EvalCorpus {
   // e-harbor: the earlier session that did the work.
   const sHarbor = session("e-harbor", "Upload client changes", PROJECT_DIR, now - 70_000);
 
+  // ── A subagent only the slim index finds ──
+  // e-scout: the current session in that case. Two of its subagents' cards
+  // rank on the query's first word; a third, e-scout-needle, holds the whole
+  // needle only in a reasoning part, and the code tokens it mentions more
+  // often fill its card's inventory first, so only the slim index has it.
+  // e-skyops is an outsider that mentions the word once.
+  const sScout = session("e-scout", "Imagery rollout", PROJECT_DIR, now - 80_000);
+  const sScoutA = session(
+    "e-scout-a",
+    "Skyhook mirror check A",
+    PROJECT_DIR,
+    now - 76_000,
+    undefined,
+    "e-scout",
+  );
+  const sScoutB = session(
+    "e-scout-b",
+    "Skyhook mirror check B",
+    PROJECT_DIR,
+    now - 75_000,
+    undefined,
+    "e-scout",
+  );
+  const sScoutNeedle = session(
+    "e-scout-needle",
+    "Tile audit",
+    PROJECT_DIR,
+    now - 78_000,
+    undefined,
+    "e-scout",
+  );
+  const sSkyops = session("e-skyops", "Ops notes", PROJECT_DIR, now - 77_000);
+  const tileFiller = Array.from({ length: 200 }, (_, i) => `tl_${String(i).padStart(3, "0")}`).join(
+    " ",
+  );
+
   // ── Distill-then-search tier probes ──────────────────────────────────
   const HOUR = 60 * 60 * 1000;
   const DAY = 24 * HOUR;
@@ -557,6 +593,52 @@ export function makeEvalCorpus(now = Date.now()): EvalCorpus {
       ]),
     ],
 
+    // ── e-scout family / e-skyops: a needle only the slim index holds ────
+    [sScout.id]: [
+      bundle(userMessage("esc-1", sScout.id, now - 81_000), [
+        textPart("esc-1p", sScout.id, "esc-1", "Split the imagery work across subagents."),
+      ]),
+    ],
+    ...Object.fromEntries(
+      [sScoutA, sScoutB].map((s) => [
+        s.id,
+        [
+          bundle(assistantMessage(`${s.id}-1`, s.id, s.time.updated - 500), [
+            textPart(
+              `${s.id}-1p`,
+              s.id,
+              `${s.id}-1`,
+              "Checked the skyhook mirror settings for this region.",
+            ),
+          ]),
+        ],
+      ]),
+    ),
+    [sScoutNeedle.id]: [
+      bundle(userMessage("esn-1", sScoutNeedle.id, now - 79_000), [
+        textPart("esn-1p", sScoutNeedle.id, "esn-1", "Audit the broken tiles."),
+      ]),
+      bundle(assistantMessage("esn-2", sScoutNeedle.id, now - 78_500), [
+        reasoningPart(
+          "esn-2r",
+          sScoutNeedle.id,
+          "esn-2",
+          `The broken tile is skyhook-qorv.webp in the image bucket. Checked ${tileFiller}`,
+        ),
+        textPart("esn-2p", sScoutNeedle.id, "esn-2", `Checked ${tileFiller}`),
+      ]),
+    ],
+    [sSkyops.id]: [
+      bundle(assistantMessage("esk-1", sSkyops.id, now - 77_500), [
+        textPart(
+          "esk-1p",
+          sSkyops.id,
+          "esk-1",
+          "Noted the skyhook timing next to the queue depth, the worker counts and the nightly build schedule.",
+        ),
+      ]),
+    ],
+
     // ── e-inv: card-inventory needle (distinctive token in a tool INPUT) ──
     [sInv.id]: [
       bundle(userMessage("ei-1", sInv.id, now - 7_000), [
@@ -645,6 +727,11 @@ export function makeEvalCorpus(now = Date.now()): EvalCorpus {
     sHub,
     sHubEcho,
     sHarbor,
+    sScout,
+    sScoutA,
+    sScoutB,
+    sScoutNeedle,
+    sSkyops,
     sInv,
     sFts,
     sOut,
@@ -668,6 +755,11 @@ export function makeEvalCorpus(now = Date.now()): EvalCorpus {
     sHub,
     sHubEcho,
     sHarbor,
+    sScout,
+    sScoutA,
+    sScoutB,
+    sScoutNeedle,
+    sSkyops,
     sInv,
     sFts,
     sOut,
