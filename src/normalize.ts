@@ -6,6 +6,17 @@ export function splitCamelCase(text: string): string {
 }
 
 /**
+ * Text with separators (`_-/.`) turned into spaces, camelCase split and
+ * lowercased: the string {@link tokenizeAll} splits at whitespace and
+ * {@link normalize} collapses. A token is a whitespace-delimited run of it.
+ */
+export function tokenText(text: string): string {
+  const separated = text.replace(/[_\-/.]/g, " ");
+  const camelSplit = splitCamelCase(separated);
+  return camelSplit.toLowerCase();
+}
+
+/**
  * Split text into normalized tokens, preserving duplicates and order.
  * Splits on separators (`_-/.`), splits camelCase, lowercases.
  *
@@ -13,10 +24,9 @@ export function splitCamelCase(text: string): string {
  * frequency is preserved (a document that repeats a term is more relevant).
  */
 export function tokenizeAll(text: string): string[] {
-  const separated = text.replace(/[_\-/.]/g, " ");
-  const camelSplit = splitCamelCase(separated);
-  const lowered = camelSplit.toLowerCase();
-  return lowered.split(/\s+/).filter((t) => t.length > 0);
+  return tokenText(text)
+    .split(/\s+/)
+    .filter((t) => t.length > 0);
 }
 
 /**
@@ -27,10 +37,8 @@ export function tokenize(text: string): string[] {
   return [...new Set(tokenizeAll(text))];
 }
 
-/** Produce a fully normalized whitespace-collapsed string for indexed fields. */
+/** Produce a fully normalized whitespace-collapsed string for indexed fields:
+ *  the {@link tokenizeAll} tokens joined by single spaces. */
 export function normalize(text: string): string {
-  const separated = text.replace(/[_\-/.]/g, " ");
-  const camelSplit = splitCamelCase(separated);
-  const lowered = camelSplit.toLowerCase();
-  return lowered.replace(/\s+/g, " ").trim();
+  return tokenText(text).replace(/\s+/g, " ").trim();
 }

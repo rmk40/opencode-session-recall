@@ -14,8 +14,8 @@ import { buildSessionDigest } from "./corpus.js";
 import { normalize } from "./normalize.js";
 import { searchable } from "./extract.js";
 import { authorshipOf, type Authorship, type AuthorshipCounts } from "./authorship.js";
-import { bm25Search, type Bm25Hit, type Bm25Mode } from "./bm25.js";
-import { mergeShortlistHits } from "./rerank.js";
+import type { Bm25Hit, Bm25Mode } from "./bm25.js";
+import { rerankDrilled } from "./rerank.js";
 import type { FtsHit } from "./store.js";
 
 /**
@@ -469,6 +469,19 @@ function estimateRetained(msg: HistoryMessage): number {
   return total;
 }
 
+/** {@link estimateRetained} for a message whose candidates are built: each
+ *  part with searchable text builds one candidate holding those texts as its
+ *  `fieldTexts`, so this reads them instead of extracting the parts again. */
+function retainedOf(candidates: readonly Candidate[]): number {
+  let total = 0;
+  for (const candidate of candidates) {
+    for (const field of candidate.fieldTexts) {
+      total += Math.min(field.text.length, MAX_CHARS_PER_CANDIDATE);
+    }
+  }
+  return total;
+}
+
 export function createDrill(deps: DrillDeps): Drill {
   const { source, gate, limits } = deps;
   const clock = deps.now ?? Date.now;
@@ -574,7 +587,7 @@ export function createDrill(deps: DrillDeps): Drill {
     return {
       message: { info: msg.info, parts: [] },
       candidates,
-      retained: estimateRetained(msg),
+      retained: retainedOf(candidates),
       chars: charsUsed,
     };
   }
@@ -964,16 +977,13 @@ export function createDrill(deps: DrillDeps): Drill {
   return {
     async drill(input): Promise<DrillOutput> {
       const collected = await collectPools(input);
-      const broadPool: Candidate[] = [];
-      const deepPool: Candidate[] = [];
-      for (const pool of collected.pools) {
-        broadPool.push(...pool.candidates);
-        if (input.deepSet.has(pool.target.sessionId)) deepPool.push(...pool.candidates);
-      }
-
-      const broad = bm25Search(broadPool, input.query, input.mode, input.explain);
-      const deep = bm25Search(deepPool, input.query, input.mode, input.explain);
-      const hits = mergeShortlistHits(broad, deep, input.explain);
+      const hits = rerankDrilled(
+        collected.pools,
+        input.deepSet,
+        input.query,
+        input.mode,
+        input.explain,
+      );
       return { hits, ...collected };
     },
 

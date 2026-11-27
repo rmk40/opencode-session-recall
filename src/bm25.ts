@@ -1,25 +1,27 @@
-import MiniSearch from "minisearch";
 import { distance } from "fastest-levenshtein";
 import type { Candidate } from "./candidates.js";
 import type { ParsedQuery } from "./query.js";
-import { tokenize, tokenizeAll } from "./normalize.js";
+import { tokenize, tokenizeAll, tokenText } from "./normalize.js";
 import { evidenceClassFor } from "./extract.js";
 import type { EvidenceClass, ResultWhy } from "./types.js";
 
 /**
- * BM25 relevance ranking via an in-memory MiniSearch index built per query.
+ * BM25 relevance ranking over a per-query candidate pool.
  *
- * This replaces Fuse.js as the relevance engine for smart/fuzzy modes. MiniSearch
- * provides BM25+ scoring (term-rarity / IDF weighting and document-length
- * normalization) which Fuse — a fuzzy string matcher — does not. Structural
- * signals from the old rank.ts (recency, role, part type, error text, exact
- * phrase, coverage) are layered on as multiplicative document boosts so they
- * ride on a calibrated relevance score rather than an uncalibrated fuzzy distance.
+ * Each candidate is scored with BM25+ (term rarity over the pool and
+ * field-length normalization) across five weighted fields, with prefix and
+ * fuzzy expansion of the query terms. Structural signals (recency, role, part
+ * type, error text, exact phrase, coverage) are layered on as multiplicative
+ * boosts so they ride on a calibrated relevance score.
  *
- * The index is rebuilt per query over candidates served from the shared
- * corpus cache (src/corpus.ts), which already amortizes fetching, extraction,
- * tokenization, and normalization per session version — rebuilding the
- * MiniSearch index itself is the cheap part.
+ * The BM25+ scores are exactly the ones a MiniSearch index over the pool would
+ * give with the fields, boosts, tokenizer and prefix and fuzzy options below
+ * (MiniSearch 7's scoring defaults), but no index is built. A pass over the
+ * pool counts what those scores depend on: the pool size, each field's average
+ * length, and the document frequency of every pool term a query term reaches.
+ * Only the candidates holding such a term are scored, so the work per
+ * candidate is a lookup per distinct term rather than an index insert per
+ * token.
  */
 
 export type Bm25Mode = "smart" | "fuzzy";
@@ -75,7 +77,7 @@ const WEAK_FUZZY_THRESHOLD = 0.7;
 
 /**
  * Minimum final score (after structural multipliers) for a hit to be returned.
- * MiniSearch combines terms with OR, so a single weakly-matched term can surface
+ * BM25 combines terms with OR, so a single weakly-matched term can surface
  * an otherwise-irrelevant document. This floor drops that noise. It is a relative
  * floor: scores are normalized to the top hit, so the best match always survives.
  * (Applied to the unclamped boosted score; multipliers shift hits across the
@@ -92,13 +94,14 @@ function fuzzyFor(mode: Bm25Mode): number {
   return mode === "smart" ? 0.2 : 0.3;
 }
 
-/** MiniSearch caps fractional fuzzy distance at this many edits. */
+/** Fractional fuzzy distance is capped at this many edits. */
 const MAX_FUZZY = 6;
 
 /**
- * Max edit distance MiniSearch would allow for a term in this mode, matching its
- * `fuzzy: fraction` + `maxFuzzy` behavior. Used so matched-term metadata agrees
- * with what the index actually matched.
+ * Max edit distance a fuzzy match of `term` may have in this mode: none under
+ * four characters, else the mode's fraction of its length, rounded, at most
+ * {@link MAX_FUZZY}. Scoring and matched-term metadata share it, so reported
+ * matched terms agree with what was scored.
  */
 function maxEditDistance(term: string, mode: Bm25Mode): number {
   if (term.length < 4) return 0;
@@ -109,7 +112,10 @@ function maxEditDistance(term: string, mode: Bm25Mode): number {
  *  Exported so the distiller mines the same error vocabulary from tool outputs
  *  when building a card's error-signature list. */
 export function containsErrorPattern(text: string): boolean {
-  const lower = text.toLowerCase();
+  return lowerHasErrorPattern(text.toLowerCase());
+}
+
+function lowerHasErrorPattern(lower: string): boolean {
   return ERROR_PATTERNS.some((p) => lower.includes(p));
 }
 
@@ -135,78 +141,82 @@ export function compareHits(a: Bm25Hit, b: Bm25Hit): number {
   return a.candidate.partID.localeCompare(b.candidate.partID);
 }
 
-/**
- * Token-match detection for metadata (matchedTerms / matchedFields).
- * A query token matches a candidate token by substring, or by edit distance
- * within the SAME fuzzy budget MiniSearch used for the index (so reported
- * matched terms agree with what actually matched).
- */
-function findMatchedTerms(
-  queryTokens: readonly string[],
-  candidateTokens: readonly string[],
-  mode: Bm25Mode,
-): string[] {
-  const matched: string[] = [];
-  for (const qt of queryTokens) {
-    // Mirror MiniSearch's own matching: exact token, or prefix when the term is
-    // long enough for prefix search (length > 3). Using substring containment
-    // here would over-report terms BM25 never matched, which would distort the
-    // coverage boost/penalty and the matchedTerms metadata.
-    const prefixEligible = qt.length > 3;
-    if (candidateTokens.some((ct) => (prefixEligible ? ct.startsWith(qt) : ct === qt))) {
-      matched.push(qt);
-      continue;
-    }
-    const maxDist = maxEditDistance(qt, mode);
-    if (maxDist > 0) {
-      const typo = candidateTokens.some(
-        (ct) => Math.abs(ct.length - qt.length) <= maxDist && distance(qt, ct) <= maxDist,
-      );
-      if (typo) matched.push(qt);
-    }
-  }
-  return matched;
-}
+// ── Term expansion ────────────────────────────────────────────────────
 
-/**
- * Token pool covering every field the BM25 index searches (raw message/tool
- * text plus directory, session title, and tool name). matchedTerms/coverage are
- * computed against this pool so a hit caused by a title/directory/tool-name
- * match still reports its matched terms instead of being penalized for coverage.
- */
-function indexedTokenPool(candidate: Candidate): string[] {
-  const pool = new Set<string>(candidate.tokens);
-  for (const extra of [candidate.directory, candidate.sessionTitle, candidate.toolName]) {
-    if (extra) for (const t of tokenize(extra)) pool.add(t);
-  }
-  return [...pool];
-}
-
-function findMatchedFields(
-  query: ParsedQuery,
-  candidate: Candidate,
-  mode: Bm25Mode,
-): ResultWhy["matchedFields"] {
-  const fields = new Set<ResultWhy["matchedFields"][number]>();
-  for (const field of candidate.fieldTexts) {
-    const lower = field.text.toLowerCase();
-    const phraseMatched = query.phrases.some((phrase) => lower.includes(phrase));
-    const termsMatched = findMatchedTerms(query.tokens, tokenize(field.text), mode).length > 0;
-    if (phraseMatched || termsMatched) fields.add(field.field);
-  }
-  return [...fields];
-}
-
-type IndexedDoc = {
-  id: number;
-  primaryText: string;
-  secondaryText: string;
-  titleText: string;
-  hintText: string;
-  digestText: string;
+/** How a pool term reaches one query term, and the weight of that match. */
+type Expansion = {
+  /** Index of the query term in the term list the expander was built for. */
+  term: number;
+  kind: "exact" | "prefix" | "fuzzy";
+  weight: number;
 };
 
+/** The expansions a pool term takes part in, or undefined when it reaches no
+ *  query term. Remembered per distinct term for one search. */
+type Expander = (token: string) => readonly Expansion[] | undefined;
+
+/** Weights of a prefix and of a fuzzy expansion relative to an exact match
+ *  (MiniSearch's defaults). */
+const PREFIX_WEIGHT = 0.375;
+const FUZZY_WEIGHT = 0.45;
+
+/**
+ * The expander for `terms`. A pool term reaches a query term when it equals
+ * it, when the query term is longer than three characters and a prefix of it,
+ * or within {@link maxEditDistance} edits of it; an exact match takes weight
+ * 1 and a prefix match takes precedence over a fuzzy one. Each weight falls
+ * as the pool term moves away from the query term, as MiniSearch weighs its
+ * prefix and fuzzy matches.
+ */
+function createExpander(terms: readonly string[], mode: Bm25Mode): Expander {
+  const specs = terms.map((text) => ({
+    text,
+    prefix: text.length > 3,
+    maxDistance: maxEditDistance(text, mode),
+  }));
+  // A prototype-less object rather than a Map: it is read once per distinct
+  // token of every candidate, and a property read interns its key, so the
+  // tokens of the drill cache's candidates are hashed on their first search
+  // only. Under Bun that makes a repeated read several times cheaper.
+  const memo = Object.create(null) as Record<string, readonly Expansion[] | null | undefined>;
+  return (token) => {
+    let found = memo[token];
+    if (found === undefined) {
+      let list: Expansion[] | null = null;
+      for (let i = 0; i < specs.length; i++) {
+        const { text, prefix, maxDistance } = specs[i]!;
+        let expansion: Expansion | undefined;
+        if (token === text) {
+          expansion = { term: i, kind: "exact", weight: 1 };
+        } else if (prefix && token.startsWith(text)) {
+          const gap = token.length - text.length;
+          const weight = (PREFIX_WEIGHT * token.length) / (token.length + 0.3 * gap);
+          expansion = { term: i, kind: "prefix", weight };
+        } else if (maxDistance > 0 && Math.abs(token.length - text.length) <= maxDistance) {
+          const edits = distance(text, token);
+          if (edits <= maxDistance) {
+            const weight = (FUZZY_WEIGHT * token.length) / (token.length + edits);
+            expansion = { term: i, kind: "fuzzy", weight };
+          }
+        }
+        if (expansion) (list ??= []).push(expansion);
+      }
+      found = list;
+      memo[token] = found;
+    }
+    return found ?? undefined;
+  };
+}
+
+/** Whether two term lists are the same terms in the same order. */
+function sameTerms(a: readonly string[], b: readonly string[]): boolean {
+  return a.length === b.length && a.every((term, i) => term === b[i]);
+}
+
+// ── BM25+ scoring ─────────────────────────────────────────────────────
+
 const FIELDS = ["primaryText", "secondaryText", "titleText", "hintText", "digestText"] as const;
+const PRIMARY_FIELD = 0;
 
 /** Field boosts mirror the old Fuse key weights (primary dominates). The
  *  digest sits between directory (0.6) and title (0.3): content-derived
@@ -219,9 +229,328 @@ const FIELD_BOOST: Record<(typeof FIELDS)[number], number> = {
   hintText: 0.15,
   digestText: 0.4,
 };
+const BOOSTS = FIELDS.map((field) => FIELD_BOOST[field]);
+
+/** BM25+ term-frequency saturation, length normalization and lower bound
+ *  (MiniSearch's defaults). */
+const BM25_K = 1.2;
+const BM25_B = 0.7;
+const BM25_D = 0.5;
+
+/** BM25+ for one term in one field of one document, written as MiniSearch
+ *  computes it so the floating-point result is the same. */
+function bm25Plus(
+  termFreq: number,
+  docFreq: number,
+  docCount: number,
+  fieldLength: number,
+  avgFieldLength: number,
+): number {
+  const idf = Math.log(1 + (docCount - docFreq + 0.5) / (docFreq + 0.5));
+  return (
+    idf *
+    (BM25_D +
+      (termFreq * (BM25_K + 1)) /
+        (termFreq + BM25_K * (1 - BM25_B + (BM25_B * fieldLength) / avgFieldLength)))
+  );
+}
+
+/** A distinct token of a field text that reaches a query term, with the
+ *  number of times the text holds it. */
+type ReachingTerm = { token: string; expansions: readonly Expansion[]; count: number };
+
+/** A field text's length (its number of distinct tokens) and its reaching
+ *  tokens in first occurrence order. */
+type FieldTerms = { length: number; reaching: readonly ReachingTerm[] };
+
+function fieldTerms(text: string, expand: Expander): FieldTerms {
+  const counts = new Map<string, number>();
+  for (const token of tokenizeAll(text)) counts.set(token, (counts.get(token) ?? 0) + 1);
+  const reaching: ReachingTerm[] = [];
+  for (const [token, count] of counts) {
+    const expansions = expand(token);
+    if (expansions) reaching.push({ token, expansions, count });
+  }
+  return { length: counts.size, reaching };
+}
+
+/** {@link fieldTerms} for a `normalize` result whose distinct tokens are
+ *  known: only the reaching ones are counted, in the text itself. */
+function knownFieldTerms(
+  normalized: string,
+  distinct: readonly string[],
+  expand: Expander,
+): FieldTerms {
+  const reaching: ReachingTerm[] = [];
+  for (const token of distinct) {
+    const expansions = expand(token);
+    if (expansions) reaching.push({ token, expansions, count: countToken(normalized, token) });
+  }
+  return { length: distinct.length, reaching };
+}
+
+/** Occurrences of `token` as a whole token of `normalized`, a `normalize`
+ *  result: tokens joined by single spaces. */
+function countToken(normalized: string, token: string): number {
+  let count = 0;
+  let at = normalized.indexOf(token);
+  while (at !== -1) {
+    const end = at + token.length;
+    const starts = at === 0 || normalized.charCodeAt(at - 1) === 32;
+    const ends = end === normalized.length || normalized.charCodeAt(end) === 32;
+    if (starts && ends) {
+      count++;
+      at = normalized.indexOf(token, end + 1);
+    } else {
+      at = normalized.indexOf(token, at + 1);
+    }
+  }
+  return count;
+}
+
+/** One pool term a candidate holds that reaches a query term: the fields
+ *  holding it, in field order, and its frequency in each. */
+type HeldTerm = { expansions: readonly Expansion[]; fields: number[]; freqs: number[] };
+
+/** A candidate holding at least one reaching term, with its field lengths. */
+type Holder = {
+  doc: number;
+  lengths: number[];
+  held: Map<string, HeldTerm>;
+  primaryReaching: readonly string[] | undefined;
+};
+
+/** A scored candidate. `primaryReaching` lists the tokens of its
+ *  `primaryTerms` that reach a query term, in their order, when the score
+ *  read them from there. */
+type RawHit = { doc: number; score: number; primaryReaching: readonly string[] | undefined };
+
+const LATER_KINDS = ["prefix", "fuzzy"] as const;
 
 /**
- * Build a per-query BM25 index over candidates and return ranked hits.
+ * BM25+ scores for every candidate holding a term that reaches a query term,
+ * highest first (ties in pool order).
+ *
+ * The statistics are the ones a MiniSearch index over all of `candidates`
+ * holds: the document count is the pool size, a field's length is its number
+ * of distinct tokens, its average length is the running mean over the pool in
+ * order, and a term's document frequency in a field is the number of
+ * candidates holding it there. A candidate that holds a reaching term in some
+ * field counts toward those frequencies, so counting only candidates that
+ * hold one loses nothing.
+ *
+ * The primary field's distinct tokens come from `primaryTerms` and its term
+ * frequencies from `primaryText` when both are set; the other fields repeat
+ * across a session's candidates and are tokenized once per distinct text.
+ *
+ * A candidate's score sums, for each query term in order, its exact term and
+ * then its prefix and fuzzy expansions across fields, each weighted by its
+ * expansion weight and field boost; the sum is multiplied by how many distinct
+ * query terms it reached.
+ */
+function scorePool(
+  candidates: readonly Candidate[],
+  terms: readonly string[],
+  expand: Expander,
+): RawHit[] {
+  const fieldCount = FIELDS.length;
+  const docFreqs = FIELDS.map(() => new Map<string, number>());
+  const avgLengths = FIELDS.map(() => 0);
+  const labels = new Map<string, FieldTerms>();
+  const holders: Holder[] = [];
+  const lengths = FIELDS.map(() => 0);
+
+  for (let doc = 0; doc < candidates.length; doc++) {
+    const candidate = candidates[doc]!;
+    let held: Map<string, HeldTerm> | undefined;
+    let primaryReaching: string[] | undefined;
+    for (let field = 0; field < fieldCount; field++) {
+      const text = candidate[FIELDS[field]!] ?? "";
+      let terms: FieldTerms;
+      if (field !== PRIMARY_FIELD) {
+        let known = labels.get(text);
+        if (!known) {
+          known = fieldTerms(text, expand);
+          labels.set(text, known);
+        }
+        terms = known;
+      } else if (candidate.primaryText !== undefined && candidate.primaryTerms !== undefined) {
+        terms = knownFieldTerms(text, candidate.primaryTerms, expand);
+        primaryReaching = terms.reaching.map(({ token }) => token);
+      } else {
+        terms = fieldTerms(text, expand);
+      }
+      lengths[field] = terms.length;
+      avgLengths[field] = (avgLengths[field]! * doc + terms.length) / (doc + 1);
+      for (const { token, expansions, count } of terms.reaching) {
+        held ??= new Map();
+        let entry = held.get(token);
+        if (!entry) {
+          entry = { expansions, fields: [], freqs: [] };
+          held.set(token, entry);
+        }
+        entry.fields.push(field);
+        entry.freqs.push(count);
+        const freqs = docFreqs[field]!;
+        freqs.set(token, (freqs.get(token) ?? 0) + 1);
+      }
+    }
+    if (held) holders.push({ doc, lengths: [...lengths], held, primaryReaching });
+  }
+
+  const docCount = candidates.length;
+  const firstIndex = terms.map((term) => terms.indexOf(term));
+  const add = (score: number, token: string, entry: HeldTerm, holder: Holder, weight: number) => {
+    let sum = score;
+    for (let k = 0; k < entry.fields.length; k++) {
+      const field = entry.fields[k]!;
+      const raw = bm25Plus(
+        entry.freqs[k]!,
+        docFreqs[field]!.get(token)!,
+        docCount,
+        holder.lengths[field]!,
+        avgLengths[field]!,
+      );
+      sum += weight * BOOSTS[field]! * raw;
+    }
+    return sum;
+  };
+
+  const hits: RawHit[] = [];
+  for (const holder of holders) {
+    let total = 0;
+    let quality = 0;
+    for (let i = 0; i < terms.length; i++) {
+      const term = terms[i]!;
+      let sum = 0;
+      let reached = false;
+      const exact = holder.held.get(term);
+      if (exact) {
+        sum = add(sum, term, exact, holder, 1);
+        reached = true;
+      }
+      for (const kind of LATER_KINDS) {
+        for (const [token, entry] of holder.held) {
+          if (token === term) continue;
+          const expansion = entry.expansions.find((e) => e.term === i && e.kind === kind);
+          if (!expansion) continue;
+          sum = add(sum, token, entry, holder, expansion.weight);
+          reached = true;
+        }
+      }
+      if (!reached) continue;
+      total += sum;
+      if (firstIndex[i] === i) quality++;
+    }
+    hits.push({
+      doc: holder.doc,
+      score: total * quality,
+      primaryReaching: holder.primaryReaching,
+    });
+  }
+  hits.sort((a, b) => b.score - a.score || a.doc - b.doc);
+  return hits;
+}
+
+// ── Matched-term and matched-field metadata ───────────────────────────
+
+/** Whitespace as `tokenizeAll` splits on it. */
+const WHITESPACE = /\s/;
+
+/** Whether `token` (no whitespace) is a whitespace-delimited run of `text`. */
+function holdsToken(text: string, token: string): boolean {
+  let at = text.indexOf(token);
+  while (at !== -1) {
+    const end = at + token.length;
+    const starts = at === 0 || WHITESPACE.test(text[at - 1]!);
+    const ends = end === text.length || WHITESPACE.test(text[end]!);
+    if (starts && ends) return true;
+    at = text.indexOf(token, at + 1);
+  }
+  return false;
+}
+
+/**
+ * Matched-term and matched-field metadata for hits, sharing one expander
+ * over the query tokens. A query token matches a candidate token by the same
+ * rule as scoring (exact, prefix when longer than three characters, or within
+ * the mode's edit distance), so reported matched terms agree with what was
+ * scored. `scoredWith` says the scores used this same expander, so a hit's
+ * `primaryReaching` are its reaching tokens whenever its `tokens` are its
+ * `primaryTerms`.
+ */
+function createHitMetadata(query: ParsedQuery, expand: Expander, scoredWith: boolean) {
+  const labelTerms = new Map<string, readonly number[]>();
+  const reachedBy = (label: string): readonly number[] => {
+    let reached = labelTerms.get(label);
+    if (!reached) {
+      const indices = new Set<number>();
+      for (const token of tokenize(label)) {
+        for (const expansion of expand(token) ?? []) indices.add(expansion.term);
+      }
+      reached = [...indices];
+      labelTerms.set(label, reached);
+    }
+    return reached;
+  };
+
+  /** Whether the field's tokens hold a term reaching a query token. `held`
+   *  is the candidate's tokens that do; when `complete`, they include every
+   *  such token of every field. */
+  const fieldReached = (
+    candidate: Candidate,
+    text: string,
+    held: readonly string[],
+    complete: boolean,
+  ): boolean => {
+    if (text === candidate.rawText) return held.length > 0;
+    if (complete && held.length === 0) return false;
+    const lowered = tokenText(text);
+    if (held.some((token) => holdsToken(lowered, token))) return true;
+    if (complete) return false;
+    return lowered.split(/\s+/).some((token) => token.length > 0 && expand(token) !== undefined);
+  };
+
+  return (candidate: Candidate, primaryReaching: readonly string[] | undefined) => {
+    const reached = new Uint8Array(query.tokens.length);
+    let held: readonly string[];
+    if (scoredWith && primaryReaching && candidate.tokens === candidate.primaryTerms) {
+      held = primaryReaching;
+      for (const token of held) {
+        for (const expansion of expand(token)!) reached[expansion.term] = 1;
+      }
+    } else {
+      const found: string[] = [];
+      for (const token of candidate.tokens) {
+        const expansions = expand(token);
+        if (!expansions) continue;
+        found.push(token);
+        for (const expansion of expansions) reached[expansion.term] = 1;
+      }
+      held = found;
+    }
+    // The searched fields beyond the text: directory, session title and tool name.
+    for (const label of [candidate.directory, candidate.sessionTitle, candidate.toolName]) {
+      if (label) for (const i of reachedBy(label)) reached[i] = 1;
+    }
+    const matchedTerms = query.tokens.filter((_, i) => reached[i] === 1);
+
+    const complete = candidate.rawComplete === true;
+    const fields = new Set<ResultWhy["matchedFields"][number]>();
+    for (const field of candidate.fieldTexts) {
+      if (fields.has(field.field)) continue;
+      const lower = query.phrases.length > 0 ? field.text.toLowerCase() : "";
+      const phraseMatched = query.phrases.some((phrase) => lower.includes(phrase));
+      if (phraseMatched || fieldReached(candidate, field.text, held, complete)) {
+        fields.add(field.field);
+      }
+    }
+    return { matchedTerms, matchedFields: [...fields] };
+  };
+}
+
+/**
+ * Score candidates with BM25+ over the pool and return ranked hits.
  * Candidates MUST have stage-2 normalized fields populated (primaryText etc.).
  */
 export function bm25Search(
@@ -232,71 +561,57 @@ export function bm25Search(
 ): Bm25Hit[] {
   if (candidates.length === 0) return [];
 
-  const docs: IndexedDoc[] = candidates.map((c, id) => ({
-    id,
-    primaryText: c.primaryText ?? "",
-    secondaryText: c.secondaryText ?? "",
-    titleText: c.titleText ?? "",
-    hintText: c.hintText ?? "",
-    digestText: c.digestText ?? "",
-  }));
+  // Search terms come from the parsed query tokens (already normalized),
+  // through the same tokenizer as the fields.
+  const terms = tokenizeAll(query.tokens.join(" "));
+  if (terms.length === 0) return [];
+  const expand = createExpander(terms, mode);
 
-  const mini = new MiniSearch<IndexedDoc>({
-    idField: "id",
-    fields: [...FIELDS],
-    // Use the plugin's shared tokenizer (camelCase/separator aware) for both
-    // indexing and search. tokenizeAll preserves duplicate terms so BM25 term
-    // frequency stays meaningful — a document that repeats a term ranks higher.
-    tokenize: (text: string) => tokenizeAll(text),
-  });
-  mini.addAll(docs);
-
-  // Search terms come from the parsed query tokens (already normalized).
-  const queryText = query.tokens.join(" ");
-  if (queryText.trim().length === 0) return [];
-
-  const rawHits = mini.search(queryText, {
-    fields: [...FIELDS],
-    boost: FIELD_BOOST,
-    combineWith: "OR",
-    prefix: (term) => term.length > 3,
-    fuzzy: (term) => (term.length >= 4 ? fuzzyFor(mode) : false),
-    maxFuzzy: MAX_FUZZY,
-  });
-
+  const rawHits = scorePool(candidates, terms, expand);
   if (rawHits.length === 0) return [];
 
   // Normalize BM25 scores to a 0..1 relative scale using the top score.
   const maxScore = rawHits[0]!.score || 1;
 
-  // Digest strings repeat across a session's candidates; tokenize each once.
-  const digestTokenCache = new Map<string, Set<string>>();
+  const shared = sameTerms(terms, query.tokens);
+  const metadataOf = createHitMetadata(
+    query,
+    shared ? expand : createExpander(query.tokens, mode),
+    shared,
+  );
+
+  // Digest strings repeat across a session's candidates; check each once.
+  const digestCovered = new Map<string, boolean>();
 
   const hits: Bm25Hit[] = [];
   for (const hit of rawHits) {
-    const candidate = candidates[hit.id as number]!;
+    const candidate = candidates[hit.doc]!;
     const base = clamp01(hit.score / maxScore);
     const reasons: string[] = [];
     if (explain) reasons.push(`BM25 relative score: ${base.toFixed(2)}`);
 
     let mult = 1;
 
+    // Raw text lowercased once, only for the checks that read it.
+    let rawLowerMemo: string | undefined;
+    const rawLower = (): string => (rawLowerMemo ??= candidate.rawText.toLowerCase());
+
     // Exact phrase present in raw text.
-    const rawLower = candidate.rawText.toLowerCase();
-    if (query.phrases.some((p) => rawLower.includes(p))) {
+    if (query.phrases.length > 0 && query.phrases.some((p) => rawLower().includes(p))) {
       mult *= EXACT_PHRASE_MULT;
       if (explain) reasons.push(`Exact phrase: ×${EXACT_PHRASE_MULT}`);
     }
 
     // Session-identity: the session's own statements/actions cover the query.
     if (candidate.digestText && query.tokens.length > 0) {
-      let digestTokens = digestTokenCache.get(candidate.digestText);
-      if (!digestTokens) {
-        digestTokens = new Set(tokenize(candidate.digestText));
-        digestTokenCache.set(candidate.digestText, digestTokens);
+      let covered = digestCovered.get(candidate.digestText);
+      if (covered === undefined) {
+        const digestTokens = new Set(tokenize(candidate.digestText));
+        const count = query.tokens.filter((token) => digestTokens.has(token)).length;
+        covered = count * 2 >= query.tokens.length;
+        digestCovered.set(candidate.digestText, covered);
       }
-      const covered = query.tokens.filter((token) => digestTokens!.has(token)).length;
-      if (covered * 2 >= query.tokens.length) {
+      if (covered) {
         mult *= DIGEST_MATCH_MULT;
         if (explain) reasons.push(`Session digest match: ×${DIGEST_MATCH_MULT}`);
       }
@@ -305,14 +620,13 @@ export function bm25Search(
     // Verbatim code-like compound token (case-insensitive).
     if (
       query.codeTokens.length > 0 &&
-      query.codeTokens.some((token) => rawLower.includes(token.toLowerCase()))
+      query.codeTokens.some((token) => rawLower().includes(token.toLowerCase()))
     ) {
       mult *= EXACT_TOKEN_MULT;
       if (explain) reasons.push(`Exact code token: ×${EXACT_TOKEN_MULT}`);
     }
 
-    const matchedTerms = findMatchedTerms(query.tokens, indexedTokenPool(candidate), mode);
-    const matchedFields = findMatchedFields(query, candidate, mode);
+    const { matchedTerms, matchedFields } = metadataOf(candidate, hit.primaryReaching);
     const evidenceClass = evidenceClassFor(candidate.partType, candidate.toolName, matchedFields);
     if (evidenceClass === "tool-input") {
       mult *= TOOL_INPUT_MULT;
@@ -338,7 +652,7 @@ export function bm25Search(
       mult *= REASONING_MULT;
       if (explain) reasons.push(`Reasoning part: ×${REASONING_MULT}`);
     }
-    if (candidate.partType === "tool" && containsErrorPattern(candidate.rawText)) {
+    if (candidate.partType === "tool" && lowerHasErrorPattern(rawLower())) {
       mult *= ERROR_TEXT_MULT;
       if (explain) reasons.push(`Error text: ×${ERROR_TEXT_MULT}`);
     }

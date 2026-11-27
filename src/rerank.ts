@@ -1,4 +1,12 @@
-import { compareHits, MIN_RELATIVE_SCORE, type Bm25Hit } from "./bm25.js";
+import {
+  bm25Search,
+  compareHits,
+  MIN_RELATIVE_SCORE,
+  type Bm25Hit,
+  type Bm25Mode,
+} from "./bm25.js";
+import type { Candidate } from "./candidates.js";
+import type { ParsedQuery } from "./query.js";
 
 /**
  * Two-stage DRILLED rerank.
@@ -17,6 +25,35 @@ import { compareHits, MIN_RELATIVE_SCORE, type Bm25Hit } from "./bm25.js";
  */
 
 export const SHORTLIST_MULT = 1.1;
+
+/**
+ * Rank drilled sessions' candidates: the broad pass over every pool, the deep
+ * pass over the pools of `deepSet` sessions, merged by
+ * {@link mergeShortlistHits}. When every pool is in `deepSet` the deep pool is
+ * the broad pool, so the broad pass's hits serve as the deep pass's.
+ */
+export function rerankDrilled(
+  pools: ReadonlyArray<{ target: { sessionId: string }; candidates: Candidate[] }>,
+  deepSet: ReadonlySet<string>,
+  query: ParsedQuery,
+  mode: Bm25Mode,
+  explain: boolean,
+): Bm25Hit[] {
+  const broadPool: Candidate[] = [];
+  const deepPool: Candidate[] = [];
+  let allDeep = true;
+  for (const pool of pools) {
+    const deep = deepSet.has(pool.target.sessionId);
+    if (!deep) allDeep = false;
+    for (const candidate of pool.candidates) {
+      broadPool.push(candidate);
+      if (deep) deepPool.push(candidate);
+    }
+  }
+  const broad = bm25Search(broadPool, query, mode, explain);
+  const deep = allDeep ? broad : bm25Search(deepPool, query, mode, explain);
+  return mergeShortlistHits(broad, deep, explain);
+}
 
 /**
  * Merge the broad and deep drilled passes into one ranked list.
