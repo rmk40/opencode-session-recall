@@ -12,6 +12,7 @@ import {
   CARDS_STAMPED_KEY,
   openStore,
   pluginBuild,
+  REPAIR_STATE_PAGE,
   VECTORS_REV_KEY,
   WEAK_MATCH_ROWS,
   type AppendLayout,
@@ -227,8 +228,8 @@ function snapshot(db: SqliteDb): unknown {
   };
 }
 
-/** Whether the file holds `card_repair_pending`, the index behind
- *  {@link Store.repairPendingCount}. */
+/** Whether the file holds `card_repair_pending`, a partial index over the
+ *  cards with a repair reason that some builds of schema 5 create on open. */
 function hasRepairIndex(db: SqliteDb): boolean {
   return (
     db.get("SELECT name FROM sqlite_master WHERE type='index' AND name='card_repair_pending'") !==
@@ -236,12 +237,12 @@ function hasRepairIndex(db: SqliteDb): boolean {
   );
 }
 
-/** Drop the repair-pending index from the store at `path`, as a build that
- *  does not know it leaves the file. Throws when the index is not there. */
-async function dropRepairIndex(path: string): Promise<void> {
+/** Create the repair-pending index in the store at `path`, as a build that
+ *  creates it on open leaves the file. Throws when the index is there. */
+async function addRepairIndex(path: string): Promise<void> {
   const db = await openSqlite(path);
   if (!db) throw new Error("open failed");
-  db.exec("DROP INDEX card_repair_pending");
+  db.exec("CREATE INDEX card_repair_pending ON card(session_id) WHERE repair_reason IS NOT NULL");
   db.close();
 }
 
@@ -1250,14 +1251,20 @@ describe("the repair-pending index across opens", () => {
     {
       name: "a current store without it",
       identity: v2("/data/opencode.db"),
+      build: (path) => buildCurrentStore(path, v2("/data/opencode.db")),
+      cards: 1,
+    },
+    {
+      name: "a current store an earlier build gave it",
+      identity: v2("/data/opencode.db"),
       build: async (path) => {
         await buildCurrentStore(path, v2("/data/opencode.db"));
-        await dropRepairIndex(path);
+        await addRepairIndex(path);
       },
       cards: 1,
     },
   ])(
-    "an open creates it on $name, keeping the cards and the schema version",
+    "an open leaves no index on $name, keeping the cards and the schema version",
     async ({ identity, build, cards }) => {
       const path = freshDbPath();
       await build?.(path);
@@ -1265,7 +1272,7 @@ describe("the repair-pending index across opens", () => {
       if (!db) throw new Error("open failed");
       const opened = openStore(db, identity);
       if (!opened.ok) throw new Error(opened.reason);
-      expect(hasRepairIndex(db)).toBe(true);
+      expect(hasRepairIndex(db)).toBe(false);
       expect(opened.store.getMeta("schema_version")).toBe("5");
       expect(opened.store.allCards()).toHaveLength(cards);
       db.close();
@@ -1286,11 +1293,11 @@ describe("the repair-pending index across opens", () => {
       opener: v2("/data/b/opencode.db"),
     },
   ])(
-    "a $reason refusal leaves a store without it as it was",
+    "a $reason refusal leaves a store an earlier build gave it as it was",
     async ({ reason, owner, opener, edit }) => {
       const path = freshDbPath();
       await buildCurrentStore(path, owner);
-      await dropRepairIndex(path);
+      await addRepairIndex(path);
       if (edit) {
         const raw = await openSqlite(path);
         if (!raw) throw new Error("reopen failed");
@@ -1300,12 +1307,12 @@ describe("the repair-pending index across opens", () => {
       await expectRefusal(path, opener, reason);
       const db = await openSqlite(path);
       if (!db) throw new Error("reopen failed");
-      expect(hasRepairIndex(db)).toBe(false);
+      expect(hasRepairIndex(db)).toBe(true);
       db.close();
     },
   );
 
-  it("an existingOnly open takes a current store without it as it is, and still counts repair-pending cards", async () => {
+  it("an existingOnly open takes a current store an earlier build gave it as it is, and still counts repair-pending cards", async () => {
     const path = freshDbPath();
     const identity = v2("/data/opencode.db");
     const seed = await openSqlite(path);
@@ -1315,7 +1322,7 @@ describe("the repair-pending index across opens", () => {
     for (const id of ["s1", "s2"]) seeded.store.replaceSessionParts(id, [], makeCard(id));
     seeded.store.markRepairPending("s1", "malformed");
     seed.close();
-    await dropRepairIndex(path);
+    await addRepairIndex(path);
     const probe = await openSqlite(path);
     if (!probe) throw new Error("probe open failed");
     const before = snapshot(probe);
@@ -1326,7 +1333,7 @@ describe("the repair-pending index across opens", () => {
     const opened = openStore(db, identity, { existingOnly: true });
     if (!opened.ok) throw new Error(opened.reason);
     expect(opened.store.repairPendingCount()).toBe(1);
-    expect(hasRepairIndex(db)).toBe(false);
+    expect(hasRepairIndex(db)).toBe(true);
     expect(db.get("SELECT total_changes() AS n")?.n).toBe(0);
     expect(snapshot(db)).toEqual(before);
     db.close();
@@ -4717,17 +4724,21 @@ describe("change listing and stats", () => {
   });
 
   it.each([
-    { name: "with its index", dropIndex: false },
+    { name: "on its own", withIndex: false },
     {
-      name: "without its index, as a build that does not know it leaves the file",
-      dropIndex: true,
+      name: "with the index an earlier build creates over those cards",
+      withIndex: true,
     },
   ])(
     "repairPendingCount counts the cards with a repair reason $name, however the reason is set or cleared",
-    async ({ dropIndex }) => {
+    async ({ withIndex }) => {
       const { db, store } = await fresh();
       for (const id of ["s1", "s2", "s3", "s4"]) store.replaceSessionParts(id, [], makeCard(id));
-      if (dropIndex) db.exec("DROP INDEX card_repair_pending");
+      if (withIndex) {
+        db.exec(
+          "CREATE INDEX card_repair_pending ON card(session_id) WHERE repair_reason IS NOT NULL",
+        );
+      }
       const steps: Array<{ name: string; act: () => unknown; pending: number }> = [
         { name: "no reason yet", act: () => undefined, pending: 0 },
         {
@@ -4773,25 +4784,27 @@ describe("change listing and stats", () => {
         expect(store.repairPendingCount(), step.name).toBe(step.pending);
         expect(store.cardStats().repairPending, step.name).toBe(step.pending);
       }
-      expect(hasRepairIndex(db)).toBe(!dropIndex);
+      expect(hasRepairIndex(db)).toBe(withIndex);
       db.close();
     },
   );
 
-  it("repairPendingCount reads the index over cards with a repair reason, not the card table", async () => {
+  it("repairPendingCount reads the card table in bounded pages", async () => {
     const raw = await openSqlite(freshDbPath());
     if (!raw) throw new Error("open failed");
     const watched = watchReads(raw);
     const store = openV1Store(watched.db);
     if (!store) throw new Error("openStore returned null");
-    for (const id of ["s1", "s2", "s3"]) store.replaceSessionParts(id, [], makeCard(id));
+    const ids = Array.from({ length: REPAIR_STATE_PAGE + 3 }, (_, i) => `s${i}`);
+    for (const id of ids) store.replaceSessionParts(id, [], makeCard(id));
     store.markRepairPending("s2", "malformed");
     watched.reads.length = 0;
     expect(store.repairPendingCount()).toBe(1);
-    expect(watched.reads).toHaveLength(1);
-    const [{ sql, params }] = watched.reads as [{ sql: string; params?: SqlValue[] }];
-    const plan = raw.all(`EXPLAIN QUERY PLAN ${sql}`, params).map((row) => String(row.detail));
-    expect(plan).toEqual([expect.stringMatching(/ USING (COVERING )?INDEX card_repair_pending\b/)]);
+    expect(watched.reads).toHaveLength(2);
+    for (const { sql, params } of watched.reads) {
+      expect(sql).toMatch(/ LIMIT \?$/);
+      expect(params?.at(-1)).toBe(REPAIR_STATE_PAGE);
+    }
     raw.close();
   });
 

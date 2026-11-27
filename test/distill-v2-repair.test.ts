@@ -744,7 +744,7 @@ describe("v2 repair sweep", () => {
     expect(h.distiller.repair()?.sweep).toMatchObject({ pending: 0, repairPending: 0, done: 1 });
   });
 
-  it("counts repair-pending cards for its progress from the store's count of them, never whole-table stats", async () => {
+  it("counts repair-pending cards for its progress from pages of the card table, never a whole-table read", async () => {
     addSession("ses_a", { time_updated: T0 + 200 });
     addUser("ses_a", "a prompt");
     addSession("ses_b", { time_updated: T0 + 100 });
@@ -753,8 +753,12 @@ describe("v2 repair sweep", () => {
     store.markRepairPending("ses_a", "an earlier failure");
     store.setMeta(REPAIR_GEN_KEY, String(GEN));
     store.setMeta(REPAIR_PROGRESS_KEY, "");
-    const counted = vi.spyOn(store, "repairPendingCount");
-    const wholeTable = vi.spyOn(store, "cardStats");
+    const counted = vi.spyOn(store, "repairStatePage");
+    const wholeTable = [
+      vi.spyOn(store, "cardStats"),
+      vi.spyOn(store, "repairPendingCount"),
+      vi.spyOn(store, "staleCards"),
+    ];
 
     // Nothing stale: the sweep only reports.
     let h = startDistiller();
@@ -772,7 +776,7 @@ describe("v2 repair sweep", () => {
     );
     expect(h.distiller.repair()?.sweep).toMatchObject({ pending: 0, repairPending: 1, done: 1 });
     expect(counted).toHaveBeenCalled();
-    expect(wholeTable).not.toHaveBeenCalled();
+    for (const read of wholeTable) expect(read).not.toHaveBeenCalled();
   });
 });
 

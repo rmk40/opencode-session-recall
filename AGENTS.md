@@ -298,6 +298,21 @@ nothing. A lexical write that allocates no revision stays invisible to readers. 
 card runtime applies only the cards stamped since its last refresh (see the card
 runtime section below), so it keeps serving the old card until its next full load.
 
+The lease holder also owns WAL checkpoints. SQLite's automatic checkpoint runs
+inside whichever commit crosses 1,000 WAL pages and copies them all into the
+database there, so one small meta write can carry tens of milliseconds of copying
+on a long-used store. While a process holds the lease its connection sets
+`wal_autocheckpoint=0` (`Store.setAutoCheckpoint`), and the distiller runs passive
+checkpoints (`Store.checkpoint`) itself: at the start of a background slice once
+the last one is 10 ms old, so each copies about one slice of writes, and on a
+timer for writes no distiller slice follows. A session write that already held the
+loop past the 35 ms background budget checkpoints before it yields, so its pages
+are not left for the next slice to copy. It gives the setting back when it
+loses the lease or stops, so a store whose lease nobody holds still checkpoints on
+SQLite's default. The cold pass examines sessions newest first, so its cursor
+(`coldpass_cursor`) moves with nearly every session; it is written at most once a
+second.
+
 ## Schema 5 card writes account for their own revisions
 
 Schema 5 adds five nullable `card` columns and one table. Existing rows read NULL in
@@ -334,10 +349,19 @@ of its writes and never closes. `cardCounters()` reads every counter in one
 statement over `meta` alone, and it is what anything polling for changes reads.
 `cardStats()` adds card counts that read the whole card table (16 to 20 ms on a
 12,000-card store, over a second on a cold file), so no runtime path calls it.
-`repairPendingCount()` counts through `card_repair_pending`, a partial index over
-the cards with a repair reason, which SQLite keeps exact whichever build writes.
-The index is no part of a schema version: every accepted open except an
-`existingOnly` one creates it when missing.
+The stale cards and the repair-pending count come from `repairStatePage()`, 500
+cards at a time in session-id order, and the distiller walks the pages with a
+yield between them (`readRepairState` in `src/distill.ts`). `staleCards()` and
+`repairPendingCount()` walk every page in one call, so no runtime path calls them.
+The holder keeps the count against the card revisions, `cards_deleted` and
+`repair_rev`, which every write of this build that sets or clears a repair reason
+advances in its own transaction. An older build writes reasons without it, which
+only a lease holder does, so a process drops its count whenever it takes the
+lease. Some builds of schema 5 create `card_repair_pending`, a partial index over
+the cards with a repair reason, inside the open transaction, which reads every
+card. Every accepted open except an `existingOnly` one drops it. That is bounded
+(the index has an entry per repair-pending card) and changes no read's result.
+**Never build an index over the card table on the open path.**
 **A new lexical write path allocates through `nextRev()` in its own transaction**,
 never by bumping `cards_rev` from outside the store.
 
