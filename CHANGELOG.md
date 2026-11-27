@@ -263,10 +263,11 @@ most of them on a store of 12,000 cards.
   statement, which SQLite ran over an index of every message in the
   database. It now reads the messages created up to its start, 2,000 at a
   time in order of creation with a pause between pages and at most ten pages
-  a poll. The next poll goes on from where it stopped. Each session is
-  signaled once a poll. A window read to its end moves the watermark to the
-  poll's start, so a message committed behind the poll while it read is read
-  again by the next one. In the gates the 11 polls that drained 200,000 new
+  a poll. The next poll goes on from where it stopped, up to the same point
+  in time. Each session is signaled once a poll. A window read to its end
+  sets the watermark to the start of the poll that began it, so a message
+  committed behind the polls while they read is read again by the next
+  window. In the gates the 11 polls that drained 200,000 new
   messages after 600,000 older ones held the event loop for at most 10 ms,
   against 26 ms in one statement.
 

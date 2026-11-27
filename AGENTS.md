@@ -835,11 +835,15 @@ filter are bounded by an index range the same way. The message poll, for example
 reads the rows past its watermark in `(time_created, id)` pages of 2,000
 (`pollPageRows`) with a yield before each, because grouping them by session in one
 statement leads SQLite to scan a covering index of the whole table. Paging makes
-the read take time, so **the window ends at the poll's start and a drained window
-moves the watermark to that start, never to the newest row read.** A row committed
-behind the position during the poll is then inside the next poll's overlap. A poll
-reads at most `pollPages` (10) pages, since it holds a fetch permit throughout, and
-the next poll goes on from its row position.
+the read take time, so **a window ends at its cutoff, the start of the poll that
+began it, and a drained window sets the watermark to that cutoff, never to the
+newest row read.** A poll reads at most `pollPages` (10) pages, since it holds a
+fetch permit throughout. The next poll goes on from the row position, which keeps
+the cutoff, so every poll of one window reads up to the same time and rows created
+later belong to the next window. A row committed behind the position while the
+window was read is then inside the next window's overlap. The watermark is set to
+the cutoff even when an older build moved it further meanwhile, so that overlap is
+never skipped.
 `test/history-v2-plans.test.ts` plans every statement the reader and the sync run
 over a long session, with automatic indexes on and off and after `ANALYZE`, and fails
 one that scans either table or reaches it in a join by `session_id=?` alone. A new
