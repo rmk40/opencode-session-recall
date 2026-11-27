@@ -4,6 +4,7 @@ import type { ParsedQuery } from "./query.js";
 import { tokenize, tokenizeAll, tokenText } from "./normalize.js";
 import { evidenceClassFor } from "./extract.js";
 import type { EvidenceClass, ResultWhy } from "./types.js";
+import { runSteps, runStepsPausing, type Steps } from "./yield.js";
 
 /**
  * BM25 relevance ranking over a per-query candidate pool.
@@ -121,9 +122,10 @@ function lowerHasErrorPattern(lower: string): boolean {
 
 /** Recency prior: linearly decays from {@link RECENCY_MULT_MAX} at now to 1.0 at
  *  {@link RECENCY_WINDOW_MS} old, then flat. Exported so tier-1 card ranking
- *  applies the same recency shape as part-level scoring. */
-export function recencyMultiplier(time: number): number {
-  const ageMs = Date.now() - time;
+ *  applies the same recency shape as part-level scoring. `now` defaults to
+ *  the current time. */
+export function recencyMultiplier(time: number, now: number = Date.now()): number {
+  const ageMs = now - time;
   const factor = Math.max(0, 1 - ageMs / RECENCY_WINDOW_MS);
   return 1 + factor * (RECENCY_MULT_MAX - 1);
 }
@@ -347,12 +349,15 @@ const LATER_KINDS = ["prefix", "fuzzy"] as const;
  * then its prefix and fuzzy expansions across fields, each weighted by its
  * expansion weight and field boost; the sum is multiplied by how many distinct
  * query terms it reached.
+ *
+ * It stops every {@link STEP_ITEMS} candidates and scored candidates and
+ * before its sort (see {@link Steps}).
  */
-function scorePool(
+function* scorePool(
   candidates: readonly Candidate[],
   terms: readonly string[],
   expand: Expander,
-): RawHit[] {
+): Steps<RawHit[]> {
   const fieldCount = FIELDS.length;
   const docFreqs = FIELDS.map(() => new Map<string, number>());
   const avgLengths = FIELDS.map(() => 0);
@@ -361,6 +366,7 @@ function scorePool(
   const lengths = FIELDS.map(() => 0);
 
   for (let doc = 0; doc < candidates.length; doc++) {
+    if (doc > 0 && doc % STEP_ITEMS === 0) yield;
     const candidate = candidates[doc]!;
     let held: Map<string, HeldTerm> | undefined;
     let primaryReaching: string[] | undefined;
@@ -418,6 +424,7 @@ function scorePool(
 
   const hits: RawHit[] = [];
   for (const holder of holders) {
+    if (hits.length > 0 && hits.length % STEP_ITEMS === 0) yield;
     let total = 0;
     let quality = 0;
     for (let i = 0; i < terms.length; i++) {
@@ -448,6 +455,7 @@ function scorePool(
       primaryReaching: holder.primaryReaching,
     });
   }
+  yield;
   hits.sort((a, b) => b.score - a.score || a.doc - b.doc);
   return hits;
 }
@@ -552,13 +560,45 @@ function createHitMetadata(query: ParsedQuery, expand: Expander, scoredWith: boo
 /**
  * Score candidates with BM25+ over the pool and return ranked hits.
  * Candidates MUST have stage-2 normalized fields populated (primaryText etc.).
+ * Recency is taken against `now` (default the current time).
  */
 export function bm25Search(
   candidates: Candidate[],
   query: ParsedQuery,
   mode: Bm25Mode,
   explain: boolean,
+  now: number = Date.now(),
 ): Bm25Hit[] {
+  return runSteps(bm25Steps(candidates, query, mode, explain, now));
+}
+
+/** {@link bm25Search}, awaiting `pause` every so often so a large pool does
+ *  not hold the event loop in one slice. The hits are the same. */
+export function bm25SearchPausing(
+  candidates: Candidate[],
+  query: ParsedQuery,
+  mode: Bm25Mode,
+  explain: boolean,
+  pause: () => Promise<void>,
+  now: number = Date.now(),
+): Promise<Bm25Hit[]> {
+  return runStepsPausing(bm25Steps(candidates, query, mode, explain, now), pause);
+}
+
+/** Candidates (or scored candidates) handled between two stops of the
+ *  ranking's steps, and hits given their metadata between two stops. */
+const STEP_ITEMS = 256;
+const STEP_HITS = 64;
+
+/** The ranking as steps. Recency is taken against the one clock reading
+ *  `now`, so where the steps stop cannot change a score. */
+function* bm25Steps(
+  candidates: Candidate[],
+  query: ParsedQuery,
+  mode: Bm25Mode,
+  explain: boolean,
+  now: number,
+): Steps<Bm25Hit[]> {
   if (candidates.length === 0) return [];
 
   // Search terms come from the parsed query tokens (already normalized),
@@ -567,7 +607,7 @@ export function bm25Search(
   if (terms.length === 0) return [];
   const expand = createExpander(terms, mode);
 
-  const rawHits = scorePool(candidates, terms, expand);
+  const rawHits = yield* scorePool(candidates, terms, expand);
   if (rawHits.length === 0) return [];
 
   // Normalize BM25 scores to a 0..1 relative scale using the top score.
@@ -585,6 +625,8 @@ export function bm25Search(
 
   const hits: Bm25Hit[] = [];
   for (const hit of rawHits) {
+    // A hit's matched fields may tokenize its whole field texts.
+    if (hits.length > 0 && hits.length % STEP_HITS === 0) yield;
     const candidate = candidates[hit.doc]!;
     const base = clamp01(hit.score / maxScore);
     const reasons: string[] = [];
@@ -661,7 +703,7 @@ export function bm25Search(
       if (explain) reasons.push(`User text: ×${USER_ROLE_MULT}`);
     }
 
-    const recency = recencyMultiplier(candidate.time);
+    const recency = recencyMultiplier(candidate.time, now);
     if (recency > 1) {
       mult *= recency;
       if (explain) reasons.push(`Recency: ×${recency.toFixed(3)}`);
@@ -691,6 +733,7 @@ export function bm25Search(
     });
   }
 
+  yield;
   hits.sort(compareHits);
 
   // Drop trailing noise from OR-combined weak single-term matches, but never

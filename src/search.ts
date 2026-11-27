@@ -53,7 +53,8 @@ import {
 } from "./candidates.js";
 import type { CandidateEmbedder } from "./corpus.js";
 import { cosineSimilarity } from "./semantic/similarity.js";
-import { clamp01, bm25Search, type Bm25Hit } from "./bm25.js";
+import { clamp01, bm25SearchPausing, type Bm25Hit } from "./bm25.js";
+import { yieldOnBudget } from "./yield.js";
 import { smartSnippet, truncatePreservingMatch } from "./snippet.js";
 import { compileRegex, regexFirstIndex, regexSnippet } from "./regex.js";
 import { classifyQuery } from "./route.js";
@@ -116,6 +117,10 @@ export type SearchDeps = {
   store: Store | null;
   cards: CardsRuntime;
   drill: Drill;
+  /** Awaited between the slim-index lookup's statements, while a deep
+   *  sweep's pool is ranked and while results are built from ranked hits.
+   *  Default: {@link yieldOnBudget}, the search's foreground yield point. */
+  yieldPoint?: () => Promise<void>;
   /** Opt-in semantic layer. When present and ready, the tier-1 card runtime
    *  already blends its signal; the search tool additionally uses the embedder
    *  here for the bounded zero-lexical-hit part-level rescue (semantic-
@@ -882,16 +887,23 @@ function regexScanCandidates(
 
 // ── Convert ranked results to SearchResult[] ─────────────────────────
 
-function rankedToSearchResults(
+/** Ranked hits converted between two awaits of the caller's yield point:
+ *  each builds a snippet over the hit's raw text. */
+const RESULTS_PER_STEP = 32;
+
+async function rankedToSearchResults(
   ranked: Bm25Hit[],
   mode: MatchMode,
   explain: boolean,
   query: ReturnType<typeof parseQuery>,
   width: number | undefined,
   relevanceBySession: Map<string, DirectoryRelevance>,
-  emitAuthorship = false,
-): SearchResult[] {
-  return ranked.map((r) => {
+  emitAuthorship: boolean,
+  pause: () => Promise<void>,
+): Promise<SearchResult[]> {
+  const results: SearchResult[] = [];
+  for (const r of ranked) {
+    if (results.length > 0 && results.length % RESULTS_PER_STEP === 0) await pause();
     const c = r.candidate;
     // Directory relevance is per-query (it depends on the caller's directory
     // filter), so it comes from the query's session map, never from the
@@ -938,8 +950,10 @@ function rankedToSearchResults(
       result.matchReasons = r.matchReasons;
     }
 
-    return result;
-  });
+    results.push(result);
+  }
+  await pause();
+  return results;
 }
 
 // ── Zero-lexical-hit semantic rescue ─────────────────────────────────
@@ -2539,6 +2553,7 @@ export function search(
   deps: SearchDeps,
 ): ToolDefinition {
   const { cards, drill, store, gate, mode, maybeRefresh } = deps;
+  const pause = deps.yieldPoint ?? yieldOnBudget;
   return tool({
     description: `Search prior opencode conversations by message/tool-output content. Primary history-discovery tool; prefer over recall_sessions for topical discovery (titles only).
 
@@ -3906,7 +3921,10 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
           /** The lookup's rows in its order, kept for the family's preference. */
           let ftsRows: FtsHit[] = [];
           if (store) {
-            const rows = store.ftsSearch({ strong: strongAnchors, weak: queryMeta.tokens });
+            const rows = await store.ftsSearchPausing(
+              { strong: strongAnchors, weak: queryMeta.tokens },
+              pause,
+            );
             ftsRows = rows;
             ftsBySession = new Map<string, FtsHit[]>();
             for (const row of rows) {
@@ -4757,8 +4775,14 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
           } else {
             effMode = smartMode;
             const allCandidates = deepResult.pools.flatMap((pool) => pool.candidates);
-            const hits = bm25Search(allCandidates, queryMeta, smartMode, explain);
-            const allResults = rankedToSearchResults(
+            const hits = await bm25SearchPausing(
+              allCandidates,
+              queryMeta,
+              smartMode,
+              explain,
+              pause,
+            );
+            const allResults = await rankedToSearchResults(
               hits,
               smartMode,
               explain,
@@ -4766,6 +4790,7 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
               widthArg,
               relevanceBySession,
               emitAuthorship,
+              pause,
             );
             const sliced = applyGroupAndSlice(
               allResults,
@@ -4879,7 +4904,7 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
           drilled.loadErrors,
           drilled.budgetExhausted,
         );
-        let allResults = rankedToSearchResults(
+        let allResults = await rankedToSearchResults(
           drilled.hits,
           smartMode,
           explain,
@@ -4887,6 +4912,7 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
           widthArg,
           relevanceBySession,
           emitAuthorship,
+          pause,
         );
 
         // ── Zero-lexical-hit semantic rescue (Path A) ──

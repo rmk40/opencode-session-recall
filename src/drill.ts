@@ -15,8 +15,9 @@ import { normalize } from "./normalize.js";
 import { searchable } from "./extract.js";
 import { authorshipOf, type Authorship, type AuthorshipCounts } from "./authorship.js";
 import type { Bm25Hit, Bm25Mode } from "./bm25.js";
-import { rerankDrilled } from "./rerank.js";
+import { rerankDrilledPausing } from "./rerank.js";
 import type { FtsHit } from "./store.js";
+import { yieldOnBudget } from "./yield.js";
 
 /**
  * Tier-2 bounded drill.
@@ -282,6 +283,9 @@ export type DrillDeps = {
    *  {@link MAX_CACHED_OBJECTS}). Injectable so tests can reach the bound
    *  without fetching tens of thousands of messages. */
   maxCachedObjects?: number;
+  /** Awaited every so often while the drilled pool is ranked. Default:
+   *  {@link yieldOnBudget}, the search's foreground yield point. */
+  yieldPoint?: () => Promise<void>;
 };
 
 /** Messages per page during a deep sweep (the spec's exhaustive page size). */
@@ -1297,12 +1301,13 @@ export function createDrill(deps: DrillDeps): Drill {
   return {
     async drill(input): Promise<DrillOutput> {
       const collected = await collectPools(input);
-      const hits = rerankDrilled(
+      const hits = await rerankDrilledPausing(
         collected.pools,
         input.deepSet,
         input.query,
         input.mode,
         input.explain,
+        deps.yieldPoint ?? yieldOnBudget,
       );
       return { hits, ...collected };
     },

@@ -1,6 +1,7 @@
 import type { Row, SqliteDb, SqlValue } from "./sqlite.js";
 import { loadFs, loadPath, loadOs } from "./node-import.js";
 import { EMBED_REPRESENTATION } from "./embedding-text.js";
+import { runSteps, runStepsPausing, type Steps } from "./yield.js";
 
 /**
  * Card + slim-part-index store over a {@link SqliteDb}.
@@ -926,6 +927,10 @@ export type Store = {
    * the whole lookup.
    */
   ftsSearch(input: FtsQuery): FtsHit[];
+  /** {@link Store.ftsSearch}, awaiting `pause` before, between and after its
+   *  statements, so a plain-word lookup's several statements do not run in
+   *  one slice of the event loop. The statements and rows are the same. */
+  ftsSearchPausing(input: FtsQuery, pause: () => Promise<void>): Promise<FtsHit[]>;
   getMeta(key: string): string | undefined;
   setMeta(key: string, value: string): void;
   /**
@@ -2696,6 +2701,20 @@ class SqliteStore implements Store {
   }
 
   ftsSearch(input: FtsQuery): FtsHit[] {
+    return runSteps(this.ftsSteps(input));
+  }
+
+  async ftsSearchPausing(input: FtsQuery, pause: () => Promise<void>): Promise<FtsHit[]> {
+    // Before the first statement and after the last too, so the work around
+    // the lookup does not share a slice with one of its statements.
+    await pause();
+    const hits = await runStepsPausing(this.ftsSteps(input), pause);
+    await pause();
+    return hits;
+  }
+
+  /** The lookup as steps that stop between its statements. */
+  private *ftsSteps(input: FtsQuery): Steps<FtsHit[]> {
     const budget =
       input.weakRowBudget != null && Number.isFinite(input.weakRowBudget) && input.weakRowBudget > 0
         ? Math.floor(input.weakRowBudget)
@@ -2707,30 +2726,45 @@ class SqliteStore implements Store {
     // Strong anchors as before; only a plain-word lookup is bounded.
     const strong = buildMatch(input.strong ?? [], []);
     if (strong) return this.scoredRows(strong, limit);
-    return this.plainWordRows(input.weak ?? [], budget, limit);
+    return yield* this.plainWordRows(input.weak ?? [], budget, limit);
   }
 
-  /** A lookup by plain words under `budget` (see {@link Store.ftsSearch}). */
-  private plainWordRows(words: readonly string[], budget: number, limit: number): FtsHit[] {
+  /** A lookup by plain words under `budget` (see {@link Store.ftsSearch}),
+   *  stopping before each statement after the first. */
+  private *plainWordRows(words: readonly string[], budget: number, limit: number): Steps<FtsHit[]> {
     const phrases = [...new Set(words.map(quoteAnchor).filter((a): a is string => a !== null))];
-    const kept = boundWeakAnchors(phrases, (phrase) => this.matchRows(phrase, budget), budget);
+    const counts = new Map<string, number>();
+    for (const phrase of phrases) {
+      if (counts.size > 0) yield;
+      counts.set(phrase, this.matchRows(phrase, budget));
+    }
+    const kept = boundWeakAnchors(phrases, (phrase) => counts.get(phrase) ?? 0, budget);
     let full: FtsHit[] = [];
     if (phrases.length >= 2) {
       const together = phrases.join(" AND ");
+      yield;
       const rows = this.recentRows(together, limit);
       // Fewer than `limit` rows are the whole match, so only a full list
       // needs counting; an AND walks its posting lists once per statement.
-      const total = rows.length < limit ? rows.length : this.matchRows(together, budget);
+      let total = rows.length;
+      if (rows.length >= limit) {
+        yield;
+        total = this.matchRows(together, budget);
+      }
       if (total > 0 && total < budget) full = rows;
     }
     if (kept.length === 0 || full.length >= limit) return full;
     const rankCap = Math.min(budget * RANKING_ROWS_FACTOR, Number.MAX_SAFE_INTEGER);
-    const ranking = phrases.filter(
-      (phrase) => !kept.includes(phrase) && this.matchRows(phrase, rankCap) < rankCap,
-    );
+    const ranking: string[] = [];
+    for (const phrase of phrases) {
+      if (kept.includes(phrase)) continue;
+      yield;
+      if (this.matchRows(phrase, rankCap) < rankCap) ranking.push(phrase);
+    }
     // Every row holding all the words holds a kept one, so the kept lookup
     // lists them again; `limit` rows leave enough once they are skipped.
     const listed = new Set(full.map((hit) => hit.partId));
+    yield;
     const rest = this.scoredRows(rankedMatch(phrases, kept, ranking), limit).filter(
       (hit) => !listed.has(hit.partId),
     );

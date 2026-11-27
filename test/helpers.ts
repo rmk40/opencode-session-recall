@@ -116,6 +116,11 @@ export type FakeOptions = {
   childrenThrows?: boolean;
   /** session.children returns a divergent non-array `data` payload. */
   childrenNonArray?: boolean;
+  /** Sessions and messages to serve instead of the fixture's. */
+  corpus?: { sessions: Session[]; messagesBySession: Record<string, MessageBundle[]> };
+  /** Awaited by session.messages before it answers, as a server's reply
+   *  would make the caller wait for I/O. */
+  beforeMessages?: () => Promise<void>;
 };
 
 export type FakeHarness = {
@@ -533,7 +538,9 @@ function filtered<T extends Session | GlobalSession>(
 }
 
 export function makeFakeHarness(options: FakeOptions = {}): FakeHarness {
-  const fixture = makeFixture();
+  const fixture = options.corpus
+    ? { ...options.corpus, globalSessions: options.corpus.sessions.map(globalSessionFrom) }
+    : makeFixture();
   const calls: FakeCalls = {
     projectList: [],
     globalList: [],
@@ -575,6 +582,7 @@ export function makeFakeHarness(options: FakeOptions = {}): FakeHarness {
       messages: async (params: { sessionID: string; limit?: number; before?: string }) => {
         const { sessionID, limit, before } = params;
         calls.messages.push({ sessionID, limit, before });
+        await options.beforeMessages?.();
         options.afterMessagesCall?.(sessionID);
         if (options.messageThrows?.has(sessionID)) throw new Error(`thrown messages: ${sessionID}`);
         if (options.messageErrors?.[sessionID]) {
@@ -891,6 +899,8 @@ export async function makeRecallDeps(
      *  its loaded snapshot regardless of wall time). */
     cardsNow?: () => number;
     cardsRefreshIntervalMs?: number;
+    /** The search's and the drill's yield point. */
+    yieldPoint?: () => Promise<void>;
   } = {},
 ): Promise<{ deps: SearchDeps; store: Store; cleanup: () => void }> {
   const dir = mkdtempSync(join(tmpdir(), "recall-deps-"));
@@ -914,9 +924,10 @@ export async function makeRecallDeps(
     limits,
     now: opts.now,
     deepWallClockMs: opts.deepWallClockMs,
+    yieldPoint: opts.yieldPoint,
   });
   return {
-    deps: { gate, store, cards, drill },
+    deps: { gate, store, cards, drill, yieldPoint: opts.yieldPoint },
     store,
     cleanup: () => {
       db.close();

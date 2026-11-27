@@ -1,5 +1,6 @@
 import {
   bm25Search,
+  bm25SearchPausing,
   compareHits,
   MIN_RELATIVE_SCORE,
   type Bm25Hit,
@@ -33,12 +34,50 @@ export const SHORTLIST_MULT = 1.1;
  * the broad pool, so the broad pass's hits serve as the deep pass's.
  */
 export function rerankDrilled(
-  pools: ReadonlyArray<{ target: { sessionId: string }; candidates: Candidate[] }>,
+  pools: readonly DrilledCandidates[],
   deepSet: ReadonlySet<string>,
   query: ParsedQuery,
   mode: Bm25Mode,
   explain: boolean,
 ): Bm25Hit[] {
+  const { broadPool, deepPool, allDeep } = splitPools(pools, deepSet);
+  const now = Date.now();
+  const broad = bm25Search(broadPool, query, mode, explain, now);
+  const deep = allDeep ? broad : bm25Search(deepPool, query, mode, explain, now);
+  return mergeShortlistHits(broad, deep, explain);
+}
+
+/** {@link rerankDrilled}, awaiting `pause` every so often (and between the
+ *  passes) so a large pool does not hold the event loop in one slice. Both
+ *  passes take recency against one clock reading, as there, so the hits are
+ *  the same. */
+export async function rerankDrilledPausing(
+  pools: readonly DrilledCandidates[],
+  deepSet: ReadonlySet<string>,
+  query: ParsedQuery,
+  mode: Bm25Mode,
+  explain: boolean,
+  pause: () => Promise<void>,
+): Promise<Bm25Hit[]> {
+  const { broadPool, deepPool, allDeep } = splitPools(pools, deepSet);
+  const now = Date.now();
+  const broad = await bm25SearchPausing(broadPool, query, mode, explain, pause, now);
+  const deep = allDeep
+    ? broad
+    : await bm25SearchPausing(deepPool, query, mode, explain, pause, now);
+  await pause();
+  return mergeShortlistHits(broad, deep, explain);
+}
+
+/** One drilled session's candidates. */
+type DrilledCandidates = { target: { sessionId: string }; candidates: Candidate[] };
+
+/** Every pool's candidates, the `deepSet` pools' candidates in the same
+ *  order, and whether those are every pool. */
+function splitPools(
+  pools: readonly DrilledCandidates[],
+  deepSet: ReadonlySet<string>,
+): { broadPool: Candidate[]; deepPool: Candidate[]; allDeep: boolean } {
   const broadPool: Candidate[] = [];
   const deepPool: Candidate[] = [];
   let allDeep = true;
@@ -50,9 +89,7 @@ export function rerankDrilled(
       if (deep) deepPool.push(candidate);
     }
   }
-  const broad = bm25Search(broadPool, query, mode, explain);
-  const deep = allDeep ? broad : bm25Search(deepPool, query, mode, explain);
-  return mergeShortlistHits(broad, deep, explain);
+  return { broadPool, deepPool, allDeep };
 }
 
 /**

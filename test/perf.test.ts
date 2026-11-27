@@ -29,6 +29,11 @@
  *     code slice over 35ms, that read included.
  *   - 24 `recall` searches with card writes between them: card tier p50 <
  *     250ms, whole search p50 < 1s, no full load.
+ * A search call's own slices, SQLite included:
+ *   - A warm drilled smart search over about 11,000 parts: no code slice over
+ *     150ms with GC pauses excluded.
+ *   - Plain-word lookups on a 1,000,000-row slim index: no code slice over
+ *     150ms, nor more than 30ms past the lookup's longest statement.
  * The slice budgets leave out V8's garbage-collection pauses, logged beside
  * them with the raw stalls: building an index of this size makes major
  * collections that, on a loaded machine, pause the loop past the budget on
@@ -64,9 +69,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import v8 from "node:v8";
 import vm from "node:vm";
+import { yieldOnBudget } from "../src/yield.js";
 import {
   hashingEmbedder,
   loadAverage,
+  mulberry32,
   perfCorpus,
   stallProbe,
   type PerfCorpus,
@@ -78,6 +85,8 @@ import {
   bundle,
   completedToolPart,
   globalSessionFrom,
+  makeFakeHarness,
+  makeRecallDeps,
   messagesResponse,
   paginateBundles,
   session,
@@ -1263,4 +1272,186 @@ describe.skipIf(!ENABLED)(`perf: card runtime on a ${BIG_CARDS}-card store`, () 
     expect(p50).toBeLessThan(CARD_TIER_P50_BUDGET_MS);
     expect(percentile(totals, 0.5)).toBeLessThan(SEARCH_P50_BUDGET_MS);
   }, 300_000);
+});
+
+// ── A search's own slices ────────────────────────────────────────────────────
+
+/** The longest event-loop slice a search call may hold, SQLite included. */
+const SEARCH_SLICE_BUDGET_MS = 150;
+
+/** Words of 3 to 10 letters, drawn Zipf-like so a few are in most texts. */
+function zipfWords(seed: number, size: number): (rand: () => number) => string {
+  const words: string[] = [];
+  const letters = "abcdefghijklmnoprstuvwz";
+  const rand = mulberry32(seed);
+  const seen = new Set<string>();
+  while (words.length < size) {
+    let word = "";
+    const length = 3 + Math.floor(rand() * 8);
+    while (word.length < length) word += letters[Math.floor(rand() * letters.length)];
+    if (seen.has(word)) continue;
+    seen.add(word);
+    words.push(word);
+  }
+  return (r) => words[Math.floor(Math.pow(r(), 2.2) * size)]!;
+}
+
+describe.skipIf(!ENABLED)("perf: a search call's slices", () => {
+  it(`a drilled smart search over a large pool keeps each code slice under ${SEARCH_SLICE_BUDGET_MS} ms excluding GC pauses`, async () => {
+    // 12 sessions of 550 messages, about 11,000 drilled parts and 16 million
+    // characters (near the drill's per-session and per-query budgets), every
+    // page holding the query's words.
+    const word = zipfWords(11, 4_000);
+    const rand = mulberry32(13);
+    const prose = (n: number): string => Array.from({ length: n }, () => word(rand)).join(" ");
+    const sessions: Session[] = [];
+    const messagesBySession: Record<string, { info: Message; parts: Part[] }[]> = {};
+    for (let s = 0; s < 12; s++) {
+      const id = `slice-${s}`;
+      sessions.push(session(id, `Slice session ${s} ${prose(4)}`, PROJECT_DIR, NOW - s * 60_000));
+      const bundles: { info: Message; parts: Part[] }[] = [];
+      for (let m = 0; m < 550; m++) {
+        const mid = `${id}-m${String(m).padStart(3, "0")}`;
+        const time = NOW - s * 60_000 - (550 - m) * 100;
+        bundles.push(
+          m % 3 === 0
+            ? bundle(userMessage(mid, id, time), [textPart(`${mid}-t`, id, mid, prose(40))])
+            : bundle(assistantMessage(mid, id, time), [
+                textPart(`${mid}-t`, id, mid, prose(190)),
+                completedToolPart(
+                  `${mid}-k`,
+                  id,
+                  mid,
+                  "bash",
+                  { command: prose(6), cwd: PROJECT_DIR },
+                  prose(280),
+                  { title: prose(3) },
+                ),
+              ]),
+        );
+      }
+      messagesBySession[id] = bundles;
+    }
+    // A history read waits on I/O, as the host's would.
+    const h = makeFakeHarness({
+      corpus: { sessions, messagesBySession },
+      beforeMessages: () => new Promise((resolve) => setImmediate(resolve)),
+    });
+    const { deps, cleanup } = await makeRecallDeps(h, LIMITS);
+    const probe = stallProbe();
+    try {
+      const tool = search(h.source, true, LIMITS, deps);
+      const query = `${word(() => 0.05)} ${word(() => 0.1)} ${word(() => 0.15)}`;
+      const run = async (): Promise<SearchOutput> =>
+        JSON.parse(
+          toolResultText(
+            await tool.execute(
+              { query, match: "smart", scope: "global", results: 20 } as Parameters<
+                typeof tool.execute
+              >[0],
+              perfContext(),
+            ),
+          ),
+        ) as SearchOutput;
+      const first = await run(); // fills the drill cache: the measured run is warm
+      probe.reset();
+      const started = performance.now();
+      const out = await run();
+      const elapsed = performance.now() - started;
+      const stalls = await probe.stalls();
+      console.log(
+        `[perf] drilled smart search over ${out.coverage?.messagesFetched ?? "?"} messages: ${elapsed.toFixed(0)} ms, longest code slice ${stalls.maxOutsideGcMs.toFixed(1)} ms (raw ${stalls.maxMs.toFixed(1)} ms, GC pause max ${stalls.maxGcMs.toFixed(1)} ms), load ${loadAverage()}`,
+      );
+      expect(out.ok).toBe(true);
+      // The same parts as the cold run, whose recency was read earlier.
+      expect(out.results.map((r) => r.partID)).toEqual(first.results.map((r) => r.partID));
+      expect(out.results.length).toBeGreaterThan(0);
+      expect(stalls.maxOutsideGcMs).toBeLessThan(SEARCH_SLICE_BUDGET_MS);
+    } finally {
+      probe.stop();
+      cleanup();
+    }
+  }, 300_000);
+
+  it(`a plain-word lookup on a 1,000,000-row index keeps each code slice under ${SEARCH_SLICE_BUDGET_MS} ms excluding GC pauses`, async () => {
+    const dir = mkdtempSync(join(tmpdir(), "perf-lookup-"));
+    const raw = await openSqlite(join(dir, "store.db"));
+    expect(raw).not.toBeNull();
+    const db = raw!;
+    // Every statement the store runs, timed, so a slice can be held to the
+    // longest one.
+    let longestStatementMs = 0;
+    const timed =
+      <A extends unknown[], R>(fn: (...args: A) => R) =>
+      (...args: A): R => {
+        const started = performance.now();
+        try {
+          return fn(...args);
+        } finally {
+          longestStatementMs = Math.max(longestStatementMs, performance.now() - started);
+        }
+      };
+    const store = openV1Store({ ...db, get: timed(db.get), all: timed(db.all) })!;
+    const probe = stallProbe();
+    try {
+      const ROWS = 1_000_000;
+      const word = zipfWords(17, 60_000);
+      const rand = mulberry32(19);
+      for (let start = 0; start < ROWS; start += 20_000) {
+        db.tx(() => {
+          for (let i = start; i < start + 20_000; i++) {
+            const words = Array.from({ length: 6 }, () => word(rand));
+            if (rand() < 0.45) words.push("in");
+            if (rand() < 0.25) words.push("app");
+            if (rand() < 0.12) words.push("sign");
+            if (rand() < 0.04) words.push("desktop");
+            if (rand() < 0.015) words.push("inference");
+            if (rand() < 0.003) words.push("launcher");
+            if (rand() < 0.0005) words.push("governed");
+            // Two words in 45% of rows each, interleaved, sharing one row.
+            if (i % 20 < 9 || i === 777_777) words.push("omega");
+            if (i % 20 >= 11 || i === 777_777) words.push("sigma");
+            const text = words.join(" ");
+            const { lastInsertRowid } = db.run(
+              "INSERT INTO part_text(session_id, part_id, message_id, prev_message_id, next_message_id, class, time_created, raw, norm) VALUES(?, ?, ?, NULL, NULL, 'human-text', ?, ?, ?)",
+              [`s${Math.floor(i / 1000)}`, `p${i}`, `m${i}`, i, text, text],
+            );
+            db.run("INSERT INTO part_fts(rowid, raw, norm) VALUES(?, ?, ?)", [
+              lastInsertRowid,
+              text,
+              text,
+            ]);
+          }
+        });
+      }
+      const lookups = [
+        ["actualyze", "desktop", "app", "launcher", "sign", "in", "governed", "inference"],
+        ["omega", "sigma"],
+        ["in", "app", "sign"],
+      ];
+      for (const weak of lookups) {
+        const input = { strong: [], weak };
+        store.ftsSearch(input); // warm the pages
+        const syncStarted = performance.now();
+        const expected = store.ftsSearch(input);
+        const syncMs = performance.now() - syncStarted;
+        longestStatementMs = 0;
+        probe.reset();
+        const hits = await store.ftsSearchPausing(input, yieldOnBudget);
+        const stalls = await probe.stalls();
+        console.log(
+          `[perf] lookup "${weak.join(" ")}" over ${ROWS} rows: whole lookup ${syncMs.toFixed(1)} ms, longest code slice ${stalls.maxOutsideGcMs.toFixed(1)} ms, longest statement ${longestStatementMs.toFixed(1)} ms, load ${loadAverage()}`,
+        );
+        expect(hits).toEqual(expected);
+        expect(stalls.maxOutsideGcMs).toBeLessThan(SEARCH_SLICE_BUDGET_MS);
+        // The lookup yields between statements: no slice holds much more than
+        // the longest one and the slicer's budget.
+        expect(stalls.maxOutsideGcMs).toBeLessThan(longestStatementMs + 30);
+      }
+    } finally {
+      probe.stop();
+      db.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 600_000);
 });
