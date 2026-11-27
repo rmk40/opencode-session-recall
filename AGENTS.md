@@ -384,6 +384,20 @@ A write that stamps no revision (an older build's) passes that check unseen. The
 indexed text is re-read in the transaction, so the index stays whole. The next full
 write compares against the rows as they are.
 
+An append reads the stored rows the same way. It builds its card from
+`appendedRows` before the transaction, with yields while it derives the inventory.
+`appendedRows` is the layout the store applies inside the transaction, which reads
+the session's rowids and the indexed text of the rows it evicts and no other stored
+row. A refused append runs again over the rows read inside the transaction, which
+recomputes the card there.
+
+The card inventory ranks tokens by count and then `localeCompare`. `topByFrequency`
+keeps the first tokens of that order without sorting them all. A session can hold
+hundreds of thousands of distinct code tokens. Sorting them all took over 100 ms in
+one slice. Its order must stay exactly that of a stable full
+sort, which `test/distill.test.ts` checks. Any other order changes the inventory of
+every card on its next write, so each would allocate a revision and lose its vector.
+
 ## The card runtime applies store changes in place
 
 `src/cards.ts` keeps two layers per process. The card map (`cardById`) holds every

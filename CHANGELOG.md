@@ -173,6 +173,19 @@ most of them on a store of 12,000 cards.
   evicted the oldest took 23 to 25 ms from its first read to its commit, with
   no slice over 8 ms. Before, it took 97 to 100 ms in one slice. It now runs 9
   row and index statements, against 15,001.
+- **An append builds its card before its write.** Once a session has more
+  than 2,000 parts, the distiller appends new messages to its card. The
+  append read every stored row of the session twice inside its transaction
+  and derived the card's inventory there, over every row it kept. It now
+  reads the stored rows before the write, 500 at a time with a pause between
+  reads. It derives the card before the write too, pausing as it goes. The
+  transaction reads only the rows it evicts. Ranking the inventory also no
+  longer sorts every token. A session with a real spread of code tokens can
+  hold over 200,000 distinct ones. That sort alone held the event loop for
+  over 100 ms. The inventory comes out the same. In the gates, with 5,000 indexed rows the
+  size of a real session's, appending one message held the event loop for at
+  most 21 to 24 ms, against 504 to 644 ms in one slice before. A full re-read
+  of the same card held it for at most 23 to 29 ms, against 202 to 263 ms.
 - **`recall_get` continuations read on from where the output stopped.** On
   opencode v2 a continuation into a message's part rows reads from the row
   of the part where the previous output stopped, about two outputs' worth at
