@@ -3294,7 +3294,7 @@ export function createDistiller(options: DistillerOptions): Distiller {
     // A new generation retries every card an earlier one could not repair.
     adoptRepairGeneration();
     const stale = store.staleCards(gen);
-    const repairPending = (): number => store.cardStats().repairPending;
+    const repairPending = (): number => store.repairPendingCount();
     if (stale.length === 0) {
       shareRepair(
         { pending: 0, repairPending: repairPending(), done: 0, gen, running: false },
@@ -3361,8 +3361,8 @@ export function createDistiller(options: DistillerOptions): Distiller {
         if (!stopped && pendingRerun.delete(sessionId)) scheduleReDistill(sessionId);
         followUpMeta(sessionId);
       }
-      // Counting repair-pending cards reads every card, so only when the
-      // progress is due to be shared.
+      // The progress is written to the store, so only when it is due to be
+      // shared.
       if (now() - repairWrittenAt >= PROGRESS_WRITE_MS) shareRepair(progress(true));
     });
     if (stopped || !ownsLease()) return;
