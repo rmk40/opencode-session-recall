@@ -92,7 +92,9 @@ export function messages(source: HistorySource, gate: FetchGate, limits: Limits)
       order: tool.schema
         .enum(ORDERS)
         .optional()
-        .describe('"newest" (default) or "oldest" first; oldest needs opencode v2'),
+        .describe(
+          '"newest" (default) or "oldest" first; oldest needs opencode v2; a cursor keeps its own',
+        ),
       scan: tool.schema
         .number()
         .min(1)
@@ -104,8 +106,8 @@ export function messages(source: HistorySource, gate: FetchGate, limits: Limits)
       const sid = optionalString(args.sessionID) ?? ctx.sessionID;
       const query = optionalString(args.query);
       // The live MCP host can bypass Zod defaults, so coerce every optional arg
-      // defensively. An undefined `role` previously made `role !== "all"` true
-      // and filtered out every message (returned: 0 on a non-empty session).
+      // defensively. An undefined `role` would make `role !== "all"` true and
+      // filter out every message (returned: 0 on a non-empty session).
       const role = coerceEnum(args.role, ROLES, "all");
       const limit = coerceInt(args.limit, Math.min(10, limits.maxMessages), 1, limits.maxMessages);
       const scan = coerceInt(args.scan, SCAN_DEFAULT, 1, SCAN_MAX);
