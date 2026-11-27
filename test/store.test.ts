@@ -4227,6 +4227,23 @@ describe("repair reasons", () => {
     db.close();
   });
 
+  it("clearRepairReasonsPage clears the reasons of one page of cards in session-id order and says where the next starts", async () => {
+    const { db, store } = await fresh();
+    for (const id of ["s5", "s4", "s3", "s2", "s1"])
+      store.replaceSessionParts(id, [], makeCard(id));
+    for (const id of ["s1", "s2", "s4"]) store.markRepairPending(id, "malformed");
+    const reasons = (): Array<string | undefined> =>
+      ["s1", "s2", "s3", "s4", "s5"].map((id) => store.getCard(id)?.repairReason);
+
+    expect(store.clearRepairReasonsPage(undefined, 2)).toEqual({ read: 2, last: "s2", cleared: 2 });
+    expect(reasons()).toEqual([undefined, undefined, undefined, "malformed", undefined]);
+    expect(store.clearRepairReasonsPage("s2", 2)).toEqual({ read: 2, last: "s4", cleared: 1 });
+    expect(store.clearRepairReasonsPage("s4", 2)).toEqual({ read: 1, last: "s5", cleared: 0 });
+    expect(store.clearRepairReasonsPage("s5", 2)).toEqual({ read: 0, cleared: 0 });
+    expect(reasons()).toEqual([undefined, undefined, undefined, undefined, undefined]);
+    db.close();
+  });
+
   // `marked` and `other` both carry a reason, `plain` none; all at generation 2.
   it.each<{ name: string; write: (store: Store) => unknown; moves: "once" | "not at all" }>([
     {
@@ -4252,6 +4269,16 @@ describe("repair reasons", () => {
         return s.clearRepairReasons();
       },
       moves: "once",
+    },
+    {
+      name: "clearing the reasons of a page of cards",
+      write: (s) => s.clearRepairReasonsPage(undefined, 2),
+      moves: "once",
+    },
+    {
+      name: "clearing a page of cards with no reason among them",
+      write: (s) => s.clearRepairReasonsPage("other", 10),
+      moves: "not at all",
     },
     {
       name: "a replace that leaves the card as it was and clears its reason",

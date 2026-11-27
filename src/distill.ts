@@ -134,14 +134,26 @@ const CURSOR_WRITE_MS = 1_000;
  *  follows the pages it copies, and copying a page costs less than writing
  *  it, so such a checkpoint stays below a slice of its own. */
 const CHECKPOINT_BUSY_MS = 10;
-/** And this soon once a checkpoint found nothing new. */
+/** And this soon once a checkpoint found nothing new. A checkpoint that could
+ *  copy nothing more, because a reader on another connection still needs the
+ *  frames, doubles the wait for the next timed one up to this. */
 const CHECKPOINT_IDLE_MS = 1_000;
 /** A checkpoint at the start of a slice that took at least this long yields
  *  again before the slice's work. */
 const CHECKPOINT_OWN_SLICE_MS = 2;
 /** A session write that held the loop this long, past the background slice
- *  budget, checkpoints the WAL before it yields (see `yieldAfterWrite`). */
+ *  budget, has the next slice start with a checkpoint (see `yieldAfterWrite`). */
 const LONG_WRITE_MS = 35;
+/**
+ * The lease holder writes no session while the last checkpoint left more WAL
+ * frames than this uncopied (a reader on another connection holds them), so
+ * the checkpoint after the reader lets go copies about this many. Copying a
+ * frame of a session write's pages took 2 to 4 µs on a warm 12,000-card
+ * store, so this many take 8 to 16 ms.
+ */
+export const WAL_BACKLOG_FRAMES = 4_000;
+/** A session write waits for the backlog at most this long, then goes ahead. */
+const WAL_BACKLOG_WAIT_MS = 5_000;
 
 /** With `yieldBetween`, long store sweeps pause after this many writes. */
 const YIELD_EVERY_WRITES = 50;
@@ -1597,9 +1609,23 @@ export function createDistiller(options: DistillerOptions): Distiller {
   /** This connection's commits never checkpoint while it holds the lease:
    *  {@link runCheckpoint} does instead, in a background slice of its own. */
   let checkpointsHeld = false;
-  /** The WAL frame count the last checkpoint reported, and when it ran. */
+  /** The WAL frame count and copied-frame count the last checkpoint
+   *  reported, and when it ran. */
   let lastWalFrames = -1;
+  let lastWalCheckpointed = -1;
   let lastCheckpointAt = -Infinity;
+  /** The frames the last checkpoint left uncopied ({@link WAL_BACKLOG_FRAMES}). */
+  let walBacklog = 0;
+  /** The wait before the next timed checkpoint while checkpoints copy
+   *  nothing more ({@link runCheckpoint}). */
+  let stuckCheckpointMs = CHECKPOINT_BUSY_MS;
+  /** Session writes waiting for the backlog to fall ({@link awaitWalBacklog}). */
+  const backlogWaiters = new Set<() => void>();
+  /** This distiller's projector generation is the stored repair reasons'
+   *  ({@link adoptRepairGeneration}); the stamp only ever rises. */
+  let repairGenAdopted = false;
+  /** The adoption in flight, which every reason waits for. */
+  let adopting: Promise<boolean> | undefined;
   /** The repair-pending count and the store counters it was read against
    *  (see {@link repairPendingCount}); dropped whenever this process takes
    *  the lease, since an older build holding it writes reasons without
@@ -2256,50 +2282,138 @@ export function createDistiller(options: DistillerOptions): Distiller {
    * {@link REPAIR_GEN_KEY} names no generation or a lower one, every reason
    * belongs to an earlier generation: they are cleared, so those cards are
    * tried again, and this generation is stamped. Every reason this distiller
-   * records is preceded by this call, so a reason recorded at the current
-   * generation (by the cold pass, a re-distill or the sweep) is never
-   * cleared. A higher stamp is a newer build's, whose reasons are left
-   * alone. No-op without a projector generation.
+   * records waits for this, so a reason recorded at the current generation
+   * (by the cold pass, a re-distill or the sweep) is never cleared. A higher
+   * stamp is a newer build's, whose reasons are left alone. True at once
+   * without a projector generation.
+   *
+   * The reasons are cleared {@link REPAIR_STATE_PAGE} cards at a time, with a
+   * yield and a check of the lease row before each page, and the generation
+   * is stamped only after the last page. False when a stop or a lost lease
+   * interrupted it: the next holder starts again from the first card.
    */
-  function adoptRepairGeneration(): void {
-    if (projectorGen === undefined) return;
-    const raw = store.getMeta(REPAIR_GEN_KEY);
-    const stamped = raw !== undefined && /^-?\d+$/.test(raw) ? Number(raw) : undefined;
-    if (stamped !== undefined && stamped >= projectorGen) return;
-    const cleared = store.clearRepairReasons();
-    store.setMeta(REPAIR_GEN_KEY, String(projectorGen));
-    if (cleared > 0) {
-      logMsg(`cleared ${cleared} repair reason(s) for projector generation ${projectorGen}`);
-    }
+  function adoptRepairGeneration(): Promise<boolean> {
+    if (projectorGen === undefined || repairGenAdopted) return Promise.resolve(true);
+    adopting ??= clearEarlierRepairReasons(projectorGen).finally(() => {
+      adopting = undefined;
+    });
+    return adopting;
   }
 
-  /** Record a read's projection loss as the card's repair reason. */
-  function markLoss(sessionId: string, loss: string, kept: boolean): void {
-    adoptRepairGeneration();
+  async function clearEarlierRepairReasons(target: number): Promise<boolean> {
+    const raw = store.getMeta(REPAIR_GEN_KEY);
+    const stamped = raw !== undefined && /^-?\d+$/.test(raw) ? Number(raw) : undefined;
+    if (stamped !== undefined && stamped >= target) {
+      repairGenAdopted = true;
+      return true;
+    }
+    let cleared = 0;
+    let after: string | undefined;
+    for (;;) {
+      if (stopped || !ownsLease()) return false;
+      const page = store.clearRepairReasonsPage(after, REPAIR_STATE_PAGE);
+      cleared += page.cleared;
+      if (page.read < REPAIR_STATE_PAGE) break;
+      after = page.last;
+      if (pause) await pause();
+    }
+    if (stopped || !ownsLease()) return false;
+    store.setMeta(REPAIR_GEN_KEY, String(target));
+    repairGenAdopted = true;
+    if (cleared > 0) {
+      logMsg(`cleared ${cleared} repair reason(s) for projector generation ${target}`);
+    }
+    return true;
+  }
+
+  /** Record a read's projection loss as the card's repair reason, once the
+   *  stored reasons are this generation's. False when they are not, because a
+   *  stop or a lost lease interrupted that: nothing is recorded. */
+  async function markLoss(sessionId: string, loss: string, kept: boolean): Promise<boolean> {
+    if (!(await adoptRepairGeneration())) return false;
+    if (stopped || !ownsLease()) return false;
     store.markRepairPending(sessionId, loss);
     logMsg(`session ${sessionId} ${kept ? "kept its card" : "is repair-pending"}: ${loss}`);
+    return true;
   }
 
   /** Start the yield the next session write waits for ({@link writeYield}).
    *  A write that started at `writeStartedAt` and already held the loop for
-   *  {@link LONG_WRITE_MS} takes its WAL checkpoint in the same slice: the
-   *  pages it left are what a checkpoint copies, so the next slice would
-   *  otherwise start with a long copy of its own. */
+   *  {@link LONG_WRITE_MS} left many pages in the WAL: the slice after the
+   *  yield starts with their checkpoint, whatever the distiller's clock says,
+   *  and a long one yields again ({@link pause}), so the copy has a slice of
+   *  its own rather than lengthening the write's. */
   function yieldAfterWrite(writeStartedAt: number): void {
-    if (
-      checkpointsHeld &&
-      !stopped &&
-      leaseHeld &&
-      performance.now() - writeStartedAt >= LONG_WRITE_MS
-    ) {
-      checkpointNow();
-    }
+    if (performance.now() - writeStartedAt >= LONG_WRITE_MS) lastCheckpointAt = -Infinity;
     if (!pause) return;
     const clear = (): void => {
       if (writeYield === settled) writeYield = undefined;
     };
     const settled: Promise<void> = pause().then(clear, clear);
     writeYield = settled;
+  }
+
+  /**
+   * What a session write waits for before the yield after the last one
+   * ({@link writeYield}): the stored repair reasons made this generation's
+   * ({@link adoptRepairGeneration}), so no reason the write records is
+   * cleared after it, and the WAL backlog ({@link awaitWalBacklog}). The
+   * caller then waits out {@link writeYield} in its own loop and checks the
+   * lease, with no await between that loop and the write: two writes never
+   * share a slice.
+   */
+  async function awaitWriteRoom(sessionId: string): Promise<void> {
+    await adoptRepairGeneration();
+    await awaitWalBacklog(sessionId);
+  }
+
+  /** The last checkpoint left more than {@link WAL_BACKLOG_FRAMES} frames
+   *  uncopied while this process checkpoints the WAL. */
+  const backlogged = (): boolean =>
+    checkpointsHeld && !stopped && leaseHeld && walBacklog > WAL_BACKLOG_FRAMES;
+
+  /**
+   * Hold a session write while {@link backlogged}: a reader on another
+   * connection keeps frames no checkpoint can copy, and each write would add
+   * to what the checkpoint after the reader lets go has to copy in one go.
+   * The checkpoints that run meanwhile ({@link runCheckpoint}, slice starts)
+   * wake the write once one leaves the backlog under the bound, and a stop
+   * or a lost lease wakes it too. After {@link WAL_BACKLOG_WAIT_MS} the write
+   * goes ahead, logged. A woken write yields first, so it does not share the
+   * checkpoint's slice.
+   */
+  async function awaitWalBacklog(sessionId: string): Promise<void> {
+    if (!backlogged()) return;
+    const startedAt = performance.now();
+    let timedOut = false;
+    let wake = (): void => {};
+    const timer = setTimeout(() => {
+      timedOut = true;
+      wake();
+    }, WAL_BACKLOG_WAIT_MS);
+    try {
+      while (backlogged() && !timedOut) {
+        await new Promise<void>((resolve) => {
+          wake = resolve;
+          backlogWaiters.add(resolve);
+        });
+        backlogWaiters.delete(wake);
+      }
+    } finally {
+      clearTimeout(timer);
+    }
+    if (backlogged()) {
+      logMsg(
+        `WAL holds ${walBacklog} frames no checkpoint could copy after ${Math.round(performance.now() - startedAt)} ms; writing session ${sessionId}`,
+      );
+    }
+    if (pause) await pause();
+  }
+
+  function wakeBacklogWaiters(): void {
+    const waiters = [...backlogWaiters];
+    backlogWaiters.clear();
+    for (const wake of waiters) wake();
   }
 
   /**
@@ -2322,8 +2436,11 @@ export function createDistiller(options: DistillerOptions): Distiller {
    * the store compares against instead of reading them inside the write's
    * transaction. When it refuses them because a write changed the card
    * since, the write runs again against the rows stored now.
+   *
+   * Called right after the lease check, so the write runs in the slice that
+   * checked the lease.
    */
-  function writeFull(
+  async function writeFull(
     session: DistillSessionMeta,
     derived: DerivedCard,
     read: SessionRead,
@@ -2331,10 +2448,10 @@ export function createDistiller(options: DistillerOptions): Distiller {
     moved: boolean,
     digest: Digest | undefined,
     stored: StoredRows | undefined,
-  ): CardWrite & { kept?: string } {
+  ): Promise<CardWrite & { kept?: string }> {
     const loss = lossOf(read.counts);
     if (loss && store.getCard(session.id)) {
-      markLoss(session.id, loss, true);
+      await markLoss(session.id, loss, true);
       // The tail read is current even though the card is kept, so a session
       // whose turn has ended stops being re-read on every poll.
       noteSettled(session.id, checkpoint, moved);
@@ -2361,7 +2478,7 @@ export function createDistiller(options: DistillerOptions): Distiller {
     }
     yieldAfterWrite(writeStartedAt);
     // An accepted replace clears the repair reason, so the mark follows it.
-    if (loss && !result.refused) markLoss(session.id, loss, false);
+    if (loss && !result.refused) await markLoss(session.id, loss, false);
     noteSettled(session.id, checkpoint, moved);
     return { changed: result.changed };
   }
@@ -2536,6 +2653,7 @@ export function createDistiller(options: DistillerOptions): Distiller {
     if (pause) await pause();
     const stored = await storedRowsOf(session.id);
     if (stored === null) return { changed: false };
+    await awaitWriteRoom(session.id);
     while (writeYield) await writeYield;
     // Authoritative re-check (live lease row, not the cached flag): a process
     // suspended past the TTL can lose the lease to a rival before its heartbeat
@@ -2661,7 +2779,7 @@ export function createDistiller(options: DistillerOptions): Distiller {
     // keeps the card, its rows and its checkpoint, as a full write does.
     const loss = lossOf(fetched.counts);
     if (loss) {
-      markLoss(session.id, loss, true);
+      await markLoss(session.id, loss, true);
       noteSettled(session.id, tail, moved);
       return { changed: false, kept: loss };
     }
@@ -2768,6 +2886,7 @@ export function createDistiller(options: DistillerOptions): Distiller {
       if (stopped || !leaseHeld) return { changed: false };
       prepared = { stored: prior, card: cardOf(after, inventory), rows: after.length };
     }
+    await awaitWriteRoom(session.id);
     while (writeYield) await writeYield;
     if (stopped || !ownsLease()) return { changed: false };
     const hashes = rangeHashes ? { rangeHashes, replaceRangeHashes } : undefined;
@@ -2997,7 +3116,7 @@ export function createDistiller(options: DistillerOptions): Distiller {
     // and its checkpoint.
     const loss = lossOf(fetched.counts);
     if (loss) {
-      markLoss(session.id, loss, true);
+      await markLoss(session.id, loss, true);
       noteSettled(session.id, checkpoint, moved);
       return { changed: false, kept: loss };
     }
@@ -3065,6 +3184,7 @@ export function createDistiller(options: DistillerOptions): Distiller {
             allRows.length - tailRows,
           ),
     );
+    await awaitWriteRoom(session.id);
     while (writeYield) await writeYield;
     if (stopped || !ownsLease()) return { changed: false };
     const writeStartedAt = performance.now();
@@ -3313,9 +3433,18 @@ export function createDistiller(options: DistillerOptions): Distiller {
           // distilled.
           const stored = await storedRowsOf(session.id);
           if (stored === null) return;
+          await awaitWriteRoom(session.id);
           while (writeYield) await writeYield;
           if (stopped || !ownsLease()) return;
-          const written = writeFull(session, derived, read, checkpoint, moved, digest, stored);
+          const written = await writeFull(
+            session,
+            derived,
+            read,
+            checkpoint,
+            moved,
+            digest,
+            stored,
+          );
           if (written.kept === undefined) {
             distilled++;
             distilledCount = distilled; // status counts only sessions actually distilled
@@ -3522,8 +3651,7 @@ export function createDistiller(options: DistillerOptions): Distiller {
       // A data-shape failure, as the cold pass quarantines it; anything else
       // (a transport failure) leaves the card stale for the next sweep.
       if (!(error instanceof MalformedSessionError) && !(error instanceof TypeError)) throw error;
-      if (stopped || !ownsLease()) return "skipped";
-      adoptRepairGeneration();
+      if (!(await adoptRepairGeneration()) || stopped || !ownsLease()) return "skipped";
       store.markRepairPending(sessionId, `malformed: ${errmsg(error)}`);
       logMsg(`session ${sessionId} is repair-pending: ${errmsg(error)}`);
       return "marked";
@@ -3532,7 +3660,8 @@ export function createDistiller(options: DistillerOptions): Distiller {
 
   /**
    * The repair sweep: rebuild every card below projector generation `gen`
-   * ({@link Store.staleCards}, archived sessions included), sessions with
+   * (the cards {@link Store.staleCards} lists, read in pages with
+   * {@link readRepairState}; archived sessions included), sessions with
    * part rows first, at `distillConcurrency`, through the fetch gate behind
    * foreground work. A session being re-distilled is skipped (that write
    * stamps the generation too). A card leaves the stale set only when its
@@ -3544,7 +3673,7 @@ export function createDistiller(options: DistillerOptions): Distiller {
   async function runRepairSweep(gen: number): Promise<void> {
     if (stopped || !ownsLease()) return;
     // A new generation retries every card an earlier one could not repair.
-    adoptRepairGeneration();
+    if (!(await adoptRepairGeneration())) return;
     const start = await readRepairStateCounted(gen);
     if (!start || stopped || !leaseHeld) return;
     const stale = start.stale;
@@ -3709,6 +3838,9 @@ export function createDistiller(options: DistillerOptions): Distiller {
     if (!hold) {
       clearTimer(checkpointTimer);
       checkpointTimer = undefined;
+      walBacklog = 0;
+      stuckCheckpointMs = CHECKPOINT_BUSY_MS;
+      wakeBacklogWaiters();
     }
     if (hold === checkpointsHeld) return;
     try {
@@ -3729,21 +3861,32 @@ export function createDistiller(options: DistillerOptions): Distiller {
     }, delayMs);
   }
 
-  /** One passive checkpoint now. True when it found frames written since the
-   *  last one, or could not copy them all. */
-  function checkpointNow(): boolean {
+  /**
+   * One passive checkpoint now, which also measures {@link walBacklog} and
+   * wakes the writes waiting for it once it is under the bound. `moved` when
+   * the WAL has frames the last one did not see, or frames are left and this
+   * one copied some; `stuck` when frames are left and it copied none of them
+   * (a reader on another connection still needs them); `idle` when nothing is
+   * left and nothing is new, or when it failed.
+   */
+  function checkpointNow(): "moved" | "stuck" | "idle" {
     lastCheckpointAt = now();
     try {
       const result = store.checkpoint();
       // A full checkpoint leaves the frame count as it was until the next
-      // write starts the WAL over; any other count means new frames, and a
-      // checkpoint readers held back is tried again soon.
-      const found = result.frames !== lastWalFrames || result.checkpointed < result.frames;
+      // write starts the WAL over; any other count means new frames.
+      const grew = result.frames !== lastWalFrames;
+      const copied = result.checkpointed !== lastWalCheckpointed;
       lastWalFrames = result.frames;
-      return found;
+      lastWalCheckpointed = result.checkpointed;
+      walBacklog = Math.max(0, result.frames - result.checkpointed);
+      if (walBacklog <= WAL_BACKLOG_FRAMES) wakeBacklogWaiters();
+      const left = result.busy || walBacklog > 0;
+      if (grew || (left && copied)) return "moved";
+      return left ? "stuck" : "idle";
     } catch (error) {
       logMsg(`WAL checkpoint failed: ${errmsg(error)}`);
-      return false;
+      return "idle";
     }
   }
 
@@ -3761,17 +3904,32 @@ export function createDistiller(options: DistillerOptions): Distiller {
 
   /** The timed checkpoint, for writes no distiller slice follows (another
    *  process's, or this one's search path). A timer callback is a task of its
-   *  own, so it shares no slice with other work. The next one runs sooner
-   *  while checkpoints keep finding new frames. Gives the checkpoints back
-   *  once this process no longer holds the lease. */
+   *  own, so it shares no slice with other work. The next one runs after
+   *  {@link CHECKPOINT_BUSY_MS} while the WAL keeps changing and after
+   *  {@link CHECKPOINT_IDLE_MS} once it stops; while frames are left that
+   *  checkpoints copy no more of, the wait doubles from the busy one up to the
+   *  idle one, so a reader holding them does not wake this process every few
+   *  milliseconds. Gives the checkpoints back once this process no longer
+   *  holds the lease. */
   function runCheckpoint(): void {
     if (stopped || !leaseHeld) {
       holdCheckpoints(false);
       return;
     }
-    const found = checkpointNow();
+    const outcome = checkpointNow();
+    if (outcome === "stuck") {
+      stuckCheckpointMs = Math.min(stuckCheckpointMs * 2, CHECKPOINT_IDLE_MS);
+    } else {
+      stuckCheckpointMs = CHECKPOINT_BUSY_MS;
+    }
     if (!stopped && leaseHeld && checkpointsHeld) {
-      scheduleCheckpoint(found ? CHECKPOINT_BUSY_MS : CHECKPOINT_IDLE_MS);
+      scheduleCheckpoint(
+        outcome === "moved"
+          ? CHECKPOINT_BUSY_MS
+          : outcome === "stuck"
+            ? stuckCheckpointMs
+            : CHECKPOINT_IDLE_MS,
+      );
     }
   }
 

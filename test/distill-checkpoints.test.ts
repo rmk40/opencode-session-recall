@@ -188,6 +188,29 @@ describe("the lease holder's connection", () => {
     );
   });
 
+  it("waits twice as long for each timed checkpoint that copies no more of the frames a reader holds, up to a second, and 10 ms again once one copies some", async () => {
+    const { store } = await openStoreFile();
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout", "Date"] });
+    const t0 = Date.now();
+    const held: WalCheckpoint = { busy: false, frames: 9, checkpointed: 6 };
+    const results: WalCheckpoint[] = [
+      { busy: false, frames: 5, checkpointed: 5 }, // new frames
+      held, // new frames, three of them held back
+      ...Array<WalCheckpoint>(8).fill(held), // nothing more copied
+      { busy: false, frames: 9, checkpointed: 8 }, // one more copied
+      { busy: false, frames: 9, checkpointed: 9 }, // the rest copied: nothing new
+    ];
+    const at: number[] = [];
+    vi.spyOn(store, "checkpoint").mockImplementation(() => {
+      at.push(Date.now() - t0);
+      return results.shift() ?? { busy: false, frames: 2, checkpointed: 2 };
+    });
+    start(store, { now: () => Date.now() });
+
+    await vi.advanceTimersByTimeAsync(4_300);
+    expect(at).toEqual([10, 20, 30, 50, 90, 170, 330, 650, 1290, 2290, 3290, 3300, 4300]);
+  });
+
   it.each([
     {
       how: "its heartbeat",

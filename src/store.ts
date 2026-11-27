@@ -476,6 +476,11 @@ export type RepairStatePage = {
   repairPending: number;
 };
 
+/** One page of {@link Store.clearRepairReasonsPage}: how many cards it read,
+ *  the last one's session id (absent when it read none) and how many repair
+ *  reasons it cleared. */
+export type RepairClearPage = { read: number; last?: string; cleared: number };
+
 /** What a passive WAL checkpoint reported ({@link Store.checkpoint}): whether
  *  it could not finish, the frames in the WAL and how many of them are now in
  *  the database file. Both counts read -1 when the store is not in WAL mode. */
@@ -706,10 +711,11 @@ export type Store = {
    */
   staleCards(gen?: number): StaleCard[];
   /**
-   * The repair state of up to `limit` cards (a positive integer; anything
-   * else reads as 1), in session-id order after `after` (from the first card
-   * when undefined): which of them {@link staleCards} lists for `gen` (none
-   * when `gen` is undefined) and how many carry a {@link Card.repairReason}.
+   * The repair state of up to `limit` cards (rounded down to a whole number;
+   * anything below 1, or not finite, reads as 1), in session-id order after
+   * `after` (from the first card when undefined): which of them
+   * {@link staleCards} lists for `gen` (none when `gen` is undefined) and how
+   * many carry a {@link Card.repairReason}.
    * Paging continues from `last`, by the immutable session id, so a walk
    * reads each card once however the cards change during it; it ends at a
    * page that read fewer than `limit` cards. Every card of a page is read
@@ -729,8 +735,19 @@ export type Store = {
    */
   markRepairPending(sessionId: string, reason: string): CardWrite;
   /** Clear every card's repair reason, returning how many were set, and
-   *  advance {@link REPAIR_REV_KEY} when there were any. */
+   *  advance {@link REPAIR_REV_KEY} when there were any. One statement over
+   *  the whole card table: the distiller clears reasons with
+   *  {@link clearRepairReasonsPage}. */
   clearRepairReasons(): number;
+  /**
+   * Clear the repair reasons of up to `limit` cards (read as
+   * {@link repairStatePage} reads it) in session-id order after `after`
+   * (from the first card when undefined). Paging continues from `last` and
+   * ends at a page that read fewer than `limit` cards. Only a page that
+   * cleared a reason writes, in one transaction that also advances
+   * {@link REPAIR_REV_KEY}.
+   */
+  clearRepairReasonsPage(after: string | undefined, limit: number): RepairClearPage;
   /**
    * Run a passive WAL checkpoint on this connection: copy into the database
    * file every WAL frame no reader still needs, without waiting for readers
@@ -2154,6 +2171,35 @@ class SqliteStore implements Store {
       if (changes > 0) this.bumpCounter(REPAIR_REV_KEY);
       return changes;
     });
+  }
+
+  clearRepairReasonsPage(after: string | undefined, limit: number): RepairClearPage {
+    const columns = "session_id, repair_reason IS NOT NULL AS pending";
+    const rows =
+      after === undefined
+        ? this.db.all(`SELECT ${columns} FROM card ORDER BY session_id LIMIT ?`, [pageLimit(limit)])
+        : this.db.all(
+            `SELECT ${columns} FROM card WHERE session_id > ? ORDER BY session_id LIMIT ?`,
+            [after, pageLimit(limit)],
+          );
+    if (rows.length === 0) return { read: 0, cleared: 0 };
+    const last = asString(rows[rows.length - 1]!.session_id);
+    const pending = rows
+      .filter((row) => asNumber(row.pending) !== 0)
+      .map((row) => asString(row.session_id));
+    if (pending.length === 0) return { read: rows.length, last, cleared: 0 };
+    const cleared = this.db.tx((): number => {
+      let changes = 0;
+      for (const sessionId of pending) {
+        changes += this.db.run(
+          "UPDATE card SET repair_reason=NULL WHERE session_id=? AND repair_reason IS NOT NULL",
+          [sessionId],
+        ).changes;
+      }
+      if (changes > 0) this.bumpCounter(REPAIR_REV_KEY);
+      return changes;
+    });
+    return { read: rows.length, last, cleared };
   }
 
   checkpoint(): WalCheckpoint {

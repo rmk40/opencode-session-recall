@@ -306,8 +306,16 @@ on a long-used store. While a process holds the lease its connection sets
 checkpoints (`Store.checkpoint`) itself: at the start of a background slice once
 the last one is 10 ms old, so each copies about one slice of writes, and on a
 timer for writes no distiller slice follows. A session write that already held the
-loop past the 35 ms background budget checkpoints before it yields, so its pages
-are not left for the next slice to copy. It gives the setting back when it
+loop past the 35 ms background budget makes the slice after its yield start with a
+checkpoint, and a checkpoint of 2 ms or more yields again, so copying the write's
+pages takes a slice of its own instead of lengthening the write's. The timer runs
+every 10 ms while the WAL changes and every second once it stops; while a reader on
+another connection holds frames no checkpoint can copy, its wait doubles up to that
+second. Such a reader also lets the WAL grow, and the checkpoint after it lets go
+copies all of it in one slice, so the distiller writes no session while the last
+checkpoint left more than `WAL_BACKLOG_FRAMES` (4,000) frames uncopied: about 8 to
+16 ms of copying on a warm 12,000-card store. A write waits at most 5 s for that, then
+goes ahead and logs it. The distiller gives the setting back when it
 loses the lease or stops, so a store whose lease nobody holds still checkpoints on
 SQLite's default. The cold pass examines sessions newest first, so its cursor
 (`coldpass_cursor`) moves with nearly every session; it is written at most once a
@@ -667,7 +675,11 @@ writes nothing. `staleCards(gen)` lists cards below the generation (NULL include
 and cards whose checkpoint is `v: 1`, which only an older build writes, leaving out
 cards with a `repair_reason`. A distiller at a higher generation than
 `meta.repair_gen` clears every stored repair reason before it records a reason or
-runs a sweep, so the cards an earlier generation gave up on are tried again.
+runs a sweep, so the cards an earlier generation gave up on are tried again. It
+clears them a page of cards at a time (`Store.clearRepairReasonsPage`), checking the
+lease before each page, and stamps `meta.repair_gen` only after the last page, so
+when a stop or a lost lease interrupts it, the next holder starts over from the first
+card. Every reason it records waits for that to finish, so no later page clears one.
 
 All of it is inert on v1, which passes no generation. `staleCards` returns nothing,
 the guard does nothing, the repair sweep and the range check never start and v1
@@ -680,8 +692,9 @@ Both run only in the lease holder and only with a projector generation and the v
 sync. They write through the same lease-checked paths as every other distiller write.
 
 The repair sweep (`runRepairSweep` in `distill.ts`) starts after each cold pass,
-which leaves cards below the generation to it. It takes `staleCards(gen)`, archived
-sessions included, puts the sessions that have part rows first (`withParts`) and
+which leaves cards below the generation to it. It reads the stale cards for `gen`
+with `readRepairState`, archived sessions included, puts the sessions that have part
+rows first (`withParts`) and
 rebuilds each with `distillFull` at `distillConcurrency` through the fetch gate's
 background lane. A session already being re-distilled is skipped, since that write
 stamps the generation too. A session that is gone is left to the deletion reconcile.

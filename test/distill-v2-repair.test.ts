@@ -33,6 +33,7 @@ import {
   CARDS_STAMPED_KEY,
   openStore,
   REPAIR_REV_KEY,
+  REPAIR_STATE_PAGE,
   type Store,
 } from "../src/store.js";
 import type { Limits } from "../src/types.js";
@@ -755,6 +756,57 @@ describe("v2 repair sweep", () => {
     expect(store.getCard("ses_a")?.projectorGen).toBe(GEN);
     expect(store.getMeta(REPAIR_GEN_KEY)).toBe(String(GEN));
     expect(h.distiller.repair()?.sweep).toMatchObject({ pending: 0, repairPending: 0, done: 1 });
+  });
+
+  it("clears an older generation's reasons a page of cards at a time and stamps the generation after the last page, starting over when stopped part-way", async () => {
+    addSession("ses_a");
+    addUser("ses_a", "a prompt");
+    await built();
+    // Cards at this generation for sessions opencode.db does not hold, kept
+    // by the deletion reconcile: `ses_a` and all but the last fill the first
+    // page, the last is the second page.
+    const card = store.getCard("ses_a")!;
+    const fillers = Array.from(
+      { length: REPAIR_STATE_PAGE },
+      (_, i) => `ses_f${String(i).padStart(4, "0")}`,
+    );
+    for (const id of fillers) {
+      store.replaceSessionParts(id, [], { ...card, sessionId: id, rootId: id, slug: id });
+    }
+    const last = fillers.at(-1)!;
+    store.markRepairPending("ses_a", "an earlier failure");
+    store.markRepairPending(last, "an earlier failure");
+    store.setMeta(REPAIR_GEN_KEY, String(GEN - 1));
+    store.setMeta(REPAIR_PROGRESS_KEY, "");
+    const keepFillers = (inner: DistillSync): DistillSync => ({
+      ...inner,
+      missing: async () => [],
+    });
+
+    // Stopped after the first page.
+    let h: Started | undefined;
+    const clearPage = store.clearRepairReasonsPage.bind(store);
+    const pages = vi.spyOn(store, "clearRepairReasonsPage").mockImplementation((after, limit) => {
+      const page = clearPage(after, limit);
+      void h?.distiller.stop();
+      return page;
+    });
+    h = startDistiller({ wrapSync: keepFillers });
+    await waitFor(() => pages.mock.calls.length > 0);
+    await h.distiller.stop();
+    expect(pages).toHaveBeenCalledTimes(1);
+    expect(store.getCard("ses_a")?.repairReason).toBeUndefined();
+    expect(store.getCard(last)?.repairReason).toBe("an earlier failure");
+    expect(store.getMeta(REPAIR_GEN_KEY)).toBe(String(GEN - 1));
+    pages.mockRestore();
+
+    // The next distiller starts again from the first card and finishes.
+    h = startDistiller({ wrapSync: keepFillers });
+    await waitFor(() => h?.distiller.repair()?.sweep?.running === false);
+    expect(store.getCard(last)?.repairReason).toBeUndefined();
+    expect(store.getMeta(REPAIR_GEN_KEY)).toBe(String(GEN));
+    expect(h.logs.some((line) => line.includes("cleared 1 repair reason(s)"))).toBe(true);
+    expect(h.distiller.repair()?.sweep).toMatchObject({ repairPending: 0 });
   });
 
   it("counts repair-pending cards for its progress from pages of the card table, never a whole-table read", async () => {
