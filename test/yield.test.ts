@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createV2HistorySource, openOpencodeDb } from "../src/history/v2.js";
-import { macrotask, SLICE_MS, timeSlicer, yieldOnBudget } from "../src/yield.js";
+import { macrotask, prioritySlicer, SLICE_MS, timeSlicer, yieldOnBudget } from "../src/yield.js";
 import { insertProject, insertSession, makeV2PartsDb } from "./v2-db.js";
 
 /** A clock the test advances by hand, and a yield that records each call. */
@@ -186,6 +186,43 @@ describe("timeSlicer", () => {
     now = 200;
     await slicer();
     expect(calls).toBe(2);
+  });
+});
+
+describe("prioritySlicer", () => {
+  it("gives a slice to a waiting foreground caller before background callers that came first, and one turn in every backgroundEvery to the background", async () => {
+    let now = 0;
+    const turns: Array<() => void> = [];
+    const slicer = prioritySlicer({
+      budgetMs: 8,
+      backgroundEvery: 3,
+      now: () => now,
+      yieldNow: () => new Promise<void>((resolve) => turns.push(resolve)),
+    });
+    const ran: string[] = [];
+    // Each time a worker resumes it does a whole slice of work.
+    const worker = async (name: string, at: () => Promise<void>, slices: number): Promise<void> => {
+      for (let i = 0; i < slices; i++) {
+        await at();
+        ran.push(name);
+        now += 8;
+      }
+    };
+    const settle = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0));
+    now = 8;
+    const workers = [
+      worker("b1", slicer.background, 2),
+      worker("b2", slicer.background, 2),
+      worker("f", slicer.foreground, 5),
+    ];
+    await settle();
+    for (let turn = 0; turn < 9; turn++) {
+      turns.shift()!();
+      await settle();
+    }
+    expect(ran).toEqual(["f", "f", "b1", "f", "f", "b2", "f", "b1", "b2"]);
+    expect(turns).toEqual([]);
+    await Promise.all(workers);
   });
 });
 

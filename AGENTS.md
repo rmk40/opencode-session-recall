@@ -463,15 +463,30 @@ median search waiting on timers. Every long-running loop therefore awaits a
 yield point, and the default yield point (`yieldOnBudget`, one per process)
 yields to the event loop only once `SLICE_MS` (8 ms) of work has run since
 anything last yielded through it. The v2 reader, the v2 sync, the card runtime's
-chunked jobs, the distiller and discovery all default to it. A yield itself is
+chunked jobs and discovery all default to it. The hosts give the distiller its
+background twin (below). A yield itself is
 `macrotask()`, which uses `setImmediate` where the runtime has it and
 `setTimeout(0)` otherwise. **Do not use `MessageChannel` for it.** Node and Bun
 deliver a port's messages back to back without returning to the event loop, so a
 chain of such yields keeps timers from ever firing (a probe of 200 slices of 3 ms
 saw no interval tick at all). Callers past the budget wait in line on one
-pending yield, and only the first to resume takes the slice it starts: resumed
-waiters all run before any of them does its work, so a waiter cannot tell from
-the clock whether another already holds the slice. A pending yield older than
+pending yield, and only one of them takes the slice it starts. Resumed waiters
+all run before any of them does its work, so a waiter cannot tell from the
+clock whether another already holds the slice. The yield names the class that
+takes it when it resolves.
+
+One slicer has two yield points that share its slice. `yieldOnBudget` is for
+work a caller waits on, such as the card runtime's jobs behind `ready()` and the
+drill's reads. `yieldInBackground` is for upkeep. The distiller yields through
+it on both hosts. On v2 so do the history facade, the sync and the discovery
+the distiller reads through. A yield gives its slice to the first
+foreground waiter whenever one waits on it. Background waiters that have
+waited through `BACKGROUND_EVERY - 1` (7) foreground turns in a row take the
+next one, so upkeep slows down while a search runs but never stops. Within a
+class the first to wait goes first. A reader yields through the one point it
+was built with, which is why the drill and the distiller read `opencode.db`
+through separate facades. **Give new upkeep the background point, and work a
+search awaits the foreground one.** A pending yield older than
 100 ms, or from a clock that went backwards, is replaced, because a test that
 swaps fake timers in and out can drop its callback and would otherwise stall
 every later caller in the process. A test that injects `yieldBetween` gets it

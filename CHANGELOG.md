@@ -200,6 +200,14 @@ most of them on a store of 12,000 cards.
   turns, one slice each. A drill of 12 sessions of 70 messages each took 32
   to 39 ms against 440 ms. In the gates the v2 cold pass took 12 s against
   33 s and a repair sweep over 400 stale cards 2 s against 6 s.
+- **A search goes ahead of the distiller.** The distiller's passes, the
+  history reads they make, the v2 sync and discovery yield through a
+  background yield point that shares the time slice with a search's reads
+  and card build. While a search waits, the background takes one turn in
+  eight, so a cold pass slows down during the search but keeps going. Over
+  12,000 sessions the first search after a restart took 32.5 s during a
+  cold pass against 7.0 s with none running. It now takes 6.5 to 7.9 s
+  against 6.4 to 6.8 s. The pass finishes about 10 s after it.
 - **Time-bounded searches read less.** Over 12 subagents that each wrote
   40 messages inside a window and 600 after it, a drill read 480 messages
   in 26 ms instead of 7,680 in 358 ms. With a lower bound near the end of 12
