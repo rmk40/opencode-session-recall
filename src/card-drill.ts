@@ -222,7 +222,7 @@ export function createCardDrill(cards: CardsRuntime, narrow: CardDrillFilters): 
     async drill(input): Promise<DrillOutput> {
       const collected = collect(input);
       const all = collected.pools.flatMap((pool) => pool.candidates);
-      const hits = bm25Search(all, input.query, input.mode, input.explain);
+      const hits = bm25Search(all, input.query, input.mode, input.explain, input.now);
       return { hits, ...collected };
     },
     async pools(input): Promise<DrillPoolsOutput> {
