@@ -18,6 +18,7 @@ import { clamp01, recencyMultiplier } from "./bm25.js";
 import { cosineSimilarity } from "./semantic/similarity.js";
 import type { CandidateEmbedder } from "./corpus.js";
 import type { DirectoryRelevance } from "./types.js";
+import { SLICE_MS, yieldOnBudget } from "./yield.js";
 
 /**
  * Tier-1 card runtime.
@@ -42,8 +43,9 @@ import type { DirectoryRelevance } from "./types.js";
  * writes widen the gap between `cards_rev` and `cards_stamped`. The index is
  * built in full when there is none yet or when more cards changed than
  * swapping them one by one is worth (more than 64 and more than half the
- * index). A full load reads in keyset pages and a build indexes in chunks,
- * with a macrotask between them, so neither holds the event loop for long.
+ * index). A full load reads in keyset pages and a build indexes in time
+ * slices, yielding to the event loop once a slice of work has run, so neither
+ * holds it for long.
  *
  * This layer only SHORTLISTS which sessions to drill; final result ranking is
  * tier-2's job over the drilled parts. So generous recall here is correct: a
@@ -55,14 +57,11 @@ import type { DirectoryRelevance } from "./types.js";
 const MAX_FAMILY_DEPTH = 16;
 /** The store is checked for changes no more often than this. */
 const REFRESH_INTERVAL_MS = 5_000;
-/** Cards per keyset page of a full load and per `cardsSince` page: one page
- *  is one synchronous slice, so it stays small enough to read (vectors
- *  included) in a few milliseconds. */
+/** Cards per keyset page of a full load and per `cardsSince` page. A page is
+ *  read in one synchronous step, so it stays small enough to read (vectors
+ *  included) in a few milliseconds; the load yields between pages once a
+ *  slice of work has run. */
 const LOAD_PAGE = 250;
-/** How long a chunked build indexes or embeds before it yields to the event
- *  loop. A time budget rather than a card count, because a card's cost varies
- *  with its size and with the machine's load. */
-const SLICE_MS = 8;
 /** Card vectors persisted per write of a chunked build. */
 const VECTOR_WRITE_CHUNK = 200;
 /** Changed cards a synchronous `rank` applies to the index in place; more run
@@ -122,10 +121,17 @@ export type CardHit = {
   semanticScore?: number;
 };
 
+/**
+ * `since` and `until` keep the sessions that overlap the window between them:
+ * one last updated at or after `since` and created at or before `until`. A
+ * session that kept running past `until` stays in, since its messages inside
+ * the window are as findable as any other's; the drill reads toward the
+ * window and the per-message filters apply it exactly.
+ */
 export type CardFilters = {
   /** Keep cards with `timeUpdated >= since` (ms epoch). */
   since?: number;
-  /** Keep cards with `timeUpdated <= until` (ms epoch). */
+  /** Keep cards with `timeCreated <= until` (ms epoch). */
   until?: number;
   /** Exact agent match when set. */
   agent?: string;
@@ -319,8 +325,9 @@ export type CardsRuntimeDeps = {
   semanticReady?: Promise<void>;
   now?: () => number;
   refreshIntervalMs?: number;
-  /** Awaited between the slices of a chunked build. Default: one macrotask
-   *  (`setTimeout(0)`), so other work on the event loop runs in between. */
+  /** Awaited between the steps of a chunked build (a page read, a slice of
+   *  indexing). Default: {@link yieldOnBudget}, which yields to the event
+   *  loop once a slice of work has run, so other work runs in between. */
   yieldBetween?: () => Promise<void>;
 };
 
@@ -328,7 +335,7 @@ export type CardsRuntime = {
   /**
    * Resolves once the card map is loaded and current, and with `index` also
    * the search index and card vectors. A cold or full load runs in chunks
-   * with a macrotask between them; an async caller awaits this so its later
+   * that yield to the event loop; an async caller awaits this so its later
    * synchronous calls find everything built. Without `index` it never waits
    * on index or vector work, which may still be running when it resolves.
    * Rejects when a load fails.
@@ -520,8 +527,6 @@ function revisionNumber(value: string | undefined): number {
   return Number(value ?? 0) || 0;
 }
 
-const macrotask = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0));
-
 /** Runs a build to completion in one synchronous slice. */
 function runSync(steps: Generator<void, void>): void {
   while (!steps.next().done);
@@ -623,7 +628,7 @@ export function createCardsRuntime(deps: CardsRuntimeDeps): CardsRuntime {
   // vectors once (see embedding-text.ts).
   const semanticModelId = deps.semanticModel;
   const configuredModel = semanticModelId != null ? cardVectorStamp(semanticModelId) : undefined;
-  const yieldBetween = deps.yieldBetween ?? macrotask;
+  const yieldBetween = deps.yieldBetween ?? yieldOnBudget;
   const source = deps.source;
   const reads = source.store;
   /** Semantic is configured on: vectors are kept, though the embedder may
@@ -1291,8 +1296,9 @@ export function createCardsRuntime(deps: CardsRuntimeDeps): CardsRuntime {
     // through the SAME helper the authorship classifier uses, so a degenerate
     // value cannot be a child here and a human there.
     if (filters.rootOnly && parentageOf(card.parentId) === "child") return false;
+    // The session overlaps the window (see CardFilters).
     if (filters.since != null && card.timeUpdated < filters.since) return false;
-    if (filters.until != null && card.timeUpdated > filters.until) return false;
+    if (filters.until != null && card.timeCreated > filters.until) return false;
     if (filters.agent && card.agent !== filters.agent) return false;
     if (filters.directoryFilter && card.directory !== filters.directoryFilter) return false;
     const scope = filters.scope ?? "global";

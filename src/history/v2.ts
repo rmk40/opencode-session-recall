@@ -1,5 +1,6 @@
 import { openSqliteReadOnly, type ReadOnlyDb, type Row, type SqlValue } from "../sqlite.js";
 import { unavailableText } from "../digest.js";
+import { yieldOnBudget } from "../yield.js";
 import type { HistoryMessage, HistorySession } from "./model.js";
 import {
   assertBoundedLimit,
@@ -82,8 +83,10 @@ import {
  *   `session_part` statements scoped by session id and the page's message
  *   ids. No `session_message` statement reads `session_part`. A database
  *   without the table (opencode before 2.4) reads inline content only.
- * - Polite: an `await` on a macrotask separates statements, so a page never
- *   holds the shared v2 service's event loop for more than one statement.
+ * - Polite: every statement, and every few rows decoded or projected, is a
+ *   yield point. A read yields to the event loop at the first one past a
+ *   time budget ({@link yieldOnBudget}), so it holds the shared v2 service's
+ *   loop for about one slice, plus at most one statement, at a time.
  * - Tolerant: a row with unparseable data becomes a placeholder message (a
  *   `MalformedSessionError` under `strict`), so a page with rows is never
  *   empty; non-content types never leave SQL. The next-page cursor comes from
@@ -434,7 +437,9 @@ export type V2SourceOptions = {
   /** Per-read cap on part rows. A first message with more parts is cut and
    *  continued through `getMessage`. Default 2,000. */
   pagePartRows?: number;
-  /** Awaited between statements. Default: one macrotask (`setTimeout(0)`). */
+  /** Awaited at every yield point (before each statement and every few rows
+   *  decoded or projected). Default: {@link yieldOnBudget}, which yields to
+   *  the event loop only once a slice of work has run. */
   yieldBetween?: () => Promise<void>;
   /** What the schema check found ({@link openOpencodeDb}'s `schema`).
    *  Default: probed once per handle. */
@@ -458,7 +463,7 @@ const PART_ID_CHUNK = 500;
  *  parameters of its statements stay far below SQLite's bound-parameter
  *  limit. */
 const PAGE_MESSAGES_MAX = 5_000;
-/** Part rows decoded between yields to the event loop. */
+/** Part rows decoded between yield points. */
 const PARTS_PER_YIELD = 200;
 /** The largest envelope metadata (the row's data without its inline content)
  *  a part continuation loads; a larger one is left out and the message takes
@@ -472,7 +477,7 @@ const ENVELOPE_ATTEMPTS = 3;
 const FIRST_ORDINAL = Number.MIN_SAFE_INTEGER;
 /** Sessions whose immutable fork fields are remembered per source. */
 const FORK_MEMO_LIMIT = 512;
-/** Rows decoded or projected between yields to the event loop. */
+/** Rows decoded or projected between yield points. */
 const ROWS_PER_YIELD = 25;
 /** Switch rows of one type read at once between a page's oldest and newest
  *  user; a longer run falls back to one seek per user. */
@@ -487,6 +492,12 @@ const NO_CURSOR_SEQ = Number.MAX_SAFE_INTEGER;
 /** Page plans retried when a whole planned range turns ineligible between the
  *  size read and the body read. */
 const PAGE_ATTEMPTS = 3;
+/** Rows a seek reads by creation time, newest first, to take the highest seq
+ *  among them: a row whose creation time is out of order (opencode moves an
+ *  assistant's `time_created` to the start of a retried step) stays on the
+ *  right side of the seek unless more rows than this were created between
+ *  its two times. */
+const SEEK_ROWS = 16;
 
 /** Which way a page walks a session's rows by `seq`. */
 type PageOrder = {
@@ -515,8 +526,6 @@ const OLDEST_FIRST: PageOrder = {
   encode: encodeV2AscendingCursor,
   decode: decodeV2AscendingCursor,
 };
-
-const macrotask = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0));
 
 function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
@@ -816,7 +825,7 @@ export function createV2HistorySource(db: ReadOnlyDb, opts: V2SourceOptions = {}
     typeof opts.pagePartRows === "number" && Number.isFinite(opts.pagePartRows)
       ? Math.max(1, Math.floor(opts.pagePartRows))
       : DEFAULT_PAGE_PART_ROWS;
-  const pause = opts.yieldBetween ?? macrotask;
+  const pause = opts.yieldBetween ?? yieldOnBudget;
   const { schema, drift } = sharedState(db, opts);
   /** Whether part rows are read at all (`session_part` with every column). */
   const partsOn = schema.parts;
@@ -858,7 +867,8 @@ export function createV2HistorySource(db: ReadOnlyDb, opts: V2SourceOptions = {}
   /**
    * Part row sizes per message, from ordinal `from` on (rows below it are
    * only counted): one `session_part` statement per {@link PART_ID_CHUNK}
-   * messages, each after a yield. Messages without part rows are absent.
+   * messages, each after a yield point. Messages without part rows are
+   * absent.
    */
   async function partSizes(
     sessionID: string,
@@ -1012,7 +1022,7 @@ export function createV2HistorySource(db: ReadOnlyDb, opts: V2SourceOptions = {}
    * The ids, among `rows` (message rows with the `time_updated` and `bytes`
    * they were read with), whose stored row changed since: one
    * `session_message` statement per {@link PART_ID_CHUNK} ids, each after a
-   * yield. A row that is gone counts as changed.
+   * yield point. A row that is gone counts as changed.
    */
   async function changedRows(
     sessionID: string,
@@ -2026,6 +2036,52 @@ export function createV2HistorySource(db: ReadOnlyDb, opts: V2SourceOptions = {}
 
     messagePageAscending(o): Promise<MessagePage> {
       return readPage(o, o.after, OLDEST_FIRST);
+    },
+
+    /**
+     * Two point reads. The first walks the `(session_id, time_created, id)`
+     * index down from `until` and takes the highest seq among its first
+     * {@link SEEK_ROWS} rows (fork copies left out, as pages leave them out);
+     * the second asks the `(session_id, seq)` index whether any row lies past
+     * that seq. Neither reads a row's data.
+     */
+    async seekPage(o): Promise<Lookup<string | null | undefined>> {
+      if (typeof o.until !== "number" || Number.isNaN(o.until)) {
+        return {
+          ok: false,
+          reason: "error",
+          error: `seek time must be a number, got ${String(o.until)}`,
+        };
+      }
+      const fork = forkBinds(o.sessionID);
+      if (!fork) return sessionNotFound(o.sessionID);
+      await pause();
+      const rows = read("seek", () =>
+        db.all(
+          `SELECT seq FROM session_message
+           WHERE session_id = ? AND time_created <= ? AND ${FORK_FILTER}
+           ORDER BY time_created DESC, id DESC LIMIT ?`,
+          [o.sessionID, o.until, ...fork, SEEK_ROWS],
+        ),
+      );
+      let newest: number | undefined;
+      for (const row of rows) {
+        const seq = asNumber(row.seq);
+        if (seq !== null && (newest === undefined || seq > newest)) newest = seq;
+      }
+      if (newest === undefined) return { ok: true, value: null };
+      // The cursor reads rows below its seq, so it names the row past `newest`.
+      if (!Number.isSafeInteger(newest + 1) || newest + 1 < 0)
+        return { ok: true, value: undefined };
+      await pause();
+      const later = read("seek end", () =>
+        db.get(
+          `SELECT seq FROM session_message WHERE session_id = ? AND seq > ?
+           ORDER BY seq ASC LIMIT ?`,
+          [o.sessionID, newest, 1],
+        ),
+      );
+      return { ok: true, value: later ? encodeV2Cursor(newest + 1) : undefined };
     },
 
     async getMessage(sessionID, messageID, o = {}): Promise<Lookup<HistoryMessage>> {

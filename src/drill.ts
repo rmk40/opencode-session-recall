@@ -35,6 +35,13 @@ import type { FtsHit } from "./store.js";
  * hits) point-fetches the hit message plus its stored prev/next neighbors. A
  * per-query retained budget caps the whole drill.
  *
+ * A search with a time window reads only toward it: with an upper bound the
+ * walk starts at the newest message created at or before it, where the source
+ * can seek (v2), and the walk ends at the first page that reaches the lower
+ * bound. Messages outside the window are left out of the slice and charge
+ * neither budget; a source that cannot seek (v1) reads past the newer ones
+ * under a separate bound ({@link OUT_OF_WINDOW_FACTOR}).
+ *
  * A small per-session LRU keeps repeat and refined queries warm. It holds the
  * pages and point lookups earlier queries fetched, not their slices: each query
  * replays the paging loop over the cached pages with its own stop rules,
@@ -64,9 +71,22 @@ export type DrillTarget = {
   writeRev?: number;
 };
 
+/**
+ * A search's time window over message creation times: a message is inside
+ * when it was created after `after` and before `before`, both exclusive, the
+ * bounds the query's `candidateFilter` applies. Either bound may be absent.
+ */
+export type TimeWindow = { after?: number; before?: number };
+
 export type DrillInput = {
   /** Ordered sessions to drill (already capped at limits.drillSessions). */
   sessions: DrillTarget[];
+  /** The query's time window. Each target's walk starts at the newest message
+   *  created at or before `before` where the source can seek and ends at the
+   *  first page that reaches `after`; messages outside it are left out of
+   *  the pool and of both budgets. The `filter` still applies the window to
+   *  every candidate. Absent = no window. */
+  window?: TimeWindow;
   /** Card-supported neighborhood — the deep pass's pool. */
   deepSet: Set<string>;
   /** Targeted point-fetch hints per session, from the FTS rows. */
@@ -185,6 +205,11 @@ export type DeepInput = {
   authorship?: ReadonlySet<Authorship>;
   /** Retained-chars budget for the whole sweep (`limits.deepCharsPerQuery`). */
   charsPerQuery: number;
+  /** The query's time window, read as {@link DrillInput.window} is: a
+   *  session swept from its start begins at the window's upper bound where
+   *  the source can seek, is complete once a page reaches the lower bound,
+   *  and its messages outside the window charge nothing. */
+  window?: TimeWindow;
   /** Resume state: the page cursor to continue the FIRST session from. */
   resume?: { before: string | null };
   abort?: AbortSignal;
@@ -265,12 +290,32 @@ const DEFAULT_DEEP_WALL_CLOCK_MS = 20_000;
  *  how stale those pages can get. */
 export const UNREVISED_ENTRY_TTL_MS = 30_000;
 /** Default bound on the objects the drill cache holds, counting each session
- *  entry, cached page, page message, point lookup and not-found lookup as one.
+ *  entry, cached page, page message, seek, point lookup and not-found lookup
+ *  as one.
  *  `cacheMaxChars` bounds candidate chars only, and an entry or page with no
  *  messages, a message with no searchable text or a not-found lookup charges
  *  none, though each stays in memory. So the cache evicts while either bound
  *  is passed. */
 export const MAX_CACHED_OBJECTS = 50_000;
+/** How far a walk reads past messages outside its time window, in retained
+ *  chars, as a multiple of `drillCharsPerSession`. Those messages charge no
+ *  budget, and a source that cannot seek (v1) reads every message newer than
+ *  the window first, so this bound is what ends such a walk. */
+export const OUT_OF_WINDOW_FACTOR = 4;
+
+/** Where a message falls against a time window. */
+type WindowSide = "inside" | "newer" | "older";
+
+function sideOf(window: TimeWindow | undefined, created: number): WindowSide {
+  if (window?.before != null && created >= window.before) return "newer";
+  if (window?.after != null && created <= window.after) return "older";
+  return "inside";
+}
+
+/** A window as part of a slice signature. */
+function windowKey(window: TimeWindow | undefined): string {
+  return `${window?.after ?? ""}..${window?.before ?? ""}`;
+}
 
 // ── Deep continuation cursor (opaque base64url JSON) ─────────────────────────
 // btoa/atob are DOM globals (available under Bun and Node), so no Node Buffer is
@@ -337,17 +382,20 @@ type CachedPage = { items: DrilledMessage[]; nextCursor: string | null };
 type SliceStop = Extract<DrillStop, "anchor" | "sessionBudget" | "end" | "targetsCut">;
 
 /** The messages one query's slice of a session holds (see `sliceFor`).
- *  `fetches` counts the history reads building it took (0 when the cache
- *  held everything). */
+ *  `read` counts the distinct messages its walk and lookups read, those
+ *  outside the query's time window included; `fetches` counts the history
+ *  reads building it took (0 when the cache held everything). */
 type Slice = {
   messages: DrilledMessage[];
   signature: string;
   points: Array<[string, DrilledMessage]>;
   stop: SliceStop;
+  read: number;
   fetches: number;
 };
 
-/** History reads a slice made, counted as `pageAt` and `pointAt` fetch. */
+/** History reads a slice made, counted as `seekAt`, `pageAt` and `pointAt`
+ *  fetch. */
 type SliceReads = { fetches: number };
 
 /**
@@ -370,6 +418,9 @@ type SliceBuild = {
  * entry filled without a revision. `pages` is keyed by the cursor that
  * produced each page ("" for the first page: a source never hands back an
  * empty cursor, since the paging loop reads one as the end of the session).
+ * A page does not depend on the query's time window, so every window walks
+ * the same pages from a given cursor. `seeks` holds each seek's answer (the
+ * cursor a walk below that upper bound starts from) by the bound.
  * `points` holds point lookups by requested message id, with null for a
  * not-found. `chars` and `objects` are the entry's charge against
  * `cacheMaxChars` and the cached-object bound; `objects` counts the entry
@@ -384,6 +435,7 @@ type SessionEntry = {
   stamp: string;
   expiresAt: number | undefined;
   pages: Map<string, CachedPage>;
+  seeks: Map<number, string | null | undefined>;
   points: Map<string, DrilledMessage | null>;
   pointChars: number;
   chars: number;
@@ -542,6 +594,7 @@ export function createDrill(deps: DrillDeps): Drill {
       stamp,
       expiresAt: target.writeRev === undefined ? now + UNREVISED_ENTRY_TTL_MS : undefined,
       pages: new Map(),
+      seeks: new Map(),
       points: new Map(),
       pointChars: 0,
       chars: 0,
@@ -614,6 +667,38 @@ export function createDrill(deps: DrillDeps): Drill {
   }
 
   /**
+   * The cursor a walk below the upper bound `before` starts from, from the
+   * cache or sought and cached: undefined to start at the newest page (also
+   * when the source cannot seek, or `before` is absent), null when the
+   * session holds nothing created at or before it. Only an answer is cached:
+   * a failed seek starts at the newest page this time and is asked again by
+   * the next query.
+   */
+  async function seekAt(
+    entry: SessionEntry,
+    target: DrillTarget,
+    before: number | undefined,
+    reads: SliceReads,
+  ): Promise<string | null | undefined> {
+    const seek = source.seekPage;
+    if (before === undefined || !seek) return undefined;
+    if (entry.seeks.has(before)) return entry.seeks.get(before);
+    const sought = await gate.runQuery(() =>
+      seek.call(source, { sessionID: target.sessionId, until: before }),
+    );
+    if (!sought.ok) {
+      if (sought.reason !== "unsupported") reads.fetches++;
+      return undefined;
+    }
+    reads.fetches++;
+    if (!entry.seeks.has(before)) {
+      entry.seeks.set(before, sought.value);
+      charge(entry, 0, 1);
+    }
+    return entry.seeks.get(before);
+  }
+
+  /**
    * A point lookup, from the cache or fetched and cached; null when the source
    * has no such message. Only a not-found is cached as null: any other failure
    * may be transient, so the next query asks again.
@@ -675,46 +760,83 @@ export function createDrill(deps: DrillDeps): Drill {
    * anchor), else the anchor stop or the per-session budget, and
    * `targetsCut` when paging ended otherwise but the budget then left point
    * lookups unread.
+   *
+   * With a time window the walk starts where {@link seekAt} says, and the
+   * slice holds only the messages inside the window: the others charge
+   * neither the per-session budget nor the query budget (the build's chars),
+   * and the stop rules look only at what the window holds. The anchor stop
+   * counts pages from the first one holding a message in the window. A page
+   * that reaches the lower bound ends the walk as `end`, since everything
+   * older is outside the window too; the out-of-window bound
+   * ({@link OUT_OF_WINDOW_FACTOR}) ends it as `sessionBudget`. The signature
+   * also names the start and the window, the two things besides the pages
+   * walked that decide which messages the slice holds.
    */
   async function sliceFor(
     entry: SessionEntry,
     target: DrillTarget,
     needles: string[],
     ftsHits: FtsHit[] | undefined,
+    window: TimeWindow | undefined,
   ): Promise<Slice> {
     const byId = new Map<string, DrilledMessage>();
+    /** Every message read, inside the window or not. */
+    const read = new Set<string>();
     const reads: SliceReads = { fetches: 0 };
     let retained = 0;
+    let outside = 0;
+    const outsideLimit = limits.drillCharsPerSession * OUT_OF_WINDOW_FACTOR;
 
-    // Untargeted: bounded newest-first paging.
-    let cursor: string | undefined;
+    // Untargeted: bounded newest-first paging, from the window's upper bound.
+    const start = await seekAt(entry, target, window?.before, reads);
+    let cursor = start ?? undefined;
     let pagesWalked = 0;
-    let anchorStop = false;
-    do {
-      const page = await pageAt(entry, target, cursor, reads);
-      pagesWalked++;
-      for (const msg of page.items) {
-        const id = msg.message.info.id;
-        if (!byId.has(id)) {
-          byId.set(id, msg);
-          retained += msg.retained;
+    let stop: SliceStop = "end";
+    if (start !== null) {
+      let windowPages = 0;
+      let anchorStop = false;
+      let reachedAfter = false;
+      do {
+        const page = await pageAt(entry, target, cursor, reads);
+        pagesWalked++;
+        const inside: DrilledMessage[] = [];
+        for (const msg of page.items) {
+          const id = msg.message.info.id;
+          const side = sideOf(window, msg.message.info.time.created);
+          if (side !== "inside") {
+            if (side === "older") reachedAfter = true;
+            if (!read.has(id)) outside += msg.retained;
+            read.add(id);
+            continue;
+          }
+          read.add(id);
+          inside.push(msg);
+          if (!byId.has(id)) {
+            byId.set(id, msg);
+            retained += msg.retained;
+          }
         }
-      }
-      cursor = page.nextCursor ?? undefined;
-      // Stop once a non-first page stops matching any anchor (nothing more to gain).
-      if (pagesWalked > 1 && !partsMatchAnchor(page.items, needles)) {
-        anchorStop = true;
-        break;
-      }
-    } while (cursor && retained < limits.drillCharsPerSession);
-    let stop: SliceStop = !cursor ? "end" : anchorStop ? "anchor" : "sessionBudget";
+        cursor = page.nextCursor ?? undefined;
+        if (reachedAfter) break;
+        if (inside.length === 0) continue;
+        windowPages++;
+        // Stop once a non-first page of the window stops matching any anchor
+        // (nothing more to gain).
+        if (windowPages > 1 && !partsMatchAnchor(inside, needles)) {
+          anchorStop = true;
+          break;
+        }
+      } while (cursor && retained < limits.drillCharsPerSession && outside < outsideLimit);
+      stop = !cursor || reachedAfter ? "end" : anchorStop ? "anchor" : "sessionBudget";
+    }
 
     // Targeted: point-fetch each FTS hit's message plus its stored neighbors,
     // charging their retained chars against the SAME per-session budget as the
     // untargeted paging — once the session's budget is exhausted, stop fetching
-    // further point targets (matching the documented per-session bound).
+    // further point targets (matching the documented per-session bound). A
+    // session with nothing at or before the upper bound has none to fetch.
     const points: Array<[string, DrilledMessage]> = [];
-    if (ftsHits && ftsHits.length > 0) {
+    if (start !== null && ftsHits && ftsHits.length > 0) {
       const wanted = new Set<string>();
       for (const hit of ftsHits) {
         wanted.add(hit.messageId);
@@ -723,7 +845,9 @@ export function createDrill(deps: DrillDeps): Drill {
       }
       const asked = new Set<string>();
       for (const messageID of wanted) {
-        if (byId.has(messageID)) continue;
+        // A message the walk read is in the slice already, or outside the
+        // window.
+        if (read.has(messageID)) continue;
         if (retained >= limits.drillCharsPerSession) {
           if (stop !== "sessionBudget") stop = "targetsCut";
           break;
@@ -731,7 +855,10 @@ export function createDrill(deps: DrillDeps): Drill {
         asked.add(messageID);
         const msg = await pointAt(entry, target, messageID, asked, reads);
         if (!msg) continue;
-        byId.set(msg.message.info.id, msg);
+        const id = msg.message.info.id;
+        read.add(id);
+        if (sideOf(window, msg.message.info.time.created) !== "inside") continue;
+        byId.set(id, msg);
         retained += msg.retained;
         points.push([messageID, msg]);
       }
@@ -739,9 +866,15 @@ export function createDrill(deps: DrillDeps): Drill {
 
     return {
       messages: [...byId.values()],
-      signature: [String(pagesWalked), ...points.map(([id]) => id)].join("\n"),
+      signature: [
+        start === undefined ? "" : start === null ? "-" : `@${start}`,
+        windowKey(window),
+        String(pagesWalked),
+        ...points.map(([id]) => id),
+      ].join("\n"),
       points,
       stop,
+      read: read.size,
       fetches: reads.fetches,
     };
   }
@@ -795,12 +928,13 @@ export function createDrill(deps: DrillDeps): Drill {
     target: DrillTarget,
     needles: string[],
     ftsHits: FtsHit[] | undefined,
+    window: TimeWindow | undefined,
   ): Promise<{ build: SliceBuild; fetched: number; stop: SliceStop; cached: boolean }> {
     const entry = entryFor(target);
     try {
-      const slice = await sliceFor(entry, target, needles, ftsHits);
+      const slice = await sliceFor(entry, target, needles, ftsHits, window);
       const read = {
-        fetched: slice.messages.length,
+        fetched: slice.read,
         stop: slice.stop,
         cached: slice.fetches === 0,
       };
@@ -844,7 +978,12 @@ export function createDrill(deps: DrillDeps): Drill {
       }
       let read: Awaited<ReturnType<typeof candidatesFor>>;
       try {
-        read = await candidatesFor(target, needles, input.ftsBySession?.get(target.sessionId));
+        read = await candidatesFor(
+          target,
+          needles,
+          input.ftsBySession?.get(target.sessionId),
+          input.window,
+        );
       } catch (error) {
         if (loadErrors.length < MAX_LOAD_ERROR_SAMPLES) {
           loadErrors.push(`${target.sessionId}: ${errmsg(error)}`);
@@ -1005,8 +1144,28 @@ export function createDrill(deps: DrillDeps): Drill {
         return undefined;
       };
 
-      /** Sweep one session exhaustively from `startBefore`, stopping cleanly on a
-       *  budget. Always fetches at least one page so the sweep makes progress. */
+      const window = input.window;
+
+      /** Where a session swept from its start begins: the newest page, or
+       *  under an upper bound the page a seek names (null: nothing in the
+       *  session was created at or before the bound). */
+      const sweepStart = async (target: DeepTarget): Promise<string | null | undefined> => {
+        const seek = source.seekPage;
+        const until = window?.before;
+        if (until === undefined || !seek) return undefined;
+        const sought = await gate.runQuery(() =>
+          seek.call(source, { sessionID: target.sessionId, until }),
+        );
+        return sought.ok ? sought.value : undefined;
+      };
+
+      /** Sweep one session exhaustively from `startBefore` (from its start, or
+       *  the window's upper bound, when null), stopping cleanly on a budget.
+       *  Always fetches at least one page so the sweep makes progress, unless
+       *  the session holds nothing at or before the upper bound. Messages
+       *  outside the window are counted as fetched but kept out of the pool
+       *  and the budget, and a page that reaches the lower bound completes
+       *  the session. */
       const sweepSession = async (
         target: DeepTarget,
         startBefore: string | null,
@@ -1017,10 +1176,17 @@ export function createDrill(deps: DrillDeps): Drill {
         stopped: SweepStop | undefined;
       }> => {
         const messages: HistoryMessage[] = [];
+        let fetched = 0;
         let cursor: string | undefined = startBefore ?? undefined;
         let stopped: SweepStop | undefined;
         let fetchedAny = false;
-        for (;;) {
+        if (startBefore === null && !input.abort?.aborted) {
+          const start = await sweepStart(target);
+          // Nothing to sweep: fetchedAny keeps the loop from reading a page.
+          if (start === null) fetchedAny = true;
+          cursor = start ?? undefined;
+        }
+        while (!(fetchedAny && cursor === undefined)) {
           stopped = fetchedAny ? overBudget() : input.abort?.aborted ? "aborted" : undefined;
           if (stopped) break;
           const before = cursor;
@@ -1032,12 +1198,22 @@ export function createDrill(deps: DrillDeps): Drill {
             }),
           );
           fetchedAny = true;
+          let reachedAfter = false;
           for (const msg of page.items) {
+            fetched++;
+            const side = sideOf(window, msg.info.time.created);
+            if (side === "older") reachedAfter = true;
+            if (side !== "inside") continue;
             messages.push(msg);
             budget.retained += estimateRetained(msg);
           }
           cursor = page.nextCursor ?? undefined;
-          if (!cursor) break; // session fully swept
+          // Fully swept: the session's end, or everything older is outside
+          // the window.
+          if (!cursor || reachedAfter) {
+            cursor = undefined;
+            break;
+          }
         }
 
         const chrono = [...messages].sort(compareMessages);
@@ -1053,7 +1229,7 @@ export function createDrill(deps: DrillDeps): Drill {
         for (const candidate of candidates) candidate.digestText = normalizedDigest;
         return {
           candidates,
-          fetched: messages.length,
+          fetched,
           nextBefore: stopped ? (cursor ?? null) : null,
           stopped,
         };

@@ -42,6 +42,7 @@ import type { SearchDeps, SemanticSearchConfig } from "../search.js";
 import type { SessionEnrichment } from "../sessions.js";
 import type { ResolvedOptions } from "../options.js";
 import { errmsg, settleWithin, type Limits } from "../types.js";
+import { yieldOnBudget } from "../yield.js";
 import { loadFs, loadPath } from "../node-import.js";
 import type { V2Event } from "./opencode-v2-types.js";
 import { createIdDedupe, type ResolvedIdentity, type RuntimeFactory } from "./runtime.js";
@@ -458,9 +459,7 @@ async function createV2Runtime(
 
   const gate = createFetchGate({ concurrency: limits.concurrency });
 
-  const macrotask = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0));
-
-  const discover = (): Promise<HistorySession[]> => discoverSessions(globalSource, macrotask);
+  const discover = (): Promise<HistorySession[]> => discoverSessions(globalSource, yieldOnBudget);
 
   let liteCards: Card[] = [];
   const cardSource: CardSource = store
@@ -534,7 +533,7 @@ async function createV2Runtime(
     ...(opencodeDb && {
       sync: createV2Sync(opencodeDb, { ...inputs.sync, ...(schema && { schema }) }),
     }),
-    yieldBetween: macrotask,
+    yieldBetween: yieldOnBudget,
     ...(inputs.idleDebounceMs !== undefined && { idleDebounceMs: inputs.idleDebounceMs }),
   });
   // What reads could not project, logged when it changes (debug log only).

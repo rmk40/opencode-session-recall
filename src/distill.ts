@@ -1503,9 +1503,10 @@ export function createDistiller(options: DistillerOptions): Distiller {
   const rollupDetached = new Set<Promise<void>>();
   /** With `yieldBetween`: the yield that follows the latest session write,
    *  until it has run. Every session write (cold pass, repair sweep,
-   *  re-distill) waits for it first, so the writes of concurrent workers whose
-   *  yields end in the same turn of the loop never run back to back in one
-   *  slice. */
+   *  re-distill) waits for it first, so the writes of concurrent workers
+   *  whose yields end in the same turn of the loop run back to back only as
+   *  far as `yieldBetween` lets them (with a time-budgeted yield, within one
+   *  slice). */
   let writeYield: Promise<void> | undefined;
   /** One set per running {@link recomputeAllRootRollups}: the roots written
    *  by a recompute that started after the pass began. That recompute read

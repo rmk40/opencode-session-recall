@@ -35,8 +35,9 @@ export type Listing<T> =
  * response whose body has the wrong shape, and only `getSession` returns it
  * (v1 `getMessage` passes a truthy body through unchecked, exactly as the
  * tools read it before the seam); `unsupported` is a request this host cannot
- * answer (a part continuation on v1). `error` carries the host's string when
- * there was one, so callers can keep their own wording for the empty case.
+ * answer (a part continuation or a seek on v1). `error` carries the host's
+ * string when there was one, so callers can keep their own wording for the
+ * empty case.
  * `counts` is what a message read could not project faithfully (v2
  * `getMessage` only), present only when some count is non-zero.
  * `partOrdinals` maps the id of each returned part that came from a part row
@@ -290,6 +291,18 @@ export interface HistorySource {
     strict?: boolean;
   }): Promise<MessagePage>;
   /**
+   * Where a newest-first walk that leaves out the messages created after
+   * `until` (ms epoch) starts: a {@link messagePage} `before` cursor whose
+   * page starts at the newest message created at or before `until`. The
+   * value is undefined when no message is newer than that one, so the walk
+   * starts at the session's first page as any other does, and null when the
+   * session has no message created at or before `until`. The position comes
+   * from creation times, which rise with the row order, so a message whose
+   * creation time is out of order by more than a few rows may fall on the
+   * other side of it. v1 cannot seek and answers `unsupported`.
+   */
+  seekPage?(o: { sessionID: string; until: number }): Promise<Lookup<string | null | undefined>>;
+  /**
    * One message. `partOrdinal` continues a message a read cut short (its
    * `partial.nextOrdinal`): the result holds the part rows from that ordinal
    * on, then the message's inline content, with the same part ids a whole
@@ -370,9 +383,12 @@ export function createUnavailableSource(
     getSession: async () => ({ ok: false, reason: "error", error }),
     listChildren: async () => ({ ok: false, error }),
     messagePage: reject,
-    // A v2 source pages oldest first too, so its reads report the outage
-    // rather than a missing capability.
-    ...(kind === "v2-sqlite" && { messagePageAscending: reject }),
+    // A v2 source pages oldest first and seeks too, so its reads report the
+    // outage rather than a missing capability.
+    ...(kind === "v2-sqlite" && {
+      messagePageAscending: reject,
+      seekPage: async () => ({ ok: false as const, reason: "error" as const, error }),
+    }),
     getMessage: async () => ({ ok: false, reason: "error", error }),
   };
 }

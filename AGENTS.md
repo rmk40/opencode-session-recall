@@ -380,7 +380,7 @@ The runtime reads the store's counters at most every 5 seconds
 - A full load, on a cold start, after `invalidate()`, when a counter went
   backwards (the store was reset or replaced) and when `cards_rev` advanced
   further than `cards_stamped` (an older build wrote without stamping). It reads
-  `cardsPage` keyset pages of 250 with a macrotask between them. The one
+  `cardsPage` keyset pages of 250 with a yield point between them. The one
   exception is a map that was never loaded or was invalidated. A synchronous
   accessor that reaches it first loads it in place, since nothing may serve
   before it. `rank()` may then rebuild the index in place too.
@@ -446,9 +446,51 @@ Concurrent distiller workers (cold-pass workers, repair-sweep workers and
 concurrent re-distills) each yield before a write. Those yields can end in the
 same turn of the event loop, so after each session write (a replace, an append or
 a tail write) the distiller starts a yield (`yieldAfterWrite`) that the next write
-waits for, then re-checks `stopped` and the lease. One slice then holds at most
-one session's write transaction. A new session write path calls
+waits for, then re-checks `stopped` and the lease. Writes then run back to back
+only within one slice of the time budget below. A new session write path calls
 `yieldAfterWrite()` after its write and waits out `writeYield` before it.
+
+## Yield on a time budget, through `src/yield.ts`
+
+A `setTimeout(0)` turn costs about 1.25 ms in both Bun and Node (timers are
+clamped to 1 ms), several times what one history statement costs, so a history
+reader that awaited one before every statement would spend about a third of a
+median search waiting on timers. Every long-running loop therefore awaits a
+yield point, and the default yield point (`yieldOnBudget`, one per process)
+yields to the event loop only once `SLICE_MS` (8 ms) of work has run since
+anything last yielded through it. The v2 reader, the v2 sync, the card runtime's
+chunked jobs, the distiller and discovery all default to it. A yield itself is
+`macrotask()`, which uses `setImmediate` where the runtime has it and
+`setTimeout(0)` otherwise. **Do not use `MessageChannel` for it.** Node and Bun
+deliver a port's messages back to back without returning to the event loop, so a
+chain of such yields keeps timers from ever firing (a probe of 200 slices of 3 ms
+saw no interval tick at all). A test that injects `yieldBetween` gets it called
+at every yield point, so tests that interleave writes between statements keep
+working. **Do not add a per-statement `setTimeout(0)`**; await the component's
+yield point instead.
+
+## Time windows: sessions overlap, reads go toward the window
+
+A search's `since`/`until` (or `after`/`before`) keeps the sessions that overlap
+the window: last updated at or after the lower bound and created at or before the
+upper one (`CardFilters`, the slim-index lane, the deep listing, the live probe
+of uncarded ids and the hooks' FTS backfill all apply the same rule). A subagent
+that kept running for hours past the bound stays findable. The per-message
+filters still apply the exact window, so results never leave it.
+
+The drill and the deep sweep read toward the window (`DrillInput.window`). With
+an upper bound, a walk starts at `HistorySource.seekPage`, the newest message
+created at or before it. On v2 that is two point reads, one down the
+`(session_id, time_created, id)` index (the highest seq among its first 16 rows,
+so a row whose creation time a retried step moved later stays on the walk's
+side) and one down `(session_id, seq)`. Both bind `LIMIT ?`. A walk ends at the
+first page that reaches the lower bound. Messages outside the window stay out of
+the pool and charge neither the per-session nor the per-query budget. v1 cannot
+seek and answers `unsupported`, so its walk reads every newer message first,
+bounded by `OUT_OF_WINDOW_FACTOR` (4) times the per-session budget in their own
+count. The drill cache keys pages by cursor, which no window changes, and keeps
+seek answers per bound. A slice's signature names its start and its window, so a
+build is reused only for the same window.
 
 ## Embedding representation changes MUST ride a schema bump
 

@@ -128,6 +128,9 @@ describe("cards tier-1 rank", () => {
     store.upsertCard(
       makeCard("s-new", {
         inventory: "widget parser",
+        // Created after the `until` bound below, so no part of it overlaps
+        // the window that bound closes.
+        timeCreated: 8000,
         timeUpdated: 9000,
         directory: "/b",
         projectId: "pb",

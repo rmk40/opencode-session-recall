@@ -66,6 +66,7 @@ import {
   type DrillTarget,
   type DrillTargetStats,
   type DrilledPool,
+  type TimeWindow,
 } from "./drill.js";
 import type { Store, FtsHit, Card } from "./store.js";
 import type { FetchGate } from "./fetch-gate.js";
@@ -3262,7 +3263,14 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
         const probeMeta = async (
           id: string,
         ): Promise<
-          { title: string; directory: string; updated: number; parentID: string | null } | undefined
+          | {
+              title: string;
+              directory: string;
+              created: number;
+              updated: number;
+              parentID: string | null;
+            }
+          | undefined
         > => {
           const probeScopes: SessionScope[] = source.scopedLookup
             ? ["project", "global"]
@@ -3275,6 +3283,7 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
                 return {
                   title: data.title,
                   directory: data.directory,
+                  created: data.time.created,
                   updated: data.time.updated,
                   // A SUCCESSFUL fetch whose `parentID` is absent means root,
                   // so it maps to `null` — never `undefined` (which is reserved
@@ -3295,7 +3304,8 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
          *  excludes the id entirely (a truly-uncarded worker cannot be caught
          *  by the card-title checks, and its content — plain user/assistant
          *  text — would otherwise sail through the extract-level part
-         *  filters), and before/after bounds apply against `time.updated`. On
+         *  filters), and before/after bounds keep the sessions that overlap the
+         *  window (`time.created` and `time.updated`). On
          *  double failure: a minimal unverified target with selection bounds
          *  bypassed — the warning says so.
          *
@@ -3330,8 +3340,9 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
               const meta = metas[i];
               if (meta) {
                 if (isSummarizerTitle(meta.title)) continue; // worker: never a target
+                // The session overlaps the window, as `CardFilters` keeps it.
                 if (after != null && meta.updated < after) continue;
-                if (before != null && meta.updated > before) continue;
+                if (before != null && meta.created > before) continue;
                 relevanceBySession.set(id, "unknown");
                 searchedMeta.set(id, { id, title: meta.title, directory: meta.directory });
                 resolved.push({
@@ -3767,8 +3778,9 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
               // A direct store read bypasses the card runtime's filter, so a stray
               // worker card (crash leftover) must be rejected here too.
               if (isSummarizerTitle(card.title)) continue;
+              // The session overlaps the window, as `CardFilters` keeps it.
               if (after != null && card.timeUpdated < after) continue;
-              if (before != null && card.timeUpdated > before) continue;
+              if (before != null && card.timeCreated > before) continue;
               const relevance = relevanceOf(card);
               if (bucketDirectory) {
                 if (relevance === "global" && !(directoryFilter && fallback)) continue;
@@ -3982,10 +3994,17 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
           );
         }
 
+        // The drill and the sweep read toward the time window; the filter
+        // still applies it to every candidate.
+        const timeWindow: TimeWindow | undefined =
+          after != null || before != null
+            ? { ...(after != null && { after }), ...(before != null && { before }) }
+            : undefined;
         const drillInput = {
           sessions: drillTargets,
           deepSet,
           ftsBySession,
+          ...(timeWindow && { window: timeWindow }),
           query: queryMeta,
           explain,
           filter: eligibleFilter,
@@ -4495,6 +4514,7 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
             authorship: authorshipFilter,
             charsPerQuery: limits.deepCharsPerQuery,
             resume: deepResume,
+            ...(timeWindow && { window: timeWindow }),
             abort: ctx.abort,
           });
           if (ctx.abort.aborted) return abortedOutput();
