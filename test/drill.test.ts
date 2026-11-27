@@ -2306,7 +2306,7 @@ describe("deep sweep time window bounds", () => {
   });
 
   it("covers a resumed session with nothing created inside the window without reading from its cursor", async () => {
-    // s-a was written at 1000 to 3000, before a lower bound of 4500.
+    // s-a was written at 1000 to 3000, before a window of (4500, 9000).
     const sessionA = series("s-a", 3);
     const { source, ctl } = makeControlledSource(
       { messagesBySession: { "s-a": sessionA, "s-b": series("s-b", 6) } },
@@ -2316,7 +2316,7 @@ describe("deep sweep time window bounds", () => {
       sessions: [revised("s-a"), revised("s-b")],
       query: parseQuery("alpha"),
       charsPerQuery: 10_000,
-      window: { after: 4500 },
+      window: { after: 4500, before: 9000 },
       resume: { before: paginateBundles(sessionA, 1).nextCursor! },
     });
     expect(ctl.floors.map((f) => f.sessionID)).toEqual(["s-a", "s-b"]);
@@ -2696,7 +2696,7 @@ describe("drill time window order and outside bounds", () => {
     const { source, ctl } = makeControlledSource(oneEmpty(), { floor: true });
     const drill = newDrill(source, { drillPageMessages: 1 });
     const out = await drill.pools({
-      ...windowed([revised("s-a")], "alpha", { after: 4500 }),
+      ...windowed([revised("s-a")], "alpha", { after: 4500, before: 9000 }),
       ftsBySession: new Map([["s-a", [ftsHit("s-a", "a4"), ftsHit("s-a", "a1")]]]),
     });
     expect(ctl.pages).toEqual([]);
@@ -2776,5 +2776,50 @@ describe("drill time window order and outside bounds", () => {
       { sessionId: "s-c", fetched: 3, candidate: 2, eligible: 2, stop: "end", cached: true },
     ]);
     expect(ctl.pages).toHaveLength(pages);
+  });
+
+  it("reads before asking for the floor under a lower bound alone, and asks once a walk or sweep meets an older message", async () => {
+    // m101 to m120 are inside a lower bound of 100,500, as under `last:`.
+    const graph: Graph = {
+      messagesBySession: {
+        "s-a": Array.from({ length: 120 }, (_, i) =>
+          note("s-a", `s-a-m${i + 1}`, (i + 1) * 1000, `alpha ${i + 1}`),
+        ),
+      },
+    };
+    const { source: inner } = makeControlledSource(graph, { floor: true });
+    const events: string[] = [];
+    const source: HistorySource = {
+      ...inner,
+      async messagePage(o) {
+        events.push("page");
+        return inner.messagePage(o);
+      },
+      async seqFloor(o) {
+        events.push("floor");
+        return inner.seqFloor!(o);
+      },
+    };
+    const window = { after: 100_500 };
+
+    // The drill's third page of ten is the first to hold an older message.
+    const drilled = await newDrill(source, { drillPageMessages: 10 }).pools(
+      windowed([revised("s-a")], "alpha", window),
+    );
+    expect(events).toEqual(["page", "page", "page", "floor"]);
+    expect(drilled.targets[0]).toMatchObject({ fetched: 30, stop: "end" });
+
+    // The sweep's first page of 50 already holds one.
+    events.length = 0;
+    const swept = await newDrill(source).deep({
+      sessions: [revised("s-a")],
+      query: parseQuery("alpha"),
+      charsPerQuery: 1_000_000,
+      window,
+    });
+    expect(events).toEqual(["page", "floor"]);
+    expect(swept.targets).toEqual([
+      { sessionId: "s-a", fetched: 50, candidate: 20, eligible: 20, stop: "end" },
+    ]);
   });
 });

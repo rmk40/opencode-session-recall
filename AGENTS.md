@@ -520,10 +520,14 @@ message's time.**
   read one whose `info.seq` is at or below `HistorySource.seqFloor`, the lowest
   seq of a row created inside the window. On v2 one read pages the window's
   rows up the creation-time index 1,000 at a time and range reads walk seq up
-  from the oldest row, in turn, and whichever finishes first is exact. A walk
-  asks for the floor before its first read. A null floor (nothing created
-  inside the window) means the session is not read at all. A deep sweep counts
-  it covered. The answer is cached per session and window.
+  from the oldest row, in turn, and whichever finishes first is exact. With
+  both bounds a walk asks for the floor before its first read. A null floor
+  (nothing created inside the window) means the session is not read at all. A
+  deep sweep counts it covered. Under a lower bound alone the card filters, the
+  slim lane and the deep listing have already left out sessions last updated
+  before it, so a null floor is rare there and the ask, which can examine up to
+  40,000 rows, waits until the walk meets an older message. The answer is
+  cached per session and window.
 - Every one of these statements binds `LIMIT ?` and reads only `seq`,
   `time_created` and `id`, never `data`.
 - Messages outside the window stay out of the pool and charge neither the

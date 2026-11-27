@@ -217,7 +217,8 @@ most of them on a store of 12,000 cards.
     bound. Finding where to start in a session of 4,896 messages before the
     bound and 60,000 after it took 12 ms, in ten statements that read no
     message bodies.
-  - A session that wrote nothing inside the window is not read at all.
+  - A session that wrote nothing inside a window with both bounds is not
+    read at all.
 
 ## 3.0.1
 
