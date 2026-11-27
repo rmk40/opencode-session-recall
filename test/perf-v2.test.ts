@@ -30,7 +30,11 @@
  * check over a 500-row session. Each records its total time. The last runs
  * the first search after a restart over 12,000 sessions through the runtime
  * the plugin creates, once with no cold pass and once during one with more
- * work than the search, and bounds how much the pass slows the search.
+ * work than the search, and bounds how much the pass slows the search. Two
+ * more bound what grows with history: the CPU of one page read of a
+ * 35,000-message session, newest, oldest and from its middle, at 10 ms with
+ * automatic indexes on and off; and the slices of a poll over 200,000
+ * messages written since its watermark, after 600,000 older ones, at 35 ms.
  *
  * Every gate asserts its longest slice with V8's garbage-collection pauses
  * taken out (`…MaxSliceMs`) and logs the raw stall (`…MaxStallMs`) and the
@@ -72,16 +76,19 @@ import type { HistorySession } from "../src/history/model.js";
 import type { HistorySource } from "../src/history/source.js";
 import { openStore, type Store } from "../src/store.js";
 import { openSqlite, type ReadOnlyDb, type SqliteDb } from "../src/sqlite.js";
-import { createV2HistorySource, openOpencodeDb } from "../src/history/v2.js";
+import { createV2HistorySource, encodeV2Cursor, openOpencodeDb } from "../src/history/v2.js";
+import type { MessagePage } from "../src/history/source.js";
 import { V2_PROJECTOR_GEN } from "../src/history/v2-project.js";
 import {
   createV2Sync,
   POLL_CURSOR_KEY,
+  POLL_ROW_CURSOR_KEY,
   POLL_WATERMARK_KEY,
   SESSION_CURSOR_KEY,
   SESSION_WATERMARK_KEY,
   type V2SyncOptions,
 } from "../src/history/v2-sync.js";
+import { yieldInBackground } from "../src/yield.js";
 import { DEFAULTS, DISCOVERY_LIMIT, type SearchOutput } from "../src/types.js";
 import { discoverSessions, v2RuntimeFactory, type V2Runtime } from "../src/host/v2-runtime.js";
 import { search } from "../src/search.js";
@@ -189,6 +196,18 @@ const RANGE_CHECK_TOTAL_BUDGET_MS = 250;
  *  as long it may take while a cold pass runs as with none running. */
 const FIRST_SEARCH_SESSIONS = 12_000;
 const FIRST_SEARCH_SLOWDOWN_MAX = 2;
+/** Messages of the session the page-read gate reads, the CPU one page read
+ *  may take, and how often each read is measured. */
+const LONG_SESSION_ROWS = 35_000;
+const PAGE_READ_CPU_BUDGET_MS = 10;
+const PAGE_READ_REPEATS = 5;
+/** New messages since the watermark the poll gate reads, the messages of
+ *  the history before it, the sessions they belong to, and the slice budget
+ *  of background work. */
+const POLL_MESSAGES = 200_000;
+const POLL_OLDER_MESSAGES = 600_000;
+const POLL_SESSIONS = 400;
+const POLL_SLICE_BUDGET_MS = 35;
 
 /** Wait for `pred`, failing after ten minutes. */
 async function until(pred: () => boolean, what: string): Promise<void> {
@@ -1766,4 +1785,214 @@ describe.skipIf(!ENABLED)("perf: v2 event-loop stalls", () => {
       rmSync(storeDir, { recursive: true, force: true });
     }
   }, 900_000);
+
+  it(`page reads of a ${LONG_SESSION_ROWS}-message session take under ${PAGE_READ_CPU_BUDGET_MS} ms of CPU each, with automatic indexes on and off`, async () => {
+    const v2 = await makeV2PartsDb();
+    v2.db.exec("PRAGMA synchronous = OFF");
+    try {
+      const at = Date.now() - 86_400_000;
+      const w = v2.db;
+      w.tx(() => {
+        insertProject(w, { id: "prj", worktree: "/workspace/perf" });
+        insertSession(w, {
+          id: "ses_long",
+          project_id: "prj",
+          directory: "/workspace/perf",
+          title: "Long",
+          time_created: at,
+          time_updated: at + LONG_SESSION_ROWS,
+        });
+        for (let seq = 1; seq <= LONG_SESSION_ROWS; seq++) {
+          const id = `msg_long_${String(seq).padStart(6, "0")}`;
+          const t = at + seq;
+          if (seq % 2 === 1) {
+            insertMessage(w, {
+              id,
+              session_id: "ses_long",
+              type: "user",
+              seq,
+              time_created: t,
+              data: userData(sentence(seq, 30), t),
+            });
+            continue;
+          }
+          insertMessage(w, {
+            id,
+            session_id: "ses_long",
+            type: "assistant",
+            seq,
+            time_created: t,
+            data: replyData([], t),
+          });
+          const items = [
+            textItem(sentence(seq, 40)),
+            toolItem(`call_${seq}`, `rg ${sentence(seq, 3)}`, sentence(seq, 60), t),
+          ];
+          items.forEach((data, ordinal) =>
+            insertPart(w, {
+              message_id: id,
+              session_id: "ses_long",
+              ordinal,
+              time_created: t,
+              data,
+            }),
+          );
+        }
+      });
+      const opened = await openOpencodeDb(v2.path);
+      if (!opened.ok) throw new Error(opened.reason);
+      const source = createV2HistorySource(limitSpy(opened.db), { yieldBetween: async () => {} });
+      // The newest page, the oldest and one from the middle of the session.
+      const reads: Array<[string, () => Promise<MessagePage>]> = [
+        ["newest", () => source.messagePage({ sessionID: "ses_long", limit: 50 })],
+        ["oldest", () => source.messagePageAscending!({ sessionID: "ses_long", limit: 50 })],
+        [
+          "deep",
+          () =>
+            source.messagePage({
+              sessionID: "ses_long",
+              limit: 50,
+              before: encodeV2Cursor(LONG_SESSION_ROWS / 2),
+            }),
+        ],
+      ];
+      const results: Record<string, number> = {};
+      const load = loadAverage();
+      try {
+        // Without automatic indexes the planner has nothing to match a
+        // page's rows against but a walk, as it planned on a real database.
+        for (const auto of ["ON", "OFF"]) {
+          opened.db.get(`PRAGMA automatic_index = ${auto}`);
+          const suffix = auto === "ON" ? "" : "NoAutoIndex";
+          for (const [label, read] of reads) {
+            await read();
+            let worst = 0;
+            for (let i = 0; i < PAGE_READ_REPEATS; i++) {
+              // The main thread's CPU: the collector's helper threads run
+              // beside it and are not the read's cost.
+              const before = process.threadCpuUsage();
+              const page = await read();
+              const used = process.threadCpuUsage(before);
+              worst = Math.max(worst, (used.user + used.system) / 1_000);
+              results[`${label}Items`] = page.items.length;
+            }
+            results[`${label}${suffix}MaxCpuMs`] = worst;
+          }
+        }
+      } finally {
+        opened.db.get("PRAGMA automatic_index = ON");
+        opened.db.close();
+      }
+
+      console.log(`v2 long-session page reads (load ${load}):`, JSON.stringify(rounded(results)));
+
+      for (const label of ["newest", "oldest", "deep"]) {
+        expect(results[`${label}Items`]).toBe(50);
+        expect(results[`${label}MaxCpuMs`]).toBeLessThan(PAGE_READ_CPU_BUDGET_MS);
+        expect(results[`${label}NoAutoIndexMaxCpuMs`]).toBeLessThan(PAGE_READ_CPU_BUDGET_MS);
+      }
+    } finally {
+      v2.cleanup();
+    }
+  }, 300_000);
+
+  it(`a poll over ${POLL_MESSAGES} new messages after ${POLL_OLDER_MESSAGES} older ones keeps each code slice under ${POLL_SLICE_BUDGET_MS} ms excluding GC pauses`, async () => {
+    const v2 = await makeV2Db();
+    v2.db.exec("PRAGMA synchronous = OFF");
+    const slow = slowLog();
+    try {
+      const at = Date.now();
+      // About 25 minutes of writes since the watermark, several rows to a
+      // millisecond.
+      const t0 = at - 1_500_000;
+      const w = v2.db;
+      let newest = 0;
+      w.tx(() => {
+        insertProject(w, { id: "prj", worktree: "/workspace/perf" });
+        for (let s = 0; s < POLL_SESSIONS; s++) {
+          insertSession(w, {
+            id: `ses_poll_${String(s).padStart(4, "0")}`,
+            project_id: "prj",
+            directory: "/workspace/perf",
+            title: `Poll ${s}`,
+            time_created: t0 - 60_000,
+            // Older than the session scan's window, so only the message
+            // window signals them.
+            time_updated: t0 - 60_000,
+          });
+        }
+        // The history before the watermark, over the day before it, then
+        // the new messages.
+        for (let i = 0; i < POLL_OLDER_MESSAGES + POLL_MESSAGES; i++) {
+          const fresh = i - POLL_OLDER_MESSAGES;
+          const t =
+            fresh < 0
+              ? t0 - 86_400_000 + Math.floor((i * 80_000_000) / POLL_OLDER_MESSAGES)
+              : t0 + Math.floor((fresh * 1_400_000) / POLL_MESSAGES);
+          if (fresh >= 0) newest = Math.max(newest, t);
+          insertMessage(w, {
+            id: `msg_poll_${String(i).padStart(7, "0")}`,
+            session_id: `ses_poll_${String(i % POLL_SESSIONS).padStart(4, "0")}`,
+            type: "user",
+            seq: Math.floor(i / POLL_SESSIONS) + 1,
+            time_created: t,
+            data: userData(sentence(i, 8), t),
+          });
+        }
+      });
+      const opened = await openOpencodeDb(v2.path);
+      if (!opened.ok) throw new Error(opened.reason);
+      let statements = 0;
+      const timed = timedReader(opened.db, slow);
+      const counted: ReadOnlyDb = {
+        ...timed,
+        all: (sql, params) => {
+          if (/FROM session_message/.test(sql)) statements++;
+          return timed.all(sql, params);
+        },
+      };
+      // The background yield point, as the runtime's distiller polls with.
+      const sync = createV2Sync(limitSpy(counted), {
+        sessionScanEveryMs: 1e12,
+        now: () => at,
+        yieldBetween: yieldInBackground,
+      });
+      const values = new Map<string, string>();
+      const meta: PollMeta = {
+        get: (key) => values.get(key),
+        set: (key, value) => void values.set(key, value),
+      };
+      meta.set(POLL_WATERMARK_KEY, String(t0 - 1));
+      const results: Record<string, number> = {};
+      const probe = stallProbe();
+      const load = loadAverage();
+      try {
+        probe.reset();
+        const start = performance.now();
+        const polled = await sync.poll(meta);
+        results.pollTotalMs = performance.now() - start;
+        Object.assign(results, stallFields("poll", await probe.stalls()));
+        polled.commit();
+        results.signals = polled.signals.length;
+        results.failures = polled.failures.length;
+        results.statements = statements;
+      } finally {
+        probe.stop();
+        opened.db.close();
+      }
+
+      console.log(`v2 poll over new messages (load ${load}):`, JSON.stringify(rounded(results)));
+      console.log("slowest synchronous calls:", JSON.stringify(slow.top(4)));
+
+      expect(results.failures).toBe(0);
+      // Every session, once, and the window drained to its newest row.
+      expect(results.signals).toBe(POLL_SESSIONS);
+      expect(values.get(POLL_WATERMARK_KEY)).toBe(String(newest));
+      expect(values.get(POLL_ROW_CURSOR_KEY)).toBe("");
+      expect(results.statements).toBeGreaterThanOrEqual(POLL_MESSAGES / 2_000);
+      expect(results.pollMaxSliceMs).toBeLessThan(POLL_SLICE_BUDGET_MS);
+    } finally {
+      v2.cleanup();
+    }
+  }, 600_000);
 });
