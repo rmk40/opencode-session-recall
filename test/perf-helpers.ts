@@ -215,6 +215,35 @@ function zipf(size: number, s: number): (rand: () => number) => number {
 
 const TOOLS = ["bash", "read", "edit", "grep", "glob", "write", "task", "webfetch"];
 
+let messageRanks: ((rand: () => number) => number) | undefined;
+
+/**
+ * Message text of about `chars` characters, as people and agents write it in
+ * a coding session: Zipf-distributed words with code identifiers, snake_case
+ * names and file paths among them. Most of its tokens are distinct, so the
+ * slim index's normalized text of a row is about as long as its text.
+ * Deterministic in `seed`.
+ */
+export function perfMessageText(seed: number, chars: number): string {
+  const rankOf = (messageRanks ??= zipf(VOCABULARY, 1.05));
+  const rand = mulberry32(fnv1a(`message:${seed}`));
+  const pick = (): string => word(rankOf(rand));
+  const camel = (n: number): string =>
+    Array.from({ length: n }, (_, k) => {
+      const w = pick();
+      return k === 0 ? w : w[0]!.toUpperCase() + w.slice(1);
+    }).join("");
+  let out = "";
+  while (out.length < chars) {
+    const kind = rand();
+    if (kind < 0.25) out += `${camel(2 + Math.floor(rand() * 2))} `;
+    else if (kind < 0.33) out += `${pick()}_${pick()} `;
+    else if (kind < 0.43) out += `src/${pick()}/${camel(2)}.ts `;
+    else out += `${pick()} `;
+  }
+  return out.slice(0, chars).trim();
+}
+
 export type PerfCorpus = {
   /** Session id of card `i`. */
   id(i: number): string;
