@@ -3052,13 +3052,14 @@ describe("family rollups read a page at a time", () => {
 
   /**
    * A store whose next yield after a call of an armed method waits until
-   * that hold is released. Every store call made while `closed` is set is
-   * recorded.
+   * that hold is released. Every store call is recorded in `calls`, and
+   * those made while `closed` is set in `after` too.
    */
   function holding(store: Store) {
     type Hold = { method: string; held: boolean; release: () => void; wait: Promise<void> };
     const armed: Hold[] = [];
     let next: Hold | undefined;
+    const calls: string[] = [];
     const after: string[] = [];
     let closed = false;
     const wrapped = new Proxy(store, {
@@ -3067,6 +3068,7 @@ describe("family rollups read a page at a time", () => {
         if (typeof value !== "function") return value;
         const method = value as (...args: unknown[]) => unknown;
         return (...args: unknown[]) => {
+          calls.push(String(prop));
           if (closed) after.push(String(prop));
           const hold = armed.find((h) => h.method === prop);
           if (hold) {
@@ -3096,9 +3098,17 @@ describe("family rollups read a page at a time", () => {
       close(): void {
         closed = true;
       },
+      calls,
       after,
     };
   }
+
+  /** Put a rival's name on the lease row, as a takeover does. */
+  const takeLease = (store: Store): void =>
+    store.setMeta(
+      "distill_lease",
+      JSON.stringify({ holder: "rival", heartbeat: Date.now(), ttl: 30_000, build: "x", gen: 1 }),
+    );
 
   async function setup(o: { coldPass: boolean; cards: Card[] }) {
     const { db, store } = await freshStore();
@@ -3235,6 +3245,49 @@ describe("family rollups read a page at a time", () => {
     await waitFor(() => store.getCard("R")!.familyRollup[0]?.snippet === "new title");
     await new Promise((resolve) => setTimeout(resolve, 30));
     expect(store.getCard("R")!.familyRollup).toEqual(rollupFromAll(store, "R"));
+    await distiller.stop();
+    db.close();
+  });
+
+  it("writes no rollup when the lease moves while a recompute of a family waits", async () => {
+    const { db, store, h, distiller } = await setup({
+      coldPass: false,
+      cards: [member("R", "R", 1_000), ...children("R", 600, 5_000)],
+    });
+    distiller.start();
+    const hold = h.arm("familyPage");
+    distiller.onEvent({ type: "deleted", sessionID: "R-a0000" });
+    await waitFor(() => hold.held);
+    takeLease(store);
+    const mark = h.calls.length;
+    hold.release();
+    await waitFor(() => !distiller.status().leaseHeld);
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    expect(h.calls.slice(mark)).not.toContain("setFamilyRollup");
+    expect(store.getCard("R")!.familyRollup).toEqual([]);
+    await distiller.stop();
+    db.close();
+  });
+
+  it("writes no rollup when the lease moves while a full pass waits between pages", async () => {
+    const { db, store, h, distiller } = await setup({
+      coldPass: true,
+      cards: [
+        member("R", "R", 1_000),
+        member("R-c", "R", 3_000),
+        ...Array.from({ length: 600 }, (_, i) => member(`solo-${i}`, `solo-${i}`, 2_000)),
+      ],
+    });
+    const hold = h.arm("rollupFieldsPage");
+    distiller.start();
+    await waitFor(() => hold.held);
+    takeLease(store);
+    const mark = h.calls.length;
+    hold.release();
+    await waitFor(() => !distiller.status().leaseHeld && distiller.status().coldPass !== "running");
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    expect(h.calls.slice(mark)).not.toContain("setFamilyRollup");
+    expect(store.getCard("R")!.familyRollup).toEqual([]);
     await distiller.stop();
     db.close();
   });
