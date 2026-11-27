@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -74,6 +74,7 @@ beforeEach(async () => {
 
 afterEach(async () => {
   await Promise.all(distillers.splice(0).map((d) => d.stop()));
+  vi.restoreAllMocks();
   storeDb.close();
   reader.close();
   v2db.cleanup();
@@ -220,6 +221,8 @@ type StartOptions = {
   wrapSource?: (inner: HistorySource) => HistorySource;
   /** Runs before each tail write reaches the store. */
   beforeTail?: () => void;
+  /** Runs each card write (`write`) in its place, returning its result. */
+  aroundWrite?: (method: string, write: () => unknown) => unknown;
   /** The distiller's yield (`yieldBetween`); none by default. */
   pause?: () => Promise<void>;
 };
@@ -272,7 +275,8 @@ function start(o: StartOptions = {}): Started {
       if (typeof prop === "string" && WRITES.has(prop)) {
         return (...args: unknown[]) => {
           if (prop === "replaceSessionTail") o.beforeTail?.();
-          const result = method.apply(target, args);
+          const write = (): unknown => method.apply(target, args);
+          const result = o.aroundWrite ? o.aroundWrite(prop, write) : write();
           writes.push({ method: prop, result });
           return result;
         };
@@ -1211,4 +1215,52 @@ describe("v2 reads of the stored rows before a write", () => {
     expect(now[1]).toEqual(hashes[1]);
     storeDb.run("INSERT INTO part_fts(part_fts, rank) VALUES('integrity-check', 1)");
   }, 20_000);
+});
+
+// ── WAL checkpoints after long writes ────────────────────────────────────────
+
+describe("v2 session writes that held the loop", () => {
+  const SESSION_WRITES = ["replaceSessionParts", "appendSessionParts", "replaceSessionTail"];
+
+  it.each([
+    { took: 35, name: "checkpoint the WAL before they yield", after: ["checkpoint", "yield"] },
+    { took: 34, name: "yield, leaving the checkpoint to a later slice", after: ["yield"] },
+  ])("for $took ms (a full write, an append and a tail write) $name", async ({ took, after }) => {
+    // `performance.now` moves only while a session write runs.
+    let perf = 10_000;
+    vi.spyOn(performance, "now").mockImplementation(() => perf);
+    const events: string[] = [];
+    const checkpoint = store.checkpoint.bind(store);
+    vi.spyOn(store, "checkpoint").mockImplementation(() => {
+      events.push("checkpoint");
+      return checkpoint();
+    });
+    addSession("ses_a");
+    addUser("ses_a", "openingword");
+    addReply("ses_a", ["answerword"]);
+    const h = start({
+      appendThresholdParts: 0,
+      pause: async () => {
+        events.push("yield");
+      },
+      aroundWrite: (method, write) => {
+        if (SESSION_WRITES.includes(method)) perf += took;
+        const result = write();
+        events.push(method);
+        return result;
+      },
+    });
+    await redistill(h, "ses_a");
+    addUser("ses_a", "followword");
+    const reply = addReply("ses_a", ["draftword"], { running: true });
+    expect(methods(await redistill(h, "ses_a"))).toEqual(["appendSessionParts"]);
+    addPart(reply, "ses_a", 1, "grownword");
+    expect(methods(await redistill(h, "ses_a"))).toEqual(["replaceSessionTail"]);
+
+    for (const method of SESSION_WRITES) {
+      const i = events.indexOf(method);
+      expect(i, method).toBeGreaterThanOrEqual(0);
+      expect(events.slice(i + 1, i + 1 + after.length), method).toEqual(after);
+    }
+  });
 });

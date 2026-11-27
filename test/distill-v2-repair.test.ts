@@ -4,12 +4,15 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   createDistiller,
+  parseRepairProgress,
   PROGRESS_STALE_MS,
+  PROGRESS_WRITE_MS,
   RECONCILE_PROGRESS_KEY,
   REPAIR_GEN_KEY,
   REPAIR_PROGRESS_KEY,
   type Distiller,
   type DistillSync,
+  type RepairProgress,
 } from "../src/distill.js";
 import { isUnavailableText } from "../src/digest.js";
 import { createFetchGate } from "../src/fetch-gate.js";
@@ -24,7 +27,14 @@ import {
 import { V2_PROJECTOR_GEN } from "../src/history/v2-project.js";
 import { createV2Sync, inspectCheckpoint, type V2SyncOptions } from "../src/history/v2-sync.js";
 import { openSqlite, type ReadOnlyDb, type SqliteDb } from "../src/sqlite.js";
-import { openStore, type Store } from "../src/store.js";
+import {
+  CARDS_DELETED_KEY,
+  CARDS_REV_KEY,
+  CARDS_STAMPED_KEY,
+  openStore,
+  REPAIR_REV_KEY,
+  type Store,
+} from "../src/store.js";
 import type { Limits } from "../src/types.js";
 import { makeFakeHarness, openV1Store, TEST_LIMITS } from "./helpers.js";
 import {
@@ -236,6 +246,8 @@ type StartOptions = {
   onColdPassDone?: () => void;
   coldPassRetryMs?: number;
   leaseRetryMs?: number;
+  /** The distiller's clock; `Date.now` by default. */
+  now?: () => number;
   /** Default: the test's store. */
   store?: Store;
 };
@@ -304,6 +316,7 @@ function startDistiller(o: StartOptions = {}): Started {
     ...(o.onColdPassDone && { onColdPassDone: o.onColdPassDone }),
     ...(o.coldPassRetryMs !== undefined && { coldPassRetryMs: o.coldPassRetryMs }),
     ...(o.leaseRetryMs !== undefined && { leaseRetryMs: o.leaseRetryMs }),
+    ...(o.now && { now: o.now }),
   });
   distillers.push(distiller);
   distiller.start();
@@ -777,6 +790,166 @@ describe("v2 repair sweep", () => {
     expect(h.distiller.repair()?.sweep).toMatchObject({ pending: 0, repairPending: 1, done: 1 });
     expect(counted).toHaveBeenCalled();
     for (const read of wholeTable) expect(read).not.toHaveBeenCalled();
+  });
+});
+
+// ── The sweep's repair-pending count ─────────────────────────────────────────
+
+describe("v2 repair sweep progress count", () => {
+  /** Four sessions, newest first, indexed at this generation; then `ses_a`
+   *  and `ses_b` made stale, `ses_c` marked repair-pending under this
+   *  generation and `ses_d` left current. */
+  async function staleStore(): Promise<void> {
+    for (const [id, updated] of [
+      ["ses_a", 400],
+      ["ses_b", 300],
+      ["ses_c", 200],
+      ["ses_d", 100],
+    ] as const) {
+      addSession(id, { time_updated: T0 + updated });
+      addUser(id, `${id} prompt`);
+    }
+    await built();
+    store.markRepairPending("ses_c", "an earlier failure");
+    store.setMeta(REPAIR_GEN_KEY, String(GEN));
+    store.setMeta(REPAIR_PROGRESS_KEY, "");
+    makeStale(["ses_a", "ses_b"]);
+  }
+
+  type Event = "walk" | RepairProgress;
+
+  /** From here on, every walk of the card table (a page read from its first
+   *  card) and every progress the sweep shares, in order. */
+  function record(): Event[] {
+    const events: Event[] = [];
+    const page = store.repairStatePage.bind(store);
+    vi.spyOn(store, "repairStatePage").mockImplementation((gen, after, limit) => {
+      if (after === undefined) events.push("walk");
+      return page(gen, after, limit);
+    });
+    const setMeta = store.setMeta.bind(store);
+    vi.spyOn(store, "setMeta").mockImplementation((key, value) => {
+      const progress = key === REPAIR_PROGRESS_KEY ? parseRepairProgress(value) : undefined;
+      if (progress) events.push(progress);
+      setMeta(key, value);
+    });
+    return events;
+  }
+
+  /** The progress the sweep shared after its first rebuild, and how many
+   *  walks it took since the progress it shared when it started. */
+  function afterFirstRebuild(events: Event[]): { walks: number; repairPending: number } {
+    const progress = (e: Event, done: number): boolean =>
+      e !== "walk" && e.running && e.done === done;
+    const started = events.findIndex((e) => progress(e, 0));
+    const next = events.findIndex((e) => progress(e, 1));
+    expect(started).toBeGreaterThanOrEqual(0);
+    expect(next).toBeGreaterThan(started);
+    return {
+      walks: events.slice(started + 1, next).filter((e) => e === "walk").length,
+      repairPending: (events[next] as RepairProgress).repairPending,
+    };
+  }
+
+  /** A distiller whose sweep runs `during` while it looks `ses_a` up, its
+   *  first rebuild, and whose clock then moves on so the progress after that
+   *  rebuild is due to be shared. Resolves once the sweep has ended. */
+  async function sweep(during: (h: Started) => void | Promise<void>, events: Event[]) {
+    let clock = Date.now();
+    let ran = false;
+    const self: { h?: Started } = {};
+    self.h = startDistiller({
+      now: () => clock,
+      leaseRetryMs: 1,
+      wrapSource: (inner) => ({
+        ...inner,
+        getSession: async (id, opts) => {
+          if (id === "ses_a" && !ran) {
+            ran = true;
+            clock += PROGRESS_WRITE_MS;
+            await during(self.h!);
+          }
+          return inner.getSession(id, opts);
+        },
+      }),
+    });
+    await waitFor(() => events.some((e) => e !== "walk" && !e.running));
+    expect(ran).toBe(true);
+    return self.h;
+  }
+
+  /** A repair reason on `ses_d` written without moving any counter, as an
+   *  older build writes one. */
+  const reasonElsewhere = (): void => {
+    storeDb.run("UPDATE card SET repair_reason = 'set elsewhere' WHERE session_id = 'ses_d'");
+  };
+  /** {@link reasonElsewhere}, with the counter `key` moved on by one. */
+  const moved = (key: string) => (): void => {
+    reasonElsewhere();
+    store.setMeta(key, String(Number(store.getMeta(key) ?? "0") + 1));
+  };
+
+  it.each<{ name: string; change: () => void; walks: number; repairPending: number }>([
+    {
+      name: "keeps the count it read while nothing it counts by moved",
+      change: () => {},
+      walks: 0,
+      repairPending: 1,
+    },
+    {
+      name: "counts again once cards_rev moved",
+      change: moved(CARDS_REV_KEY),
+      walks: 1,
+      repairPending: 2,
+    },
+    {
+      name: "counts again once cards_stamped moved",
+      change: moved(CARDS_STAMPED_KEY),
+      walks: 1,
+      repairPending: 2,
+    },
+    {
+      name: "counts again once cards_deleted moved",
+      change: moved(CARDS_DELETED_KEY),
+      walks: 1,
+      repairPending: 2,
+    },
+    {
+      name: "counts again once repair_rev moved",
+      change: moved(REPAIR_REV_KEY),
+      walks: 1,
+      repairPending: 2,
+    },
+    {
+      name: "counts again once this build marked a card",
+      change: () => {
+        store.markRepairPending("ses_d", "malformed");
+      },
+      walks: 1,
+      repairPending: 2,
+    },
+  ])("$name", async ({ change, walks, repairPending }) => {
+    await staleStore();
+    const events = record();
+    await sweep(change, events);
+    expect(afterFirstRebuild(events)).toEqual({ walks, repairPending });
+  });
+
+  it("counts again after it takes the lease back, so the reasons the holder before it wrote are counted", async () => {
+    await staleStore();
+    const events = record();
+    const h = await sweep(async (self) => {
+      // An older build takes the lease and writes a reason, moving no counter.
+      storeDb.run("UPDATE meta SET value = ? WHERE key = 'distill_lease'", [
+        JSON.stringify({ holder: "older", heartbeat: Date.now(), ttl: 30_000, build: "", gen: 0 }),
+      ]);
+      expect(self.distiller.ownsLease()).toBe(false);
+      reasonElsewhere();
+      expect(store.releaseLease("older")).toBe(true);
+      await waitFor(() => self.distiller.status().leaseHeld);
+    }, events);
+    expect(h.logs.filter((line) => line.includes("lease acquired"))).toHaveLength(2);
+    expect(afterFirstRebuild(events)).toEqual({ walks: 1, repairPending: 2 });
   });
 });
 

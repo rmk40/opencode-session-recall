@@ -12,6 +12,7 @@ import {
   CARDS_STAMPED_KEY,
   openStore,
   pluginBuild,
+  REPAIR_REV_KEY,
   REPAIR_STATE_PAGE,
   VECTORS_REV_KEY,
   WEAK_MATCH_ROWS,
@@ -21,8 +22,10 @@ import {
   type FtsHit,
   type PartTextRow,
   type RangeHash,
+  type RepairStatePage,
   type SessionTail,
   type SettledBase,
+  type StaleCard,
   type Store,
   type StoredRows,
   type StoreIdentity,
@@ -4223,6 +4226,89 @@ describe("repair reasons", () => {
     expect(store.clearRepairReasons()).toBe(0);
     db.close();
   });
+
+  // `marked` and `other` both carry a reason, `plain` none; all at generation 2.
+  it.each<{ name: string; write: (store: Store) => unknown; moves: "once" | "not at all" }>([
+    {
+      name: "marking a card",
+      write: (s) => s.markRepairPending("plain", "malformed"),
+      moves: "once",
+    },
+    {
+      name: "marking a card with the reason it has",
+      write: (s) => s.markRepairPending("marked", "malformed"),
+      moves: "not at all",
+    },
+    {
+      name: "marking an unknown card",
+      write: (s) => s.markRepairPending("ghost", "x"),
+      moves: "not at all",
+    },
+    { name: "clearing every reason", write: (s) => s.clearRepairReasons(), moves: "once" },
+    {
+      name: "clearing every reason twice, the second time with none set,",
+      write: (s) => {
+        s.clearRepairReasons();
+        return s.clearRepairReasons();
+      },
+      moves: "once",
+    },
+    {
+      name: "a replace that leaves the card as it was and clears its reason",
+      write: (s) =>
+        s.replaceSessionParts(
+          "marked",
+          [makePart("p1", "alpha")],
+          makeCard("marked", { projectorGen: 2 }),
+        ),
+      moves: "once",
+    },
+    {
+      name: "a replace that changes the card and clears its reason",
+      write: (s) =>
+        s.replaceSessionParts("marked", [], makeCard("marked", { projectorGen: 2, title: "New" })),
+      moves: "once",
+    },
+    {
+      name: "a replace of a card without a reason",
+      write: (s) =>
+        s.replaceSessionParts("plain", [], makeCard("plain", { projectorGen: 2, title: "New" })),
+      moves: "not at all",
+    },
+    {
+      name: "a replace refused below the stored generation",
+      write: (s) => s.replaceSessionParts("marked", [], makeCard("marked", { projectorGen: 1 })),
+      moves: "not at all",
+    },
+    {
+      name: "an append, which keeps the reason",
+      write: (s) =>
+        s.appendSessionParts(
+          "marked",
+          [makePart("p2", "beta")],
+          0,
+          { checkpointMessageId: "m-p1", firstNewMessageId: "m-p2" },
+          (all) => makeCard("marked", { projectorGen: 2, partCount: all.length }),
+        ),
+      moves: "not at all",
+    },
+  ])("$name moves the repair revision $moves", async ({ write, moves }) => {
+    const { db, store } = await fresh();
+    store.replaceSessionParts(
+      "marked",
+      [makePart("p1", "alpha")],
+      makeCard("marked", { projectorGen: 2 }),
+    );
+    store.replaceSessionParts("other", [], makeCard("other", { projectorGen: 2 }));
+    store.replaceSessionParts("plain", [], makeCard("plain", { projectorGen: 2 }));
+    store.markRepairPending("marked", "malformed");
+    store.markRepairPending("other", "missing");
+    const before = Number(store.getMeta(REPAIR_REV_KEY));
+    expect(before).toBe(2);
+    write(store);
+    expect(Number(store.getMeta(REPAIR_REV_KEY)) - before).toBe(moves === "once" ? 1 : 0);
+    db.close();
+  });
 });
 
 describe("staleCards", () => {
@@ -4269,6 +4355,289 @@ describe("staleCards", () => {
     ).toEqual(["garbled", "scalar"]);
     db.close();
   });
+
+  it("orders cards updated at the same time by session id in SQLite's byte order", async () => {
+    const { db, store } = await fresh();
+    // Locale order puts "a" before "B"; UTF-16 order puts the astral
+    // character (a surrogate pair from U+D83D) before U+FF5E. SQLite compares
+    // UTF-8 bytes, which is code point order.
+    for (const id of ["\u{1F600}", "b", "\uFF5E", "ab", "a", "B", "_"]) {
+      store.upsertCard(makeCard(id, { timeUpdated: 5000 }));
+    }
+    store.upsertCard(makeCard("newest", { timeUpdated: 9000 }));
+    expect(store.staleCards(2).map((c) => c.sessionId)).toEqual([
+      "newest",
+      "B",
+      "_",
+      "a",
+      "ab",
+      "b",
+      "\uFF5E",
+      "\u{1F600}",
+    ]);
+    expect(store.staleCards(2)).toEqual(staleBySql(db, 2));
+    db.close();
+  });
+
+  it("lists what one ordered statement over every card lists, across many pages", async () => {
+    const { db, store } = await fresh();
+    seedRandomCards(db, store, REPAIR_STATE_PAGE * 2 + 37, 7);
+    const stale = store.staleCards(2);
+    expect(stale.length).toBeGreaterThan(REPAIR_STATE_PAGE);
+    expect(stale).toEqual(staleBySql(db, 2));
+    db.close();
+  });
+});
+
+/** The stale cards for `gen` from one statement over the card table, newest
+ *  first and then by session id in SQLite's order. */
+function staleBySql(db: SqliteDb, gen: number): StaleCard[] {
+  return db
+    .all(
+      `SELECT session_id, time_updated FROM card
+       WHERE repair_reason IS NULL
+         AND (projector_gen IS NULL OR projector_gen < ?
+              OR (CASE WHEN json_valid(distill_cursor) THEN json_extract(distill_cursor, '$.v') END) = 1)
+       ORDER BY time_updated DESC, session_id`,
+      [gen],
+    )
+    .map((row) => ({ sessionId: String(row.session_id), timeUpdated: Number(row.time_updated) }));
+}
+
+/** Characters whose order differs between UTF-8 bytes, UTF-16 code units and
+ *  locale collation: upper and lower case ASCII, two BMP characters above the
+ *  surrogate range and two astral characters. */
+const ID_CHARS = ["A", "Z", "_", "a", "z", "0", "\uE000", "\uFF5E", "\u{10000}", "\u{1F600}"];
+
+/**
+ * `n` cards from `seed`, written in one transaction: distinct ids of one to
+ * four {@link ID_CHARS}, four distinct update times (so many cards tie on time
+ * and fall back to their id), a fifth at generation 2 and so not stale for it,
+ * the rest stale in every way {@link Store.staleCards} lists, and a tenth of
+ * all of them repair-pending.
+ */
+function seedRandomCards(db: SqliteDb, store: Store, n: number, seed: number): void {
+  const rand = mulberry32(seed);
+  const ids = new Set<string>();
+  while (ids.size < n) {
+    let id = "";
+    const length = 1 + Math.floor(rand() * 4);
+    for (let i = 0; i < length; i++) id += ID_CHARS[Math.floor(rand() * ID_CHARS.length)];
+    ids.add(id);
+  }
+  db.tx(() => {
+    for (const id of ids) {
+      const roll = rand();
+      store.upsertCard(
+        makeCard(id, {
+          timeUpdated: 1000 * (1 + Math.floor(rand() * 4)),
+          ...(roll < 0.2 && { projectorGen: 2, distillCursor: '{"v":2}' }),
+          ...(roll >= 0.2 && roll < 0.3 && { projectorGen: 3, distillCursor: '{"v":1}' }),
+          ...(roll >= 0.3 && roll < 0.6 && { projectorGen: 1 }),
+        }),
+      );
+      if (rand() < 0.1) {
+        db.run("UPDATE card SET repair_reason = 'malformed' WHERE session_id = ?", [id]);
+      }
+    }
+  });
+}
+
+describe("repairStatePage", () => {
+  /** Every page of a walk from the first card, `limit` cards at a time. */
+  function walk(store: Store, gen: number | undefined, limit: number): RepairStatePage[] {
+    const pages: RepairStatePage[] = [];
+    let after: string | undefined;
+    for (;;) {
+      const page = store.repairStatePage(gen, after, limit);
+      pages.push(page);
+      if (page.read < limit) return pages;
+      after = page.last;
+    }
+  }
+
+  it("reads cards in session-id byte order, a limit at a time, each page from after the last", async () => {
+    const { db, store } = await fresh();
+    for (const id of ["\u{1F600}", "b", "\uFF5E", "ab", "a", "B", "_"]) {
+      store.upsertCard(makeCard(id));
+    }
+    const pages = walk(store, 2, 3);
+    expect(pages.map((p) => [p.read, p.last])).toEqual([
+      [3, "a"],
+      [3, "\uFF5E"],
+      [1, "\u{1F600}"],
+    ]);
+    expect(pages.flatMap((p) => p.stale.map((c) => c.sessionId))).toEqual([
+      "B",
+      "_",
+      "a",
+      "ab",
+      "b",
+      "\uFF5E",
+      "\u{1F600}",
+    ]);
+    // Past the last card: an empty page with nowhere to continue from.
+    const end = store.repairStatePage(2, "\u{1F600}", 3);
+    expect(end).toEqual({ read: 0, stale: [], repairPending: 0 });
+    expect(end).not.toHaveProperty("last");
+    db.close();
+  });
+
+  it("lists a page's stale cards and counts its repair-pending ones, stale or not", async () => {
+    const { db, store } = await fresh();
+    store.upsertCard(makeCard("a-no-gen", { timeUpdated: 7000 }));
+    store.upsertCard(makeCard("b-below", { projectorGen: 1, timeUpdated: 6000 }));
+    store.upsertCard(makeCard("c-current", { projectorGen: 2, distillCursor: '{"v":2}' }));
+    store.upsertCard(makeCard("d-v1-cursor", { projectorGen: 2, distillCursor: '{"v":1}' }));
+    store.upsertCard(makeCard("e-pending-below", { projectorGen: 1 }));
+    store.upsertCard(makeCard("f-pending-current", { projectorGen: 2, distillCursor: '{"v":2}' }));
+    store.markRepairPending("e-pending-below", "malformed");
+    store.markRepairPending("f-pending-current", "missing");
+
+    expect(store.repairStatePage(2, undefined, 10)).toEqual({
+      read: 6,
+      last: "f-pending-current",
+      stale: [
+        { sessionId: "a-no-gen", timeUpdated: 7000 },
+        { sessionId: "b-below", timeUpdated: 6000 },
+        { sessionId: "d-v1-cursor", timeUpdated: 1000 },
+      ],
+      repairPending: 2,
+    });
+    // Without a generation nothing is stale, and the count is the same.
+    expect(store.repairStatePage(undefined, undefined, 10)).toMatchObject({
+      read: 6,
+      stale: [],
+      repairPending: 2,
+    });
+    expect(store.repairStatePage(Number.NaN, undefined, 10)).toMatchObject({ stale: [] });
+    // A page counts only its own cards.
+    expect(store.repairStatePage(2, "d-v1-cursor", 1)).toMatchObject({
+      read: 1,
+      last: "e-pending-below",
+      stale: [],
+      repairPending: 1,
+    });
+    db.close();
+  });
+
+  it.each([0, -2, Number.NaN, Number.POSITIVE_INFINITY])(
+    "reads a limit of %s as one card",
+    async (limit) => {
+      const { db, store } = await fresh();
+      for (const id of ["s1", "s2", "s3"]) store.upsertCard(makeCard(id));
+      expect(store.repairStatePage(2, undefined, limit)).toMatchObject({ read: 1, last: "s1" });
+      expect(store.repairStatePage(2, "s1", limit)).toMatchObject({ read: 1, last: "s2" });
+      db.close();
+    },
+  );
+
+  it("reads each card once, as it is when its page is read, however cards change during a walk", async () => {
+    const { db, store } = await fresh();
+    for (const id of ["c1", "c2", "c3", "c4", "c5", "c6"]) store.upsertCard(makeCard(id));
+    const first = store.repairStatePage(2, undefined, 2);
+    expect(first).toMatchObject({ read: 2, last: "c2", repairPending: 0 });
+
+    store.upsertCard(makeCard("c0")); // before the walk's position
+    store.upsertCard(makeCard("c25")); // ahead of it
+    store.deleteSession("c3");
+    store.markRepairPending("c1", "malformed"); // already read
+    store.markRepairPending("c4", "malformed"); // not yet read
+
+    const rest = [store.repairStatePage(2, first.last, 2)];
+    while (rest.at(-1)!.read === 2) rest.push(store.repairStatePage(2, rest.at(-1)!.last, 2));
+    const read = [first, ...rest].flatMap((p) => p.stale.map((c) => c.sessionId));
+    expect(read).toEqual(["c1", "c2", "c25", "c5", "c6"]);
+    expect(rest.reduce((n, p) => n + p.repairPending, 0)).toBe(1);
+    db.close();
+  });
+
+  it("walks every card once, to the stale cards and the count one statement over the card table finds", async () => {
+    const { db, store } = await fresh();
+    seedRandomCards(db, store, REPAIR_STATE_PAGE + 20, 3);
+    const pages = walk(store, 2, REPAIR_STATE_PAGE);
+    expect(pages.map((p) => p.read)).toEqual([REPAIR_STATE_PAGE, 20]);
+    expect(pages.reduce((n, p) => n + p.repairPending, 0)).toBe(
+      db.get("SELECT count(*) AS n FROM card WHERE repair_reason IS NOT NULL")?.n,
+    );
+    const stale = new Set(staleBySql(db, 2).map((c) => c.sessionId));
+    const inIdOrder = db
+      .all("SELECT session_id, time_updated FROM card ORDER BY session_id")
+      .filter((row) => stale.has(String(row.session_id)))
+      .map((row) => ({ sessionId: String(row.session_id), timeUpdated: Number(row.time_updated) }));
+    expect(pages.flatMap((p) => p.stale)).toEqual(inIdOrder);
+    db.close();
+  });
+});
+
+describe("WAL checkpoints", () => {
+  const autoCheckpoint = (db: SqliteDb): number =>
+    Number(db.get("PRAGMA wal_autocheckpoint")?.wal_autocheckpoint);
+
+  it("copies every WAL frame and reports how many there are", async () => {
+    const { db, store } = await fresh();
+    for (const id of ["s1", "s2", "s3"]) store.replaceSessionParts(id, [], makeCard(id));
+    const done = store.checkpoint();
+    expect(done.busy).toBe(false);
+    expect(done.frames).toBeGreaterThan(0);
+    expect(done.checkpointed).toBe(done.frames);
+    // Nothing written since: the WAL holds the same frames until the next write.
+    expect(store.checkpoint()).toEqual(done);
+    db.close();
+  });
+
+  it("reports the frames a reader still needs as not checkpointed", async () => {
+    const path = freshDbPath();
+    const db = await openSqlite(path);
+    const store = db && openV1Store(db);
+    const reader = await openSqlite(path);
+    if (!db || !store || !reader) throw new Error("open failed");
+    store.replaceSessionParts("s1", [], makeCard("s1"));
+    store.checkpoint();
+    reader.exec("BEGIN");
+    reader.get("SELECT count(*) AS n FROM card");
+    for (const id of ["s2", "s3"]) store.replaceSessionParts(id, [], makeCard(id));
+    const held = store.checkpoint();
+    expect(held.busy).toBe(false);
+    expect(held.checkpointed).toBeLessThan(held.frames);
+    reader.exec("COMMIT");
+    const after = store.checkpoint();
+    expect(after.checkpointed).toBe(after.frames);
+    reader.close();
+    db.close();
+  });
+
+  it("reports -1 frames on a store that is not in WAL mode", async () => {
+    const { db, store } = await fresh();
+    db.exec("PRAGMA journal_mode=DELETE");
+    expect(store.checkpoint()).toEqual({ busy: false, frames: -1, checkpointed: -1 });
+    db.close();
+  });
+
+  it.each([
+    [0, 0],
+    [250, 250],
+    [2.9, 2],
+    [-1, 1000],
+    [Number.NaN, 1000],
+  ])(
+    "reads a setting of %s pages as %s for the connection's automatic checkpoints",
+    async (pages, set) => {
+      const path = freshDbPath();
+      const db = await openSqlite(path);
+      const store = db && openV1Store(db);
+      if (!db || !store) throw new Error("open failed");
+      store.setAutoCheckpoint(123);
+      store.setAutoCheckpoint(pages);
+      expect(autoCheckpoint(db)).toBe(set);
+      // A setting of this connection alone: another one keeps SQLite's default.
+      const other = await openSqlite(path);
+      if (!other) throw new Error("open failed");
+      expect(autoCheckpoint(other)).toBe(1000);
+      other.close();
+      db.close();
+    },
+  );
 });
 
 describe("projector generation guard", () => {
