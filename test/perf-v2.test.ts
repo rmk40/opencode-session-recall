@@ -36,15 +36,13 @@
  * and the calls inside the worst stall, so the offending path is visible
  * rather than the budget being loosened. Every gate logs the load average.
  *
- * Status (2026-09-28, Apple Silicon, Node): all three pass. The cold pass
- * peaks at 38 to 48 ms, now set by one 4,000-row replaceSessionParts
- * transaction (32 to 46 ms), which stays whole for per-session atomicity;
- * the derivation yields cooperatively (deriveCardCooperative). The poll
- * peaks near 3 ms and listSessions under 12 ms. Before the cooperative
- * derivation the cold pass peaked at 93 to 153 ms. The append of 200 rows to
- * a 4,002-part session peaks at 37.6 to 41.3 ms, set by its one
- * appendSessionParts transaction (36 to 39 ms); the whole append takes about
- * 110 ms.
+ * The longest slice of the cold pass is one session's write: the
+ * replaceSessionParts transaction of a 4,000-row session, which stays whole so
+ * readers never see half a session. The derivation before it yields
+ * cooperatively (deriveCardCooperative), and concurrent workers yield between
+ * their writes, so one slice holds at most one such transaction. The longest
+ * slice of the append is likewise its one appendSessionParts transaction,
+ * which derives the merged card over every retained row.
  */
 import { describe, expect, it } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
