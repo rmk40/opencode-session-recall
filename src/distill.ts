@@ -56,8 +56,8 @@ const ERRORS_CAP = 8;
 const ERROR_SIG_CHARS = 200;
 const ROLLUP_CAP = 12;
 const ROLLUP_HINT_CHARS = 120;
-/** Cards a rollup recompute reads per page. With `yieldBetween`, it yields
- *  between pages. */
+/** Cards a rollup recompute reads per page unless `rollupPage` says
+ *  otherwise. With `yieldBetween`, it yields between pages. */
 const ROLLUP_PAGE = 500;
 const ROOT_MAX_DEPTH = 16;
 const DEFAULT_FTS_ROWS_PER_SESSION = 5_000;
@@ -613,6 +613,9 @@ export type DistillerOptions = {
   /** First delay before a failed metadata re-read is retried, doubling
    *  with each failure (spec: 5000ms). */
   metaRetryMs?: number;
+  /** Cards a rollup recompute reads per page, a positive integer (default
+   *  500). A small page lets a small family span several pages. */
+  rollupPage?: number;
   /** Called (while holding the lease) once the cold pass finishes, so the Path B
    *  summarizer can run its own pass over the freshly distilled cards. */
   onColdPassDone?: () => void;
@@ -1518,6 +1521,11 @@ export function createDistiller(options: DistillerOptions): Distiller {
   const metaRetries = new Map<string, number>();
   const metaRetryTimers = new Map<string, ReturnType<typeof setTimeout>>();
   const metaRetryMs = options.metaRetryMs ?? DEFAULT_META_RETRY_MS;
+  const requestedPage = options.rollupPage;
+  const rollupPage =
+    requestedPage !== undefined && Number.isInteger(requestedPage) && requestedPage > 0
+      ? requestedPage
+      : ROLLUP_PAGE;
   /** Sessions the running cold pass has written. It read every session's
    *  metadata at discovery, so a session it has not written yet may still
    *  be written from metadata older than a patch. */
@@ -2255,7 +2263,7 @@ export function createDistiller(options: DistillerOptions): Distiller {
       const family = new Map<string, RollupFields>();
       let after: number | undefined;
       for (;;) {
-        const page = store.familyPage(rootId, after, ROLLUP_PAGE);
+        const page = store.familyPage(rootId, after, rollupPage);
         for (const card of page.cards) family.set(card.sessionId, card);
         if (page.next === undefined) break;
         after = page.next;
@@ -2298,7 +2306,7 @@ export function createDistiller(options: DistillerOptions): Distiller {
       const childrenByRoot = new Map<string, RollupFields[]>();
       let after: string | undefined;
       for (;;) {
-        const page = store.rollupFieldsPage(after, ROLLUP_PAGE);
+        const page = store.rollupFieldsPage(after, rollupPage);
         for (const card of page) {
           if (card.rootId === card.sessionId) rootCards.set(card.sessionId, card);
           else {
@@ -2307,7 +2315,7 @@ export function createDistiller(options: DistillerOptions): Distiller {
             else childrenByRoot.set(card.rootId, [card]);
           }
         }
-        if (page.length < ROLLUP_PAGE) break;
+        if (page.length < rollupPage) break;
         after = page[page.length - 1]!.sessionId;
         if (pause) {
           await pause();
