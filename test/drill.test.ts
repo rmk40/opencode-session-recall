@@ -2304,6 +2304,63 @@ describe("deep sweep time window bounds", () => {
       stop: "end",
     });
   });
+
+  it("covers a resumed session with nothing created inside the window without reading from its cursor", async () => {
+    // s-a was written at 1000 to 3000, before a lower bound of 4500.
+    const sessionA = series("s-a", 3);
+    const { source, ctl } = makeControlledSource(
+      { messagesBySession: { "s-a": sessionA, "s-b": series("s-b", 6) } },
+      { floor: true },
+    );
+    const out = await newDrill(source).deep({
+      sessions: [revised("s-a"), revised("s-b")],
+      query: parseQuery("alpha"),
+      charsPerQuery: 10_000,
+      window: { after: 4500 },
+      resume: { before: paginateBundles(sessionA, 1).nextCursor! },
+    });
+    expect(ctl.floors.map((f) => f.sessionID)).toEqual(["s-a", "s-b"]);
+    expect(ctl.pages.map((p) => p.sessionID)).toEqual(["s-b"]);
+    expect(out.targets).toEqual([
+      { sessionId: "s-a", fetched: 0, candidate: 0, eligible: 0, stop: "end" },
+      { sessionId: "s-b", fetched: 6, candidate: 2, eligible: 2, stop: "end" },
+    ]);
+    expect(out.coverage).toMatchObject({ sessionsCovered: 2, sessionsPartial: 0 });
+  });
+
+  it("sweeps a session to its start past the lower bound when the source gives no floor", async () => {
+    // With a floor the first page would complete the session; m101 to m120
+    // are inside the window.
+    const graph = { messagesBySession: { "s-a": series("s-a", 120) } };
+    const failing = (): ReturnType<typeof makeControlledSource> => {
+      const { source, ctl } = makeControlledSource(graph, { floor: true });
+      return {
+        source: {
+          ...source,
+          seqFloor: async () => ({ ok: false, reason: "error", error: "host busy" }),
+        },
+        ctl,
+      };
+    };
+    const variants: Array<[string, () => ReturnType<typeof makeControlledSource>]> = [
+      ["without seqFloor", () => makeControlledSource(graph)],
+      ["whose floor ask fails", failing],
+    ];
+    for (const [label, make] of variants) {
+      const { source, ctl } = make();
+      const out = await newDrill(source).deep({
+        sessions: [revised("s-a")],
+        query: parseQuery("alpha"),
+        charsPerQuery: 1_000_000,
+        window: { after: 100_500 },
+      });
+      expect(ctl.pages, label).toHaveLength(3);
+      expect(out.targets, label).toEqual([
+        { sessionId: "s-a", fetched: 120, candidate: 20, eligible: 20, stop: "end" },
+      ]);
+      expect(out.coverage, label).toMatchObject({ sessionsCovered: 1, sessionsPartial: 0 });
+    }
+  });
 });
 
 // ── Time windows where creation times are out of row order (opencode moves a
@@ -2633,5 +2690,91 @@ describe("drill time window order and outside bounds", () => {
       { sessionId: "s-b", fetched: 3, candidate: 2, eligible: 2, stop: "end" },
     ]);
     expect(out.coverage).toMatchObject({ sessionsCovered: 2, sessionsPartial: 0 });
+  });
+
+  it("looks up no FTS hit in a session with nothing created inside the window", async () => {
+    const { source, ctl } = makeControlledSource(oneEmpty(), { floor: true });
+    const drill = newDrill(source, { drillPageMessages: 1 });
+    const out = await drill.pools({
+      ...windowed([revised("s-a")], "alpha", { after: 4500 }),
+      ftsBySession: new Map([["s-a", [ftsHit("s-a", "a4"), ftsHit("s-a", "a1")]]]),
+    });
+    expect(ctl.pages).toEqual([]);
+    expect(ctl.lookups).toEqual([]);
+    expect(out.targets).toEqual([
+      { sessionId: "s-a", fetched: 0, candidate: 0, eligible: 0, stop: "end" },
+    ]);
+  });
+
+  it("asks for the floor of each window apart, so a session with nothing inside one window is read for another", async () => {
+    // s-a was written at 1000 to 4000: nothing inside (2500, 2900), its
+    // third and fourth messages inside (2500, 9000).
+    const { source, ctl } = makeControlledSource(oneEmpty(), { floor: true });
+    const drill = newDrill(source, { drillPageMessages: 1 });
+    const run = (window: DrillInput["window"]) =>
+      drill.pools(windowed([revised("s-a")], "alpha", window));
+
+    const narrow = await run({ after: 2500, before: 2900 });
+    expect(narrow.targets[0]).toMatchObject({ fetched: 0, stop: "end" });
+    expect(ctl.pages).toEqual([]);
+
+    const wide = await run({ after: 2500, before: 9000 });
+    expect(poolTexts(wide, "s-a")).toEqual(["alpha 4", "alpha 3"]);
+    expect(wide.targets[0]).toMatchObject({ fetched: 3, candidate: 2, stop: "end" });
+
+    const again = await run({ after: 2500, before: 2900 });
+    expect(again.targets[0]).toMatchObject({ fetched: 0, stop: "end", cached: true });
+    expect(ctl.floors).toEqual([
+      { sessionID: "s-a", after: 2500, before: 2900 },
+      { sessionID: "s-a", after: 2500, before: 9000 },
+    ]);
+  });
+
+  it("walks past the lower bound after a failed floor ask, counts the ask as a read and asks again next time", async () => {
+    // Inside a lower bound of 4500: s-c's two newest messages. Without a
+    // floor the walk can only stop at the first page with nothing inside.
+    const graph: Graph = {
+      messagesBySession: {
+        "s-c": [1000, 2000, 3000, 5000, 6000].map((created, i) =>
+          note("s-c", `c${i + 1}`, created, `alpha ${i + 1}`),
+        ),
+      },
+    };
+    const { source: inner, ctl } = makeControlledSource(graph, { floor: true });
+    let failing = true;
+    let attempts = 0;
+    const source: HistorySource = {
+      ...inner,
+      async seqFloor(o) {
+        attempts++;
+        if (failing) return { ok: false, reason: "error", error: "host busy" };
+        return inner.seqFloor!(o);
+      },
+    };
+    const drill = newDrill(source, { drillPageMessages: 1 });
+    // An unbounded walk caches every page first, so only a floor ask can read.
+    await drill.pools(poolsInput([revised("s-c")], "alpha"));
+    const pages = ctl.pages.length;
+    const input = windowed([revised("s-c")], "alpha", { after: 4500 });
+
+    const failed = await drill.pools(input);
+    expect(poolTexts(failed, "s-c")).toEqual(["alpha 5", "alpha 4"]);
+    expect(failed.targets).toEqual([
+      { sessionId: "s-c", fetched: 3, candidate: 2, eligible: 2, stop: "anchor" },
+    ]);
+
+    failing = false;
+    const found = await drill.pools(input);
+    expect(attempts).toBe(2);
+    expect(found.targets).toEqual([
+      { sessionId: "s-c", fetched: 3, candidate: 2, eligible: 2, stop: "end" },
+    ]);
+
+    const repeat = await drill.pools(input);
+    expect(attempts).toBe(2);
+    expect(repeat.targets).toEqual([
+      { sessionId: "s-c", fetched: 3, candidate: 2, eligible: 2, stop: "end", cached: true },
+    ]);
+    expect(ctl.pages).toHaveLength(pages);
   });
 });
