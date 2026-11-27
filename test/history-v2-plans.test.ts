@@ -13,6 +13,7 @@ import {
   insertPart,
   insertProject,
   insertSession,
+  limitSpy,
   makeV2PartsDb,
   type V2TestDb,
 } from "./v2-db.js";
@@ -114,23 +115,30 @@ afterAll(() => {
 
 type Statement = { sql: string; params: SqlValue[] };
 
-/** A reader that records each history statement it runs. */
-function recording(): { db: ReadOnlyDb; statements: Statement[] } {
+/**
+ * A reader that records each history statement it runs, through the LIMIT
+ * spy. The reader and the sync catch some read errors (a poll window that
+ * fails is only named in its result), so the spy's throws are recorded too.
+ */
+function recording(): { db: ReadOnlyDb; statements: Statement[]; violations: string[] } {
   const statements: Statement[] = [];
-  const note = (sql: string, params: SqlValue[] = []): void => {
+  const violations: string[] = [];
+  const spy = limitSpy(reader);
+  const note = <T>(sql: string, params: SqlValue[] = [], run: () => T): T => {
     if (/\bsession_(message|part)\b/.test(sql)) statements.push({ sql, params });
+    try {
+      return run();
+    } catch (error) {
+      violations.push(error instanceof Error ? error.message : String(error));
+      throw error;
+    }
   };
   return {
     statements,
+    violations,
     db: {
-      get: (sql, params) => {
-        note(sql, params);
-        return reader.get(sql, params);
-      },
-      all: (sql, params) => {
-        note(sql, params);
-        return reader.all(sql, params);
-      },
+      get: (sql, params) => note(sql, params, () => spy.get(sql, params)),
+      all: (sql, params) => note(sql, params, () => spy.all(sql, params)),
       close: () => {},
     },
   };
@@ -140,8 +148,8 @@ function recording(): { db: ReadOnlyDb; statements: Statement[] } {
  *  session: pages either way and from deep inside it, a cut message and its
  *  continuation, point reads, seeks, floors, checkpoints, range digests and
  *  a poll. */
-async function workload(): Promise<Statement[]> {
-  const { db, statements } = recording();
+async function workload(): Promise<{ statements: Statement[]; violations: string[] }> {
+  const { db, statements, violations } = recording();
   const source = createV2HistorySource(db, { schema, yieldBetween: async () => {} });
   const sync = createV2Sync(db, { schema, yieldBetween: async () => {} });
   await source.messagePage({ sessionID: "ses_long", limit: 50 });
@@ -175,8 +183,9 @@ async function workload(): Promise<Statement[]> {
   await sync.seqOf!("ses_long", `msg_${String(ROWS / 2).padStart(6, "0")}`);
   const values = new Map<string, string>();
   const meta: PollMeta = { get: (key) => values.get(key), set: (k, v) => void values.set(k, v) };
-  await sync.poll(meta);
-  return statements;
+  const polled = await sync.poll(meta);
+  if (polled.failures.length > 0) throw new Error(polled.failures.join("; "));
+  return { statements, violations };
 }
 
 /** The plan's accesses to `session_message` and `session_part` that a long
@@ -206,7 +215,9 @@ function slowAccesses(db: ReadOnlyDb, statement: Statement): string[] {
 
 describe("v2 history query plans over a long session", () => {
   it("reaches session_message and session_part by more than the session id in every join, and never scans them", async () => {
-    const statements = await workload();
+    const { statements, violations } = await workload();
+    // Every statement also bound its rows with LIMIT ?.
+    expect(violations).toEqual([]);
     expect(statements.length).toBeGreaterThan(20);
     const found: string[] = [];
     const check = (label: string, db: ReadOnlyDb): void => {
