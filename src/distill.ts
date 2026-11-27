@@ -2899,6 +2899,9 @@ export function createDistiller(options: DistillerOptions): Distiller {
       );
       let examined = 0;
       let distilled = 0;
+      /** Writes of the pass that changed what readers see: a write of rows
+       *  that are unchanged is suppressed and counts as distilled only. */
+      let changedWrites = 0;
       /** Fetch failures in a row of sessions with no strike yet. Only fetches
        *  move it: an up-to-date or quarantined session is not a fetch and
        *  leaves it as is, and a known-bad session's failure does not add to
@@ -3062,10 +3065,12 @@ export function createDistiller(options: DistillerOptions): Distiller {
           // distilled.
           while (writeYield) await writeYield;
           if (stopped || !ownsLease()) return;
-          if (writeFull(session, derived, read, checkpoint, moved, digest).kept === undefined) {
+          const written = writeFull(session, derived, read, checkpoint, moved, digest);
+          if (written.kept === undefined) {
             distilled++;
             distilledCount = distilled; // status counts only sessions actually distilled
           }
+          if (written.changed) changedWrites++;
           coldPassWrote.add(session.id);
           followUpMeta(session.id);
         } else {
@@ -3136,7 +3141,7 @@ export function createDistiller(options: DistillerOptions): Distiller {
         );
       }
       logMsg(
-        `cold pass done (${distilled} distilled / ${examined} examined / ${knownCount} known)`,
+        `cold pass done (${distilled} distilled, ${changedWrites} changed / ${examined} examined / ${knownCount} known)`,
       );
       options.onColdPassDone?.();
       // Cards below the projector generation were left to the sweep.
