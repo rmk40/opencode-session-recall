@@ -4,8 +4,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openSqlite, type SqliteDb } from "../src/sqlite.js";
 import {
+  boundWeakAnchors,
+  buildMatch,
   openStore,
   pluginBuild,
+  WEAK_MATCH_ROWS,
   type Card,
   type PartTextRow,
   type RangeHash,
@@ -1553,6 +1556,141 @@ describe("plain-word slim-index lookup", () => {
     expect(scored).toHaveLength(1);
     expect(matched(scored[0]!)).toBeLessThanOrEqual(BUDGET);
     expect(matched(words.map((word) => `"${word}"`).join(" OR "))).toBe(483);
+    db.close();
+  });
+});
+
+describe("plain-word anchor selection", () => {
+  const rowsFrom =
+    (rows: Record<string, number>) =>
+    (anchor: string): number =>
+      rows[anchor] ?? 0;
+
+  it("keeps every word, in the given order, while their rows add up to at most the budget", () => {
+    expect(boundWeakAnchors(["c", "a", "b"], rowsFrom({ c: 3, a: 1, b: 6 }), 10)).toEqual([
+      "c",
+      "a",
+      "b",
+    ]);
+  });
+
+  it("keeps the rarest words while their rows fit the budget, and none after", () => {
+    // Rarest first: d (1), a (3 in all), c (7); b would make 12.
+    const rows = rowsFrom({ a: 2, b: 5, c: 4, d: 1 });
+    expect(boundWeakAnchors(["a", "b", "c", "d"], rows, 7)).toEqual(["a", "c", "d"]);
+  });
+
+  it("leaves out a word whose rows alone reach the budget", () => {
+    expect(boundWeakAnchors(["x", "y"], rowsFrom({ x: 10, y: 3 }), 10)).toEqual(["y"]);
+    expect(boundWeakAnchors(["x"], rowsFrom({ x: 9 }), 10)).toEqual(["x"]);
+    expect(boundWeakAnchors(["x", "y"], rowsFrom({ x: 10, y: 10 }), 10)).toEqual([]);
+  });
+
+  it("prefers the earlier of equally common words", () => {
+    const rows = rowsFrom({ x: 4, y: 4, z: 4 });
+    expect(boundWeakAnchors(["x", "y", "z"], rows, 10)).toEqual(["x", "y"]);
+    expect(boundWeakAnchors(["z", "y", "x"], rows, 10)).toEqual(["z", "y"]);
+  });
+
+  it("keeps a repeated word as given when it fits and drops every copy when too common", () => {
+    expect(boundWeakAnchors(["a", "b", "a"], rowsFrom({ a: 3, b: 2 }), 100)).toEqual([
+      "a",
+      "b",
+      "a",
+    ]);
+    expect(boundWeakAnchors(["a", "b", "a"], rowsFrom({ a: 10, b: 2 }), 10)).toEqual(["b"]);
+  });
+
+  // One session, written in one transaction: "common" in 12 rows, "mid" in
+  // 4, "rare" and "launcher" in r0 only.
+  async function anchorStore(): Promise<{
+    db: SqliteDb;
+    store: Store;
+    counts: Array<{ anchor: string; cap: number }>;
+    matches: string[];
+  }> {
+    const db = await openSqlite(freshDbPath());
+    if (!db) throw new Error("openSqlite returned null");
+    const counts: Array<{ anchor: string; cap: number }> = [];
+    const matches: string[] = [];
+    const recording: SqliteDb = {
+      ...db,
+      get: (sql, params) => {
+        if (sql.includes("count(*)") && sql.includes("part_fts MATCH")) {
+          counts.push({ anchor: String(params?.[0]), cap: Number(params?.[1]) });
+        }
+        return db.get(sql, params);
+      },
+      all: (sql, params) => {
+        if (sql.includes("bm25(part_fts)")) matches.push(String(params?.[0]));
+        return db.all(sql, params);
+      },
+    };
+    const store = openV1Store(recording);
+    if (!store) throw new Error("openStore returned null");
+    const text = (r: number): string =>
+      r === 0 ? "common mid rare launcher" : r < 4 ? "common mid" : "common";
+    store.replaceSessionParts(
+      "s",
+      Array.from({ length: 12 }, (_, r) => makePart(`r${r}`, text(r))),
+      makeCard("s"),
+    );
+    counts.length = 0;
+    matches.length = 0;
+    return { db, store, counts, matches };
+  }
+
+  const parts = (hits: { partId: string }[]): string[] => hits.map((h) => h.partId);
+
+  it("looks a strong anchor up without counting or ORing the plain words", async () => {
+    const { db, store, counts, matches } = await anchorStore();
+    const hits = store.ftsSearch({ strong: ["launcher"], weak: ["common", "mid"] });
+    expect(parts(hits)).toEqual(["r0"]);
+    expect(matches).toEqual(['"launcher"']);
+    expect(counts).toEqual([]);
+    db.close();
+  });
+
+  it("bounds the plain words when no strong anchor survives quoting", async () => {
+    const { db, store, matches } = await anchorStore();
+    const hits = store.ftsSearch({
+      strong: ['""', "  "],
+      weak: ["common", "rare"],
+      weakRowBudget: 5,
+    });
+    expect(matches).toEqual(['"rare"']);
+    expect(parts(hits)).toEqual(["r0"]);
+    db.close();
+  });
+
+  it("ORs every plain word as before when their rows fit the budget together", async () => {
+    const { db, store, matches } = await anchorStore();
+    const words = ["mid", "rare", "common", "launcher"];
+    // 4 + 1 + 12 + 1 = 18 rows.
+    expect(store.ftsSearch({ strong: [], weak: words })).toHaveLength(12);
+    store.ftsSearch({ strong: [], weak: words, weakRowBudget: 18 });
+    store.ftsSearch({ strong: [], weak: words, weakRowBudget: 17 });
+    expect(matches).toEqual([
+      buildMatch([], words),
+      buildMatch([], words),
+      buildMatch([], ["mid", "rare", "launcher"]),
+    ]);
+    db.close();
+  });
+
+  it("counts and keeps words under a positive budget rounded down, else the default", async () => {
+    const { db, store, counts } = await anchorStore();
+    const lookup = (weakRowBudget: number | undefined) => {
+      counts.length = 0;
+      const hits = store.ftsSearch({ strong: [], weak: ["common"], weakRowBudget });
+      return { hits: hits.length, caps: counts.map((c) => c.cap) };
+    };
+    // "common" is in 12 rows: a budget of 12 leaves it out, 13 keeps it.
+    expect(lookup(12.9)).toEqual({ hits: 0, caps: [12] });
+    expect(lookup(13)).toEqual({ hits: 12, caps: [13] });
+    for (const invalid of [0, -5, Number.NaN, Number.POSITIVE_INFINITY, undefined]) {
+      expect(lookup(invalid), String(invalid)).toEqual({ hits: 12, caps: [WEAK_MATCH_ROWS] });
+    }
     db.close();
   });
 });
