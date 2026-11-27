@@ -455,10 +455,16 @@ card and serves `list`, `get`, `exclusionFamily`, `familyOf`, `coverage` and
 `semanticStatus`. The search index (the MiniSearch index and the card vectors) is
 brought up to date only by `rank()` and `ready({ index: true })`, so a call that
 reads only the map never waits on index work. Both hosts build the card source
-with `storeCardSource(store)`, which adds the reads an incremental refresh needs
-(`cardCounters`, `cardsSince`, `cardSessionIds`, `cardsPage`, `cardVectorsPage`). A
-source without them (cards-lite, the static sources in tests) reloads every card
-whenever its revision changes.
+with `storeCardSource(store, writer)`, which adds the reads an incremental refresh
+needs (`cardCounters`, `cardsSince`, `cardSessionIds`, `cardsPage`,
+`cardVectorsPage`). Its store parameter (`CardSourceStore`) is a `Pick` of those
+reads plus `allCards` and `getMeta`, with no write method. Vectors are persisted
+only through `writer`, a `CardVectorWriter`. Both hosts pass
+`inlineVectorWriter(store)`, which runs `writeCardEmbeddings` on the calling thread
+and returns its outcome as a settled promise. Without a writer the runtime keeps the
+vectors it computes in memory and writes none. A source without the reads
+(cards-lite, the static sources in tests) reloads every card whenever its revision
+changes.
 
 The runtime reads the store's counters at most every 5 seconds
 (`REFRESH_INTERVAL_MS`) and picks one of three things to do.
@@ -514,6 +520,49 @@ would let another process reuse the vector under the wrong model's stamp. A
 lexical write may clear a vector (`embedding = NULL`, as a re-distill or
 `writeSummary` does). Readers learn of the card through its new `write_rev` and
 keep their in-memory vector only while the content it came from is unchanged.
+
+Vector persistence runs after the vectors are installed and off every search's
+await path. A build, a vector reload or an in-place update installs its index and
+vectors, then queues the rows it computed. A write queue of its own issues them in
+chunks of 200 (`VECTOR_WRITE_CHUNK`), one write in flight at a time, with a yield
+between writes. The first write of an idle queue is issued on the caller's turn,
+so with the inline writer a pass of up to 200 rows commits where it did before.
+**No `rank()`, `ready()` or search awaits a vector write**, so a search that waits
+on index work never also waits on whatever thread commits the write.
+
+- **Before each write**, a queued row is written only while it is the last row
+  queued for its session and the card the map holds still indexes and embeds like
+  the version the vector was computed for. A card that changed meanwhile is dirty,
+  and the pass that takes it queues its own vector.
+- **A restamp:** a pass that found another model's stamp queues a restamp. Its
+  first write restamps even with no row left, unless the stamp is this model's by
+  then.
+- **A write's result** is a `CardVectorWriteResult`, which is `committed` with
+  `vectors_rev` after it, `refused` or `failed`. The promise must settle for every
+  call, `failed` when the outcome cannot be known.
+- **Only an acknowledged commit moves `vectorsRevSeen`**, and only when its
+  revision is exactly one past the value cached at the acknowledgement
+  (`ownWriteRevision`). A refused, failed or thrown write moves nothing and leaves
+  the in-memory vectors serving. The runtime logs one line per pass when any of its
+  writes failed or were refused (`deps.log`).
+- **While a write is in flight**, its commit may already be visible to the
+  refreshes that run before its acknowledgement arrives. A refresh that reads a
+  `vectors_rev` other than the cached one then records it instead of marking the
+  vectors stale. The acknowledgement settles it: once the write's own revision is
+  applied, a recorded revision past the cached one is another process's write, and
+  the vectors reload for it.
+- **A vector reload installs its sample**, unless an own write was acknowledged
+  during it. Then it keeps the larger of the sample and the cached revision, since
+  that write's vectors are in memory. A source without store reads does the same at
+  a full load. A store that was reset can therefore move the cached revision down.
+- **The model-stamp guard (`stampedRead`) is unchanged**, because it depends only
+  on store state at the moment of a read. Every write, the runtime's own included,
+  bumps `vectors_rev` in its transaction, whenever its acknowledgement arrives.
+- **Shutdown:** `dispose()` drops every queued write. The write in flight settles
+  on its own. `flushVectorWrites(deadlineMs)` resolves `true` once nothing is
+  queued or in flight, or `false` when the deadline passes first. A test that checks
+  stored vectors after `ready()`, or a cached revision right after a synchronous
+  `rank()`, awaits it first.
 
 ## Distiller write paths stay in short slices
 
@@ -580,6 +629,37 @@ every later caller in the process. A test that injects `yieldBetween` gets it
 called at every yield point, so tests that interleave writes between statements
 keep working. **Do not add a per-statement `setTimeout(0)`**; await the
 component's yield point instead.
+
+Foreground work on another thread reaches upkeep through a foreground signal
+(`src/foreground.ts`). The signal is one `Int32` in a `SharedArrayBuffer`. The
+thread that serves searches creates it (`createForegroundSignal`), and a thread
+it hands `signal.buffer` to wraps it with `foregroundSignalFrom`.
+
+- **Raising it:** the count rises only through `signal.run(operation)`, which adds
+  one on entry and subtracts it in a `finally`. An operation that returns, throws
+  or rejects therefore leaves no increment behind.
+- **The fetch gate's `foreground` option:** each `runQuery` counts in the signal
+  from entry until it settles. A `runBackground` call that finds the signal
+  non-zero waits until it reads zero or `FOREGROUND_WAIT_MS` (250 ms) pass, then
+  queues for a permit as before. `activeQueries()` reports the larger of the gate's
+  own queries and the signal's count, so the range check keeps standing aside for
+  another thread's searches.
+- **The slicer:** `prioritySlicer({ foreground })`, `slicer.yieldTo(signal)` and
+  `yieldBackgroundTo(signal)` (for this thread's `yieldInBackground`) make a
+  background yield that has to yield wait the same bounded time first. A
+  background call within its slice, and every foreground yield, never waits.
+- **Waiting:** `waitForQuiet` reads the count on a 4 ms timer. It ends once either
+  the clock or the timers it waited on cover the bound, so fake timers cannot
+  stretch it. Upkeep slows while the count is up but never stops, even if an
+  operation never settles. Both runtimes have `Atomics.waitAsync`, but the timer
+  needs no notify protocol and runs under fake timers.
+- **No signal:** with none, or with one that reads zero, nothing awaits anything
+  new, and the gate and the slicer behave as they do without one.
+
+**Never gate a write another thread serves for the thread that raised the signal**
+(the card runtime's vector writes, any acknowledged request) on the signal or the
+background lane. The thread that raised it may be awaiting that write, and a gated
+write would hold upkeep and the search behind each other.
 
 ## Time windows: sessions overlap, reads go toward the window
 
