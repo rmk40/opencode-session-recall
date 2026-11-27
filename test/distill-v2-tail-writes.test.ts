@@ -27,9 +27,10 @@ import {
  * a real opencode 2.4-shaped database: which reads re-read only the tail past
  * its settled boundary and which fall back to a full read, the settled base
  * full and append writes record, the checkpoint a read whose tail moved
- * keeps, and the range hashes writes over a running tail take; and how a
- * full write treats the stored rows it reads before its transaction when a
- * write lands or the lease moves while it reads them. No poll runs
+ * keeps, and the range hashes writes over a running tail take; and how full
+ * writes, appends and the cold pass read the stored rows before their
+ * transaction, and treat them when a write lands, the lease moves or the
+ * distiller stops while they read them. No poll runs
  * unless a test starts one: each step signals the distiller itself. Every
  * history statement goes through the LIMIT spy.
  */
@@ -827,5 +828,236 @@ describe("v2 full writes over stored rows", () => {
     expect(store.getCard("ses_a")).toEqual(before);
     expect(hits("changedword")).toEqual([]);
     store.releaseLease("rival");
+  }, 20_000);
+});
+
+describe("v2 reads of the stored rows before a write", () => {
+  /**
+   * Lists, in order, every page of stored rows the distiller reads
+   * (`page <offset>+<limit>`) and every yield it makes (`pause`). `onPage`
+   * runs after each page is read and `onPause` at each yield; `pause` is the
+   * yield to start a distiller with.
+   */
+  function watch() {
+    const events: string[] = [];
+    const hooks: { onPage?: (offset: number) => void; onPause?: () => void } = {};
+    const sessionRows = store.sessionRows.bind(store);
+    store.sessionRows = (id, offset, limit) => {
+      const rows = sessionRows(id, offset, limit);
+      events.push(`page ${offset}+${limit}`);
+      hooks.onPage?.(offset);
+      return rows;
+    };
+    const pause = async (): Promise<void> => {
+      events.push("pause");
+      hooks.onPause?.();
+    };
+    return { events, hooks, pause };
+  }
+
+  /** ses_a with `count` settled user rows, written once by a distiller
+   *  started with `o` and {@link watch}'s yield; its events start empty. */
+  async function seeded(count: number, o: StartOptions = {}) {
+    addSession("ses_a");
+    v2db.db.tx(() => {
+      for (let i = 0; i < count; i++) addUser("ses_a", `filler${i} common`);
+    });
+    const w = watch();
+    const h = start({ ...o, pause: w.pause });
+    await redistill(h, "ses_a");
+    w.events.length = 0;
+    return { h, ...w };
+  }
+
+  /** One message changes, for a full read to find. */
+  const changeOne = (): void => {
+    v2db.db.run("UPDATE session_message SET data = ? WHERE id = ?", [
+      JSON.stringify({ text: "changedword common", time: { created: T0 + 3 } }),
+      "msg_ses_a_3",
+    ]);
+  };
+
+  /** A write that changes the text of one stored row, keeping their number. */
+  const raceOne = (at: number): void => {
+    const rows = store.sessionRows("ses_a", 0, 2_000);
+    rows[at] = { ...rows[at]!, raw: "racedword", norm: "racedword" };
+    store.replaceSessionParts("ses_a", rows, store.getCard("ses_a")!);
+  };
+
+  const refusedThenWritten = (method: string): Write[] => [
+    { method, result: { changed: false, refused: "base-changed" } },
+    { method, result: { changed: true } },
+  ];
+
+  it("read the stored rows 500 at a time with a yield between pages, and the store takes them", async () => {
+    const { h, events } = await seeded(1_001);
+    changeOne();
+    expect(await redistill(h, "ses_a", "removal")).toEqual([
+      { method: "replaceSessionParts", result: { changed: true } },
+    ]);
+    const pages = events.flatMap((event, i) => (event.startsWith("page") ? [i] : []));
+    expect(pages.map((i) => events[i])).toEqual(["page 0+500", "page 500+500", "page 1000+1"]);
+    for (let p = 1; p < pages.length; p++) {
+      expect(events.slice(pages[p - 1]! + 1, pages[p]!)).toContain("pause");
+    }
+    expect(hits("changedword")).toEqual(["ses_a"]);
+  }, 20_000);
+
+  it("write again when a write lands after the last page is read, before the store's transaction", async () => {
+    // One page, so no yield follows it: the card's revision, read before the
+    // rows, is what shows the write.
+    const { h, hooks } = await seeded(20);
+    changeOne();
+    let raced = false;
+    hooks.onPage = () => {
+      hooks.onPage = undefined;
+      raced = true;
+      raceOne(10);
+    };
+    const writes = await redistill(h, "ses_a", "removal", (w) => w.length >= 2);
+    expect(raced).toBe(true);
+    expect(writes).toEqual(refusedThenWritten("replaceSessionParts"));
+    expect(hits("racedword")).toEqual([]);
+    expect(hits("changedword")).toEqual(["ses_a"]);
+    expect(storedText("ses_a")).toHaveLength(20);
+  });
+
+  it.each<{
+    name: string;
+    write: "full" | "append";
+    lose: (h: Started) => void;
+  }>([
+    { name: "the distiller stops", write: "full", lose: (h) => h.distiller.quiesce() },
+    { name: "the distiller stops", write: "append", lose: (h) => h.distiller.quiesce() },
+    {
+      name: "the distiller finds the lease taken",
+      write: "full",
+      lose: (h) => {
+        store.setMeta(
+          "distill_lease",
+          JSON.stringify({
+            holder: "rival",
+            heartbeat: Date.now(),
+            ttl: 30_000,
+            build: "x",
+            gen: 1,
+          }),
+        );
+        expect(h.distiller.ownsLease()).toBe(false);
+      },
+    },
+    {
+      name: "the distiller finds the lease taken",
+      write: "append",
+      lose: (h) => {
+        store.setMeta(
+          "distill_lease",
+          JSON.stringify({
+            holder: "rival",
+            heartbeat: Date.now(),
+            ttl: 30_000,
+            build: "x",
+            gen: 1,
+          }),
+        );
+        expect(h.distiller.ownsLease()).toBe(false);
+      },
+    },
+  ])(
+    "a $write write reads no further page and writes nothing once $name between pages",
+    async ({ write, lose }) => {
+      const { h, events, hooks } = await seeded(
+        1_200,
+        write === "append" ? { appendThresholdParts: 0 } : {},
+      );
+      if (write === "full") {
+        changeOne();
+      } else {
+        addUser("ses_a", "appendedword common");
+        v2db.db.run("UPDATE session_v2 SET time_updated = ? WHERE id = ?", [T0 + 10_000, "ses_a"]);
+      }
+      const before = store.getCard("ses_a");
+      let read = false;
+      let lost: number | undefined;
+      hooks.onPage = (offset) => {
+        if (offset === 0) read = true;
+      };
+      hooks.onPause = () => {
+        if (!read || lost !== undefined) return;
+        lose(h);
+        lost = events.length;
+      };
+      const from = h.writes.length;
+      h.distiller.onEvent({
+        type: write === "full" ? "removal" : "turn-ended",
+        sessionID: "ses_a",
+      });
+      await waitFor(() => lost !== undefined);
+      await sleep(50);
+      expect(events.slice(lost).filter((event) => event.startsWith("page"))).toEqual([]);
+      expect(h.writes.slice(from)).toEqual([]);
+      expect(store.getCard("ses_a")).toEqual(before);
+      expect(hits("changedword")).toEqual([]);
+      expect(hits("appendedword")).toEqual([]);
+      store.releaseLease("rival");
+    },
+    20_000,
+  );
+
+  it("a cold pass writes again against the rows stored now when a write lands while it reads them, with the new range hashes", async () => {
+    const { h, pause, hooks } = await seeded(600);
+    const hashes = store.getRangeHashes("ses_a");
+    expect(hashes.map((span) => [span.startSeq, span.endSeq])).toEqual([
+      [1, 500],
+      [501, 600],
+    ]);
+    await h.distiller.stop();
+    changeOne();
+    // A range's hash covers its rows' times, not their content.
+    v2db.db.run("UPDATE session_message SET time_updated = ? WHERE id = ?", [
+      T0 + 9_000,
+      "msg_ses_a_3",
+    ]);
+    v2db.db.run("UPDATE session_v2 SET time_updated = ? WHERE id = ?", [T0 + 10_000, "ses_a"]);
+    let read = false;
+    let raced = false;
+    hooks.onPage = (offset) => {
+      if (offset === 0) read = true;
+    };
+    hooks.onPause = () => {
+      if (!read || raced) return;
+      raced = true;
+      // The rows after the first page move into it, so as many rows are read
+      // as are stored, and one holds new text.
+      const rows = store.sessionRows("ses_a", 0, 2_000).slice(100);
+      rows[300] = { ...rows[300]!, raw: "racedword", norm: "racedword" };
+      store.replaceSessionParts("ses_a", rows, store.getCard("ses_a")!);
+    };
+    const cold = start({
+      limits: { coldPass: true },
+      pause,
+      // The source here has no project id: the pass discovers every session.
+      wrapSource: (inner) => ({
+        ...inner,
+        listSessions: (query) => inner.listSessions({ ...query, scope: "global" }),
+      }),
+    });
+    await waitFor(() => cold.writes.length >= 2);
+    await waitFor(() => cold.distiller.status().coldPass === "done");
+    expect(raced).toBe(true);
+    expect(cold.writes).toEqual(refusedThenWritten("replaceSessionParts"));
+    expect(storedText("ses_a")).toHaveLength(600);
+    expect(hits("changedword")).toEqual(["ses_a"]);
+    expect(hits("racedword")).toEqual([]);
+    // The first range holds the changed message: the write that went
+    // through stored its new hash.
+    const now = store.getRangeHashes("ses_a");
+    expect(now.map((span) => [span.startSeq, span.endSeq])).toEqual([
+      [1, 500],
+      [501, 600],
+    ]);
+    expect(now[0]!.hash).not.toBe(hashes[0]!.hash);
+    expect(now[1]).toEqual(hashes[1]);
+    storeDb.run("INSERT INTO part_fts(part_fts, rank) VALUES('integrity-check', 1)");
   }, 20_000);
 });

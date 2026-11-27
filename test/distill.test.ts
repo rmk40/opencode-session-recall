@@ -506,6 +506,27 @@ describe("inventory ranking", () => {
     }
   });
 
+  it("topByFrequency keeps tokens that tie on count and compare equal in map order, wherever n cuts them", () => {
+    // Each pair compares equal under localeCompare, so only map order
+    // separates its tokens.
+    const counts = new Map([
+      ["x", 1],
+      ["e\u0301", 2],
+      ["a\u200bb", 3],
+      ["\u00e9", 2],
+      ["ab", 3],
+      ["x\u00ad", 1],
+    ]);
+    const order = ["a\u200bb", "ab", "e\u0301", "\u00e9", "x", "x\u00ad"];
+    for (let n = 0; n <= order.length + 1; n++) {
+      expect(topByFrequency(counts, n), `n ${n}`).toEqual(order.slice(0, n));
+    }
+    const reversed = new Map([...counts].reverse());
+    expect(topByFrequency(reversed, 1)).toEqual(["ab"]);
+    expect(topByFrequency(reversed, 3)).toEqual(["ab", "a\u200bb", "\u00e9"]);
+    expect(topByFrequency(counts, -1)).toEqual([]);
+  });
+
   it("keeps the inventory a full sort of every counted token gives", () => {
     /** The inventory as ranking every token with a full sort builds it. */
     const sortedInventory = (rows: Array<{ class: string; raw: string }>, limit: number) => {
