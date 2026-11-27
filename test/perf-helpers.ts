@@ -5,7 +5,7 @@
  * a deterministic embedder.
  */
 import { loadavg } from "node:os";
-import { PerformanceObserver } from "node:perf_hooks";
+import { PerformanceObserver, type PerformanceEntry } from "node:perf_hooks";
 import type { CandidateEmbedder } from "../src/corpus.js";
 import type { Card } from "../src/store.js";
 
@@ -48,11 +48,12 @@ export function stallProbe(): {
   let worst = { from: 0, to: 0 };
   let gaps: Array<{ from: number; to: number }> = [];
   const gcs: Array<{ from: number; to: number }> = [];
-  const observer = new PerformanceObserver((list) => {
-    for (const entry of list.getEntries()) {
+  const record = (entries: readonly PerformanceEntry[]): void => {
+    for (const entry of entries) {
       gcs.push({ from: entry.startTime, to: entry.startTime + entry.duration });
     }
-  });
+  };
+  const observer = new PerformanceObserver((list) => record(list.getEntries()));
   observer.observe({ entryTypes: ["gc"] });
   const timer = setInterval(() => {
     const now = performance.now();
@@ -75,8 +76,15 @@ export function stallProbe(): {
     max: () => max,
     worst: () => worst,
     async stalls(window): Promise<Stalls> {
-      // GC entries reach the observer a task after the collection.
+      // A collection's entry reaches the observer in two steps: a native
+      // immediate after the collection buffers it, and an immediate the
+      // observer queues then delivers it. Wait out both and one timer turn
+      // (which also lets the interval record the last gap), then take what is
+      // buffered but not yet delivered.
+      await new Promise((resolve) => setImmediate(resolve));
+      await new Promise((resolve) => setImmediate(resolve));
       await new Promise((resolve) => setTimeout(resolve, 0));
+      record(observer.takeRecords());
       const from = Math.max(resetAt, window?.from ?? resetAt);
       const to = window?.to ?? Infinity;
       const clip = (span: { from: number; to: number }) => ({
