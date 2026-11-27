@@ -1555,7 +1555,98 @@ describe("plain-word slim-index lookup", () => {
       Number(db.get("SELECT count(*) AS n FROM part_fts WHERE part_fts MATCH ?", [match])?.n);
     expect(scored).toHaveLength(1);
     expect(matched(scored[0]!)).toBeLessThanOrEqual(BUDGET);
+    // The left-out words only rank: the rows are the kept words' rows.
+    expect(matched(scored[0]!)).toBe(matched('"launcher" OR "governed" OR "inference"'));
     expect(matched(words.map((word) => `"${word}"`).join(" OR "))).toBe(483);
+    db.close();
+  });
+});
+
+describe("plain-word lookup past the budget", () => {
+  // Under a 20-row budget: "cache", "invalidation" and "pool" are in 30 rows
+  // each, and only "cache" and "invalidation" share a row (in "pair").
+  // "rollout" is in 12 rows and "canary" in 25: the one row holding both (in
+  // "both") is the oldest and as long as the 11 holding only "rollout".
+  const BUDGET = 20;
+
+  async function commonStore(): Promise<{ db: SqliteDb; store: Store; scored: string[] }> {
+    const db = await openSqlite(freshDbPath());
+    if (!db) throw new Error("openSqlite returned null");
+    const scored: string[] = [];
+    const recording: SqliteDb = {
+      ...db,
+      all: (sql, params) => {
+        if (sql.includes("bm25(part_fts)")) scored.push(String(params?.[0]));
+        return db.all(sql, params);
+      },
+    };
+    const store = openV1Store(recording);
+    if (!store) throw new Error("openStore returned null");
+    const write = (sessionId: string, texts: string[], timeCreated = 1000) =>
+      store.replaceSessionParts(
+        sessionId,
+        texts.map((text, i) =>
+          makePart(`${sessionId}-${i}`, text, { timeCreated: timeCreated + i }),
+        ),
+        makeCard(sessionId),
+      );
+    const many = (n: number, text: (i: number) => string) =>
+      Array.from({ length: n }, (_, i) => text(i));
+    write(
+      "filler",
+      many(40, (i) => `notes filler ${i}`),
+    );
+    write("pair", ["cache invalidation storm"]);
+    write(
+      "cache-only",
+      many(29, (i) => `cache warmed ${i}`),
+    );
+    write(
+      "invalidation-only",
+      many(29, (i) => `invalidation queued ${i}`),
+    );
+    write(
+      "pool-only",
+      many(30, (i) => `pool drained ${i}`),
+    );
+    write("both", ["rollout canary step"], 1);
+    write(
+      "rollout-only",
+      many(11, () => "rollout plan step"),
+    );
+    write(
+      "canary-only",
+      many(24, (i) => `canary build ${i}`),
+    );
+    scored.length = 0;
+    return { db, store, scored };
+  }
+
+  const lookup = (store: Store, words: string[], limit?: number) =>
+    store.ftsSearch({ strong: [], weak: words, weakRowBudget: BUDGET, limit });
+
+  it("matches common words together when they share a row", async () => {
+    const { db, store, scored } = await commonStore();
+    expect(sessions(lookup(store, ["cache", "invalidation"]))).toEqual(["pair"]);
+    expect(scored).toEqual(['"cache" AND "invalidation"']);
+    db.close();
+  });
+
+  it("skips common words that never share a row", async () => {
+    const { db, store, scored } = await commonStore();
+    expect(lookup(store, ["cache", "pool"])).toEqual([]);
+    expect(scored).toEqual([]);
+    db.close();
+  });
+
+  it("ranks a row holding a left-out word above rows holding only the kept word", async () => {
+    const { db, store } = await commonStore();
+    // "rollout" matches 12 rows, more than the 5 returned; without "canary"
+    // in the ranking the older "both" row would tie and come last.
+    const hits = lookup(store, ["rollout", "canary"], 5);
+    expect(hits).toHaveLength(5);
+    expect(hits[0]!.sessionId).toBe("both");
+    expect(new Set(sessions(hits.slice(1)))).toEqual(new Set(["rollout-only"]));
     db.close();
   });
 });
@@ -1592,12 +1683,14 @@ describe("plain-word anchor selection", () => {
     expect(boundWeakAnchors(["z", "y", "x"], rows, 10)).toEqual(["z", "y"]);
   });
 
-  it("keeps a repeated word as given when it fits and drops every copy when too common", () => {
-    expect(boundWeakAnchors(["a", "b", "a"], rowsFrom({ a: 3, b: 2 }), 100)).toEqual([
-      "a",
-      "b",
-      "a",
-    ]);
+  it("counts a repeated word once, keeping one copy when it fits and none when too common", () => {
+    const asked: string[] = [];
+    const counting = (anchor: string): number => {
+      asked.push(anchor);
+      return rowsFrom({ a: 3, b: 2 })(anchor);
+    };
+    expect(boundWeakAnchors(["a", "b", "a"], counting, 100)).toEqual(["a", "b"]);
+    expect(asked).toEqual(["a", "b"]);
     expect(boundWeakAnchors(["a", "b", "a"], rowsFrom({ a: 10, b: 2 }), 10)).toEqual(["b"]);
   });
 
@@ -1658,7 +1751,8 @@ describe("plain-word anchor selection", () => {
       weak: ["common", "rare"],
       weakRowBudget: 5,
     });
-    expect(matches).toEqual(['"rare"']);
+    // "common" (12 rows) is past the budget but ranks with the kept "rare".
+    expect(matches).toEqual(['("rare") AND ("common" OR "rare")']);
     expect(parts(hits)).toEqual(["r0"]);
     db.close();
   });
@@ -1673,7 +1767,7 @@ describe("plain-word anchor selection", () => {
     expect(matches).toEqual([
       buildMatch([], words),
       buildMatch([], words),
-      buildMatch([], ["mid", "rare", "launcher"]),
+      `(${buildMatch([], ["mid", "rare", "launcher"])}) AND (${buildMatch([], words)})`,
     ]);
     db.close();
   });
