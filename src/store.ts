@@ -115,9 +115,9 @@ const DEFAULT_FTS_LIMIT = 200;
  *  would touch a large share of the index. */
 export const WEAK_MATCH_ROWS = 20_000;
 /** A word the plain-word OR leaves out still ranks its rows while it is in
- *  fewer than this many times the budget's rows. `bm25()` reads every row of
- *  each phrase in the match to weigh it, so a word in more rows would cost a
- *  walk of its whole posting list for a weight that is small anyway. */
+ *  fewer than this many times the budget's rows. The cap bounds cost:
+ *  `bm25()` reads every row of each phrase in the match to weigh it, so a
+ *  word past the cap would cost a walk of its whole posting list. */
 const RANKING_ROWS_FACTOR = 5;
 
 // A lease whose heartbeat predates any realistic (or injected) cutoff, so a
@@ -458,6 +458,8 @@ export type FtsHit = {
   prevMessageId: string | null;
   nextMessageId: string | null;
   class: string;
+  /** The row's `bm25()` (lower is better), or `-Infinity` for a row holding
+   *  every plain word of the query, which is listed first unscored. */
   score: number;
 };
 
@@ -781,14 +783,18 @@ export type Store = {
     opts?: { rangeHashes?: RangeHash[]; replaceRangeHashes?: boolean },
   ): SessionWrite;
   /**
-   * Look slim-index rows up, best `bm25()` first. With a strong anchor, every
-   * strong anchor is required and the weak ones are ignored. Without one, the
-   * match ORs the weak anchors {@link boundWeakAnchors} keeps under the
-   * budget; the ones it leaves out stay in the match as ranking-only terms,
-   * which add to `bm25()` without widening the rows matched, while they are
-   * in fewer than five times the budget's rows. When it keeps none, two or
-   * more weak anchors match together (AND) if they share at least one and
-   * fewer than budget rows, and the lookup is skipped otherwise.
+   * Look slim-index rows up. With a strong anchor, every strong anchor is
+   * required, the weak ones are ignored and rows come best `bm25()` first.
+   *
+   * Without one, the weak anchors (plain words) are looked up in two steps.
+   * When there are two or more and between one and budget-1 rows hold them
+   * all, those rows come first, newest first and unscored. The rest of
+   * `limit` comes from the anchors {@link boundWeakAnchors} keeps under the
+   * budget, ORed and best `bm25()` first, skipping rows already listed. The
+   * anchors it leaves out stay in that match as ranking-only terms, which add
+   * to `bm25()` without widening the rows matched, while each is in fewer
+   * than five times the budget's rows. When it keeps none, the first step is
+   * the whole lookup.
    */
   ftsSearch(input: FtsQuery): FtsHit[];
   getMeta(key: string): string | undefined;
@@ -929,6 +935,19 @@ function asString(value: SqlValue | undefined, fallback = ""): string {
 
 function asNullableString(value: SqlValue | undefined): string | null {
   return typeof value === "string" ? value : null;
+}
+
+/** An {@link FtsHit} from a slim-index lookup row. */
+function ftsHitOf(row: Row, score: number): FtsHit {
+  return {
+    sessionId: asString(row.session_id),
+    partId: asString(row.part_id),
+    messageId: asString(row.message_id),
+    prevMessageId: asNullableString(row.prev_message_id),
+    nextMessageId: asNullableString(row.next_message_id),
+    class: asString(row.class),
+    score,
+  };
 }
 
 function asNumber(value: SqlValue | undefined, fallback = 0): number {
@@ -2304,14 +2323,45 @@ class SqliteStore implements Store {
       input.weakRowBudget != null && Number.isFinite(input.weakRowBudget) && input.weakRowBudget > 0
         ? Math.floor(input.weakRowBudget)
         : WEAK_MATCH_ROWS;
-    // Strong anchors as before; only a plain-word lookup is bounded.
-    const match =
-      buildMatch(input.strong ?? [], []) ?? this.plainWordMatch(input.weak ?? [], budget);
-    if (!match) return [];
     const limit =
       input.limit != null && Number.isFinite(input.limit) && input.limit > 0
         ? Math.floor(input.limit)
         : DEFAULT_FTS_LIMIT;
+    // Strong anchors as before; only a plain-word lookup is bounded.
+    const strong = buildMatch(input.strong ?? [], []);
+    if (strong) return this.scoredRows(strong, limit);
+    return this.plainWordRows(input.weak ?? [], budget, limit);
+  }
+
+  /** A lookup by plain words under `budget` (see {@link Store.ftsSearch}). */
+  private plainWordRows(words: readonly string[], budget: number, limit: number): FtsHit[] {
+    const phrases = [...new Set(words.map(quoteAnchor).filter((a): a is string => a !== null))];
+    const kept = boundWeakAnchors(phrases, (phrase) => this.matchRows(phrase, budget), budget);
+    let full: FtsHit[] = [];
+    if (phrases.length >= 2) {
+      const together = phrases.join(" AND ");
+      const rows = this.recentRows(together, limit);
+      // Fewer than `limit` rows are the whole match, so only a full list
+      // needs counting; an AND walks its posting lists once per statement.
+      const total = rows.length < limit ? rows.length : this.matchRows(together, budget);
+      if (total > 0 && total < budget) full = rows;
+    }
+    if (kept.length === 0 || full.length >= limit) return full;
+    const rankCap = Math.min(budget * RANKING_ROWS_FACTOR, Number.MAX_SAFE_INTEGER);
+    const ranking = phrases.filter(
+      (phrase) => !kept.includes(phrase) && this.matchRows(phrase, rankCap) < rankCap,
+    );
+    // Every row holding all the words holds a kept one, so the kept lookup
+    // lists them again; `limit` rows leave enough once they are skipped.
+    const listed = new Set(full.map((hit) => hit.partId));
+    const rest = this.scoredRows(rankedMatch(phrases, kept, ranking), limit).filter(
+      (hit) => !listed.has(hit.partId),
+    );
+    return [...full, ...rest.slice(0, limit - full.length)];
+  }
+
+  /** The rows `match` matches, best `bm25()` first. */
+  private scoredRows(match: string, limit: number): FtsHit[] {
     const rows = this.db.all(
       `SELECT p.session_id, p.part_id, p.message_id, p.prev_message_id, p.next_message_id, p.class, bm25(part_fts) AS score
        FROM part_fts JOIN part_text p ON p.id = part_fts.rowid
@@ -2320,34 +2370,22 @@ class SqliteStore implements Store {
        LIMIT ?`,
       [match, limit],
     );
-    return rows.map((row) => ({
-      sessionId: asString(row.session_id),
-      partId: asString(row.part_id),
-      messageId: asString(row.message_id),
-      prevMessageId: asNullableString(row.prev_message_id),
-      nextMessageId: asNullableString(row.next_message_id),
-      class: asString(row.class),
-      score: asNumber(row.score),
-    }));
+    return rows.map((row) => ftsHitOf(row, asNumber(row.score)));
   }
 
-  /** The MATCH for a lookup by plain words under `budget`, or null to skip
-   *  it (see {@link Store.ftsSearch}). */
-  private plainWordMatch(words: readonly string[], budget: number): string | null {
-    const phrases = [...new Set(words.map(quoteAnchor).filter((a): a is string => a !== null))];
-    const kept = boundWeakAnchors(phrases, (phrase) => this.matchRows(phrase, budget), budget);
-    if (kept.length === 0) {
-      // Every word is common; together they may still pick out a few rows.
-      if (phrases.length < 2) return null;
-      const together = phrases.join(" AND ");
-      const rows = this.matchRows(together, budget);
-      return rows > 0 && rows < budget ? together : null;
-    }
-    const rankCap = Math.min(budget * RANKING_ROWS_FACTOR, Number.MAX_SAFE_INTEGER);
-    const ranking = phrases.filter(
-      (phrase) => !kept.includes(phrase) && this.matchRows(phrase, rankCap) < rankCap,
+  /** The rows `match` matches, newest written first, unscored. `bm25()`
+   *  would first read every row of each phrase in the match to weigh it; in
+   *  rowid order FTS5 reads the posting lists only up to the LIMIT. */
+  private recentRows(match: string, limit: number): FtsHit[] {
+    const rows = this.db.all(
+      `SELECT p.session_id, p.part_id, p.message_id, p.prev_message_id, p.next_message_id, p.class
+       FROM part_fts JOIN part_text p ON p.id = part_fts.rowid
+       WHERE part_fts MATCH ?
+       ORDER BY part_fts.rowid DESC
+       LIMIT ?`,
+      [match, limit],
     );
-    return rankedMatch(phrases, kept, ranking);
+    return rows.map((row) => ftsHitOf(row, Number.NEGATIVE_INFINITY));
   }
 
   /** The slim-index rows a MATCH expression matches, counted up to `cap`:

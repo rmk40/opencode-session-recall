@@ -10,6 +10,7 @@ import {
   pluginBuild,
   WEAK_MATCH_ROWS,
   type Card,
+  type FtsHit,
   type PartTextRow,
   type RangeHash,
   type SessionTail,
@@ -1569,20 +1570,30 @@ describe("plain-word lookup past the budget", () => {
   // "both") is the oldest and as long as the 11 holding only "rollout".
   const BUDGET = 20;
 
-  async function commonStore(): Promise<{ db: SqliteDb; store: Store; scored: string[] }> {
+  type Recorded = { scored: string[]; listed: string[] };
+
+  /** A store whose lookup statements are recorded: `scored` the MATCH of
+   *  each one ranked by `bm25()`, `listed` of each one listed by rowid. */
+  async function recordingStore(): Promise<{ db: SqliteDb; store: Store } & Recorded> {
     const db = await openSqlite(freshDbPath());
     if (!db) throw new Error("openSqlite returned null");
     const scored: string[] = [];
+    const listed: string[] = [];
     const recording: SqliteDb = {
       ...db,
       all: (sql, params) => {
         if (sql.includes("bm25(part_fts)")) scored.push(String(params?.[0]));
+        else if (sql.includes("part_fts MATCH")) listed.push(String(params?.[0]));
         return db.all(sql, params);
       },
     };
     const store = openV1Store(recording);
     if (!store) throw new Error("openStore returned null");
-    const write = (sessionId: string, texts: string[], timeCreated = 1000) =>
+    return { db, store, scored, listed };
+  }
+
+  function writer(store: Store) {
+    return (sessionId: string, texts: string[], timeCreated = 1000) =>
       store.replaceSessionParts(
         sessionId,
         texts.map((text, i) =>
@@ -1590,8 +1601,14 @@ describe("plain-word lookup past the budget", () => {
         ),
         makeCard(sessionId),
       );
-    const many = (n: number, text: (i: number) => string) =>
-      Array.from({ length: n }, (_, i) => text(i));
+  }
+
+  const many = (n: number, text: (i: number) => string) =>
+    Array.from({ length: n }, (_, i) => text(i));
+
+  async function commonStore(): Promise<{ db: SqliteDb; store: Store } & Recorded> {
+    const { db, store, scored, listed } = await recordingStore();
+    const write = writer(store);
     write(
       "filler",
       many(40, (i) => `notes filler ${i}`),
@@ -1619,34 +1636,91 @@ describe("plain-word lookup past the budget", () => {
       many(24, (i) => `canary build ${i}`),
     );
     scored.length = 0;
-    return { db, store, scored };
+    listed.length = 0;
+    return { db, store, scored, listed };
   }
 
-  const lookup = (store: Store, words: string[], limit?: number) =>
-    store.ftsSearch({ strong: [], weak: words, weakRowBudget: BUDGET, limit });
+  const lookup = (store: Store, words: string[], limit?: number, weakRowBudget = BUDGET) =>
+    store.ftsSearch({ strong: [], weak: words, weakRowBudget, limit });
 
-  it("matches common words together when they share a row", async () => {
-    const { db, store, scored } = await commonStore();
-    expect(sessions(lookup(store, ["cache", "invalidation"]))).toEqual(["pair"]);
-    expect(scored).toEqual(['"cache" AND "invalidation"']);
+  it("lists the rows holding every common word without scoring them", async () => {
+    const { db, store, scored, listed } = await commonStore();
+    const hits = lookup(store, ["cache", "invalidation"]);
+    expect(sessions(hits)).toEqual(["pair"]);
+    expect(listed).toEqual(['"cache" AND "invalidation"']);
+    // bm25() would read all 59 rows of the two words to weigh them.
+    expect(scored).toEqual([]);
     db.close();
   });
 
   it("skips common words that never share a row", async () => {
-    const { db, store, scored } = await commonStore();
+    const { db, store, scored, listed } = await commonStore();
     expect(lookup(store, ["cache", "pool"])).toEqual([]);
+    // The one statement is the list of rows holding both, which finds none.
+    expect(listed).toEqual(['"cache" AND "pool"']);
     expect(scored).toEqual([]);
     db.close();
   });
 
   it("ranks a row holding a left-out word above rows holding only the kept word", async () => {
     const { db, store } = await commonStore();
-    // "rollout" matches 12 rows, more than the 5 returned; without "canary"
-    // in the ranking the older "both" row would tie and come last.
-    const hits = lookup(store, ["rollout", "canary"], 5);
+    // No row holds all three words. "rollout" matches 12 rows, more than the
+    // 5 returned; without "canary" in the ranking the older "both" row would
+    // tie and come last.
+    const hits = lookup(store, ["rollout", "canary", "notes"], 5);
+    expect(hits.every((hit) => Number.isFinite(hit.score))).toBe(true);
     expect(hits).toHaveLength(5);
     expect(hits[0]!.sessionId).toBe("both");
     expect(new Set(sessions(hits.slice(1)))).toEqual(new Set(["rollout-only"]));
+    db.close();
+  });
+
+  it("returns the row holding every word when the other word is past the ranking cap", async () => {
+    // Under a 300-row budget "migration" (202 rows) is kept and "cache"
+    // (1,501 rows) is past the 1,500-row ranking cap, so it adds nothing to
+    // the kept lookup, where the one older "migration cache" row ties with
+    // the 201 newer "migration plan" rows and comes 202nd of 200.
+    const { db, store, scored } = await recordingStore();
+    const write = writer(store);
+    write("full", ["migration cache"], 1);
+    write(
+      "caches",
+      many(1_500, (i) => `cache warmed ${i}`),
+    );
+    write(
+      "plans",
+      many(201, () => "migration plan"),
+      2_000,
+    );
+    scored.length = 0;
+    const hits = lookup(store, ["cache", "migration"], undefined, 300);
+    expect(hits).toHaveLength(200);
+    expect(hits[0]!.partId).toBe("full-0");
+    expect(sessions(hits.slice(1))).toEqual(Array.from({ length: 199 }, () => "plans"));
+    expect(scored).toEqual(['"migration"']);
+    db.close();
+  });
+
+  it("lists the rows holding every word newest first, then the kept lookup's others once each", async () => {
+    // Both words are kept. "deploy rollback" outranks the longer, newer
+    // "deploy rollback after release" under bm25(), but the rows holding both
+    // words come first newest first, and the kept lookup does not repeat them.
+    const { db, store } = await recordingStore();
+    writer(store)("s", [
+      "deploy rollback",
+      "deploy plan",
+      "rollback plan",
+      "deploy rollback after release",
+      "deploy",
+    ]);
+    const parts = (hits: FtsHit[]) => hits.map((hit) => hit.partId);
+    const top = lookup(store, ["deploy", "rollback"], 3);
+    expect(parts(top).slice(0, 2)).toEqual(["s-3", "s-0"]);
+    expect(top[2]!.partId).not.toMatch(/^s-[03]$/);
+    expect(top.slice(0, 2).map((hit) => hit.score)).toEqual([-Infinity, -Infinity]);
+    const all = parts(lookup(store, ["deploy", "rollback"], 10));
+    expect(all.slice(0, 2)).toEqual(["s-3", "s-0"]);
+    expect([...all].sort()).toEqual(["s-0", "s-1", "s-2", "s-3", "s-4"]);
     db.close();
   });
 });
