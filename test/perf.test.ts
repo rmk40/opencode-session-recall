@@ -19,16 +19,19 @@
  *
  * On a 12,000-card store with realistic inventories (perf-helpers.ts):
  *   - A cold index build, with semantic off, on with every vector computed,
- *     and on with the persisted vectors reused: no slice over 50ms, each
- *     build under 60s.
+ *     and on with the persisted vectors reused: no code slice over 50ms with
+ *     GC pauses excluded, each build under 60s, and the heap after the
+ *     lexical and the reused build under 600MB.
  *   - 400 changed cards applied through ready({ index: true }): no full load,
- *     no slice over 50ms, under 3s in total.
+ *     no code slice over 50ms with GC pauses excluded, under 3s in total.
  *   - 24 `recall` searches with card writes between them: card tier p50 <
  *     250ms, whole search p50 < 1s, no full load.
  * The slice budgets leave out V8's garbage-collection pauses, logged beside
- * them: building an index of this size makes major collections that, on a
- * loaded machine, pause the loop past the budget on their own. Every gate logs
- * the load average.
+ * them with the raw stalls: building an index of this size makes major
+ * collections that, on a loaded machine, pause the loop past the budget on
+ * their own. A pause's length follows the heap the collector has to trace,
+ * so the heap ceiling catches the growth that lengthens it even while the
+ * slices pass. Every gate logs the load average.
  *
  * Each gate warms up before measuring and uses real timers with honest
  * nearest-rank percentiles. The first five gates take a few seconds; the
@@ -90,7 +93,8 @@ const LIMITS: Limits = { ...DEFAULTS, maxSessions: 10_000 };
 const SUPPRESSED_WRITE_BUDGET_MS = 50;
 /** Cards in the large store, about as many as a long-used live store holds. */
 const BIG_CARDS = 12_000;
-/** Longest synchronous slice a card-runtime build or update may take. */
+/** Longest synchronous slice a card-runtime build or update may take, GC
+ *  pauses excluded. */
 const SLICE_BUDGET_MS = 50;
 /** Card-tier time of one `recall` search (median) on the large store. */
 const CARD_TIER_P50_BUDGET_MS = 250;
@@ -103,6 +107,10 @@ const SEARCH_P50_BUDGET_MS = 1_000;
 /** One cold build of the large store's index, which runs for seconds by
  *  design; this only catches a build that stops scaling. */
 const COLD_BUILD_TOTAL_BUDGET_MS = 60_000;
+/** Heap in use after a cold build of the large store's index, test process
+ *  and corpus included. Builds measure about 383 to 389 MB; a heap that
+ *  doubles fails. */
+const COLD_BUILD_HEAP_BUDGET_MB = 600;
 const SEMANTIC_MODEL = "perf-model";
 /** How often the card runtime checks the store for changes, as in production
  *  (cards.ts). The large-store gates advance a fake clock by it, so a refresh
@@ -934,7 +942,7 @@ describe.skipIf(!ENABLED)(`perf: card runtime on a ${BIG_CARDS}-card store`, () 
     return process.memoryUsage().heapUsed / (1024 * 1024);
   };
 
-  it(`a cold index build never blocks the loop over ${SLICE_BUDGET_MS} ms, with semantic off and on`, async () => {
+  it(`a cold index build keeps each code slice under ${SLICE_BUDGET_MS} ms excluding GC pauses and its heap under ${COLD_BUILD_HEAP_BUDGET_MB} MB, with semantic off and on`, async () => {
     const store = await copyStore();
     const results: Record<string, number> = {};
     const load = loadAverage();
@@ -1011,6 +1019,13 @@ describe.skipIf(!ENABLED)(`perf: card runtime on a ${BIG_CARDS}-card store`, () 
       `[perf] cold build (${BIG_CARDS} cards, load ${load}):`,
       JSON.stringify(Object.fromEntries(Object.entries(results).map(([k, v]) => [k, round1(v)]))),
     );
+    console.log(
+      `[perf] cold build heap (ceiling ${COLD_BUILD_HEAP_BUDGET_MB}MB): ` +
+        `lexical ${round1(results.lexicalHeapMB!)}MB with raw stall ${round1(results.lexicalMaxStallMs!)}ms ` +
+        `(GC pause max ${round1(results.lexicalMaxGcPauseMs!)}ms), ` +
+        `reuse ${round1(results.reuseHeapMB!)}MB with raw stall ${round1(results.reuseMaxStallMs!)}ms ` +
+        `(GC pause max ${round1(results.reuseMaxGcPauseMs!)}ms)`,
+    );
     expect(results.cards).toBe(BIG_CARDS);
     expect(results.lexicalHits).toBeGreaterThan(0);
     expect(results.embedVectors).toBeGreaterThan(BIG_CARDS * 0.9);
@@ -1020,9 +1035,11 @@ describe.skipIf(!ENABLED)(`perf: card runtime on a ${BIG_CARDS}-card store`, () 
       expect(results[`${phase}MaxSliceMs`], phase).toBeLessThan(SLICE_BUDGET_MS);
       expect(results[`${phase}TotalMs`], phase).toBeLessThan(COLD_BUILD_TOTAL_BUDGET_MS);
     }
+    expect(results.lexicalHeapMB).toBeLessThan(COLD_BUILD_HEAP_BUDGET_MB);
+    expect(results.reuseHeapMB).toBeLessThan(COLD_BUILD_HEAP_BUDGET_MB);
   }, 300_000);
 
-  it(`400 changed cards apply through ready({ index: true }) without a full load or a slice over ${SLICE_BUDGET_MS} ms`, async () => {
+  it(`400 changed cards apply through ready({ index: true }) without a full load or a code slice over ${SLICE_BUDGET_MS} ms excluding GC pauses`, async () => {
     const store = await copyStore();
     const counted = countingSource(store);
     let clock = Date.now();

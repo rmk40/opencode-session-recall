@@ -8,11 +8,11 @@
  * synchronous slice stalls every session, not just one TUI. This builds a
  * large synthetic opencode v2 database (thousands of small sessions, a few
  * 4,000-row sessions, and some multi-megabyte rows, including rows over the
- * page byte ceiling), then measures the longest gap a `setInterval(0)` probe
- * sees during a full v2 cold pass, one poll cycle, a `listSessions` call, and
- * an append re-distill of a 4,000-row session (distillAppend derives the merged
+ * page byte ceiling), then measures the gaps a `setInterval(0)` probe sees
+ * during a full v2 cold pass, one poll cycle, a `listSessions` call, and an
+ * append re-distill of a 4,000-row session (distillAppend derives the merged
  * card synchronously inside the store transaction, over every retained row).
- * Budget: no slice over 50 ms.
+ * Budget: no code slice over 50 ms, GC pauses excluded.
  *
  * The other gates measure, each on its own database: a tail write over a
  * 5,000-row card; a repair sweep over 400 stale cards (half of them with part
@@ -20,12 +20,16 @@
  * 12,000-card store; a child session's write and then its deletion in a
  * 12,000-card store whose root has 2,400 other children, each of which
  * recomputes the root's rollup; paged discovery of 10,501 sessions and of a
- * root's 2,400 children; and one range check over a 500-row session. Each
- * records its total time and its longest slice. Those gates assert the
- * longest slice with V8's garbage-collection pauses taken out, and log the
- * raw stall and the longest GC pause beside it: on a loaded machine a major
- * collection alone can pause the loop past the budget, which says nothing
- * about the code under test.
+ * root's 2,400 children, through the runtime's own paging; and one range
+ * check over a 500-row session. Each records its total time.
+ *
+ * Every gate asserts its longest slice with V8's garbage-collection pauses
+ * taken out (`…MaxSliceMs`) and logs the raw stall (`…MaxStallMs`) and the
+ * longest GC pause (`…MaxGcPauseMs`) beside it. On a loaded machine a major
+ * collection alone can pause the loop past the budget. That pause still
+ * depends on the code under test, since its length follows the heap the
+ * process retains: a raw stall that grows from run to run while the slices
+ * pass points at retained memory.
  *
  * When the budget fails the report names the slowest synchronous calls it
  * could attribute (opencode.db statements and store reads and transactions)
@@ -69,6 +73,8 @@ import {
   type V2SyncOptions,
 } from "../src/history/v2-sync.js";
 import { DEFAULTS, DISCOVERY_LIMIT } from "../src/types.js";
+import { discoverSessions } from "../src/host/v2-runtime.js";
+import { listAllChildren } from "../src/sessions.js";
 import { loadAverage, perfCorpus, stallProbe, type Stalls } from "./perf-helpers.js";
 import {
   insertMessage,
@@ -227,46 +233,13 @@ const sentence = (i: number, n = 12) =>
 
 // ── Fixtures for the sweep, discovery and range-check gates ──────────────────
 
+/** The pause the v2 runtime runs between discovery pages and distiller
+ *  steps. */
 const macrotask = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0));
 
-/** Session discovery as the v2 runtime runs it: global, archived included,
- *  in keyset pages of 2,000 by id, a macrotask between pages. */
-async function pagedDiscover(source: HistorySource): Promise<HistorySession[]> {
-  const sessions: HistorySession[] = [];
-  let after: string | undefined;
-  for (;;) {
-    const listing = await source.listSessions({
-      scope: "global",
-      limit: 2_000,
-      order: "id",
-      archived: "include",
-      ...(after !== undefined && { after }),
-    });
-    if (!listing.ok) throw new Error(listing.error);
-    sessions.push(...listing.items);
-    if (!listing.truncated || listing.nextCursor === undefined) return sessions;
-    after = listing.nextCursor;
-    await macrotask();
-  }
-}
-
-/** A parent's children as `recall_sessions` lists them: keyset pages of
- *  1,000 by id, one after another. */
-async function pagedChildren(source: HistorySource, parentID: string): Promise<HistorySession[]> {
-  const children: HistorySession[] = [];
-  let after: string | undefined;
-  for (;;) {
-    const listing = await source.listChildren(parentID, {
-      order: "id",
-      limit: 1_000,
-      ...(after !== undefined && { after }),
-    });
-    if (!listing.ok) throw new Error(listing.error);
-    children.push(...listing.items);
-    if (!listing.truncated || listing.nextCursor === undefined) return children;
-    after = listing.nextCursor;
-  }
-}
+/** Session discovery as the v2 runtime runs it. */
+const discover = (source: HistorySource): Promise<HistorySession[]> =>
+  discoverSessions(source, macrotask);
 
 /** The read-only opencode.db connection a gate reads through (timed, and
  *  failing any unbounded history statement), and a v2 store beside it. */
@@ -325,7 +298,7 @@ const stallFields = (prefix: string, s: Stalls): Record<string, number> => ({
 });
 
 describe.skipIf(!ENABLED)("perf: v2 event-loop stalls", () => {
-  it(`cold pass, one poll, listSessions and an append never block the loop over ${BUDGET_MS} ms`, async () => {
+  it(`cold pass, one poll, listSessions and an append keep each code slice under ${BUDGET_MS} ms excluding GC pauses`, async () => {
     const v2 = await makeV2Db();
     const storeDir = mkdtempSync(join(tmpdir(), "recall-perf-v2-"));
     try {
@@ -409,6 +382,7 @@ describe.skipIf(!ENABLED)("perf: v2 event-loop stalls", () => {
       let coldWorst = { from: 0, to: 0 };
       let appendWorst = { from: 0, to: 0 };
       const results: Record<string, number> = {};
+      const load = loadAverage();
       try {
         // ── Cold pass ──
         probe.reset();
@@ -433,12 +407,9 @@ describe.skipIf(!ENABLED)("perf: v2 event-loop stalls", () => {
           if (performance.now() - coldStart > 600_000) throw new Error("cold pass did not finish");
           await new Promise((resolve) => setTimeout(resolve, 50));
         }
-        results.coldPassMaxSliceMs = probe.max();
         coldWorst = probe.worst();
         results.coldPassTotalMs = performance.now() - coldStart;
-        const coldStalls = await probe.stalls();
-        results.coldPassMaxOutsideGcMs = coldStalls.maxOutsideGcMs;
-        results.coldPassMaxGcPauseMs = coldStalls.maxGcMs;
+        Object.assign(results, stallFields("coldPass", await probe.stalls()));
         await distiller.stop();
 
         // ── One poll cycle (both queries; the session scan is due on a first poll) ──
@@ -457,16 +428,16 @@ describe.skipIf(!ENABLED)("perf: v2 event-loop stalls", () => {
         const polled = await sync.poll(meta);
         polled.commit();
         const signals = polled.signals;
-        results.pollMaxSliceMs = probe.max();
         results.pollTotalMs = performance.now() - pollStart;
+        Object.assign(results, stallFields("poll", await probe.stalls()));
         results.pollSignals = signals.length;
 
         // ── listSessions ──
         probe.reset();
         const listStart = performance.now();
         const listing = await source.listSessions({ scope: "global", limit: DISCOVERY_LIMIT });
-        results.listMaxSliceMs = probe.max();
         results.listTotalMs = performance.now() - listStart;
+        Object.assign(results, stallFields("list", await probe.stalls()));
         results.listed = listing.ok ? listing.items.length : -1;
         results.cards = store.allCards().length;
 
@@ -514,9 +485,9 @@ describe.skipIf(!ENABLED)("perf: v2 event-loop stalls", () => {
           if (performance.now() - appendStart > 60_000) throw new Error("append did not land");
           await new Promise((resolve) => setTimeout(resolve, 5));
         }
-        results.appendMaxSliceMs = probe.max();
         appendWorst = probe.worst();
         results.appendTotalMs = performance.now() - appendStart;
+        Object.assign(results, stallFields("append", await probe.stalls()));
         results.appendCalls = appendCalls;
         results.appendPartsBefore = partsBefore;
         await appender.stop();
@@ -528,7 +499,7 @@ describe.skipIf(!ENABLED)("perf: v2 event-loop stalls", () => {
 
       const round = (n: number) => Math.round(n * 10) / 10;
       console.log(
-        "v2 perf:",
+        `v2 perf (load ${load}):`,
         JSON.stringify(
           {
             buildMs: round(buildMs),
@@ -560,7 +531,7 @@ describe.skipIf(!ENABLED)("perf: v2 event-loop stalls", () => {
     }
   }, 900_000);
 
-  it(`a tail write over a 5,000-row card never blocks the loop over ${BUDGET_MS} ms`, async () => {
+  it(`a tail write over a 5,000-row card keeps each code slice under ${BUDGET_MS} ms excluding GC pauses`, async () => {
     const TAIL_BUDGET_TOTAL_MS = 1_000;
     const v2 = await makeV2Db();
     const storeDir = mkdtempSync(join(tmpdir(), "recall-perf-v2-tail-"));
@@ -635,6 +606,7 @@ describe.skipIf(!ENABLED)("perf: v2 event-loop stalls", () => {
       });
       const probe = stallProbe();
       const results: Record<string, number> = {};
+      const load = loadAverage();
       try {
         distiller.start();
         // The first write reads in full and records the settled base.
@@ -660,15 +632,15 @@ describe.skipIf(!ENABLED)("perf: v2 event-loop stalls", () => {
           await new Promise((resolve) => setTimeout(resolve, 1));
         }
         results.tailWriteTotalMs = performance.now() - tailStart;
-        results.tailWriteMaxSliceMs = probe.max();
+        Object.assign(results, stallFields("tailWrite", await probe.stalls()));
 
         // Nothing changed: no write at all.
         probe.reset();
         const quietStart = performance.now();
         distiller.onEvent({ type: "turn-ended", sessionID: sid });
         await new Promise((resolve) => setTimeout(resolve, 200));
-        results.unchangedMaxSliceMs = probe.max();
         results.unchangedWindowMs = performance.now() - quietStart;
+        Object.assign(results, stallFields("unchanged", await probe.stalls()));
         results.tailWrites = tailWrites;
         results.storedRows = store.sessionRowCount(sid);
         await distiller.stop();
@@ -679,7 +651,7 @@ describe.skipIf(!ENABLED)("perf: v2 event-loop stalls", () => {
       }
       const round = (n: number) => Math.round(n * 10) / 10;
       console.log(
-        "v2 tail write perf:",
+        `v2 tail write perf (load ${load}):`,
         JSON.stringify(Object.fromEntries(Object.entries(results).map(([k, v]) => [k, round(v)]))),
       );
       console.log("slowest synchronous calls:", JSON.stringify(slow.top(8)));
@@ -695,7 +667,7 @@ describe.skipIf(!ENABLED)("perf: v2 event-loop stalls", () => {
     }
   }, 300_000);
 
-  it(`a repair sweep over ${SWEEP_SESSIONS} stale cards in a ${SWEEP_STORE_CARDS}-card store never blocks the loop over ${BUDGET_MS} ms`, async () => {
+  it(`a repair sweep over ${SWEEP_SESSIONS} stale cards in a ${SWEEP_STORE_CARDS}-card store keeps each code slice under ${BUDGET_MS} ms excluding GC pauses`, async () => {
     const v2 = await makeV2PartsDb();
     v2.db.exec("PRAGMA synchronous = OFF");
     const storeDir = mkdtempSync(join(tmpdir(), "recall-perf-v2-sweep-"));
@@ -776,7 +748,7 @@ describe.skipIf(!ENABLED)("perf: v2 event-loop stalls", () => {
           gate: createFetchGate({ concurrency: DEFAULTS.concurrency }),
           limits: { ...DEFAULTS, distillDelayMs: 0 },
           instanceId,
-          discover: () => pagedDiscover(source),
+          discover: () => discover(source),
           sync,
           projectorGen: V2_PROJECTOR_GEN,
           yieldBetween: macrotask,
@@ -895,7 +867,7 @@ describe.skipIf(!ENABLED)("perf: v2 event-loop stalls", () => {
     }
   }, 900_000);
 
-  it(`a child write and a child deletion in a ${SWEEP_STORE_CARDS}-card store never block the loop over ${BUDGET_MS} ms`, async () => {
+  it(`a child write and a child deletion in a ${SWEEP_STORE_CARDS}-card store keep each code slice under ${BUDGET_MS} ms excluding GC pauses`, async () => {
     const v2 = await makeV2PartsDb();
     v2.db.exec("PRAGMA synchronous = OFF");
     const storeDir = mkdtempSync(join(tmpdir(), "recall-perf-v2-child-"));
@@ -950,7 +922,7 @@ describe.skipIf(!ENABLED)("perf: v2 event-loop stalls", () => {
         gate: createFetchGate({ concurrency: DEFAULTS.concurrency }),
         limits: { ...DEFAULTS, distillDelayMs: 0 },
         instanceId: "perf-v2-child",
-        discover: () => pagedDiscover(source),
+        discover: () => discover(source),
         sync,
         projectorGen: V2_PROJECTOR_GEN,
         idleDebounceMs: 1,
@@ -1042,7 +1014,7 @@ describe.skipIf(!ENABLED)("perf: v2 event-loop stalls", () => {
     }
   }, 600_000);
 
-  it(`paged discovery of ${DISCOVERY_SESSIONS} sessions and a ${ROOT_CHILDREN}-child root never blocks the loop over ${BUDGET_MS} ms`, async () => {
+  it(`paged discovery of ${DISCOVERY_SESSIONS} sessions and a ${ROOT_CHILDREN}-child root keep each code slice under ${BUDGET_MS} ms excluding GC pauses`, async () => {
     const v2 = await makeV2PartsDb();
     v2.db.exec("PRAGMA synchronous = OFF");
     const slow = slowLog();
@@ -1090,19 +1062,22 @@ describe.skipIf(!ENABLED)("perf: v2 event-loop stalls", () => {
       try {
         probe.reset();
         let start = performance.now();
-        const sessions = await pagedDiscover(source);
+        const sessions = await discover(source);
         results.discoveryTotalMs = performance.now() - start;
         Object.assign(results, stallFields("discovery", await probe.stalls()));
         results.listed = sessions.length;
         results.distinct = new Set(sessions.map((s) => s.id)).size;
         results.archived = sessions.filter((s) => s.time.archived != null).length;
 
+        // The children as `recall_sessions` lists them for a parent.
         probe.reset();
         start = performance.now();
-        const children = await pagedChildren(source, "ses_root");
+        const children = await listAllChildren(source, "ses_root");
         results.childrenTotalMs = performance.now() - start;
         Object.assign(results, stallFields("children", await probe.stalls()));
-        results.children = children.length;
+        if (!children.ok) throw new Error(children.error);
+        results.children = children.items.length;
+        results.childrenTruncated = children.truncated ? 1 : 0;
       } finally {
         probe.stop();
         reader.close();
@@ -1115,6 +1090,7 @@ describe.skipIf(!ENABLED)("perf: v2 event-loop stalls", () => {
       expect(results.distinct).toBe(DISCOVERY_SESSIONS);
       expect(results.archived).toBe(archived);
       expect(results.children).toBe(ROOT_CHILDREN);
+      expect(results.childrenTruncated).toBe(0);
       expect(results.discoveryMaxSliceMs).toBeLessThan(BUDGET_MS);
       expect(results.childrenMaxSliceMs).toBeLessThan(BUDGET_MS);
       expect(results.discoveryTotalMs).toBeLessThan(LISTING_TOTAL_BUDGET_MS);
@@ -1124,7 +1100,7 @@ describe.skipIf(!ENABLED)("perf: v2 event-loop stalls", () => {
     }
   }, 300_000);
 
-  it(`one range check over a ${RANGE_SESSION_ROWS}-row session never blocks the loop over ${BUDGET_MS} ms`, async () => {
+  it(`one range check over a ${RANGE_SESSION_ROWS}-row session keeps each code slice under ${BUDGET_MS} ms excluding GC pauses`, async () => {
     const v2 = await makeV2PartsDb();
     v2.db.exec("PRAGMA synchronous = OFF");
     const storeDir = mkdtempSync(join(tmpdir(), "recall-perf-v2-range-"));
@@ -1234,7 +1210,7 @@ describe.skipIf(!ENABLED)("perf: v2 event-loop stalls", () => {
         gate: createFetchGate({ concurrency: DEFAULTS.concurrency }),
         limits: { ...DEFAULTS, distillDelayMs: 0 },
         instanceId: "perf-v2-range",
-        discover: () => pagedDiscover(source),
+        discover: () => discover(source),
         sync,
         projectorGen: V2_PROJECTOR_GEN,
         yieldBetween: macrotask,
