@@ -9,6 +9,7 @@ import {
 } from "../src/store.js";
 import {
   createCardsRuntime,
+  inlineVectorWriter,
   storeCardSource,
   type CardSource,
   type RankStats,
@@ -118,7 +119,7 @@ function countedSource(store: Store): {
   source: CardSource;
   reads: { stats: number; fullLoads: number; ids: number; vectors: number };
 } {
-  const base = storeCardSource(store);
+  const base = storeCardSource(store, inlineVectorWriter(store));
   const inner = base.store!;
   const reads = { stats: 0, fullLoads: 0, ids: 0, vectors: 0 };
   return {
@@ -298,7 +299,10 @@ describe("card map refresh from a store", () => {
     put(store, "s1");
     put(store, "s2", { distillState: "metadata" });
     const wholeTable = vi.spyOn(store, "cardStats");
-    const runtime = createCardsRuntime({ source: storeCardSource(store), refreshIntervalMs: 0 });
+    const runtime = createCardsRuntime({
+      source: storeCardSource(store, inlineVectorWriter(store)),
+      refreshIntervalMs: 0,
+    });
     await runtime.ready();
     // A card written without moving any counter: only the store has it.
     store.upsertCard(makeCard("s-quiet"));
@@ -340,7 +344,7 @@ describe("card map refresh from a store", () => {
     for (let i = 0; i < 5; i++) put(store, cardId(i));
     const slices = gate();
     const runtime = createCardsRuntime({
-      source: storeCardSource(store),
+      source: storeCardSource(store, inlineVectorWriter(store)),
       refreshIntervalMs: 0,
       yieldBetween: slices.yieldBetween,
     });
@@ -494,7 +498,7 @@ describe("calls that read only the card map", () => {
     });
     let clock = 1_000_000;
     const runtime = createCardsRuntime({
-      source: storeCardSource(store),
+      source: storeCardSource(store, inlineVectorWriter(store)),
       embedder: { ready: true, embed },
       semanticWeight: 0.5,
       semanticModel: MODEL,
@@ -541,7 +545,7 @@ describe("search index updates", () => {
     for (let i = 0; i < count; i++) put(store, cardId(i), { inventory: "alpha shared" });
     const slices = gate();
     const runtime = createCardsRuntime({
-      source: storeCardSource(store),
+      source: storeCardSource(store, inlineVectorWriter(store)),
       refreshIntervalMs: 0,
       yieldBetween: slices.yieldBetween,
     });
@@ -636,7 +640,7 @@ describe("search index updates", () => {
     const embed = vi.fn(() => Float32Array.from([1, 0]));
     const slices = gate();
     const runtime = createCardsRuntime({
-      source: storeCardSource(store),
+      source: storeCardSource(store, inlineVectorWriter(store)),
       embedder: { ready: true, embed },
       semanticWeight: 0.5,
       semanticModel: MODEL,
@@ -669,7 +673,7 @@ describe("search index updates", () => {
     const embed = vi.fn(() => Float32Array.from([1, 0]));
     const slices = gate();
     const runtime = createCardsRuntime({
-      source: storeCardSource(store),
+      source: storeCardSource(store, inlineVectorWriter(store)),
       embedder: { ready: true, embed },
       semanticWeight: 0.5,
       semanticModel: MODEL,
@@ -775,7 +779,7 @@ describe("a full reload during the first index build", () => {
     const slices = gate();
     slowSlices();
     const runtime = createCardsRuntime({
-      source: storeCardSource(store),
+      source: storeCardSource(store, inlineVectorWriter(store)),
       refreshIntervalMs: 0,
       yieldBetween: slices.yieldBetween,
     });
@@ -794,7 +798,7 @@ describe("a full reload during the first index build", () => {
     await building;
 
     const ranks = ["alpha", "omega"].map((q) => ids(runtime.rank(parseQuery(q), {})));
-    expect(ranks).toEqual(freshRanks(storeCardSource(store)));
+    expect(ranks).toEqual(freshRanks(storeCardSource(store, inlineVectorWriter(store))));
     expect(ranks).toEqual([["s3", "s4"], ["s1"]]);
   });
 });
@@ -811,7 +815,7 @@ describe("vectors behind a card's content", () => {
     );
     const slices = holdable();
     const runtime = createCardsRuntime({
-      source: storeCardSource(store),
+      source: storeCardSource(store, inlineVectorWriter(store)),
       embedder: { ready: true, embed },
       semanticWeight: 0.5,
       semanticModel: MODEL,
@@ -846,7 +850,7 @@ describe("vectors behind a card's content", () => {
     const embed = vi.fn(() => Float32Array.from([1, 0]));
     // Another runtime stores every card's vector first.
     await createCardsRuntime({
-      source: storeCardSource(store),
+      source: storeCardSource(store, inlineVectorWriter(store)),
       embedder: { ready: true, embed },
       semanticWeight: 0.5,
       semanticModel: MODEL,
@@ -859,7 +863,7 @@ describe("vectors behind a card's content", () => {
     const kept = store.cardVectorsPage(undefined, 1)[0]!;
     let embedderReady = false;
     const runtime = createCardsRuntime({
-      source: storeCardSource(store),
+      source: storeCardSource(store, inlineVectorWriter(store)),
       embedder: {
         get ready() {
           return embedderReady;
@@ -895,7 +899,7 @@ describe("cards left out of a ranking", () => {
     }
     const slices = gate();
     const runtime = createCardsRuntime({
-      source: storeCardSource(store),
+      source: storeCardSource(store, inlineVectorWriter(store)),
       refreshIntervalMs: 0,
       yieldBetween: slices.yieldBetween,
     });

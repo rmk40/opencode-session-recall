@@ -4,7 +4,6 @@ import {
   SEMANTIC_MODEL_KEY,
   VECTORS_REV_KEY,
   type Card,
-  type CardEmbeddingWrite,
   type CardCounters,
   type CardVectorRow,
   type Store,
@@ -47,6 +46,11 @@ import { SLICE_MS, yieldOnBudget } from "./yield.js";
  * slices, yielding to the event loop once a slice of work has run, so neither
  * holds it for long.
  *
+ * Vectors a build, a vector reload or an in-place update computes are
+ * persisted after the index and vectors are installed, by a write queue of
+ * their own with at most one write in flight ({@link CardSource.writeEmbeddings}).
+ * Nothing that serves a search awaits it.
+ *
  * This layer only SHORTLISTS which sessions to drill; final result ranking is
  * tier-2's job over the drilled parts. So generous recall here is correct: a
  * session that belongs in the answer must reach the shortlist, precision is the
@@ -62,7 +66,7 @@ const REFRESH_INTERVAL_MS = 5_000;
  *  included) in a few milliseconds; the load yields between pages once a
  *  slice of work has run. */
 const LOAD_PAGE = 250;
-/** Card vectors persisted per write of a chunked build. */
+/** Card vectors persisted per vector write. */
 const VECTOR_WRITE_CHUNK = 200;
 /** Changed cards a synchronous `rank` applies to the index in place; more run
  *  as a chunked build while the current index serves. */
@@ -296,19 +300,52 @@ export type CardSource = {
   /** The store's persisted semantic-model stamp (`meta.semantic_model`), or
    *  undefined with no store / no stamp yet. Gates card-vector reuse. */
   semanticModel?: () => string | undefined;
-  /** Persist newly computed card vectors at representation generation `gen`, plus
-   *  the model stamp. Absent in degraded mode (no store to write to). Each row
-   *  carries the summary hash the vector was embedded from so the store can skip a
-   *  row a concurrent summary write has since changed. Returns `{ revision,
-   *  committed }` — the `vectors_rev` value after the call and whether it actually
-   *  wrote — so the runtime can distinguish its own committed write from a foreign
-   *  interleave (see {@link import("./store.js").Store.writeCardEmbeddings}). */
-  writeEmbeddings?: (
-    model: string,
-    gen: number,
-    rows: Array<{ sessionId: string; embedding: Uint8Array; expectedSummaryHash: string }>,
-  ) => CardEmbeddingWrite;
+  /** Persists newly computed card vectors (see {@link CardVectorWriter}).
+   *  Absent in degraded mode, and for a store this process may not write. */
+  writeEmbeddings?: CardVectorWriter;
 };
+
+/** One card vector to persist: the card's session id, the vector's bytes and
+ *  the summary hash the vector was embedded from, so the store can skip a row
+ *  a concurrent summary write has changed since. */
+export type CardVectorWriteRow = {
+  sessionId: string;
+  embedding: Uint8Array;
+  expectedSummaryHash: string;
+};
+
+/**
+ * What one vector write reported.
+ *
+ * - `committed`: the write committed, and `revision` is `vectors_rev` right
+ *   after it.
+ * - `refused`: the store declined it and wrote nothing, as it does a write at
+ *   a lower representation generation than a stored vector's.
+ * - `failed`: it did not run or its outcome is unknown, such as a thrown
+ *   error, a writer that stopped or an acknowledgement that never came.
+ *
+ * Only `committed` may move the runtime's view of `vectors_rev`, and only by
+ * the one revision the write itself made ({@link CardsRuntime}).
+ */
+export type CardVectorWriteResult =
+  | { status: "committed"; revision: number }
+  | { status: "refused"; reason: string }
+  | { status: "failed"; error: string };
+
+/**
+ * Persists card vectors at representation generation `gen` under the model
+ * stamp `model`, the way {@link Store.writeCardEmbeddings} does: one write,
+ * which also stamps the model (clearing every stored vector first when the
+ * stamp changes). The promise must settle for every call, with `failed` when
+ * the outcome cannot be known. Each row's `embedding` is a buffer of its own,
+ * which the writer may transfer to another thread. The runtime issues the
+ * next write only once the last one has settled.
+ */
+export type CardVectorWriter = (
+  model: string,
+  gen: number,
+  rows: CardVectorWriteRow[],
+) => Promise<CardVectorWriteResult>;
 
 export type CardsRuntimeDeps = {
   source: CardSource;
@@ -329,9 +366,12 @@ export type CardsRuntimeDeps = {
   now?: () => number;
   refreshIntervalMs?: number;
   /** Awaited between the steps of a chunked build (a page read, a slice of
-   *  indexing). Default: {@link yieldOnBudget}, which yields to the event
-   *  loop once a slice of work has run, so other work runs in between. */
+   *  indexing) and between two vector writes. Default: {@link yieldOnBudget},
+   *  which yields to the event loop once a slice of work has run, so other
+   *  work runs in between. */
   yieldBetween?: () => Promise<void>;
+  /** Receives a line when vector writes of one pass failed or were refused. */
+  log?: (line: string) => void;
 };
 
 export type CardsRuntime = {
@@ -341,9 +381,19 @@ export type CardsRuntime = {
    * that yield to the event loop; an async caller awaits this so its later
    * synchronous calls find everything built. Without `index` it never waits
    * on index or vector work, which may still be running when it resolves.
-   * Rejects when a load fails.
+   * It never waits on a vector write: persisting vectors runs after they are
+   * installed ({@link flushVectorWrites}). Rejects when a load fails.
    */
   ready(opts?: { index?: boolean }): Promise<void>;
+  /**
+   * Resolves `true` once no vector write is queued or in flight, or `false`
+   * when `deadlineMs` milliseconds pass first (no bound when undefined).
+   * Writes queued before the call keep being issued until then, unless the
+   * runtime is disposed: from then on only the write in flight is waited for,
+   * and the queue is dropped. For a shutdown that must not outlast a bound,
+   * and for tests.
+   */
+  flushVectorWrites(deadlineMs?: number): Promise<boolean>;
   /** Rank cards against a query over the current index, updating the index
    *  first. Synchronous: while a chunked build runs it ranks over the index it
    *  had and leaves out every card the index has yet to take, so no hit is
@@ -371,7 +421,9 @@ export type CardsRuntime = {
    *  source, whose `revision()` stays a pure `() => undefined`. Also used by
    *  tests. */
   invalidate(): void;
-  /** Prevent deferred semantic warm-up from touching its source after shutdown. */
+  /** Prevent deferred semantic warm-up and every vector write not yet issued
+   *  from touching the source after shutdown. A write already in flight
+   *  settles on its own ({@link flushVectorWrites}). */
   dispose(): void;
 };
 
@@ -510,19 +562,37 @@ function blobToVector(blob: Uint8Array): Float32Array {
 }
 
 /**
- * The `vectors_rev` value to cache after one of this runtime's own vector
- * writes, given the cached value before it (`seen`, sampled BEFORE the vectors
- * it reflects were read) and the store's write result. Trust the returned
- * revision only when the call actually COMMITTED and it is exactly `seen + 1` —
- * proof that our own write, and no foreign one, advanced the counter. A
- * rejected write reports `committed:false`, and its unchanged revision may
- * coincide with a foreign higher-gen write that already advanced `seen` to
- * `seen + 1`; keeping `seen` in that case forces the next refresh to reload the
- * vectors instead of absorbing the foreign write. Applied once per write, in
- * order, so a pass that writes in several chunks stays exact.
+ * The `vectors_rev` value to cache once one of this runtime's own vector
+ * writes is acknowledged, given the cached value at that moment (`seen`) and
+ * the write's result. Trust the reported revision only when the write
+ * COMMITTED and it is exactly `seen + 1`: proof that this write, and no
+ * foreign one, moved the counter past what the in-memory vectors reflect. A
+ * refused or failed write moves nothing; its unchanged revision could
+ * coincide with a foreign write that already moved the counter, and keeping
+ * `seen` makes the next refresh reload the vectors instead of absorbing that
+ * write. Applied once per acknowledgement, in order (one write is in flight
+ * at a time), so a pass written in several chunks stays exact.
  */
-function ownWriteRevision(seen: number, write: CardEmbeddingWrite): number {
-  return write.committed && write.revision === seen + 1 ? write.revision : seen;
+function ownWriteRevision(seen: number, write: CardVectorWriteResult): number {
+  return write.status === "committed" && write.revision === seen + 1 ? write.revision : seen;
+}
+
+/** A writer's result as one of the three {@link CardVectorWriteResult}s; any
+ *  other value is a failed write. */
+function asWriteResult(value: unknown): CardVectorWriteResult {
+  const result = value as Partial<Record<string, unknown>> | null | undefined;
+  if (result?.status === "committed" && typeof result.revision === "number") {
+    return { status: "committed", revision: result.revision };
+  }
+  if (result?.status === "refused") {
+    return { status: "refused", reason: String(result.reason ?? "refused") };
+  }
+  if (result?.status === "failed") return { status: "failed", error: String(result.error ?? "") };
+  return { status: "failed", error: "the writer returned no result" };
+}
+
+function errorText(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 /** A vectors-revision counter value as a number; 0 when unset. */
@@ -579,7 +649,13 @@ function sameIndexedContent(a: Card, b: Card): boolean {
   );
 }
 
-type EmbeddingRow = { sessionId: string; embedding: Uint8Array; expectedSummaryHash: string };
+/** A vector a pass queued to persist, with the card version it belongs to. */
+type QueuedVector = {
+  sessionId: string;
+  vector: Float32Array;
+  expectedSummaryHash: string;
+  card: Card;
+};
 
 /** One semantic pass: the vectors it sets, the card version each vector was
  *  computed or loaded for, the rows it queued to persist, and whether the
@@ -588,9 +664,14 @@ type EmbeddingRow = { sessionId: string; embedding: Uint8Array; expectedSummaryH
 type VectorPass = {
   vectors: Map<string, Float32Array>;
   sources: Map<string, Card>;
-  rows: EmbeddingRow[];
+  rows: QueuedVector[];
   stampMatches: boolean;
 };
+
+/** One pass's vectors waiting to be written, `next` being the first row not
+ *  yet taken; `restamp` when the pass found another model's stamp, so its
+ *  first write restamps the store even with no row left to write. */
+type WriteBatch = { rows: QueuedVector[]; next: number; restamp: boolean };
 
 /** A stored vector as read with its card or its row, and the model stamp it
  *  was stored under (undefined when that could not be established). */
@@ -600,17 +681,54 @@ type StoredVector = {
   stamp: string | undefined;
 };
 
+/** The store reads a store-backed {@link CardSource} makes, and no write. */
+export type CardSourceStore = Pick<
+  Store,
+  | "allCards"
+  | "getMeta"
+  | "cardCounters"
+  | "cardsSince"
+  | "cardSessionIds"
+  | "cardsPage"
+  | "cardVectorsPage"
+>;
+
+/**
+ * A {@link CardVectorWriter} that writes through `store` on the calling
+ * thread, at the call ({@link Store.writeCardEmbeddings}), and returns its
+ * outcome as a settled promise.
+ */
+export function inlineVectorWriter(store: Pick<Store, "writeCardEmbeddings">): CardVectorWriter {
+  return (model, gen, rows) => {
+    try {
+      const write = store.writeCardEmbeddings(model, gen, rows);
+      return Promise.resolve(
+        write.committed
+          ? { status: "committed", revision: write.revision }
+          : { status: "refused", reason: "a stored vector has a higher representation generation" },
+      );
+    } catch (error) {
+      return Promise.resolve({ status: "failed", error: errorText(error) });
+    }
+  };
+}
+
 /**
  * Store-backed {@link CardSource}: the plugin's card source whenever a card
- * store is open, with the reads incremental refreshes need.
+ * store is open, with the reads incremental refreshes need. It reads through
+ * `store` and persists vectors only through `writeVectors`; without one the
+ * runtime keeps the vectors it computes in memory and writes none.
  */
-export function storeCardSource(store: Store): CardSource {
+export function storeCardSource(
+  store: CardSourceStore,
+  writeVectors: CardVectorWriter | undefined,
+): CardSource {
   return {
     getCards: (opts) => store.allCards(opts),
     revision: () => store.getMeta(CARDS_REV_KEY),
     vectorsRevision: () => store.getMeta(VECTORS_REV_KEY),
     semanticModel: () => store.getMeta(SEMANTIC_MODEL_KEY),
-    writeEmbeddings: (model, gen, rows) => store.writeCardEmbeddings(model, gen, rows),
+    ...(writeVectors && { writeEmbeddings: writeVectors }),
     store: {
       stats: () => store.cardCounters(),
       cardsSince: (rev, limit, opts) => store.cardsSince(rev, limit, opts),
@@ -691,8 +809,30 @@ export function createCardsRuntime(deps: CardsRuntimeDeps): CardsRuntime {
   /** Another process wrote vectors since they were read: reload them. */
   let vectorsStale = false;
   /** `vectors_rev` reflected in memory: sampled before the vectors were read,
-   *  then advanced only by this runtime's own writes ({@link ownWriteRevision}). */
+   *  then advanced only by this runtime's own acknowledged writes
+   *  ({@link ownWriteRevision}). */
   let vectorsRevSeen = 0;
+
+  // ── Vector persistence ──
+  /** Passes whose vectors wait to be written, oldest first. */
+  const writeQueue: WriteBatch[] = [];
+  /** The row each session was last queued with; an older one still queued
+   *  for the same session is skipped. */
+  const latestQueued = new Map<string, QueuedVector>();
+  /** The loop issuing {@link writeQueue}'s writes, one at a time. */
+  let writeRunner: Promise<void> | undefined;
+  /** A write was issued and has not been acknowledged. */
+  let writeInFlight = false;
+  /** The highest `vectors_rev` a refresh read while a write was in flight,
+   *  which only that write's acknowledgement can attribute (0 when none). */
+  let observedDuringWrite = 0;
+  /** Acknowledged writes that moved {@link vectorsRevSeen}, counted so a read
+   *  sampled before one can tell that its sample is behind it. */
+  let ownCommits = 0;
+  /** Callers of {@link CardsRuntime.flushVectorWrites} waiting for the queue
+   *  to empty. */
+  const flushWaiters = new Set<() => void>();
+  const log = deps.log;
 
   /** The running chunked builds: at most one that changes the card map and
    *  one that changes the index or vectors. They may run side by side. */
@@ -764,6 +904,30 @@ export function createCardsRuntime(deps: CardsRuntimeDeps): CardsRuntime {
     for (const card of cards) blobStamp.set(card, stamp);
   }
 
+  /**
+   * Whether `observed`, a `vectors_rev` the store reported, shows a vector
+   * write the in-memory vectors do not reflect. While one of this runtime's
+   * own writes is in flight its commit may already be visible, so a
+   * different value is held until that write's acknowledgement says whose it
+   * was ({@link settleVectorWrite}) and reads as no change for now.
+   */
+  function vectorsMoved(observed: number): boolean {
+    if (observed === vectorsRevSeen) return false;
+    if (!writeInFlight) return true;
+    observedDuringWrite = Math.max(observedDuringWrite, observed);
+    return false;
+  }
+
+  /** Another process wrote vectors: reload them, or on a source without store
+   *  reads, the cards their vectors come with. */
+  function foreignVectorWrite(): void {
+    vectorsStale = true;
+    if (!reads) {
+      metaWantHard = tick();
+      metaWantFull = metaWantHard;
+    }
+  }
+
   // ── Metadata loads and refreshes ──
 
   /**
@@ -780,6 +944,7 @@ export function createCardsRuntime(deps: CardsRuntimeDeps): CardsRuntime {
     const stats = reads?.stats();
     const revision = reads ? undefined : source.revision();
     const vectorsRev = stats ? stats.vectorsRev : readVectorsRev();
+    const commitsBefore = ownCommits;
     const next = new Map<string, Card>();
     const changed: string[] = [];
     /** Cards whose content is unchanged, with the copy they replace. */
@@ -831,12 +996,17 @@ export function createCardsRuntime(deps: CardsRuntimeDeps): CardsRuntime {
     installedRevision = revision;
     lastCheck = now();
     coverageCache = undefined;
-    if (vectorsRev !== vectorsRevSeen) {
-      // Another process wrote vectors the in-memory ones do not reflect.
-      vectorsStale = true;
+    if (!reads && quiet && vectorsRev !== vectorsRevSeen) {
       // Without store reads the new map's blobs are the vectors a reload
       // uses, so they are current as of the sample, if no write interleaved.
-      if (!reads && quiet) vectorsRevSeen = vectorsRev;
+      // An own write acknowledged during the load is past the sample and
+      // in memory already, so it is kept.
+      vectorsStale = true;
+      vectorsRevSeen =
+        ownCommits !== commitsBefore ? Math.max(vectorsRevSeen, vectorsRev) : vectorsRev;
+    } else if (vectorsMoved(vectorsRev)) {
+      // Another process wrote vectors the in-memory ones do not reflect.
+      vectorsStale = true;
     }
   }
 
@@ -897,7 +1067,7 @@ export function createCardsRuntime(deps: CardsRuntimeDeps): CardsRuntime {
     lastCheck = now();
     if (!reads) {
       // Without store reads only a full reload can apply a change.
-      if (source.revision() === installedRevision && readVectorsRev() === vectorsRevSeen) {
+      if (source.revision() === installedRevision && !vectorsMoved(readVectorsRev())) {
         return { kind: "fresh" };
       }
       metaWantHard = tick();
@@ -905,7 +1075,7 @@ export function createCardsRuntime(deps: CardsRuntimeDeps): CardsRuntime {
       return { kind: "load", hard: true };
     }
     const stats = reads.stats();
-    if (stats.vectorsRev !== vectorsRevSeen) vectorsStale = true;
+    if (vectorsMoved(stats.vectorsRev)) vectorsStale = true;
     const last = counters;
     const revisions = last ? stats.cardsRev - last.cardsRev : 0;
     const stamped = last ? stats.cardsStamped - last.cardsStamped : 0;
@@ -1000,8 +1170,9 @@ export function createCardsRuntime(deps: CardsRuntimeDeps): CardsRuntime {
       if (write) {
         pass.rows.push({
           sessionId: id,
-          embedding: vectorToBlob(vec),
+          vector: vec,
           expectedSummaryHash: card.summaryHash,
+          card,
         });
       }
     };
@@ -1038,26 +1209,163 @@ export function createCardsRuntime(deps: CardsRuntimeDeps): CardsRuntime {
   }
 
   /**
-   * Persist a pass's computed vectors in chunks, plus the model stamp when it
-   * must advance so a later start reuses them. Accepted cross-process race: a
-   * write can lose to a concurrent re-distill that cleared the same card's
-   * embedding, leaving a one-generation-stale vector; the next re-distill of
-   * that card clears it again, so it self-heals.
+   * Queue a pass's computed vectors to persist, plus the model stamp when it
+   * must advance so a later start reuses them, and start the writes unless
+   * they are running. Called once the pass's vectors are installed, so
+   * nothing that serves a search waits for them. The first write of an idle
+   * queue is issued at once, on the caller's turn; with a writer that writes
+   * on the calling thread that is where it commits.
    */
-  function* writeVectors(pass: VectorPass): Generator<void, void> {
-    const write = source.writeEmbeddings;
-    if (configuredModel == null || !write) return;
+  function queueVectorWrites(pass: VectorPass): void {
+    if (configuredModel == null || !source.writeEmbeddings || disposed) return;
     if (pass.rows.length === 0 && pass.stampMatches) return;
-    for (let i = 0; i === 0 || i < pass.rows.length; i += VECTOR_WRITE_CHUNK) {
-      if (i > 0) yield;
-      if (disposed) return;
-      const result = write(
-        configuredModel,
-        EMBED_REPRESENTATION,
-        pass.rows.slice(i, i + VECTOR_WRITE_CHUNK),
-      );
-      vectorsRevSeen = ownWriteRevision(vectorsRevSeen, result);
+    for (const row of pass.rows) latestQueued.set(row.sessionId, row);
+    writeQueue.push({ rows: pass.rows, next: 0, restamp: !pass.stampMatches });
+    pumpVectorWrites();
+  }
+
+  function pumpVectorWrites(): void {
+    if (writeRunner) return;
+    const run = runVectorWrites();
+    writeRunner = run;
+    // Cleared on a later turn even when the run finished on this one, and a
+    // batch queued meanwhile starts a new run.
+    const done = (): void => {
+      if (writeRunner !== run) return;
+      writeRunner = undefined;
+      if (!disposed && writeQueue.length > 0) pumpVectorWrites();
+      else notifyFlushed();
+    };
+    void run.then(done, done);
+  }
+
+  function notifyFlushed(): void {
+    if (writeRunner || (!disposed && writeQueue.length > 0)) return;
+    const waiters = [...flushWaiters];
+    flushWaiters.clear();
+    for (const resolve of waiters) resolve();
+  }
+
+  /**
+   * A queued vector is written only while it is the last one queued for its
+   * session and the card the map holds still indexes and embeds as the
+   * version it was computed for. A card that changed since is dirty, and the
+   * pass that takes it queues its own vector. This keeps a write that waited
+   * in the queue from storing a vector for a card version it no longer
+   * describes. Accepted race: a re-distill that commits between this check
+   * and the write can still have its card's vector set from the older
+   * content when the summary hash is unchanged; the next re-distill of that
+   * card clears it again, so it self-heals.
+   */
+  function writable(row: QueuedVector): boolean {
+    if (latestQueued.get(row.sessionId) !== row) return false;
+    latestQueued.delete(row.sessionId);
+    const card = cardById.get(row.sessionId);
+    return card !== undefined && (card === row.card || sameIndexedContent(card, row.card));
+  }
+
+  /** The next chunk of `batch`, each row with a copy of its vector's bytes
+   *  the writer may keep or transfer. */
+  function takeChunk(batch: WriteBatch): CardVectorWriteRow[] {
+    const chunk: CardVectorWriteRow[] = [];
+    while (chunk.length < VECTOR_WRITE_CHUNK && batch.next < batch.rows.length) {
+      const row = batch.rows[batch.next++]!;
+      if (!writable(row)) continue;
+      chunk.push({
+        sessionId: row.sessionId,
+        embedding: vectorToBlob(row.vector).slice(),
+        expectedSummaryHash: row.expectedSummaryHash,
+      });
     }
+    return chunk;
+  }
+
+  /**
+   * Issue the queued writes in order, one at a time, in chunks of
+   * {@link VECTOR_WRITE_CHUNK}, yielding before every write but the first.
+   * A batch that must restamp issues one write even when no row of it is
+   * left, unless the store's stamp is this model's by then. Never rejects: a
+   * write that throws counts as failed. A refused or failed write moves
+   * nothing and leaves the vectors in memory as they are, and a later pass
+   * may write them again. Stops issuing once the runtime is disposed.
+   */
+  async function runVectorWrites(): Promise<void> {
+    const write = source.writeEmbeddings;
+    const model = configuredModel;
+    if (!write || model == null) return;
+    let first = true;
+    while (!disposed) {
+      const batch = writeQueue[0];
+      if (!batch) return;
+      let issued = 0;
+      let failed = 0;
+      let refused = 0;
+      let firstProblem: string | undefined;
+      for (;;) {
+        const restampDue = issued === 0 && batch.restamp;
+        if (batch.next >= batch.rows.length && !restampDue) break;
+        if (!first) {
+          await yieldBetween();
+          if (disposed) return;
+        }
+        first = false;
+        const chunk = takeChunk(batch);
+        // Every row left was superseded or outdated: the write is still due
+        // only to restamp a store that still carries another stamp.
+        if (chunk.length === 0 && !(restampDue && source.semanticModel?.() !== model)) break;
+        issued++;
+        const result = await issueVectorWrite(write, model, chunk);
+        if (result.status === "failed") {
+          failed++;
+          firstProblem ??= result.error;
+        } else if (result.status === "refused") {
+          refused++;
+          firstProblem ??= result.reason;
+        }
+        if (disposed) return;
+      }
+      writeQueue.shift();
+      if ((failed > 0 || refused > 0) && log) {
+        log(
+          `card vectors not persisted: ${failed} of ${issued} write(s) failed and ${refused} were refused (${firstProblem ?? "no detail"}); the vectors stay in memory`,
+        );
+      }
+    }
+  }
+
+  /** One write, and what its acknowledgement means for the vectors in memory. */
+  async function issueVectorWrite(
+    write: CardVectorWriter,
+    model: string,
+    rows: CardVectorWriteRow[],
+  ): Promise<CardVectorWriteResult> {
+    writeInFlight = true;
+    let result: CardVectorWriteResult;
+    try {
+      result = asWriteResult(await write(model, EMBED_REPRESENTATION, rows));
+    } catch (error) {
+      result = { status: "failed", error: errorText(error) };
+    }
+    settleVectorWrite(result);
+    return result;
+  }
+
+  /**
+   * Apply one acknowledgement. The cached `vectors_rev` moves only by the one
+   * revision a committed write made ({@link ownWriteRevision}), whatever ran
+   * since it was issued: a refresh or reload that ran meanwhile only ever set
+   * it from a store read, never past what memory holds. A revision a refresh
+   * read meanwhile and this write does not account for is another process's
+   * write, which the vectors are then reloaded for.
+   */
+  function settleVectorWrite(result: CardVectorWriteResult): void {
+    writeInFlight = false;
+    const seen = ownWriteRevision(vectorsRevSeen, result);
+    if (seen !== vectorsRevSeen) ownCommits++;
+    vectorsRevSeen = seen;
+    const observed = observedDuringWrite;
+    observedDuringWrite = 0;
+    if (!disposed && observed > vectorsRevSeen) foreignVectorWrite();
   }
 
   /** Build a new index (and vectors) from the current map and install it. */
@@ -1095,7 +1403,7 @@ export function createCardsRuntime(deps: CardsRuntimeDeps): CardsRuntime {
     // with or without an index), so a card that changed or left since stays
     // dirty and the rest are covered.
     for (const id of dirty) if (cardById.get(id) === snapshot.get(id)) dirty.delete(id);
-    if (pass) yield* writeVectors(pass);
+    if (pass) queueVectorWrites(pass);
   }
 
   /**
@@ -1107,6 +1415,7 @@ export function createCardsRuntime(deps: CardsRuntimeDeps): CardsRuntime {
     const startedAt = tick();
     // Sampled before the reads, like a full load (see metaLoadSteps).
     const sample = readVectorsRev();
+    const commitsBefore = ownCommits;
     /** Each row with the stamp its page was read under; undefined for a page
      *  a vector write landed during, whose rows are never reused. */
     const rows = new Map<string, { row: CardVectorRow; stamp: string | undefined }>();
@@ -1170,9 +1479,15 @@ export function createCardsRuntime(deps: CardsRuntimeDeps): CardsRuntime {
     // the next pass.
     vectorsStale = !quiet;
     // Without store reads the vectors came from the map, read before `sample`,
-    // so the sample would absorb a write that landed in between.
-    if (reads) vectorsRevSeen = sample;
-    yield* writeVectors(pass);
+    // so the sample would absorb a write that landed in between. An own write
+    // acknowledged during the reload moved the cached revision past the
+    // sample by exactly its own commit, whose vectors memory holds, so it is
+    // kept; otherwise the sample replaces it, a lower one included (a store
+    // that was reset).
+    if (reads) {
+      vectorsRevSeen = ownCommits !== commitsBefore ? Math.max(vectorsRevSeen, sample) : sample;
+    }
+    queueVectorWrites(pass);
   }
 
   /**
@@ -1220,7 +1535,7 @@ export function createCardsRuntime(deps: CardsRuntimeDeps): CardsRuntime {
       }
     }
     if (dirty.size === 0) hardIndexPending = false;
-    if (pass) yield* writeVectors(pass);
+    if (pass) queueVectorWrites(pass);
   }
 
   /** A full build is due: no index yet, or so many cards changed that
@@ -1373,6 +1688,33 @@ export function createCardsRuntime(deps: CardsRuntimeDeps): CardsRuntime {
   return {
     dispose(): void {
       disposed = true;
+      // Nothing queued is issued from here on; a write in flight settles.
+      writeQueue.length = 0;
+      latestQueued.clear();
+      notifyFlushed();
+    },
+
+    flushVectorWrites(deadlineMs?: number): Promise<boolean> {
+      if (!writeRunner && (disposed || writeQueue.length === 0)) return Promise.resolve(true);
+      return new Promise<boolean>((resolve) => {
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        const flushed = (): void => {
+          if (timer !== undefined) clearTimeout(timer);
+          resolve(true);
+        };
+        flushWaiters.add(flushed);
+        // No bound when undefined or infinite; any other value that is not a
+        // finite duration (NaN, a negative) ends the wait at once.
+        if (deadlineMs !== undefined && deadlineMs !== Infinity) {
+          timer = setTimeout(
+            () => {
+              flushWaiters.delete(flushed);
+              resolve(false);
+            },
+            Number.isFinite(deadlineMs) ? Math.max(0, deadlineMs) : 0,
+          );
+        }
+      });
     },
 
     async ready(opts): Promise<void> {

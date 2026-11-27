@@ -9,6 +9,7 @@ import {
   cardsLiteFromSessions,
   createCardsRuntime,
   exclusionFamilyFromCards,
+  inlineVectorWriter,
   type CardSource,
   type RankStats,
 } from "../src/cards.js";
@@ -468,7 +469,7 @@ describe("cards semantic persistence", () => {
     revision: () => store.getMeta("cards_rev"),
     vectorsRevision: () => store.getMeta("vectors_rev"),
     semanticModel: () => store.getMeta("semantic_model"),
-    writeEmbeddings: (model, gen, rows) => store.writeCardEmbeddings(model, gen, rows),
+    writeEmbeddings: inlineVectorWriter(store),
   });
 
   it("reuses persisted card vectors on a matching model stamp (no re-embed on reload)", async () => {
@@ -726,7 +727,7 @@ describe("cards semantic persistence", () => {
         revision: () => storeB.getMeta("cards_rev"),
         vectorsRevision: () => storeB.getMeta("vectors_rev"),
         semanticModel: () => storeB.getMeta("semantic_model"),
-        writeEmbeddings: (model, gen, rows) => storeB.writeCardEmbeddings(model, gen, rows),
+        writeEmbeddings: inlineVectorWriter(storeB),
       },
       embedder,
       semanticWeight: 0.5,
@@ -740,6 +741,9 @@ describe("cards semantic persistence", () => {
     runtime.rank(parseQuery("alpha"), {});
     expect(getCards).toHaveBeenCalledTimes(1);
     expect(storeB.getMeta("vectors_rev")).toBe("1");
+    // The write's acknowledgement, which tells the runtime the revision is its
+    // own, arrives after rank() has returned.
+    expect(await runtime.flushVectorWrites()).toBe(true);
 
     // Past the interval, its OWN vector write must not trigger a self-reload
     // (the no-loop property; pinned so a future change can't reintroduce a loop).
@@ -806,7 +810,7 @@ describe("cards semantic persistence", () => {
         revision: () => storeB.getMeta("cards_rev"),
         vectorsRevision: () => storeB.getMeta("vectors_rev"),
         semanticModel: () => storeB.getMeta("semantic_model"),
-        writeEmbeddings: (model, gen, rows) => storeB.writeCardEmbeddings(model, gen, rows),
+        writeEmbeddings: inlineVectorWriter(storeB),
       },
       embedder,
       semanticWeight: 0.5,
@@ -819,6 +823,7 @@ describe("cards semantic persistence", () => {
     // mid-load), then its own write lands at rev0+2 — the interleave signature.
     runtime.rank(parseQuery("alpha"), {});
     expect(getCards).toHaveBeenCalledTimes(1);
+    expect(await runtime.flushVectorWrites()).toBe(true);
 
     // Past the interval: because the own write was NOT a clean rev0+1, the cached
     // revision stayed at rev0, so the store's higher vectors_rev forces a reload.
@@ -874,7 +879,7 @@ describe("cards semantic persistence", () => {
         revision: () => storeB.getMeta("cards_rev"),
         vectorsRevision: () => storeB.getMeta("vectors_rev"),
         semanticModel: () => storeB.getMeta("semantic_model"),
-        writeEmbeddings: (model, gen, rows) => storeB.writeCardEmbeddings(model, gen, rows),
+        writeEmbeddings: inlineVectorWriter(storeB),
       },
       embedder,
       semanticWeight: 0.5,
@@ -888,6 +893,7 @@ describe("cards semantic persistence", () => {
     // rev0 rather than the coincident rev0+1.
     runtime.rank(parseQuery("alpha"), {});
     expect(getCards).toHaveBeenCalledTimes(1);
+    expect(await runtime.flushVectorWrites()).toBe(true);
 
     // Past the interval: the store's vectors_rev (1) exceeds the cached rev0, so the
     // runtime reloads and drops its stale gen-4 snapshot.

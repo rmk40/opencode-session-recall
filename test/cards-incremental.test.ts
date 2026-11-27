@@ -3,6 +3,7 @@ import { openSqlite, type SqliteDb } from "../src/sqlite.js";
 import { CARDS_REV_KEY, type Card, type Store } from "../src/store.js";
 import {
   createCardsRuntime,
+  inlineVectorWriter,
   storeCardSource,
   type CardHit,
   type CardRankFilters,
@@ -503,7 +504,7 @@ describe("incremental card runtime parity", () => {
           }
 
           // Count full loads: everything else must reach the runtime incrementally.
-          const source = storeCardSource(store);
+          const source = storeCardSource(store, inlineVectorWriter(store));
           const reads = source.store!;
           let fullLoads = 0;
           const counted: CardSource = {
@@ -569,8 +570,11 @@ describe("incremental card runtime parity", () => {
             // the runtime under test would see another process's write and
             // reload in the background.
             const freshSource = variant.awaitReady
-              ? storeCardSource(store)
-              : { ...storeCardSource(store), writeEmbeddings: undefined };
+              ? storeCardSource(store, inlineVectorWriter(store))
+              : {
+                  ...storeCardSource(store, inlineVectorWriter(store)),
+                  writeEmbeddings: undefined,
+                };
             const fresh = runtimeOver(freshSource, makeEmbedder());
             await fresh.ready({ index: true });
             let n = 0;

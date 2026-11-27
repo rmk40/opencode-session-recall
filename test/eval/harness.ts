@@ -27,7 +27,12 @@ import {
 import { openSqlite } from "../../src/sqlite.js";
 import { createFetchGate } from "../../src/fetch-gate.js";
 import { createDistiller, type Distiller } from "../../src/distill.js";
-import { createCardsRuntime, cardsLiteFromSessions, storeCardSource } from "../../src/cards.js";
+import {
+  createCardsRuntime,
+  cardsLiteFromSessions,
+  inlineVectorWriter,
+  storeCardSource,
+} from "../../src/cards.js";
 import { createDrill } from "../../src/drill.js";
 import type { HistorySource } from "../../src/history/source.js";
 import type { HistorySession } from "../../src/history/model.js";
@@ -173,7 +178,7 @@ export async function makeEvalSearchOver(
   // persistence path (withEmbeddings forwarding + model stamp + write-back),
   // not just in-memory vectors.
   const cards = createCardsRuntime({
-    source: storeCardSource(store),
+    source: storeCardSource(store, inlineVectorWriter(store)),
     embedder: semantic?.embedder,
     semanticWeight: semantic?.weight,
     semanticModel: semantic ? EVAL_SEMANTIC_MODEL : undefined,

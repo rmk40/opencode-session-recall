@@ -22,6 +22,7 @@ import { EMBED_REPRESENTATION } from "../embedding-text.js";
 import {
   createCardsRuntime,
   cardsLiteFromSessions,
+  inlineVectorWriter,
   storeCardSource,
   type CardSource,
 } from "../cards.js";
@@ -196,7 +197,7 @@ export const server: Plugin = async (ctx, options) => {
   // accidental driver-missing degraded path keeps the frozen one-shot snapshot.
   let liteCards: Card[] = [];
   const cardSource: CardSource = store
-    ? storeCardSource(store)
+    ? storeCardSource(store, inlineVectorWriter(store))
     : { getCards: () => liteCards, revision: () => undefined, degraded: true };
   let liteRefresh: LiteRefreshController | undefined;
   if (!store) {
@@ -244,6 +245,7 @@ export const server: Plugin = async (ctx, options) => {
     semanticModel,
     semanticReady,
     pluginVersion: PLUGIN_BUILD,
+    log: pluginLog,
   });
   const drill = createDrill({ source, gate, limits });
 
