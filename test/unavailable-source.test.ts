@@ -77,6 +77,16 @@ describe("unavailable history source", () => {
     expect(createUnavailableSource("v1-http", REASON).messagePageAscending).toBeUndefined();
   });
 
+  it("seeks only as a v2 source, answering with the unavailable error", async () => {
+    const v2 = createUnavailableSource("v2-sqlite", REASON);
+    expect(await v2.seekPage!({ sessionID: "s", until: 1_000 })).toEqual({
+      ok: false,
+      reason: "error",
+      error: ERROR,
+    });
+    expect(createUnavailableSource("v1-http", REASON).seekPage).toBeUndefined();
+  });
+
   it("recall_messages oldest first reports the outage on v2 and the missing capability on v1", async () => {
     const gate = createFetchGate({ concurrency: 2 });
     const args = { sessionID: "s-current", order: "oldest" };

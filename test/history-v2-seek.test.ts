@@ -155,6 +155,51 @@ describe("v2 seekPage", () => {
     expect(await firstPage(source, "ses_fork", 11_500)).toEqual(["ses_fork-4"]);
   });
 
+  it("answers an error without reading for a bound that is not a number", async () => {
+    const t = await fresh();
+    session(t, "ses_a");
+    row(t, "ses_a", 1, 1_000);
+    const { source, spy } = await open(t);
+    spy.statements.length = 0;
+    for (const until of [Number.NaN, "5000" as unknown as number]) {
+      expect(await source.seekPage!({ sessionID: "ses_a", until })).toMatchObject({
+        ok: false,
+        reason: "error",
+      });
+    }
+    expect(spy.statements).toEqual([]);
+  });
+
+  it("calls an injected yield before each statement it runs", async () => {
+    const t = await fresh();
+    session(t, "ses_a");
+    for (let seq = 1; seq <= 4; seq++) row(t, "ses_a", seq, seq * 1_000);
+    const opened = await openOpencodeDb(t.path);
+    if (!opened.ok) throw new Error(opened.reason);
+    cleanups.push(() => opened.db.close());
+    const spy = limitSpy(opened.db);
+    let yields = 0;
+    const source = createV2HistorySource(spy, {
+      yieldBetween: async () => {
+        yields++;
+      },
+    });
+    // Later rows, the newest row, and nothing at or before the bound.
+    const counts: Array<{ yields: number; reads: number }> = [];
+    for (const until of [2_500, 4_000, 500]) {
+      yields = 0;
+      spy.statements.length = 0;
+      await source.seekPage!({ sessionID: "ses_a", until });
+      const reads = spy.statements.filter((sql) => /\bsession_message\b/.test(sql)).length;
+      counts.push({ yields, reads });
+    }
+    expect(counts).toEqual([
+      { yields: 2, reads: 2 },
+      { yields: 2, reads: 2 },
+      { yields: 1, reads: 1 },
+    ]);
+  });
+
   it("answers not-found for a session the database does not hold", async () => {
     const t = await fresh();
     const { source } = await open(t);
