@@ -359,6 +359,11 @@ export type StoredRows = {
   /** The card's {@link Card.writeRev}, read before the rows; null for a card
    *  no stamped write has touched. */
   writeRev: number | null;
+  /** How many revisions no write stamped (`cardsRev - cardsStamped` from
+   *  {@link Store.cardCounters}), read before the rows. An older build's
+   *  write moves `cards_rev` alone and leaves `write_rev` as it was, so this
+   *  is what shows it. */
+  unstamped: number;
   /** Every stored row of the session, oldest first ({@link Store.sessionRows}). */
   rows: PartTextRow[];
 };
@@ -820,10 +825,11 @@ export type Store = {
    *
    * With `opts.stored`, the rows the caller read before the call, the
    * transaction compares against those and reads only the session's rowids
-   * (and, for the rows it deletes or overwrites the text of, their indexed
-   * text). It is refused with `base-changed`, writing nothing, unless the
-   * card is still stored at the revision `opts.stored.writeRev` and the
-   * session still holds that many rows: a stamped write changed them since.
+   * (and, for the rows it deletes or overwrites, their indexed text). It is
+   * refused with `base-changed`, writing nothing, unless the card is still
+   * stored at the revision `opts.stored.writeRev`, no write that stamps
+   * nothing moved `cards_rev` since ({@link StoredRows.unstamped}) and the
+   * session still holds that many rows.
    */
   replaceSessionParts(
     sessionId: string,
@@ -862,9 +868,8 @@ export type Store = {
    * `recompute` receives that layout's rows, which the caller can build the
    * card from beforehand. The transaction reads the session's rowids and the
    * indexed text of the rows it evicts, and no other stored row. It is
-   * refused with `base-changed`, writing nothing, unless the card is still
-   * stored at the revision `opts.stored.writeRev` and the session still
-   * holds that many rows.
+   * refused with `base-changed`, writing nothing, as
+   * {@link replaceSessionParts} with `opts.stored` is.
    */
   appendSessionParts(
     sessionId: string,
@@ -1336,9 +1341,8 @@ function storedRow(id: SqlValue | undefined, row: PartTextRow): Row {
 type RowDiff = {
   /** Rowids of the stored rows to delete. */
   removed: number[];
-  /** Stored rows to overwrite in place with the new row of the same part,
-   *  and whether its indexed text differs. */
-  updated: Array<{ id: number; row: PartTextRow; text: boolean }>;
+  /** Stored rows to overwrite in place with the new row of the same part. */
+  updated: Array<{ id: number; row: PartTextRow }>;
   /** New rows to insert after every stored row left, oldest first. */
   added: PartTextRow[];
 };
@@ -1370,7 +1374,7 @@ function planRowDiff(stored: Row[], rows: PartTextRow[]): RowDiff {
     kept.add(i);
     const old = stored[i]!;
     if (!sameRow(old, row)) {
-      updated.push({ id: asNumber(old.id), row, text: !sameIndexedText(old, row) });
+      updated.push({ id: asNumber(old.id), row });
     }
   }
   return {
@@ -2555,15 +2559,18 @@ class SqliteStore implements Store {
   /** The session's rowids in order, one per row a caller read before this
    *  transaction (`prepared`), or undefined when those rows may no longer be
    *  the stored ones: the card (`card`, read in this transaction) is gone, a
-   *  stamped write moved its revision, or the session holds another number
-   *  of rows. Reads only the rowids, from the session's index. Caller
-   *  supplies the transaction. */
+   *  stamped write moved its revision, a write that stamps nothing moved
+   *  `cards_rev` ({@link StoredRows.unstamped}), or the session holds another
+   *  number of rows. Reads the counters and the rowids, from the session's
+   *  index. Caller supplies the transaction. */
   private preparedIds(
     sessionId: string,
     card: Row | undefined,
     prepared: StoredRows,
   ): number[] | undefined {
     if (!card || asNullableNumber(card.write_rev) !== prepared.writeRev) return undefined;
+    const { cardsRev, cardsStamped } = this.cardCounters();
+    if (cardsRev - cardsStamped !== prepared.unstamped) return undefined;
     const ids = this.db
       .all("SELECT id FROM part_text WHERE session_id=? ORDER BY id", [sessionId])
       .map((row) => asNumber(row.id));
@@ -2574,24 +2581,34 @@ class SqliteStore implements Store {
    * Make a session's stored rows (`stored`, with their rowids, in rowid
    * order) hold exactly `rows`, writing only the rows {@link planRowDiff}
    * plans to delete, overwrite or insert, and keep the FTS index in step for
-   * exactly those rows. The index entries of the rows it deletes, or whose
-   * text it overwrites, are removed with the values those rows hold in this
-   * transaction, read by rowid (the FTS `'delete'` command requires them).
+   * exactly those rows. Every row it deletes or overwrites is read by rowid
+   * in this transaction: the index entry of a deleted row, or of an
+   * overwritten row whose text differs from what it holds now, is removed
+   * with those values (the FTS `'delete'` command requires them).
    * Deletes run before inserts because part ids are unique: a part that
    * moves is deleted from its old place before it is inserted at its new
    * one. Caller supplies the transaction.
    */
   private writeRowDiff(sessionId: string, stored: Row[], rows: PartTextRow[]): void {
     const diff = planRowDiff(stored, rows);
-    const dropped = [...diff.removed, ...diff.updated.filter((u) => u.text).map((u) => u.id)];
+    const held = (id: number) =>
+      this.db.get("SELECT id, raw, norm FROM part_text WHERE id=?", [id]);
     const entries: Row[] = [];
-    for (const id of dropped) {
-      const row = this.db.get("SELECT id, raw, norm FROM part_text WHERE id=?", [id]);
+    for (const id of diff.removed) {
+      const row = held(id);
       if (row) entries.push(row);
     }
+    // Whether an overwritten row's index entry changes is decided from the
+    // text it holds now: rows read before the transaction may be older.
+    const updated = diff.updated.map(({ id, row }) => {
+      const now = held(id);
+      const text = now !== undefined && !sameIndexedText(now, row);
+      if (now && text) entries.push(now);
+      return { id, row, text };
+    });
     this.evictFts(entries);
     for (const id of diff.removed) this.db.run("DELETE FROM part_text WHERE id=?", [id]);
-    for (const { id, row, text } of diff.updated) {
+    for (const { id, row, text } of updated) {
       this.db.run(
         "UPDATE part_text SET message_id=?, prev_message_id=?, next_message_id=?, class=?, time_created=?, raw=?, norm=? WHERE id=?",
         [

@@ -778,10 +778,61 @@ describe("v2 full writes over stored rows", () => {
     ]);
   }, 20_000);
 
-  it("append again against the rows stored now when a write lands while they are read", async () => {
-    const { h, between } = await written(600, { appendThresholdParts: 0 });
-    addUser("ses_a", "appendedword common");
+  /** The session's rows are what a full read derives: reading it again
+   *  writes nothing, and the index holds exactly its rows. */
+  async function fullyIndexed(h: Started): Promise<void> {
+    expect(await redistill(h, "ses_a", "removal")).toEqual([
+      { method: "replaceSessionParts", result: { changed: false } },
+    ]);
+    storeDb.run("INSERT INTO part_fts(part_fts, rank) VALUES('integrity-check', 1)");
+  }
+
+  /** A grown session: two messages past the card's checkpoint. */
+  function grow(): string[] {
+    const added = [
+      addUser("ses_a", "firstnewword common"),
+      addUser("ses_a", "secondnewword common"),
+    ];
     v2db.db.run("UPDATE session_v2 SET time_updated = ? WHERE id = ?", [T0 + 10_000, "ses_a"]);
+    return added;
+  }
+
+  it("write again against the rows stored now when an older build writes while they are read", async () => {
+    const { h, between } = await written(600);
+    changeOne();
+    between(() => {
+      // An older build rewrites a row's text, keeping the index whole: it
+      // stamps no revision on the card and moves cards_rev alone.
+      const row = storeDb.get(
+        "SELECT id, raw, norm FROM part_text WHERE session_id = ? LIMIT 1 OFFSET 300",
+        ["ses_a"],
+      )!;
+      storeDb.run("INSERT INTO part_fts(part_fts, rowid, raw, norm) VALUES('delete', ?, ?, ?)", [
+        row.id!,
+        row.raw!,
+        row.norm!,
+      ]);
+      storeDb.run("UPDATE part_text SET raw = 'olderword', norm = 'olderword' WHERE id = ?", [
+        row.id!,
+      ]);
+      storeDb.run("INSERT INTO part_fts(rowid, raw, norm) VALUES(?, 'olderword', 'olderword')", [
+        row.id!,
+      ]);
+      storeDb.run("UPDATE meta SET value = CAST(value AS INTEGER) + 1 WHERE key = 'cards_rev'");
+    });
+    const writes = await redistill(h, "ses_a", "removal", (w) => w.length >= 2);
+    expect(writes).toEqual([
+      { method: "replaceSessionParts", result: { changed: false, refused: "base-changed" } },
+      { method: "replaceSessionParts", result: { changed: true } },
+    ]);
+    expect(hits("olderword")).toEqual([]);
+    expect(hits("changedword")).toEqual(["ses_a"]);
+    await fullyIndexed(h);
+  }, 20_000);
+
+  it("read in full when a write lands while an append reads the stored rows", async () => {
+    const { h, between } = await written(600, { appendThresholdParts: 0 });
+    grow();
     let raced = false;
     between(() => {
       raced = true;
@@ -795,17 +846,64 @@ describe("v2 full writes over stored rows", () => {
     expect(raced).toBe(true);
     expect(writes).toEqual([
       { method: "appendSessionParts", result: { changed: false, refused: "base-changed" } },
-      { method: "appendSessionParts", result: { changed: true } },
+      { method: "replaceSessionParts", result: { changed: true } },
     ]);
-    // The append extended the rows stored now: the raced ones and its own.
-    expect(storedText("ses_a")).toHaveLength(501);
-    expect(storedText("ses_a").at(-1)).toBe("appendedword common");
-    expect(hits("racedword")).toEqual(["ses_a"]);
-    expect(hits("filler50")).toEqual([]);
-    expect(store.getCard("ses_a")?.retainedChars).toBe(
-      storedText("ses_a").reduce((sum, raw) => sum + raw.length, 0),
+    expect(storedText("ses_a")).toHaveLength(602);
+    expect(hits("racedword")).toEqual([]);
+    expect(hits("filler50")).toEqual(["ses_a"]);
+    expect(hits("secondnewword")).toEqual(["ses_a"]);
+    expect(h.logs).toContainEqual(
+      expect.stringContaining(
+        "session ses_a append: the stored rows changed while they were read; reading the session in full (1 so far)",
+      ),
     );
-    storeDb.run("INSERT INTO part_fts(part_fts, rank) VALUES('integrity-check', 1)");
+    await fullyIndexed(h);
+  }, 20_000);
+
+  it("index each message once when a write that lands while an append reads the stored rows indexes some of them", async () => {
+    const { h, between } = await written(600, { appendThresholdParts: 0 });
+    const [first] = grow();
+    let raced = false;
+    let indexedPart: string | undefined;
+    between(() => {
+      raced = true;
+      // Another write indexes the first of the two new messages and moves
+      // the card's checkpoint to it, as a cold pass that read the session
+      // before the second was written would.
+      const rows = store.sessionRows("ses_a", 0, 2_000);
+      const last = rows.at(-1)!;
+      const added = {
+        ...last,
+        partId: last.partId.split(last.messageId).join(first!),
+        messageId: first!,
+        prevMessageId: last.messageId,
+        nextMessageId: null,
+        raw: "firstnewword common",
+        norm: "firstnewword common",
+      };
+      expect(added.partId).not.toBe(last.partId);
+      indexedPart = added.partId;
+      store.replaceSessionParts(
+        "ses_a",
+        [...rows.slice(0, -1), { ...last, nextMessageId: first! }, added],
+        { ...store.getCard("ses_a")!, distilledThrough: first! },
+      );
+    });
+    const writes = await redistill(h, "ses_a", "turn-ended", (w) => w.length >= 2);
+    expect(raced).toBe(true);
+    expect(writes).toEqual([
+      { method: "appendSessionParts", result: { changed: false, refused: "base-changed" } },
+      { method: "replaceSessionParts", result: { changed: true } },
+    ]);
+    // Both new messages are indexed, the first one once, under the part id
+    // the other write used.
+    const text = storedText("ses_a");
+    expect(text).toHaveLength(602);
+    expect(text.filter((raw) => raw === "firstnewword common")).toHaveLength(1);
+    expect(text.at(-1)).toBe("secondnewword common");
+    expect(store.sessionRows("ses_a", 600, 1)[0]?.partId).toBe(indexedPart);
+    expect(store.getCard("ses_a")?.distilledThrough).toBe("msg_ses_a_602");
+    await fullyIndexed(h);
   }, 20_000);
 
   it("write nothing when the lease moves while the stored rows are read", async () => {

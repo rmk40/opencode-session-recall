@@ -1526,6 +1526,9 @@ export function createDistiller(options: DistillerOptions): Distiller {
   let knownCount = 0;
   let distilledCount = 0;
   let examinedCount = 0;
+  /** Writes the store refused because the rows read for them changed
+   *  before their transaction, each written again another way. */
+  let rowsChangedRetries = 0;
 
   let heartbeatTimer: Timer | undefined;
   let leaseRetryTimer: Timer | undefined;
@@ -2257,6 +2260,7 @@ export function createDistiller(options: DistillerOptions): Distiller {
       stored ? { ...hashes, stored } : hashes,
     );
     if (result.refused === "base-changed") {
+      noteRowsChanged(session.id, "full write", "writing against the rows stored now");
       result = store.replaceSessionParts(session.id, derived.rows, card, hashes);
     }
     yieldAfterWrite();
@@ -2672,7 +2676,7 @@ export function createDistiller(options: DistillerOptions): Distiller {
     if (stopped || !ownsLease()) return { changed: false };
     const hashes = rangeHashes ? { rangeHashes, replaceRangeHashes } : undefined;
     const ready = prepared;
-    let result = ready
+    const result = ready
       ? store.appendSessionParts(
           session.id,
           walk.rows,
@@ -2682,18 +2686,21 @@ export function createDistiller(options: DistillerOptions): Distiller {
           (allRows) => (allRows.length === ready.rows ? ready.card : recompute(allRows)),
           { ...hashes, stored: ready.stored },
         )
-      : undefined;
-    // Without stored rows, or once a write changed them since they were
-    // read, the append reads them inside its transaction.
-    if (!result || result.refused === "base-changed") {
-      result = store.appendSessionParts(
-        session.id,
-        walk.rows,
-        caps.ftsRowsPerSession,
-        boundary,
-        recompute,
-        hashes,
-      );
+      : // Without stored rows the append reads them inside its transaction.
+        store.appendSessionParts(
+          session.id,
+          walk.rows,
+          caps.ftsRowsPerSession,
+          boundary,
+          recompute,
+          hashes,
+        );
+    if (result.refused === "base-changed") {
+      // A write changed the card while its rows were read, and it may have
+      // indexed some of the messages read here, so they are not appended
+      // again: the session is read in full against what is stored now.
+      noteRowsChanged(session.id, "append", "reading the session in full");
+      return distillFull(session);
     }
     yieldAfterWrite();
     noteSettled(session.id, tail, moved);
@@ -2788,10 +2795,11 @@ export function createDistiller(options: DistillerOptions): Distiller {
   }
 
   /**
-   * Every stored row of a session, for a full write to compare against
-   * ({@link Store.replaceSessionParts} with `stored`), read a page at a time
-   * with a yield between pages after the card's revision. A write that lands
-   * in between moves the revision, and the store then refuses the rows.
+   * Every stored row of a session, for a full write or an append to compare
+   * against (`stored`), read a page at a time with a yield between pages
+   * after the revision counters and the card's revision. A write that lands
+   * in between moves the card's revision or, for an older build's write that
+   * stamps none, `cards_rev` alone, and the store then refuses the rows.
    * Undefined when the session holds no rows, so there is nothing to compare
    * outside the transaction. Null when the distiller stopped or lost the
    * lease, before the first read or during a yield: the store may be closed
@@ -2799,6 +2807,7 @@ export function createDistiller(options: DistillerOptions): Distiller {
    */
   async function storedRowsOf(sessionID: string): Promise<StoredRows | undefined | null> {
     if (stopped || !leaseHeld) return null;
+    const { cardsRev, cardsStamped } = store.cardCounters();
     const writeRev = store.cardWriteRev(sessionID) ?? null;
     const count = store.sessionRowCount(sessionID);
     if (count === 0) return undefined;
@@ -2810,7 +2819,16 @@ export function createDistiller(options: DistillerOptions): Distiller {
       }
       rows.push(...store.sessionRows(sessionID, offset, Math.min(BASE_ROWS_PAGE, count - offset)));
     }
-    return { writeRev, rows };
+    return { writeRev, unstamped: cardsRev - cardsStamped, rows };
+  }
+
+  /** Log a write the store refused because a write changed the stored rows
+   *  while they were read, with how many this distiller has seen. */
+  function noteRowsChanged(sessionID: string, write: string, then: string): void {
+    rowsChangedRetries++;
+    logMsg(
+      `session ${sessionID} ${write}: the stored rows changed while they were read; ${then} (${rowsChangedRetries} so far)`,
+    );
   }
 
   /**
@@ -2956,7 +2974,10 @@ export function createDistiller(options: DistillerOptions): Distiller {
     );
     yieldAfterWrite();
     // Another write changed the card since its rows were read.
-    if (result.refused === "base-changed") return distillFull(session);
+    if (result.refused === "base-changed") {
+      noteRowsChanged(session.id, "tail write", "reading the session in full");
+      return distillFull(session);
+    }
     noteSettled(session.id, checkpoint, moved);
     return { changed: result.changed };
   }

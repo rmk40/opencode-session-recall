@@ -2179,6 +2179,13 @@ function rangeHash(startSeq: number, hash = `h${startSeq}`): RangeHash {
   return { startSeq, endSeq: startSeq + 499, rowCount: 500, hash, sweepGen: 1 };
 }
 
+/** How many revisions no write stamped, as a caller reads it with the rows
+ *  it hands a write ({@link StoredRows.unstamped}). */
+function unstampedOf(store: Store): number {
+  const { cardsRev, cardsStamped } = store.cardCounters();
+  return cardsRev - cardsStamped;
+}
+
 /** Run `write` and report its result and how far each revision counter moved. */
 function counterMoves<T>(
   store: Store,
@@ -2451,6 +2458,7 @@ describe("writes over stored rows", () => {
   /** The rows a caller reads before a replace, as the distiller reads them. */
   const preRead = (store: Store, sessionId: string): StoredRows => ({
     writeRev: store.cardWriteRev(sessionId) ?? null,
+    unstamped: unstampedOf(store),
     rows: store.sessionRows(sessionId, 0, 100_000),
   });
 
@@ -2761,16 +2769,9 @@ describe("writes over stored rows", () => {
   it("a replace removes index entries with the text the rows hold when it writes, not the text read before", async () => {
     const ctx = await seeded();
     const stored = preRead(ctx.store, "s1");
-    // A write that stamps no revision (an older build's) rewrites a row the
-    // caller read, keeping the index whole.
-    const row = ctx.db.get("SELECT id, raw, norm FROM part_text WHERE part_id = 'q3'")!;
-    ctx.db.run("INSERT INTO part_fts(part_fts, rowid, raw, norm) VALUES('delete', ?, ?, ?)", [
-      row.id!,
-      row.raw!,
-      row.norm!,
-    ]);
-    ctx.db.run("UPDATE part_text SET raw = 'mu', norm = 'mu' WHERE id = ?", [row.id!]);
-    ctx.db.run("INSERT INTO part_fts(rowid, raw, norm) VALUES(?, 'mu', 'mu')", [row.id!]);
+    // A write that moves no counter at all rewrites a row the caller read,
+    // keeping the index whole.
+    olderWrite(ctx.db, false);
 
     expect(ctx.store.replaceSessionParts("s1", ctx.next, ctx.card, { stored })).toEqual({
       changed: true,
@@ -2780,6 +2781,79 @@ describe("writes over stored rows", () => {
     expect(sessions(ctx.store.ftsSearch({ strong: ["lambda"], weak: [] }))).toEqual(["s1"]);
     ctx.db.close();
   });
+
+  /** A write as an older build makes it: it rewrites q3's text to "mu",
+   *  keeping the index whole, stamps no revision on the card and, when
+   *  `counted`, moves `cards_rev` alone. */
+  function olderWrite(db: SqliteDb, counted: boolean): void {
+    const row = db.get("SELECT id, raw, norm FROM part_text WHERE part_id = 'q3'")!;
+    db.run("INSERT INTO part_fts(part_fts, rowid, raw, norm) VALUES('delete', ?, ?, ?)", [
+      row.id!,
+      row.raw!,
+      row.norm!,
+    ]);
+    db.run("UPDATE part_text SET raw = 'mu', norm = 'mu' WHERE id = ?", [row.id!]);
+    db.run("INSERT INTO part_fts(rowid, raw, norm) VALUES(?, 'mu', 'mu')", [row.id!]);
+    if (counted) {
+      db.run("UPDATE meta SET value = CAST(value AS INTEGER) + 1 WHERE key = ?", [CARDS_REV_KEY]);
+    }
+  }
+
+  /** The index finds each word in exactly the rows whose text holds it. */
+  function indexAgrees(ctx: { db: SqliteDb; store: Store }, words: string[]): void {
+    for (const word of words) {
+      const found = ctx.store
+        .ftsSearch({ strong: [word], weak: [], limit: 1_000 })
+        .map((hit) => hit.partId)
+        .sort();
+      const held = ctx.db
+        .all("SELECT part_id, raw, norm FROM part_text")
+        .filter((row) => `${String(row.raw)} ${String(row.norm)}`.split(/\s+/).includes(word))
+        .map((row) => String(row.part_id))
+        .sort();
+      expect(found, word).toEqual(held);
+    }
+    checkIndex(ctx.db);
+  }
+
+  it.each([
+    { name: "its text", change: (row: PartTextRow) => ({ ...row, raw: "lambda", norm: "lambda" }) },
+    { name: "only its pointer", change: (row: PartTextRow) => ({ ...row, nextMessageId: "m-x" }) },
+  ])(
+    "a replace that changes $name, over a row an older build rewrote after it was read, keeps the index on the rows",
+    async ({ change }) => {
+      const words = ["delta", "mu", "lambda", "alpha"];
+      for (const counted of [true, false]) {
+        const ctx = await seeded();
+        const next = ctx.rows.map((row) => (row.partId === "q3" ? change(row) : row));
+        const stored = preRead(ctx.store, "s1");
+        olderWrite(ctx.db, counted);
+        const result = ctx.store.replaceSessionParts("s1", next, ctx.card, { stored });
+        if (counted) {
+          // The moved counter shows the write: the rows are refused, and the
+          // same write against the rows stored now is accepted.
+          expect(result).toEqual({ changed: false, refused: "base-changed" });
+          expect(ctx.store.replaceSessionParts("s1", next, ctx.card)).toEqual({ changed: true });
+        } else {
+          // Nothing shows it: the write goes ahead, and the index entry of
+          // the row it overwrites follows the text the row held.
+          expect(result).toEqual({ changed: true });
+        }
+        expect(rowsOf(ctx.db, "s1").map((row) => (row as Row).raw)).toEqual(
+          next.map((row) => row.raw),
+        );
+        indexAgrees(ctx, words);
+        // The rows match what was written, so writing them again changes
+        // nothing.
+        expect(
+          ctx.store.replaceSessionParts("s1", next, ctx.card, {
+            stored: preRead(ctx.store, "s1"),
+          }),
+        ).toEqual({ changed: false });
+        ctx.db.close();
+      }
+    },
+  );
 
   it.each([
     { name: "an index entry's removal", statement: /VALUES\('delete'/ },
@@ -3403,6 +3477,7 @@ describe("append suppression", () => {
       const before = store.getCard("s1")!;
       const stored = {
         writeRev: store.cardWriteRev("s1") ?? null,
+        unstamped: unstampedOf(store),
         rows: store.sessionRows("s1", 0, 100),
       };
       const moved = counterMoves(store, () =>
