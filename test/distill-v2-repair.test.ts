@@ -236,6 +236,8 @@ type StartOptions = {
   onColdPassDone?: () => void;
   coldPassRetryMs?: number;
   leaseRetryMs?: number;
+  /** Default: the test's store. */
+  store?: Store;
 };
 
 type Started = {
@@ -277,7 +279,7 @@ function startDistiller(o: StartOptions = {}): Started {
   const projectorGen = o.projectorGen === undefined ? GEN : o.projectorGen;
   const distiller = createDistiller({
     source,
-    store,
+    store: o.store ?? store,
     gate: createFetchGate({ concurrency: 2 }),
     limits: { ...TEST_LIMITS, distillDelayMs: 0, distillConcurrency: 1, ...o.limits },
     instanceId: `repair-${Math.random()}`,
@@ -1681,5 +1683,165 @@ describe("v2 bounded re-reads and raised floors", () => {
     expect(hits("one")).toEqual([]);
     expect(inspectCheckpoint(store.getCard("ses_a")?.distillCursor)?.floor).toBeUndefined();
     expect(seqReads).toBe(0);
+  });
+});
+
+// ── Re-derivations of unchanged rows ─────────────────────────────────────────
+
+describe("v2 re-derivations of unchanged rows", () => {
+  const IDS = ["ses_inline", "ses_parts", "ses_turns", "ses_child"];
+
+  /** Sessions of every shape the projector reads: inline content, part rows
+   *  with a completed tool call, several turns, and a child of another
+   *  session (so the root's family rollup is recomputed too). */
+  function addSessions(): void {
+    addSession("ses_inline");
+    addUser("ses_inline", "where is the lexer bug");
+    addReply("ses_inline", { inline: [text("the lexer bug is in tokenize.ts")] });
+    addSession("ses_parts");
+    addUser("ses_parts", "run the tests");
+    addReply("ses_parts", {
+      parts: [
+        text("running them"),
+        {
+          type: "tool",
+          id: "call_1",
+          name: "bash",
+          state: {
+            status: "completed",
+            input: { command: "npm test" },
+            content: [{ type: "text", text: "42 passed" }],
+          },
+        },
+      ],
+    });
+    addSession("ses_turns");
+    for (let turn = 0; turn < 3; turn++) {
+      addUser("ses_turns", `question ${turn} about the cursor`);
+      addReply("ses_turns", { parts: [text(`answer ${turn} about cursor.ts`)] });
+    }
+    addSession("ses_child", { parent_id: "ses_parts" });
+    addUser("ses_child", "a subagent task");
+    addReply("ses_child", { parts: [text("subagent result")] });
+  }
+
+  /** What readers see of every card (its vector aside), every slim-index
+   *  row, the range hashes and the revision counters. */
+  function snapshot(o: { cursors?: boolean } = {}) {
+    return {
+      cards: storeDb.all("SELECT * FROM card ORDER BY session_id").map((row) => {
+        const seen: Record<string, unknown> = { ...row };
+        delete seen.embedding;
+        if (o.cursors === false) delete seen.distill_cursor;
+        return seen;
+      }),
+      rows: storeDb.all(
+        `SELECT session_id, part_id, message_id, prev_message_id, next_message_id, class,
+           time_created, raw, norm FROM part_text ORDER BY session_id, id`,
+      ),
+      hashes: IDS.map(hashesOf),
+      stats: store.cardStats(),
+    };
+  }
+
+  /** The test's store, recording each content write by name. */
+  function recording(calls: string[]): Store {
+    const writes = new Set([
+      "replaceSessionParts",
+      "appendSessionParts",
+      "replaceSessionTail",
+      "refreshCardMeta",
+    ]);
+    return new Proxy(store, {
+      get(target, prop, receiver) {
+        const value: unknown = Reflect.get(target, prop, receiver);
+        if (typeof value !== "function") return value;
+        const method = value as (...args: unknown[]) => unknown;
+        return (...args: unknown[]) => {
+          const out = method.apply(target, args);
+          if (writes.has(String(prop))) calls.push(String(prop));
+          return out;
+        };
+      },
+    });
+  }
+
+  const count = (calls: string[], name: string): number => calls.filter((c) => c === name).length;
+
+  it("a cold pass over cards whose checkpoints were cleared rewrites each through a suppressed full write", async () => {
+    addSessions();
+    await built();
+    const before = snapshot();
+    storeDb.run("UPDATE card SET distill_cursor = NULL", []);
+    const calls: string[] = [];
+    const h = startDistiller({ store: recording(calls) });
+    await coldPassDone(h);
+    await waitFor(() => h.distiller.repair()?.sweep?.running === false);
+    expect(count(calls, "replaceSessionParts")).toBe(IDS.length);
+    // Every session counts as distilled, and none as changed.
+    expect(h.logs).toContainEqual(
+      expect.stringContaining(`cold pass done (${IDS.length} distilled, 0 changed /`),
+    );
+    // The cleared checkpoints are written again as they were, and nothing
+    // else changed: no revision, no row, no hash.
+    expect(snapshot()).toEqual(before);
+  });
+
+  it("a full re-read of unchanged rows allocates no revision", async () => {
+    addSessions();
+    await built();
+    const before = snapshot();
+    const calls: string[] = [];
+    const h = startDistiller({ store: recording(calls) });
+    await coldPassDone(h);
+    // A removal makes each re-distill read its session in full.
+    for (const id of IDS) h.distiller.onEvent({ type: "removal", sessionID: id });
+    await waitFor(() => count(calls, "replaceSessionParts") === IDS.length);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(snapshot()).toEqual(before);
+  });
+
+  it("an append that finds only a row that is not content allocates no revision", async () => {
+    addSessions();
+    await built();
+    const before = snapshot({ cursors: false });
+    const calls: string[] = [];
+    const h = startDistiller({ store: recording(calls), appendThresholdParts: 0 });
+    await coldPassDone(h);
+    addIdle("ses_turns");
+    h.distiller.onEvent({ type: "turn-ended", sessionID: "ses_turns" });
+    await waitFor(() => calls.length > 0);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(calls).toEqual(["refreshCardMeta"]);
+    // Only the checkpoint moved past the idle row, and a range hash now
+    // covers that row.
+    const after = snapshot({ cursors: false });
+    expect({ ...after, hashes: [] }).toEqual({ ...before, hashes: [] });
+    expect(hashesOf("ses_turns")).toContainEqual(
+      expect.objectContaining({ startSeq: 7, endSeq: 7, rowCount: 1 }),
+    );
+  });
+
+  it("a tail write over a running reply whose rows did not change allocates no revision", async () => {
+    addSession("ses_tail");
+    addUser("ses_tail", "stream an answer");
+    addReply("ses_tail", { parts: [text("a settled answer")] });
+    const running = addStreamingReply("ses_tail", [text("still streaming")]);
+    const calls: string[] = [];
+    const h = startDistiller({ store: recording(calls) });
+    await coldPassDone(h);
+    expect(store.getCard("ses_tail")?.settledBase).toBeDefined();
+    const before = snapshot({ cursors: false });
+    // The running reply's part is written again with the same content.
+    v2db.db.run("UPDATE session_part SET time_updated = ? WHERE message_id = ?", [
+      Date.now(),
+      running,
+    ]);
+    const from = calls.length;
+    h.distiller.onEvent({ type: "turn-ended", sessionID: "ses_tail" });
+    await waitFor(() => calls.length > from);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(calls.slice(from)).toEqual(["replaceSessionTail"]);
+    expect(snapshot({ cursors: false })).toEqual(before);
   });
 });
