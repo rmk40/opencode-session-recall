@@ -166,3 +166,30 @@ export const yieldOnBudget: () => Promise<void> = shared.foreground;
  * one in {@link BACKGROUND_EVERY} turns.
  */
 export const yieldInBackground: () => Promise<void> = shared.background;
+
+/**
+ * Synchronous work written as a generator that stops at each bare `yield`,
+ * where it may hand the event loop back. One body serves a caller that must
+ * have the result at once ({@link runSteps}) and one that may wait
+ * ({@link runStepsPausing}), so the two compute the same result.
+ */
+export type Steps<T> = Generator<void, T, undefined>;
+
+/** Runs `steps` to the end without stopping. */
+export function runSteps<T>(steps: Steps<T>): T {
+  for (;;) {
+    const step = steps.next();
+    if (step.done) return step.value;
+  }
+}
+
+/** Runs `steps`, awaiting `pause` (such as {@link yieldOnBudget}) at each
+ *  stop. Only where the event loop is handed back differs from
+ *  {@link runSteps}. */
+export async function runStepsPausing<T>(steps: Steps<T>, pause: () => Promise<void>): Promise<T> {
+  for (;;) {
+    const step = steps.next();
+    if (step.done) return step.value;
+    await pause();
+  }
+}
