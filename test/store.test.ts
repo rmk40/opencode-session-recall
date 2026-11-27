@@ -16,12 +16,15 @@ import {
   type SessionTail,
   type SettledBase,
   type Store,
+  type StoredRows,
   type StoreIdentity,
   type StoreOptions,
   type StoreRefusal,
 } from "../src/store.js";
 import { parseQuery } from "../src/query.js";
 import { openV1Store } from "./helpers.js";
+import { mulberry32 } from "./perf-helpers.js";
+import { changedParts, recordRowMutations, rowsByPart, touchedParts } from "./row-mutations.js";
 
 // These tests run against the REAL node:sqlite driver (Node >= 22.5). Under
 // vitest there is no `Bun` global, so openSqlite selects node:sqlite.
@@ -47,6 +50,21 @@ async function fresh(now?: () => number): Promise<{ db: SqliteDb; store: Store }
   const store = openV1Store(db, now ? { now } : undefined);
   if (!store) throw new Error("openStore returned null");
   return { db, store };
+}
+
+/** A fresh store whose connection lists, while recording, every statement
+ *  that writes a slim-index row or its FTS entry ({@link recordRowMutations}). */
+async function recordedStore(): Promise<{
+  db: SqliteDb;
+  store: Store;
+  recorded: ReturnType<typeof recordRowMutations>;
+}> {
+  const db = await openSqlite(freshDbPath());
+  if (!db) throw new Error("openSqlite returned null");
+  const recorded = recordRowMutations(db);
+  const store = openV1Store(recorded.db);
+  if (!store) throw new Error("openStore returned null");
+  return { db, store, recorded };
 }
 
 function makeCard(sessionId: string, over: Partial<Card> = {}): Card {
@@ -2217,6 +2235,401 @@ describe("replace suppression", () => {
   });
 });
 
+describe("diffed replaces", () => {
+  const WORDS = ["alpha", "beta", "gamma", "delta", "epsilon", "zeta", "theta", "kappa"];
+  const CLASSES = ["human-text", "assistant-text", "tool-input", "tool-output"];
+  const MESSAGES = ["m-1", "m-2", "m-3", "m-4", "m-5"];
+
+  /** The rows a caller reads before a replace, as the distiller reads them. */
+  const preRead = (store: Store, sessionId: string): StoredRows => ({
+    writeRev: store.cardWriteRev(sessionId) ?? null,
+    rows: store.sessionRows(sessionId, 0, 100_000),
+  });
+
+  /** A session's rows as readers see them: every field, in rowid order. */
+  const rowsOf = (db: SqliteDb, sessionId: string): unknown[] =>
+    db.all(
+      `SELECT part_id, message_id, prev_message_id, next_message_id, class, time_created, raw, norm
+       FROM part_text WHERE session_id = ? ORDER BY id`,
+      [sessionId],
+    );
+
+  /** What the index finds for each word, and for plain-word pairs, every hit
+   *  with its score, in a fixed order. */
+  const ftsView = (store: Store): string[][] =>
+    WORDS.flatMap((word, i) => [
+      store.ftsSearch({ strong: [word], weak: [], limit: 10_000 }),
+      store.ftsSearch({ strong: [], weak: [word, WORDS[(i + 3) % WORDS.length]!], limit: 10_000 }),
+    ]).map((hits) => hits.map((hit) => `${hit.sessionId}/${hit.partId} ${hit.score}`).sort());
+
+  /** Throws unless the FTS index holds exactly the rows `part_text` holds. */
+  const checkIndex = (db: SqliteDb): void => {
+    db.run("INSERT INTO part_fts(part_fts, rank) VALUES('integrity-check', 1)");
+  };
+
+  /** A card as two stores must hold it: their revisions differ. */
+  const comparable = (card: Card | undefined): Partial<Card> | undefined => {
+    if (!card) return undefined;
+    const copy: Partial<Card> = { ...card };
+    delete copy.writeRev;
+    return copy;
+  };
+
+  const pick = <T>(rand: () => number, items: readonly T[]): T =>
+    items[Math.floor(rand() * items.length)]!;
+  const words = (rand: () => number): string =>
+    Array.from({ length: 1 + Math.floor(rand() * 4) }, () => pick(rand, WORDS)).join(" ");
+  let parts = 0;
+  const newRow = (rand: () => number): PartTextRow => {
+    const raw = words(rand);
+    return makePart(`p${parts++}`, raw, {
+      messageId: pick(rand, MESSAGES),
+      prevMessageId: rand() < 0.3 ? null : pick(rand, MESSAGES),
+      nextMessageId: rand() < 0.3 ? null : pick(rand, MESSAGES),
+      class: pick(rand, CLASSES),
+      timeCreated: 1000 + Math.floor(rand() * 50),
+      norm: rand() < 0.5 ? raw : words(rand),
+    });
+  };
+  const indexIn = (rand: () => number, rows: PartTextRow[]): number =>
+    Math.floor(rand() * rows.length);
+  const changeOne = (
+    rows: PartTextRow[],
+    rand: () => number,
+    change: (row: PartTextRow) => PartTextRow,
+  ): PartTextRow[] => {
+    const at = indexIn(rand, rows);
+    return rows.map((row, i) => (i === at ? change(row) : row));
+  };
+
+  /** Random edits of a session's rows. `moves` marks the edits that add a
+   *  row before a row that stays, or move one, which rewrite every row
+   *  after it. */
+  const EDITS: Array<{
+    name: string;
+    moves?: true;
+    run: (rows: PartTextRow[], rand: () => number) => PartTextRow[];
+  }> = [
+    { name: "append", run: (rows, rand) => [...rows, newRow(rand), newRow(rand)] },
+    { name: "evict the oldest", run: (rows, rand) => rows.slice(1 + Math.floor(rand() * 3)) },
+    {
+      name: "remove one",
+      run: (rows, rand) => {
+        const at = indexIn(rand, rows);
+        return rows.filter((_, i) => i !== at);
+      },
+    },
+    {
+      name: "change the text",
+      run: (rows, rand) => changeOne(rows, rand, (row) => ({ ...row, raw: words(rand) })),
+    },
+    {
+      name: "change the normalized text",
+      run: (rows, rand) => changeOne(rows, rand, (row) => ({ ...row, norm: words(rand) })),
+    },
+    {
+      name: "change a pointer",
+      run: (rows, rand) =>
+        changeOne(rows, rand, (row) =>
+          rand() < 0.5
+            ? { ...row, prevMessageId: row.prevMessageId ? null : pick(rand, MESSAGES) }
+            : { ...row, nextMessageId: row.nextMessageId ? null : pick(rand, MESSAGES) },
+        ),
+    },
+    {
+      name: "change the message, class and time",
+      run: (rows, rand) =>
+        changeOne(rows, rand, (row) => ({
+          ...row,
+          messageId: pick(rand, MESSAGES),
+          class: pick(rand, CLASSES),
+          timeCreated: row.timeCreated + 1,
+        })),
+    },
+    {
+      name: "insert before a stored row",
+      moves: true,
+      run: (rows, rand) => {
+        const at = indexIn(rand, rows);
+        return [...rows.slice(0, at), newRow(rand), ...rows.slice(at)];
+      },
+    },
+    {
+      name: "move one",
+      moves: true,
+      run: (rows, rand) => {
+        const from = indexIn(rand, rows);
+        const moved = rows.filter((_, i) => i !== from);
+        moved.splice(indexIn(rand, moved), 0, rows[from]!);
+        return moved;
+      },
+    },
+    { name: "nothing", run: (rows) => rows },
+  ];
+
+  it("leave the rows, index and card a delete-all and insert-all write leaves, writing only the rows that differ", async () => {
+    // Replaced with rows read inside the transaction, with rows read before
+    // it, and by deleting the session and writing every row again.
+    const inTx = await recordedStore();
+    const prepared = await recordedStore();
+    const rewritten = await recordedStore();
+    const tally = new Map<string, number>();
+    const count = (what: string) => tally.set(what, (tally.get(what) ?? 0) + 1);
+    const SEQUENCES = 12;
+    const STEPS = 12;
+    for (let s = 0; s < SEQUENCES; s++) {
+      const rand = mulberry32(7_000 + s);
+      // Each sequence writes its own session; the earlier ones stay stored.
+      const sid = `s${s}`;
+      const cardOf = (rows: PartTextRow[], step: number) =>
+        makeCard(sid, {
+          distillState: "full",
+          partCount: rows.length,
+          title: rand() < 0.5 ? "Steady" : `Title ${step}`,
+          distillCursor: `c-${step}`,
+        });
+      let rows = Array.from({ length: 20 + Math.floor(rand() * 40) }, () => newRow(rand));
+      for (const { store } of [inTx, prepared, rewritten]) {
+        store.replaceSessionParts(sid, rows, cardOf(rows, 0));
+      }
+      for (let step = 1; step <= STEPS; step++) {
+        let moves = false;
+        const names: string[] = [];
+        for (let e = 1 + Math.floor(rand() * 3); e > 0; e--) {
+          const edit = rows.length < 5 ? EDITS[0]! : pick(rand, EDITS);
+          rows = edit.run(rows, rand);
+          moves ||= edit.moves === true;
+          names.push(edit.name);
+        }
+        const where = `sequence ${s}, step ${step}: ${names.join(", ")}`;
+        const card = cardOf(rows, step);
+        const before = [rowsByPart(inTx.db, sid), rowsByPart(prepared.db, sid)];
+        const stored = preRead(prepared.store, sid);
+        inTx.recorded.record(true);
+        prepared.recorded.record(true);
+        const result = inTx.store.replaceSessionParts(sid, rows, card);
+        expect(prepared.store.replaceSessionParts(sid, rows, card, { stored }), where).toEqual(
+          result,
+        );
+        inTx.recorded.record(false);
+        prepared.recorded.record(false);
+        rewritten.store.deleteSession(sid);
+        rewritten.store.replaceSessionParts(sid, rows, card);
+        expect(result.refused, where).toBeUndefined();
+        count(result.changed ? "changed" : "suppressed");
+        if (moves) count("moves");
+
+        const expected = {
+          rows: rowsOf(rewritten.db, sid),
+          card: comparable(rewritten.store.getCard(sid)),
+          fts: ftsView(rewritten.store),
+        };
+        [inTx, prepared].forEach((ctx, i) => {
+          expect(rowsOf(ctx.db, sid), where).toEqual(expected.rows);
+          expect(comparable(ctx.store.getCard(sid)), where).toEqual(expected.card);
+          expect(ftsView(ctx.store), where).toEqual(expected.fts);
+          checkIndex(ctx.db);
+
+          const after = rowsByPart(ctx.db, sid);
+          const changed = changedParts(before[i]!, after);
+          const changedText = changedParts(before[i]!, after, ["raw", "norm"]);
+          const written = touchedParts(ctx.recorded.mutations, "part_text", before[i]!, after);
+          const indexed = touchedParts(ctx.recorded.mutations, "part_fts", before[i]!, after);
+          // Every statement wrote one row of this session.
+          expect(written, where).not.toBe("session");
+          expect(indexed, where).not.toBe("session");
+          if (written === "session" || indexed === "session") return;
+          expect(
+            [...written, ...indexed].filter((part) => !after.has(part) && !before[i]!.has(part)),
+            where,
+          ).toEqual([]);
+          if (moves) {
+            expect(written, where).toEqual(expect.arrayContaining(changed));
+          } else {
+            // Without a row added before one that stays, or a part moved,
+            // the rows written are exactly the rows that differ, and the
+            // index entries written those whose text differs.
+            expect(written, where).toEqual(changed);
+            expect(indexed, where).toEqual(changedText);
+            if (changed.length > 0) count("rows written exactly");
+          }
+        });
+      }
+    }
+    // Every kind of write ran: suppressed, changed, exact and moving.
+    expect(tally.get("suppressed") ?? 0).toBeGreaterThan(0);
+    expect(tally.get("moves") ?? 0).toBeGreaterThan(SEQUENCES);
+    expect(tally.get("rows written exactly") ?? 0).toBeGreaterThan(SEQUENCES);
+    for (const ctx of [inTx, prepared, rewritten]) ctx.db.close();
+  }, 60_000);
+
+  /** s1 with six rows, one per word, and one range hash. */
+  async function seeded() {
+    const ctx = await recordedStore();
+    const rows = WORDS.slice(0, 6).map((word, i) =>
+      makePart(`q${i}`, word, { messageId: `m-${i}`, prevMessageId: i > 0 ? `m-${i - 1}` : null }),
+    );
+    const card = makeCard("s1", { distillState: "full", partCount: rows.length });
+    ctx.store.replaceSessionParts("s1", rows, card, { rangeHashes: [rangeHash(0)] });
+    // The next rows: the oldest evicted, one changed, one appended.
+    const next = [
+      ...rows.slice(1, 3),
+      { ...rows[3]!, raw: "lambda", norm: "lambda" },
+      ...rows.slice(4),
+      makePart("q9", "omega", { messageId: "m-9" }),
+    ];
+    return { ...ctx, rows, card, next };
+  }
+
+  /** Everything a refused or failed replace must leave as it was. */
+  const state = (db: SqliteDb, store: Store) => ({
+    rows: rowsOf(db, "s1"),
+    rowids: db.all("SELECT id FROM part_text ORDER BY id"),
+    card: store.getCard("s1"),
+    hashes: store.getRangeHashes("s1"),
+    fts: ftsView(store),
+    counters: store.cardStats(),
+  });
+
+  it.each<{
+    name: string;
+    race?: (ctx: Awaited<ReturnType<typeof seeded>>) => void;
+    read?: (stored: StoredRows) => StoredRows;
+  }>([
+    {
+      name: "a stamped write moved the card's revision",
+      race: ({ store }) => store.writeSummary("s1", "Summary.", "h1"),
+    },
+    {
+      name: "another replace changed the rows, keeping their number",
+      race: ({ store, rows, card }) =>
+        store.replaceSessionParts(
+          "s1",
+          rows.map((row) => ({ ...row, raw: `${row.raw} kappa` })),
+          card,
+        ),
+    },
+    { name: "the session was deleted", race: ({ store }) => store.deleteSession("s1") },
+    {
+      name: "the session holds another number of rows",
+      read: (stored) => ({ ...stored, rows: stored.rows.slice(1) }),
+    },
+  ])("refuses rows read before $name, writing nothing", async (o) => {
+    const ctx = await seeded();
+    const stored = (o.read ?? ((rows: StoredRows) => rows))(preRead(ctx.store, "s1"));
+    o.race?.(ctx);
+    const before = state(ctx.db, ctx.store);
+    const write = (extra?: { stored: StoredRows }) =>
+      ctx.store.replaceSessionParts("s1", ctx.next, ctx.card, {
+        rangeHashes: [rangeHash(500)],
+        replaceRangeHashes: true,
+        ...extra,
+      });
+
+    ctx.recorded.record(true);
+    expect(write({ stored })).toEqual({ changed: false, refused: "base-changed" });
+    ctx.recorded.record(false);
+    expect(ctx.recorded.mutations).toEqual([]);
+    expect(state(ctx.db, ctx.store)).toEqual(before);
+
+    // The same write against the rows stored now is accepted.
+    expect(write()).toEqual({ changed: true });
+    expect(rowsOf(ctx.db, "s1")).toEqual(
+      ctx.next.map((row) => ({
+        part_id: row.partId,
+        message_id: row.messageId,
+        prev_message_id: row.prevMessageId,
+        next_message_id: row.nextMessageId,
+        class: row.class,
+        time_created: row.timeCreated,
+        raw: row.raw,
+        norm: row.norm,
+      })),
+    );
+    checkIndex(ctx.db);
+    ctx.db.close();
+  });
+
+  it("removes index entries with the text the rows hold when it writes, not the text read before", async () => {
+    const ctx = await seeded();
+    const stored = preRead(ctx.store, "s1");
+    // A write that stamps no revision (an older build's) rewrites a row the
+    // caller read, keeping the index whole.
+    const row = ctx.db.get("SELECT id, raw, norm FROM part_text WHERE part_id = 'q3'")!;
+    ctx.db.run("INSERT INTO part_fts(part_fts, rowid, raw, norm) VALUES('delete', ?, ?, ?)", [
+      row.id!,
+      row.raw!,
+      row.norm!,
+    ]);
+    ctx.db.run("UPDATE part_text SET raw = 'mu', norm = 'mu' WHERE id = ?", [row.id!]);
+    ctx.db.run("INSERT INTO part_fts(rowid, raw, norm) VALUES(?, 'mu', 'mu')", [row.id!]);
+
+    expect(ctx.store.replaceSessionParts("s1", ctx.next, ctx.card, { stored })).toEqual({
+      changed: true,
+    });
+    checkIndex(ctx.db);
+    expect(ctx.store.ftsSearch({ strong: ["mu"], weak: [] })).toEqual([]);
+    expect(sessions(ctx.store.ftsSearch({ strong: ["lambda"], weak: [] }))).toEqual(["s1"]);
+    ctx.db.close();
+  });
+
+  it.each([
+    { name: "an index entry's removal", statement: /VALUES\('delete'/ },
+    { name: "a row's deletion", statement: /^DELETE FROM part_text WHERE id=\?/ },
+    { name: "a row's overwrite", statement: /^UPDATE part_text SET message_id=/ },
+    { name: "a row's insertion", statement: /^INSERT INTO part_text\(/ },
+    { name: "an index entry's insertion", statement: /^INSERT INTO part_fts\(rowid,/ },
+    { name: "the card's write", statement: /^INSERT INTO card\(/ },
+  ])("rolls a diffed replace back whole when $name fails", async ({ statement }) => {
+    for (const readFirst of [false, true]) {
+      const db = await openSqlite(freshDbPath());
+      if (!db) throw new Error("openSqlite returned null");
+      let failing = false;
+      let failed = 0;
+      const store = openV1Store({
+        ...db,
+        run(sql, params) {
+          if (failing && statement.test(sql)) {
+            failed++;
+            throw new Error("injected failure");
+          }
+          return db.run(sql, params);
+        },
+      });
+      if (!store) throw new Error("openStore returned null");
+      const rows = WORDS.slice(0, 6).map((word, i) => makePart(`q${i}`, word));
+      const card = makeCard("s1", { distillState: "full", partCount: rows.length });
+      store.replaceSessionParts("s1", rows, card, { rangeHashes: [rangeHash(0)] });
+      const next = [
+        ...rows.slice(1, 3),
+        { ...rows[3]!, raw: "lambda" },
+        ...rows.slice(4),
+        makePart("q9", "omega"),
+      ];
+      const before = state(db, store);
+      const stored = readFirst ? preRead(store, "s1") : undefined;
+
+      failing = true;
+      expect(() =>
+        store.replaceSessionParts("s1", next, card, {
+          rangeHashes: [rangeHash(500)],
+          replaceRangeHashes: true,
+          ...(stored && { stored }),
+        }),
+      ).toThrow("injected failure");
+      failing = false;
+      expect(failed).toBe(1);
+      expect(state(db, store)).toEqual(before);
+      checkIndex(db);
+      expect(store.replaceSessionParts("s1", next, card, stored && { stored })).toEqual({
+        changed: true,
+      });
+      checkIndex(db);
+      db.close();
+    }
+  });
+});
+
 describe("append suppression", () => {
   /** A session whose stored checkpoint row (`m-p2`) already points at `next`. */
   async function seeded(next: string | null) {
@@ -2447,7 +2860,7 @@ describe("tail writes", () => {
 
   /** s1 as a full write over its running tail stores it, with one range hash. */
   async function seeded() {
-    const ctx = await fresh();
+    const ctx = await recordedStore();
     current = ctx.store;
     const card = makeCard("s1", {
       distillState: "full",
@@ -2489,6 +2902,40 @@ describe("tail writes", () => {
     expect(found(store, "alpha")).toEqual(["s1"]);
     expect(found(store, "gammanew")).toEqual(["s1"]);
     expect(found(store, "gammaold")).toEqual([]);
+    db.close();
+  });
+
+  it.each<{ name: string; next: PartTextRow[]; rows: string[]; fts: string[] }>([
+    {
+      name: "a row added",
+      next: [tailRow("p3", "gammaold"), tailRow("p4", "delta")],
+      rows: ["p4"],
+      fts: ["p4"],
+    },
+    {
+      name: "a row's text changed",
+      next: [tailRow("p3", "gammanew")],
+      rows: ["p3"],
+      fts: ["p3"],
+    },
+    {
+      name: "a row's pointer changed",
+      next: [{ ...tailRow("p3", "gammaold"), nextMessageId: "m-4" }],
+      rows: ["p3"],
+      fts: [],
+    },
+  ])("writes only the tail rows that differ, with $name", async ({ next, rows, fts }) => {
+    const { db, store, card, recorded } = await seeded();
+    const before = rowsByPart(db, "s1");
+    recorded.record(true);
+    expect(
+      store.replaceSessionTail("s1", tail({ rows: next }), { ...card, partCount: 2 + next.length }),
+    ).toEqual({ changed: true });
+    recorded.record(false);
+    const after = rowsByPart(db, "s1");
+    expect(touchedParts(recorded.mutations, "part_text", before, after)).toEqual(rows);
+    expect(touchedParts(recorded.mutations, "part_fts", before, after)).toEqual(fts);
+    expect(changedParts(before, after)).toEqual(rows);
     db.close();
   });
 

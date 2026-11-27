@@ -336,8 +336,20 @@ export type CardWrite = { changed: boolean };
  *  written: `older-generation` when the card's {@link Card.projectorGen} is
  *  below the stored one, so an older projection never overwrites a newer
  *  one; `base-changed` when a tail write finds the stored settled base is no
- *  longer the one it merged with. */
+ *  longer the one it merged with, or a replace finds the stored rows may no
+ *  longer be the ones its caller read ({@link StoredRows}). */
 export type SessionWrite = { changed: boolean; refused?: "older-generation" | "base-changed" };
+
+/** A session's slim-index rows as a caller read them before a
+ *  {@link Store.replaceSessionParts}, for the write to compare against
+ *  instead of reading them inside its transaction. */
+export type StoredRows = {
+  /** The card's {@link Card.writeRev}, read before the rows; null for a card
+   *  no stamped write has touched. */
+  writeRev: number | null;
+  /** Every stored row of the session, oldest first ({@link Store.sessionRows}). */
+  rows: PartTextRow[];
+};
 
 /** The tail a {@link Store.replaceSessionTail} writes over a settled base. */
 export type SessionTail = {
@@ -708,19 +720,32 @@ export type Store = {
    * allocated and the stored vector is kept. The comparison covers every
    * column a card write stores except the vector pair, the checkpoint, the
    * generation and the settled base, and every field of every row in order.
-   * Otherwise the rows and card are rewritten with a
-   * revision. Any accepted replace, suppressed or not, clears the card's
+   * Otherwise the card is rewritten with a revision, and the rows are made
+   * to equal `rows` by writing only the rows that differ: a stored row of
+   * the same part, in order, is kept and overwritten only when a field
+   * differs, every other stored row is deleted, and the rest of `rows` is
+   * inserted, the FTS index kept in step for exactly those rows. Rows that
+   * did not change keep their rowids and index entries; a row added before
+   * a stored row that stays, or a part that moves, rewrites every row after
+   * it. Any accepted replace, suppressed or not, clears the card's
    * {@link Card.repairReason}. `opts.rangeHashes` are stored in the same
    * transaction (see {@link putRangeHashes}), suppressed or not; with
    * `opts.replaceRangeHashes` they replace every hash stored for the session
-   * instead. A refused or failed replace leaves the stored hashes as they
-   * were.
+   * instead. A refused or failed replace leaves the stored rows, index
+   * entries, card and hashes as they were.
+   *
+   * With `opts.stored`, the rows the caller read before the call, the
+   * transaction compares against those and reads only the session's rowids
+   * (and, for the rows it deletes or overwrites the text of, their indexed
+   * text). It is refused with `base-changed`, writing nothing, unless the
+   * card is still stored at the revision `opts.stored.writeRev` and the
+   * session still holds that many rows: a stamped write changed them since.
    */
   replaceSessionParts(
     sessionId: string,
     rows: PartTextRow[],
     card: Card,
-    opts?: { rangeHashes?: RangeHash[]; replaceRangeHashes?: boolean },
+    opts?: { rangeHashes?: RangeHash[]; replaceRangeHashes?: boolean; stored?: StoredRows },
   ): SessionWrite;
   /**
    * Append new slim-index rows to a session's existing rows, enforce the
@@ -760,11 +785,12 @@ export type Store = {
    * Replace the tail of a card distilled against a running tail, keeping its
    * settled base, in one transaction. The session's oldest `tail.base.rows`
    * slim-index rows are the base's: the oldest `tail.evict` of them are
-   * evicted (the row cap), the rest are kept, and every row after them (the
-   * previous tail's) is replaced by `tail.rows` unless they already equal
-   * it. The rows of the base's newest message ({@link SettledBase.messageId})
-   * are repointed at `tail.firstMessageId`, as an append of the same
-   * messages would store them. `card` is the card the caller built from the
+   * evicted (the row cap), the rest are kept, and the rows after them (the
+   * previous tail's) are made to equal `tail.rows`, writing only the rows
+   * that differ as {@link replaceSessionParts} does. The rows of the base's
+   * newest message ({@link SettledBase.messageId}) are repointed at
+   * `tail.firstMessageId`, as an append of the same messages would store
+   * them. `card` is the card the caller built from the
    * rows it read ({@link sessionRows}) with those changes, so the
    * transaction reads only the rows it replaces.
    *
@@ -1174,19 +1200,91 @@ function sameCard(stored: Row, card: Card): boolean {
  *  and in order. */
 function sameRows(stored: Row[], rows: PartTextRow[]): boolean {
   if (stored.length !== rows.length) return false;
-  return rows.every((row, i) => {
+  return rows.every((row, i) => sameRow(stored[i]!, row));
+}
+
+/** Whether a stored slim-index row (read with {@link PART_ROW_COLUMNS})
+ *  holds every field of `row`. */
+function sameRow(old: Row, row: PartTextRow): boolean {
+  return (
+    sameSqlValue(old.part_id, row.partId) &&
+    sameSqlValue(old.message_id, row.messageId) &&
+    sameSqlValue(old.prev_message_id, row.prevMessageId ?? null) &&
+    sameSqlValue(old.next_message_id, row.nextMessageId ?? null) &&
+    sameSqlValue(old.class, row.class) &&
+    sameSqlValue(old.time_created, row.timeCreated) &&
+    sameIndexedText(old, row)
+  );
+}
+
+/** Whether a stored slim-index row holds the text of `row` that the FTS
+ *  index holds. */
+function sameIndexedText(old: Row, row: PartTextRow): boolean {
+  return sameSqlValue(old.raw, row.raw) && sameSqlValue(old.norm, row.norm);
+}
+
+/** A slim-index row a caller read ({@link Store.sessionRows}) as a stored
+ *  row with rowid `id`. */
+function storedRow(id: SqlValue | undefined, row: PartTextRow): Row {
+  return {
+    id: id ?? null,
+    part_id: row.partId,
+    message_id: row.messageId,
+    prev_message_id: row.prevMessageId ?? null,
+    next_message_id: row.nextMessageId ?? null,
+    class: row.class,
+    time_created: row.timeCreated,
+    raw: row.raw,
+    norm: row.norm,
+  };
+}
+
+/** The writes {@link planRowDiff} plans. */
+type RowDiff = {
+  /** Rowids of the stored rows to delete. */
+  removed: number[];
+  /** Stored rows to overwrite in place with the new row of the same part,
+   *  and whether its indexed text differs. */
+  updated: Array<{ id: number; row: PartTextRow; text: boolean }>;
+  /** New rows to insert after every stored row left, oldest first. */
+  added: PartTextRow[];
+};
+
+/**
+ * The writes that make a session's stored rows (`stored`, with their rowids,
+ * in rowid order) hold exactly `rows` in order. Rows are read back in rowid
+ * order and an inserted row's rowid is above every stored one, so a stored
+ * row keeps its place only while the rows of `rows` match stored rows of the
+ * same part in rowid order. Each of those is overwritten when a field
+ * differs and left alone otherwise. From the first row of `rows` with no
+ * such match, every row is inserted, and every stored row left unmatched is
+ * deleted. Evicting the oldest rows, changing rows in place, removing rows
+ * and appending rows touch only those rows; a row added before a stored row
+ * that stays, or a part that moves, rewrites every row after it.
+ */
+function planRowDiff(stored: Row[], rows: PartTextRow[]): RowDiff {
+  const at = new Map<string, number>();
+  stored.forEach((row, i) => at.set(asString(row.part_id), i));
+  const kept = new Set<number>();
+  const updated: RowDiff["updated"] = [];
+  let last = -1;
+  let next = 0;
+  for (; next < rows.length; next++) {
+    const row = rows[next]!;
+    const i = at.get(row.partId);
+    if (i === undefined || i <= last) break;
+    last = i;
+    kept.add(i);
     const old = stored[i]!;
-    return (
-      sameSqlValue(old.part_id, row.partId) &&
-      sameSqlValue(old.message_id, row.messageId) &&
-      sameSqlValue(old.prev_message_id, row.prevMessageId ?? null) &&
-      sameSqlValue(old.next_message_id, row.nextMessageId ?? null) &&
-      sameSqlValue(old.class, row.class) &&
-      sameSqlValue(old.time_created, row.timeCreated) &&
-      sameSqlValue(old.raw, row.raw) &&
-      sameSqlValue(old.norm, row.norm)
-    );
-  });
+    if (!sameRow(old, row)) {
+      updated.push({ id: asNumber(old.id), row, text: !sameIndexedText(old, row) });
+    }
+  }
+  return {
+    removed: stored.filter((_, i) => !kept.has(i)).map((row) => asNumber(row.id)),
+    updated,
+    added: rows.slice(next),
+  };
 }
 
 /** Whether applying `next` would change any of a card's stored metadata. */
@@ -2091,25 +2189,26 @@ class SqliteStore implements Store {
     sessionId: string,
     rows: PartTextRow[],
     card: Card,
-    opts?: { rangeHashes?: RangeHash[]; replaceRangeHashes?: boolean },
+    opts?: { rangeHashes?: RangeHash[]; replaceRangeHashes?: boolean; stored?: StoredRows },
   ): SessionWrite {
     return this.db.tx((): SessionWrite => {
       const stored = this.db.get(CARD_COMPARE_SQL, [sessionId]);
       if (belowStoredGen(card.projectorGen, stored?.projector_gen)) {
         return { changed: false, refused: "older-generation" };
       }
+      const storedRows = opts?.stored
+        ? this.preparedRows(sessionId, stored, opts.stored)
+        : this.db.all(
+            `SELECT id, ${PART_ROW_COLUMNS} FROM part_text WHERE session_id=? ORDER BY id`,
+            [sessionId],
+          );
+      if (!storedRows) return { changed: false, refused: "base-changed" };
       if (opts?.replaceRangeHashes) {
         this.db.run("DELETE FROM range_hash WHERE session_id=?", [sessionId]);
       }
-      const storedRows = this.db.all(
-        `SELECT id, ${PART_ROW_COLUMNS} FROM part_text WHERE session_id=? ORDER BY id`,
-        [sessionId],
-      );
       const changed = !stored || !sameCard(stored, card) || !sameRows(storedRows, rows);
       if (changed) {
-        this.evictFts(storedRows);
-        this.db.run("DELETE FROM part_text WHERE session_id=?", [sessionId]);
-        for (const row of rows) this.insertRow(sessionId, row);
+        this.writeRowDiff(sessionId, storedRows, rows);
         this.writeStampedCard(card);
       } else {
         this.writeCheckpoint(sessionId, card);
@@ -2244,9 +2343,8 @@ class SqliteStore implements Store {
               !sameSqlValue(row.next_message_id, tail.firstMessageId),
           );
       const tailChanged = !sameRows(oldTail, tail.rows);
-      const dropped = tailChanged ? [...evicted, ...oldTail] : evicted;
-      this.evictFts(dropped);
-      for (const row of dropped) {
+      this.evictFts(evicted);
+      for (const row of evicted) {
         this.db.run("DELETE FROM part_text WHERE id=?", [asNumber(row.id)]);
       }
       if (repoint) {
@@ -2256,7 +2354,7 @@ class SqliteStore implements Store {
           base.messageId,
         ]);
       }
-      if (tailChanged) for (const row of tail.rows) this.insertRow(sessionId, row);
+      if (tailChanged) this.writeRowDiff(sessionId, oldTail, tail.rows);
       const changed = evict > 0 || repoint || tailChanged || !sameCard(stored, card);
       if (changed) this.writeStampedCard(card);
       else this.writeCheckpoint(sessionId, card);
@@ -2266,6 +2364,69 @@ class SqliteStore implements Store {
       this.writeRangeHashes(sessionId, opts?.rangeHashes);
       return { changed };
     });
+  }
+
+  /** The rows a caller read before this transaction (`prepared`), each with
+   *  the rowid at its place now, or undefined when they may no longer be
+   *  the stored ones: the card (`card`, read in this transaction) is gone,
+   *  a stamped write moved its revision, or the session holds another
+   *  number of rows. Reads only the session's rowids, from its index.
+   *  Caller supplies the transaction. */
+  private preparedRows(
+    sessionId: string,
+    card: Row | undefined,
+    prepared: StoredRows,
+  ): Row[] | undefined {
+    if (!card || asNullableNumber(card.write_rev) !== prepared.writeRev) return undefined;
+    const ids = this.db.all("SELECT id FROM part_text WHERE session_id=? ORDER BY id", [sessionId]);
+    if (ids.length !== prepared.rows.length) return undefined;
+    return prepared.rows.map((row, i) => storedRow(ids[i]!.id, row));
+  }
+
+  /**
+   * Make a session's stored rows (`stored`, with their rowids, in rowid
+   * order) hold exactly `rows`, writing only the rows {@link planRowDiff}
+   * plans to delete, overwrite or insert, and keep the FTS index in step for
+   * exactly those rows. The index entries of the rows it deletes, or whose
+   * text it overwrites, are removed with the values those rows hold in this
+   * transaction, read by rowid (the FTS `'delete'` command requires them).
+   * Deletes run before inserts because part ids are unique: a part that
+   * moves is deleted from its old place before it is inserted at its new
+   * one. Caller supplies the transaction.
+   */
+  private writeRowDiff(sessionId: string, stored: Row[], rows: PartTextRow[]): void {
+    const diff = planRowDiff(stored, rows);
+    const dropped = [...diff.removed, ...diff.updated.filter((u) => u.text).map((u) => u.id)];
+    const entries: Row[] = [];
+    for (const id of dropped) {
+      const row = this.db.get("SELECT id, raw, norm FROM part_text WHERE id=?", [id]);
+      if (row) entries.push(row);
+    }
+    this.evictFts(entries);
+    for (const id of diff.removed) this.db.run("DELETE FROM part_text WHERE id=?", [id]);
+    for (const { id, row, text } of diff.updated) {
+      this.db.run(
+        "UPDATE part_text SET message_id=?, prev_message_id=?, next_message_id=?, class=?, time_created=?, raw=?, norm=? WHERE id=?",
+        [
+          row.messageId,
+          row.prevMessageId,
+          row.nextMessageId,
+          row.class,
+          row.timeCreated,
+          row.raw,
+          row.norm,
+          id,
+        ],
+      );
+      if (text) {
+        this.db.run("INSERT INTO part_fts(rowid, raw, norm) VALUES(?, ?, ?)", [
+          id,
+          row.raw,
+          row.norm,
+        ]);
+      }
+    }
+    for (const row of diff.added) this.insertRow(sessionId, row);
   }
 
   /** Insert one slim-index row into `part_text` and mirror it into the
