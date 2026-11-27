@@ -138,6 +138,30 @@ most of them on a store of 12,000 cards.
   Cold-pass workers, repair-sweep workers and concurrent re-distills pause
   after each session write before the next one runs, so one slice of the
   event loop holds at most one session's write transaction.
+- **Smart and fuzzy searches rank drilled messages without building a search
+  index.** Each search used to build an in-memory index over every message
+  part the drill read and a second one over the card shortlist's sessions.
+  The ranking now counts what its scores depend on in one pass over the parts
+  and scores only the parts holding a query word, with the same results as
+  before. When every drilled session is on the shortlist, the second pass
+  reuses the first one's results. Each message read is tokenized once. Measured on synthetic
+  drilled pools, ranking about 1,400 parts (3.1 million characters) took 8 to
+  57 ms against 270 to 530 ms before. About 13,000 parts took 64 to 290 ms
+  against 3.0 to 5.5 s.
+- **A lookup by plain words reads a bounded part of the slim index.** A search
+  without a code token or a quoted phrase also looks its words up in the slim
+  index of message text. That lookup used to score every row holding any of
+  the words. It now matches the rows of the query's rarer words, taken from
+  the rarest while their rows add up to at most 20,000. A word left out still
+  ranks the rows it shares with them while it is in fewer than 100,000 rows.
+  When every word is in 20,000 rows or more, the lookup needs all the words
+  in one row and runs only when fewer than 20,000 rows hold them all. A
+  single common word is not looked up. Code tokens and phrases are looked up
+  as before.
+  - On a synthetic index of 2 million rows, the eight words of "actualyze
+    desktop app launcher sign in governed inference" matched 1.3 million rows
+    and took 2.1 s. The lookup now takes 38 ms, a ten-word question 45 ms and
+    two common words that share one row 5 ms.
 
 ## 3.0.1
 

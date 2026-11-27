@@ -229,6 +229,10 @@ deliberately in the same change-set and say why. Before tuning ranking constants
 (`bm25.ts` for the drilled rerank, `cards.ts` for the card tier), run the eval to
 see the current numbers.
 
+`bm25.ts` must keep giving the scores a MiniSearch index over the pool would.
+The parity test holds it to `test/fixtures/reference-bm25.ts`, which is the
+reference, so change a ranking constant or rule in both.
+
 ## The derived store rebuilds itself; don't hand-migrate it
 
 The card + slim-FTS store lives at `~/.cache/opencode-session-recall/store-v1.db`

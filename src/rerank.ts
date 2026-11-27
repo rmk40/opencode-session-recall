@@ -14,10 +14,10 @@ import type { ParsedQuery } from "./query.js";
  * This runs entirely within the tier-2 drilled candidate pool, never over the
  * whole corpus: a BROAD pass scores every drilled candidate,
  * and a DEEP pass re-scores only the card-supported neighborhood (the sessions
- * tier-1's cards.rank shortlisted) with a fresh, shortlist-local IDF. MiniSearch
- * computes IDF at index-build time, so the deep pass needs its own index over
- * just the neighborhood to let a term that is rare in the right neighborhood but
- * common across the drilled set rank where the card shortlist says it should.
+ * tier-1's cards.rank shortlisted) with a fresh, shortlist-local IDF. IDF comes
+ * from the pool being scored, so the deep pass scores just the neighborhood to
+ * let a term that is rare in the right neighborhood but common across the
+ * drilled set rank where the card shortlist says it should.
  *
  * The degenerate case where the deep pool equals the broad pool (every drilled
  * session is card-supported) is fine and deterministic: the merge below lifts

@@ -366,23 +366,23 @@ function scorePool(
     let primaryReaching: string[] | undefined;
     for (let field = 0; field < fieldCount; field++) {
       const text = candidate[FIELDS[field]!] ?? "";
-      let terms: FieldTerms;
+      let fieldInfo: FieldTerms;
       if (field !== PRIMARY_FIELD) {
         let known = labels.get(text);
         if (!known) {
           known = fieldTerms(text, expand);
           labels.set(text, known);
         }
-        terms = known;
+        fieldInfo = known;
       } else if (candidate.primaryText !== undefined && candidate.primaryTerms !== undefined) {
-        terms = knownFieldTerms(text, candidate.primaryTerms, expand);
-        primaryReaching = terms.reaching.map(({ token }) => token);
+        fieldInfo = knownFieldTerms(text, candidate.primaryTerms, expand);
+        primaryReaching = fieldInfo.reaching.map(({ token }) => token);
       } else {
-        terms = fieldTerms(text, expand);
+        fieldInfo = fieldTerms(text, expand);
       }
-      lengths[field] = terms.length;
-      avgLengths[field] = (avgLengths[field]! * doc + terms.length) / (doc + 1);
-      for (const { token, expansions, count } of terms.reaching) {
+      lengths[field] = fieldInfo.length;
+      avgLengths[field] = (avgLengths[field]! * doc + fieldInfo.length) / (doc + 1);
+      for (const { token, expansions, count } of fieldInfo.reaching) {
         held ??= new Map();
         let entry = held.get(token);
         if (!entry) {
