@@ -47,7 +47,7 @@
  * slice of the append is likewise its one appendSessionParts transaction,
  * which derives the merged card over every retained row.
  */
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -89,6 +89,52 @@ import {
   makeV2PartsDb,
   type V2TestDb,
 } from "./v2-db.js";
+
+/**
+ * The first-search gate opens opencode.db inside the runtime, through
+ * `openOpencodeDb`, which is wrapped here while `spied` is set so that the
+ * history readers and the sync read through the LIMIT spy. A violation would
+ * surface only as an error inside the runtime, so the spy's throws are
+ * recorded and checked after the gate. The other gates wrap the handles they
+ * open themselves.
+ */
+const history = vi.hoisted(() => ({ spied: false, reads: 0, violations: [] as string[] }));
+
+vi.mock("../src/history/v2.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../src/history/v2.js")>();
+  const { limitSpy } = await import("./v2-db.js");
+  return {
+    ...actual,
+    openOpencodeDb: async (path: string) => {
+      const opened = await actual.openOpencodeDb(path);
+      if (!opened.ok || !history.spied) return opened;
+      const spy = limitSpy(opened.db);
+      const checked = <T>(sql: string, run: () => T): T => {
+        if (/\bsession_(message|part)\b/.test(sql)) history.reads++;
+        try {
+          return run();
+        } catch (error) {
+          history.violations.push(error instanceof Error ? error.message : String(error));
+          throw error;
+        } finally {
+          // Only violations matter here, so the spy's statement log is
+          // emptied rather than kept for every statement of a cold pass.
+          spy.statements.length = 0;
+        }
+      };
+      return {
+        ...opened,
+        db: {
+          get: (sql: string, params?: unknown[]) =>
+            checked(sql, () => spy.get(sql, params as Parameters<typeof spy.get>[1])),
+          all: (sql: string, params?: unknown[]) =>
+            checked(sql, () => spy.all(sql, params as Parameters<typeof spy.all>[1])),
+          close: () => spy.close(),
+        },
+      };
+    },
+  };
+});
 
 const ENABLED = process.env.RECALL_PERF === "1";
 const BUDGET_MS = 50;
@@ -1297,6 +1343,7 @@ describe.skipIf(!ENABLED)("perf: v2 event-loop stalls", () => {
     const storeDir = mkdtempSync(join(tmpdir(), "recall-perf-v2-first-"));
     const storePath = join(storeDir, "store.db");
     const running: V2Runtime[] = [];
+    Object.assign(history, { spied: true, reads: 0, violations: [] });
     try {
       const at = Date.now();
       const corpus = perfCorpus({ now: at });
@@ -1433,6 +1480,9 @@ describe.skipIf(!ENABLED)("perf: v2 event-loop stalls", () => {
 
       console.log(`v2 first search perf (load ${load}):`, JSON.stringify(rounded(results)));
 
+      // Every history statement the runtimes ran passed the LIMIT spy.
+      expect(history.reads).toBeGreaterThan(0);
+      expect(history.violations).toEqual([]);
       expect(results.aloneOk).toBe(1);
       expect(results.duringOk).toBe(1);
       // The pass slowed down during the search but kept going, then finished.
@@ -1443,6 +1493,7 @@ describe.skipIf(!ENABLED)("perf: v2 event-loop stalls", () => {
       expect(results.duringMaxSliceMs).toBeLessThan(BUDGET_MS);
     } finally {
       await Promise.all(running.map((runtime) => runtime.dispose()));
+      history.spied = false;
       v2.cleanup();
       rmSync(storeDir, { recursive: true, force: true });
     }
