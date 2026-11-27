@@ -381,6 +381,46 @@ describe("cardRecall slim-index backfill", () => {
     expect(all).toEqual(["s-fts-a", "s-fts-b"]);
     expect(excluded).toEqual(["s-fts-b"]);
   });
+
+  it("keeps the sessions that overlap the since/until window, as card ranking does", async () => {
+    // Only the slim index holds the phrase (reasoning parts), so every hit
+    // below comes from the backfill. The window is SINCE to UNTIL.
+    const h = makeFakeHarness();
+    const SINCE = Date.now() - 10 * 86_400_000;
+    const UNTIL = SINCE + 86_400_000;
+    const spans: Array<[string, number, number]> = [
+      ["s-ran-past", SINCE + 1_000, UNTIL + 50_000],
+      ["s-updated-at-since", SINCE - 50_000, SINCE],
+      ["s-created-at-until", UNTIL, UNTIL + 50_000],
+      ["s-before", SINCE - 50_000, SINCE - 1],
+      ["s-after", UNTIL + 1, UNTIL + 50_000],
+    ];
+    for (const [id, created, updated] of spans) {
+      const sess = session(id, `Queue ${id}`, PROJECT_DIR, updated);
+      sess.time.created = created;
+      h.sessions.push(sess);
+      h.globalSessions.push(globalSessionFrom(sess));
+      h.messagesBySession[id] = [
+        bundle(assistantMessage(`m-${id}`, id, created), [
+          reasoningPart(`p-${id}`, id, `m-${id}`, "The zorvanqix eviction stalls under load."),
+        ]),
+      ];
+    }
+    const { deps, cleanup } = await hookDeps(h);
+    const ids = async (filters: CardFilters): Promise<string[]> =>
+      (await cardRecall(deps, '"zorvanqix eviction"', { limit: 10, filters }))
+        .map((hit) => hit.card.sessionId)
+        .sort();
+
+    const both = await ids({ since: SINCE, until: UNTIL });
+    const sinceOnly = await ids({ since: SINCE });
+    const untilOnly = await ids({ until: UNTIL });
+    cleanup();
+    const overlapping = ["s-created-at-until", "s-ran-past", "s-updated-at-since"];
+    expect(both).toEqual(overlapping);
+    expect(sinceOnly).toEqual([...overlapping, "s-after"].sort());
+    expect(untilOnly).toEqual([...overlapping, "s-before"].sort());
+  });
 });
 
 // ── part-id ───────────────────────────────────────────────────────────

@@ -128,6 +128,9 @@ describe("cards tier-1 rank", () => {
     store.upsertCard(
       makeCard("s-new", {
         inventory: "widget parser",
+        // Created after the `until` bound below, so no part of it overlaps
+        // the window that bound closes.
+        timeCreated: 8000,
         timeUpdated: 9000,
         directory: "/b",
         projectId: "pb",
@@ -143,6 +146,40 @@ describe("cards tier-1 rank", () => {
     expect(ids(runtime.rank(q, { directoryFilter: "/a" }))).toEqual(["s-old"]);
     expect(ids(runtime.rank(q, { scope: "exact", directory: "/b" }))).toEqual(["s-new"]);
     expect(ids(runtime.rank(q, { scope: "project", projectId: "pa" }))).toEqual(["s-old"]);
+    db.close();
+  });
+
+  it("keeps the sessions that overlap the since/until window in rank and list", async () => {
+    const { db, store } = await freshStore();
+    const span = (sessionId: string, timeCreated: number, timeUpdated: number) =>
+      store.upsertCard(
+        makeCard(sessionId, { inventory: "widget parser", timeCreated, timeUpdated }),
+      );
+    // The window is 3000 to 5000.
+    span("s-ran-past", 4000, 9000);
+    span("s-spans", 1000, 9000);
+    span("s-inside", 3500, 4500);
+    span("s-updated-at-since", 1000, 3000);
+    span("s-created-at-until", 5000, 6000);
+    span("s-before", 1000, 2999);
+    span("s-after", 5001, 9000);
+    const runtime = createCardsRuntime({ source: storeSource(store) });
+    const q = parseQuery("widget parser");
+    const sorted = (hits: { sessionId: string }[]) => ids(hits).sort();
+    const overlapping = [
+      "s-created-at-until",
+      "s-inside",
+      "s-ran-past",
+      "s-spans",
+      "s-updated-at-since",
+    ];
+
+    const window = { since: 3000, until: 5000 };
+    expect(sorted(runtime.rank(q, window))).toEqual(overlapping);
+    expect(sorted(runtime.list(window))).toEqual(overlapping);
+    // One bound alone drops only the sessions entirely on its far side.
+    expect(sorted(runtime.list({ since: 3000 }))).toEqual([...overlapping, "s-after"].sort());
+    expect(sorted(runtime.list({ until: 5000 }))).toEqual([...overlapping, "s-before"].sort());
     db.close();
   });
 

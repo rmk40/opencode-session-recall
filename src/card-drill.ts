@@ -5,6 +5,7 @@ import {
   type CandidateFilters,
 } from "./candidates.js";
 import type { CardsRuntime } from "./cards.js";
+import type { Card } from "./store.js";
 import { bm25Search } from "./bm25.js";
 import { authorshipOf, type Authorship, type AuthorshipCounts } from "./authorship.js";
 import { tokenize } from "./normalize.js";
@@ -20,6 +21,7 @@ import {
   type DrillTarget,
   type DrillTargetStats,
   type DrilledPool,
+  type TimeWindow,
 } from "./drill.js";
 
 /**
@@ -42,9 +44,12 @@ import {
  *   the card does not record one for either.
  * - The session title is always its own candidate (source `title`, as the
  *   normal pipeline emits title hits), so a metadata-only card can still match
- *   by title. It is dated by the card's last update and is subject to the
- *   same time, type and authorship filters; it claims no message role, so any
- *   role filter excludes it.
+ *   by title. It is dated by the card's last update, or, when the session ran
+ *   past the query's time window, by the window's last instant the session
+ *   was alive in (a session is selected when it overlaps the window, and the
+ *   history drill dates its title by its newest message in the window). It is
+ *   subject to the same time, type and authorship filters; it claims no
+ *   message role, so any role filter excludes it.
  *
  * A card-derived result points at the card's last distilled message where it
  * has one; `recall_get` and `recall_context` cannot open it while the source
@@ -109,12 +114,27 @@ function summaryAllowed(narrow: CardDrillFilters): boolean {
   );
 }
 
+/** When the standalone title is dated: the card's last update, or the last
+ *  millisecond before the window's upper bound when the session was updated
+ *  after it and created before it. */
+function titleTime(target: DrillTarget, card: Card | undefined, window?: TimeWindow): number {
+  const updated = card?.timeUpdated ?? target.timeUpdated;
+  const before = window?.before;
+  if (before === undefined || updated < before) return updated;
+  // Without a card the session's start is unknown, so its title is not
+  // dated into a window it may never have been alive in: it keeps the
+  // target's update time, which the window's filter then leaves out.
+  const created = card?.timeCreated ?? updated;
+  return created < before ? before - 1 : updated;
+}
+
 /** The session title as a standalone candidate: no message behind it, so it
  *  is offered only without a role filter, and it is dated by the card. */
 function standaloneTitle(
   target: DrillTarget,
   cards: CardsRuntime,
   narrow: CardDrillFilters,
+  window: TimeWindow | undefined,
 ): Candidate | undefined {
   if (narrow.filters.role !== "all") return undefined;
   const card = cards.get(target.sessionId);
@@ -123,7 +143,7 @@ function standaloneTitle(
     {
       id: card?.distilledThrough ?? `${target.sessionId}:card`,
       role: "user",
-      time: { created: card?.timeUpdated ?? target.timeUpdated },
+      time: { created: titleTime(target, card, window) },
     },
   );
   if (!title) return undefined;
@@ -140,7 +160,7 @@ function poolOf(
   target: DrillTarget,
   cards: CardsRuntime,
   narrow: CardDrillFilters,
-  input: Pick<DrillInput, "filter" | "searchTitles" | "authorship">,
+  input: Pick<DrillInput, "filter" | "searchTitles" | "authorship" | "window">,
 ): DrilledPool {
   const summary = cardSummary(target, cards);
   const all = summary && summaryAllowed(narrow) ? [summary] : [];
@@ -152,7 +172,7 @@ function poolOf(
   });
   let pool = input.filter ? all.filter(input.filter) : all;
   if (input.searchTitles) {
-    const title = standaloneTitle(target, cards, narrow);
+    const title = standaloneTitle(target, cards, narrow, input.window);
     if (title && (!input.filter || input.filter(title))) pool = [...pool, title];
   }
   if (!input.authorship) return { target, candidates: pool, stats: stats(pool) };

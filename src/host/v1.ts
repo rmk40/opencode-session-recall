@@ -36,6 +36,7 @@ import { consoleSink, createLogger } from "../log.js";
 import { registry } from "./registry.js";
 import { TOOLS, errmsg, settleWithin, type ErrorOutput } from "../types.js";
 import { boundResult } from "../output.js";
+import { yieldOnBudget } from "../yield.js";
 
 /** Per-phase bound on dispose()'s awaited waits. The host awaits dispose as a
  *  shutdown finalizer with no timeout of its own, so a never-settling in-flight
@@ -264,9 +265,9 @@ export const server: Plugin = async (ctx, options) => {
     gen: EMBED_REPRESENTATION,
     discover,
     discoveryTruncated: () => discoveryTruncated,
-    // Yield between sessions and inside a card's derivation, so a large
-    // session never holds the host's event loop in one slice.
-    yieldBetween: () => new Promise((resolve) => setTimeout(resolve, 0)),
+    // Yield between sessions and inside a card's derivation, once a slice of
+    // work has run, so a large session never holds the host's event loop.
+    yieldBetween: yieldOnBudget,
     onColdPassDone: () => {
       if (!disposed && summarizer) {
         // Summarizer.stop() owns the bounded shutdown of this drain. Do not add

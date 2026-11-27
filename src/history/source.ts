@@ -35,8 +35,9 @@ export type Listing<T> =
  * response whose body has the wrong shape, and only `getSession` returns it
  * (v1 `getMessage` passes a truthy body through unchecked, exactly as the
  * tools read it before the seam); `unsupported` is a request this host cannot
- * answer (a part continuation on v1). `error` carries the host's string when
- * there was one, so callers can keep their own wording for the empty case.
+ * answer (a part continuation or a seek on v1). `error` carries the host's
+ * string when there was one, so callers can keep their own wording for the
+ * empty case.
  * `counts` is what a message read could not project faithfully (v2
  * `getMessage` only), present only when some count is non-zero.
  * `partOrdinals` maps the id of each returned part that came from a part row
@@ -290,6 +291,34 @@ export interface HistorySource {
     strict?: boolean;
   }): Promise<MessagePage>;
   /**
+   * Where a newest-first walk that leaves out the messages created after
+   * `until` (ms epoch) starts: a {@link messagePage} `before` cursor whose
+   * page starts at the highest-ordered message created at or before
+   * `until`, so no such message is above it even where creation times are
+   * out of row order. The value is undefined when the walk starts at the
+   * session's first page as any other does: no message is above that one,
+   * or finding it would take more reading than the source allows. It is
+   * null when the session has no message created at or before `until`. v1
+   * cannot seek and answers `unsupported`.
+   */
+  seekPage?(o: { sessionID: string; until: number }): Promise<Lookup<string | null | undefined>>;
+  /**
+   * Where a newest-first walk through the window `(after, before)` (ms
+   * epoch, both exclusive, `before` optional) may stop: the lowest
+   * {@link HistoryMessage} `info.seq` of a message created inside it. A walk
+   * that has read a message with that seq or a lower one has read every
+   * message inside the window below where it started, whatever order their
+   * creation times are in. Null when no message was created inside the
+   * window; undefined when finding it would take more reading than the
+   * source allows, so the walk cannot stop at the lower bound. Only a host
+   * whose messages carry `seq` has it; v1 answers `unsupported`.
+   */
+  seqFloor?(o: {
+    sessionID: string;
+    after: number;
+    before?: number;
+  }): Promise<Lookup<number | null | undefined>>;
+  /**
    * One message. `partOrdinal` continues a message a read cut short (its
    * `partial.nextOrdinal`): the result holds the part rows from that ordinal
    * on, then the message's inline content, with the same part ids a whole
@@ -370,9 +399,13 @@ export function createUnavailableSource(
     getSession: async () => ({ ok: false, reason: "error", error }),
     listChildren: async () => ({ ok: false, error }),
     messagePage: reject,
-    // A v2 source pages oldest first too, so its reads report the outage
-    // rather than a missing capability.
-    ...(kind === "v2-sqlite" && { messagePageAscending: reject }),
+    // A v2 source pages oldest first, seeks and finds floors too, so its
+    // reads report the outage rather than a missing capability.
+    ...(kind === "v2-sqlite" && {
+      messagePageAscending: reject,
+      seekPage: async () => ({ ok: false as const, reason: "error" as const, error }),
+      seqFloor: async () => ({ ok: false as const, reason: "error" as const, error }),
+    }),
     getMessage: async () => ({ ok: false, reason: "error", error }),
   };
 }

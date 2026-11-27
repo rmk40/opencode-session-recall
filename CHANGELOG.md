@@ -48,6 +48,32 @@ loaded.
   trimmed output stopped. It finds its place even when the next call changes
   `limit`, `role` or `query`. Cursors from 3.0 still work.
   `maxMessages` still caps `limit`.
+- **A time bound keeps the sessions that overlap its window.** `recall`
+  used to keep a session only when its last update fell inside the window,
+  so an upper bound (`until`, `to`, `before`) left out every session that
+  kept running past it, such as the subagents an orchestrator started in
+  that window. A session now qualifies when it was created at or before the
+  upper bound and last updated at or after the lower bound (`last`, `since`,
+  `from`, `after`). Results still come only from messages inside the
+  window. Card ranking, the slim index, the deep listing and named sessions
+  without a card all apply the rule. `recall_sessions` still filters by
+  last update.
+- **The drill reads toward the window.** On opencode v2 a search with an
+  upper bound starts reading each session at the last message created at or
+  before it. A search with a lower bound stops once it has read every
+  message created inside the window, even where a retried step left
+  creation times out of order. Messages outside the window no longer count
+  against `drillCharsPerSession` or `drillCharsPerQuery`. Reading past them
+  has bounds of its own, four times each of those budgets in chars, 2,000
+  messages a session and 8,000 messages a search. Messages looked up from
+  the slim index count toward them as well. The session where a search
+  reaches one reports `sessionBudget` or `queryBudget`, or `targetsCut` when
+  only its slim-index lookups were left. On opencode v1, which cannot start
+  mid-session, the drill reads past the newer messages from the newest one.
+  In `coverage.sessionStops`, `fetched` counts the messages read outside the
+  window too and `candidate` counts only those inside it. A deep sweep reads
+  the same way and returns a continuation once it has read past four times
+  its budget outside the window.
 
 ### Added
 
@@ -136,8 +162,8 @@ most of them on a store of 12,000 cards.
   a time, instead of reading the message again from the start.
 - **Concurrent distiller writes yield to the event loop between them.**
   Cold-pass workers, repair-sweep workers and concurrent re-distills pause
-  after each session write before the next one runs, so one slice of the
-  event loop holds at most one session's write transaction.
+  after each session write before the next one runs, so their writes share
+  the event loop with other work one time slice at a time.
 - **Smart and fuzzy searches rank drilled messages without building a search
   index.** Each search used to build an in-memory index over every message
   part the drill read and a second one over the card shortlist's sessions.
@@ -165,6 +191,20 @@ most of them on a store of 12,000 cards.
     Two words in 900,000 rows each that share one row take 20 ms. Queries of
     common words that share too many rows to list are skipped after 16 to
     44 ms.
+- **Reads and passes yield on a time budget.** The opencode v2 history
+  reader and sync, the card runtime, the distiller and session discovery
+  used to wait out a `setTimeout(0)` turn, about 1.25 ms, before nearly
+  every statement or page. They now hand the event loop back only once
+  about 8 ms of work has run, through `setImmediate`, which lets due timers
+  and ready I/O run in a few microseconds. Callers waiting at once take
+  turns, one slice each. A drill of 12 sessions of 70 messages each took 32
+  to 39 ms against 440 ms. In the gates the v2 cold pass took 12 s against
+  33 s and a repair sweep over 400 stale cards 2 s against 6 s.
+- **Time-bounded searches read less.** Over 12 subagents that each wrote
+  40 messages inside a window and 600 after it, a drill read 480 messages
+  in 26 ms instead of 7,680 in 358 ms. With a lower bound near the end of 12
+  sessions of 2,000 messages, it read 600 in 25 ms instead of 14,700 in
+  563 ms.
 
 ## 3.0.1
 

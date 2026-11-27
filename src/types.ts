@@ -139,8 +139,9 @@ export type DrillStop =
 /**
  * What a drill read for one target session. `fetched` counts the messages
  * read (from the history source or the drill cache; the card drill reads
- * none), `candidate` those that built at least one candidate before the
- * query's filters, and `eligible` those with a candidate left after the
+ * none), those outside the query's time window included; `candidate` those
+ * inside the window that built at least one candidate before the query's
+ * other filters, and `eligible` those with a candidate left after the
  * filters and the authorship stage (the session's title candidate is not a
  * message and counts in neither). `cached` is set when every page and point
  * lookup came from the drill cache, so nothing was fetched; `stop` is still
@@ -257,8 +258,8 @@ export type SearchCoverage = {
   /** Messages the drill read across the searched sessions (see
    *  {@link DrillSessionStats}). */
   messagesFetched: number;
-  /** Of those, messages that built at least one candidate before the
-   *  query's filters. */
+  /** Of those, messages inside the query's time window that built at least
+   *  one candidate before its other filters. */
   messagesCandidate: number;
   /** Of those, messages with a candidate left after the filters and the
    *  authorship stage: what the match path searched. */

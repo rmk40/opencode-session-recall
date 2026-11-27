@@ -1,5 +1,6 @@
 import { openSqliteReadOnly, type ReadOnlyDb, type Row, type SqlValue } from "../sqlite.js";
 import { unavailableText } from "../digest.js";
+import { yieldOnBudget } from "../yield.js";
 import type { HistoryMessage, HistorySession } from "./model.js";
 import {
   assertBoundedLimit,
@@ -82,8 +83,10 @@ import {
  *   `session_part` statements scoped by session id and the page's message
  *   ids. No `session_message` statement reads `session_part`. A database
  *   without the table (opencode before 2.4) reads inline content only.
- * - Polite: an `await` on a macrotask separates statements, so a page never
- *   holds the shared v2 service's event loop for more than one statement.
+ * - Polite: every statement, and every few rows decoded or projected, is a
+ *   yield point. A read yields to the event loop at the first one past a
+ *   time budget ({@link yieldOnBudget}), so it holds the shared v2 service's
+ *   loop for about one slice, plus at most one statement, at a time.
  * - Tolerant: a row with unparseable data becomes a placeholder message (a
  *   `MalformedSessionError` under `strict`), so a page with rows is never
  *   empty; non-content types never leave SQL. The next-page cursor comes from
@@ -434,7 +437,9 @@ export type V2SourceOptions = {
   /** Per-read cap on part rows. A first message with more parts is cut and
    *  continued through `getMessage`. Default 2,000. */
   pagePartRows?: number;
-  /** Awaited between statements. Default: one macrotask (`setTimeout(0)`). */
+  /** Awaited at every yield point (before each statement and every few rows
+   *  decoded or projected). Default: {@link yieldOnBudget}, which yields to
+   *  the event loop only once a slice of work has run. */
   yieldBetween?: () => Promise<void>;
   /** What the schema check found ({@link openOpencodeDb}'s `schema`).
    *  Default: probed once per handle. */
@@ -458,7 +463,7 @@ const PART_ID_CHUNK = 500;
  *  parameters of its statements stay far below SQLite's bound-parameter
  *  limit. */
 const PAGE_MESSAGES_MAX = 5_000;
-/** Part rows decoded between yields to the event loop. */
+/** Part rows decoded between yield points. */
 const PARTS_PER_YIELD = 200;
 /** The largest envelope metadata (the row's data without its inline content)
  *  a part continuation loads; a larger one is left out and the message takes
@@ -472,7 +477,7 @@ const ENVELOPE_ATTEMPTS = 3;
 const FIRST_ORDINAL = Number.MIN_SAFE_INTEGER;
 /** Sessions whose immutable fork fields are remembered per source. */
 const FORK_MEMO_LIMIT = 512;
-/** Rows decoded or projected between yields to the event loop. */
+/** Rows decoded or projected between yield points. */
 const ROWS_PER_YIELD = 25;
 /** Switch rows of one type read at once between a page's oldest and newest
  *  user; a longer run falls back to one seek per user. */
@@ -487,6 +492,22 @@ const NO_CURSOR_SEQ = Number.MAX_SAFE_INTEGER;
 /** Page plans retried when a whole planned range turns ineligible between the
  *  size read and the body read. */
 const PAGE_ATTEMPTS = 3;
+/**
+ * Rows a seek or a floor first reads down the `(session_id, time_created,
+ * id)` index. Creation times rise with seq only mostly (opencode moves an
+ * assistant's `time_created` to the start of a retried step), so these rows
+ * give only a bound on the answer, which range reads over seq then make
+ * exact.
+ */
+const SEEK_ROWS = 16;
+/** Seqs one range read covers: seq is unique within a session, so a range
+ *  read examines at most this many rows. */
+const SCAN_RANGE = 2_000;
+/** Rows one floor read returns down the creation-time index. */
+const SCAN_PAGE = 1_000;
+/** Rows one seek or floor examines in all before it gives up (the walk then
+ *  starts at the newest page, or cannot stop at the lower bound). */
+const SCAN_ROWS_MAX = 40_000;
 
 /** Which way a page walks a session's rows by `seq`. */
 type PageOrder = {
@@ -515,8 +536,6 @@ const OLDEST_FIRST: PageOrder = {
   encode: encodeV2AscendingCursor,
   decode: decodeV2AscendingCursor,
 };
-
-const macrotask = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0));
 
 function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
@@ -665,6 +684,29 @@ function asNumber(value: SqlValue | undefined): number | null {
   if (typeof value === "number") return value;
   if (typeof value === "bigint") return Number(value);
   return null;
+}
+
+/** The highest or lowest `seq` among `rows`; undefined when there is none. */
+function extremeSeq(rows: Row[], pick: (a: number, b: number) => number): number | undefined {
+  let out: number | undefined;
+  for (const row of rows) {
+    const seq = asNumber(row.seq);
+    if (seq !== null) out = out === undefined ? seq : pick(out, seq);
+  }
+  return out;
+}
+
+/** The error a seek or a floor answers for a bound that is not a number. */
+function timeError(
+  what: string,
+  value: unknown,
+): { ok: false; reason: "error"; error: string } | undefined {
+  if (typeof value === "number" && !Number.isNaN(value)) return undefined;
+  return {
+    ok: false,
+    reason: "error",
+    error: `${what} time must be a number, got ${String(value)}`,
+  };
 }
 
 function toSessionRecord(row: Row): SessionRecord {
@@ -816,7 +858,7 @@ export function createV2HistorySource(db: ReadOnlyDb, opts: V2SourceOptions = {}
     typeof opts.pagePartRows === "number" && Number.isFinite(opts.pagePartRows)
       ? Math.max(1, Math.floor(opts.pagePartRows))
       : DEFAULT_PAGE_PART_ROWS;
-  const pause = opts.yieldBetween ?? macrotask;
+  const pause = opts.yieldBetween ?? yieldOnBudget;
   const { schema, drift } = sharedState(db, opts);
   /** Whether part rows are read at all (`session_part` with every column). */
   const partsOn = schema.parts;
@@ -858,7 +900,8 @@ export function createV2HistorySource(db: ReadOnlyDb, opts: V2SourceOptions = {}
   /**
    * Part row sizes per message, from ordinal `from` on (rows below it are
    * only counted): one `session_part` statement per {@link PART_ID_CHUNK}
-   * messages, each after a yield. Messages without part rows are absent.
+   * messages, each after a yield point. Messages without part rows are
+   * absent.
    */
   async function partSizes(
     sessionID: string,
@@ -1012,7 +1055,7 @@ export function createV2HistorySource(db: ReadOnlyDb, opts: V2SourceOptions = {}
    * The ids, among `rows` (message rows with the `time_updated` and `bytes`
    * they were read with), whose stored row changed since: one
    * `session_message` statement per {@link PART_ID_CHUNK} ids, each after a
-   * yield. A row that is gone counts as changed.
+   * yield point. A row that is gone counts as changed.
    */
   async function changedRows(
     sessionID: string,
@@ -2026,6 +2069,146 @@ export function createV2HistorySource(db: ReadOnlyDb, opts: V2SourceOptions = {}
 
     messagePageAscending(o): Promise<MessagePage> {
       return readPage(o, o.after, OLDEST_FIRST);
+    },
+
+    /**
+     * The highest seq of a row created at or before `until` (fork copies left
+     * out, as pages leave them out), read without any row's data. The newest
+     * rows by creation time give a lower bound on it; then range reads walk
+     * seq down from the session's newest row to that bound, each over at most
+     * {@link SCAN_RANGE} seqs, and the first row at or before `until` they
+     * meet is the answer. Past {@link SCAN_ROWS_MAX} seqs the walk starts at
+     * the newest page instead.
+     */
+    async seekPage(o): Promise<Lookup<string | null | undefined>> {
+      const invalid = timeError("seek", o.until);
+      if (invalid) return invalid;
+      const fork = forkBinds(o.sessionID);
+      if (!fork) return sessionNotFound(o.sessionID);
+      await pause();
+      const near = read("seek", () =>
+        db.all(
+          `SELECT seq FROM session_message
+           WHERE session_id = ? AND time_created <= ? AND ${FORK_FILTER}
+           ORDER BY time_created DESC, id DESC LIMIT ?`,
+          [o.sessionID, o.until, ...fork, SEEK_ROWS],
+        ),
+      );
+      let start = extremeSeq(near, Math.max);
+      if (start === undefined) return { ok: true, value: null };
+      await pause();
+      const top =
+        asNumber(
+          read("seek top", () =>
+            db.get(
+              `SELECT seq FROM session_message WHERE session_id = ? ORDER BY seq DESC LIMIT ?`,
+              [o.sessionID, 1],
+            ),
+          )?.seq,
+        ) ?? start;
+      for (let hi = top; hi > start; ) {
+        if (top - hi >= SCAN_ROWS_MAX) return { ok: true, value: undefined };
+        const lo = Math.max(start, hi - SCAN_RANGE);
+        await pause();
+        const hit = read("seek range", () =>
+          db.get(
+            `SELECT seq FROM session_message
+             WHERE session_id = ? AND seq > ? AND seq <= ? AND time_created <= ? AND ${FORK_FILTER}
+             ORDER BY seq DESC LIMIT ?`,
+            [o.sessionID, lo, hi, o.until, ...fork, 1],
+          ),
+        );
+        const seq = asNumber(hit?.seq);
+        if (seq !== null) {
+          start = seq;
+          break;
+        }
+        hi = lo;
+      }
+      // The cursor reads rows below its seq, so it names the row past `start`.
+      if (start >= top || !Number.isSafeInteger(start + 1) || start + 1 < 0) {
+        return { ok: true, value: undefined };
+      }
+      return { ok: true, value: encodeV2Cursor(start + 1) };
+    },
+
+    /**
+     * The lowest seq of a row created inside the window (fork copies left
+     * out), read without any row's data. One read pages the window's rows up
+     * the creation-time index, {@link SCAN_PAGE} at a time, keeping the lowest
+     * seq: once they are all read, that seq is exact. In turn, range reads
+     * walk seq up from the session's oldest row to the lowest seq found so
+     * far, each over at most {@link SCAN_RANGE} seqs: the first row inside the
+     * window they meet is exact as well. Whichever finishes first answers, so
+     * the cost follows the smaller of the window and the history before it.
+     * Past {@link SCAN_ROWS_MAX} rows it answers undefined.
+     */
+    async seqFloor(o): Promise<Lookup<number | null | undefined>> {
+      const invalid =
+        timeError("floor", o.after) ??
+        (o.before === undefined ? undefined : timeError("floor", o.before));
+      if (invalid) return invalid;
+      const fork = forkBinds(o.sessionID);
+      if (!fork) return sessionNotFound(o.sessionID);
+      const upper = o.before === undefined ? "" : "AND time_created < ?";
+      const upperBind = o.before === undefined ? [] : [o.before];
+      let examined = 0;
+      let last: { time: number; id: string } | undefined;
+      let floor: number | undefined;
+      /** The next page of the window's rows by creation time; true once
+       *  every row of the window was read. */
+      const pageUp = async (): Promise<boolean> => {
+        await pause();
+        const after = last
+          ? { clause: "(time_created, id) > (?, ?)", binds: [last.time, last.id] }
+          : { clause: "time_created > ?", binds: [o.after] };
+        const rows = read("floor", () =>
+          db.all(
+            `SELECT seq, time_created, id FROM session_message
+             WHERE session_id = ? AND ${after.clause} ${upper} AND ${FORK_FILTER}
+             ORDER BY time_created ASC, id ASC LIMIT ?`,
+            [o.sessionID, ...after.binds, ...upperBind, ...fork, SCAN_PAGE],
+          ),
+        );
+        examined += rows.length;
+        const lowest = extremeSeq(rows, Math.min);
+        if (lowest !== undefined) floor = floor === undefined ? lowest : Math.min(floor, lowest);
+        const end = rows[rows.length - 1];
+        if (end) last = { time: asNumber(end.time_created) ?? 0, id: asString(end.id) ?? "" };
+        return rows.length < SCAN_PAGE;
+      };
+      if (await pageUp()) return { ok: true, value: floor ?? null };
+      await pause();
+      let lo =
+        asNumber(
+          read("floor bottom", () =>
+            db.get(
+              `SELECT seq FROM session_message WHERE session_id = ? ORDER BY seq ASC LIMIT ?`,
+              [o.sessionID, 1],
+            ),
+          )?.seq,
+        ) ?? floor!;
+      for (;;) {
+        if (lo >= floor!) return { ok: true, value: floor! };
+        const hi = Math.min(floor!, lo + SCAN_RANGE);
+        await pause();
+        const hit = read("floor range", () =>
+          db.get(
+            `SELECT seq FROM session_message
+             WHERE session_id = ? AND seq >= ? AND seq < ? AND time_created > ? ${upper} AND ${FORK_FILTER}
+             ORDER BY seq ASC LIMIT ?`,
+            [o.sessionID, lo, hi, o.after, ...upperBind, ...fork, 1],
+          ),
+        );
+        const seq = asNumber(hit?.seq);
+        if (seq !== null) return { ok: true, value: seq };
+        examined += hi - lo;
+        lo = hi;
+        if (lo >= floor!) return { ok: true, value: floor! };
+        if (examined >= SCAN_ROWS_MAX) return { ok: true, value: undefined };
+        if (await pageUp()) return { ok: true, value: floor! };
+        if (examined >= SCAN_ROWS_MAX) return { ok: true, value: undefined };
+      }
     },
 
     async getMessage(sessionID, messageID, o = {}): Promise<Lookup<HistoryMessage>> {

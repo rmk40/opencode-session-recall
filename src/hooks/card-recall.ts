@@ -89,8 +89,9 @@ export async function cardRecall(
       if (!card) continue;
       // Direct store read: reject a stray worker card the FTS index still lists.
       if (isSummarizerTitle(card.title)) continue;
+      // The session overlaps the window, as `rank` keeps it (`CardFilters`).
       if (filters.since != null && card.timeUpdated < filters.since) continue;
-      if (filters.until != null && card.timeUpdated > filters.until) continue;
+      if (filters.until != null && card.timeCreated > filters.until) continue;
       byId.set(row.sessionId, { card, score: 0, anchors: anchorsFor(card) });
     }
   }

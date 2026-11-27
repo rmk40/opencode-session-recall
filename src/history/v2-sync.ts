@@ -1,5 +1,6 @@
 import type { ReadOnlyDb, Row, SqlValue } from "../sqlite.js";
 import { cyrb53 } from "../hash.js";
+import { yieldOnBudget } from "../yield.js";
 import type {
   CheckpointInfo,
   DistillCheckpoint,
@@ -61,8 +62,9 @@ import { inspectV2Schema, type V2SchemaInfo } from "./v2.js";
  *   have part rows at all ({@link DistillSync.withParts}).
  *
  * Every `session_message` and `session_part` statement binds `LIMIT ?`,
- * reads happen one statement at a time with a macrotask between them, and
- * nothing here writes to `opencode.db`.
+ * reads happen one statement at a time with a yield point between them
+ * that yields to the event loop once a slice of work has run, and nothing
+ * here writes to `opencode.db`.
  */
 
 export const POLL_WATERMARK_KEY = "v2_poll_watermark";
@@ -101,7 +103,8 @@ export type V2SyncOptions = {
    *  whether `session_part` is read. Default: probed once. */
   schema?: V2SchemaInfo;
   now?: () => number;
-  /** Awaited between statements. Default: one macrotask. */
+  /** Awaited between statements. Default: {@link yieldOnBudget}, which
+   *  yields to the event loop only once a slice of work has run. */
   yieldBetween?: () => Promise<void>;
 };
 
@@ -157,8 +160,6 @@ const MISSING_CHUNK = 500;
 const PART_CHUNK = 500;
 /** Rows one range digest reads at most. */
 export const RANGE_DIGEST_MAX = 500;
-
-const macrotask = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0));
 
 function num(value: SqlValue | undefined): number | null {
   if (typeof value === "number") return value;
@@ -326,7 +327,7 @@ export function createV2Sync(db: ReadOnlyDb, opts: V2SyncOptions = {}): DistillS
   const abandonAfterMs = opts.abandonAfterMs ?? 3_600_000;
   const fingerprintRows = Math.max(1, Math.floor(opts.fingerprintRows ?? 64));
   const now = opts.now ?? Date.now;
-  const pause = opts.yieldBetween ?? macrotask;
+  const pause = opts.yieldBetween ?? yieldOnBudget;
   /** Whether `session_part` is read (opencode 2.4+). */
   const partsOn = (opts.schema ?? inspectV2Schema(db)).parts;
   let lastScanAt = Number.NEGATIVE_INFINITY;
