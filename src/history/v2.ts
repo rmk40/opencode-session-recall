@@ -962,14 +962,18 @@ export function createV2HistorySource(db: ReadOnlyDb, opts: V2SourceOptions = {}
       const chunk = page.slice(i, i + PART_ID_CHUNK);
       const forcedPos = force && i === 0 ? 0 : -1;
       await pause();
+      // Both joins are CROSS JOINs so the page's messages stay the outer
+      // loop and each lookup goes by message id: with `session_part` outer,
+      // the planner could walk the whole session's part rows (or the whole
+      // table) to find a few messages' rows.
       const rows = read("part rows", () =>
         db.all(
           `WITH page(message_id, pos) AS (VALUES ${chunk.map(() => "(?, ?)").join(", ")}),
            sized AS (
              SELECT p.message_id AS message_id, p.ordinal AS ordinal, g.pos AS pos,
                ${PART_BYTES} AS bytes
-             FROM page g JOIN session_part p
-               ON p.session_id = ? AND p.message_id = g.message_id AND p.ordinal >= ?
+             FROM page g CROSS JOIN session_part p
+             WHERE p.session_id = ? AND p.message_id = g.message_id AND p.ordinal >= ?
              ORDER BY g.pos, p.ordinal LIMIT ?
            ), budget AS (
              SELECT message_id, ordinal, pos, bytes,
@@ -989,8 +993,9 @@ export function createV2HistorySource(db: ReadOnlyDb, opts: V2SourceOptions = {}
            SELECT p.message_id, p.session_id, p.ordinal, p.type, p.call_id, p.time_created,
              p.time_updated, e.pos AS pos, e.bytes AS bytes, e.inc AS inc,
              CASE WHEN e.inc = 1 AND e.bytes <= ? THEN p.data END AS data
-           FROM edge e JOIN session_part p ON p.message_id = e.message_id AND p.ordinal = e.ordinal
-           WHERE e.inc = 1 OR e.prev = 1
+           FROM edge e CROSS JOIN session_part p
+           WHERE p.session_id = ? AND p.message_id = e.message_id AND p.ordinal = e.ordinal
+             AND (e.inc = 1 OR e.prev = 1)
            ORDER BY e.pos, e.ordinal LIMIT ?`,
           [
             ...chunk.flatMap((m) => [m.id, m.pos]),
@@ -1002,6 +1007,7 @@ export function createV2HistorySource(db: ReadOnlyDb, opts: V2SourceOptions = {}
             left,
             forcedPos,
             byteCeiling,
+            sessionID,
             rowsLeft + 1,
           ],
         ),
@@ -1848,8 +1854,15 @@ export function createV2HistorySource(db: ReadOnlyDb, opts: V2SourceOptions = {}
       // the cut load `data`. The first row is always kept (on a retry, when
       // its envelope fits); its parts are cut by the part read when they no
       // longer fit. The CTEs hold only ids, seqs and sizes; bodies are read
-      // by the final join.
+      // by the final join, which looks each budget row's message up by seq.
+      // CROSS JOIN keeps the budget rows the outer loop: left to itself the
+      // planner may walk every row of the session through its session_id
+      // index and match each against the budget rows, a cost that grows
+      // with the session rather than the page. The range bounds the lookup
+      // as well.
       const firstCap = retry ? budget : byteCeiling;
+      const high = Math.max(first, last);
+      const low = Math.min(first, last);
       await pause();
       const rows = read("page rows", () =>
         db.all(
@@ -1867,20 +1880,23 @@ export function createV2HistorySource(db: ReadOnlyDb, opts: V2SourceOptions = {}
              FROM sized s LEFT JOIN extra e ON e.id = s.id
            )
            SELECT ${PAGE_BODY_COLUMNS}
-           FROM budget b JOIN session_message m ON m.session_id = ? AND m.seq = b.seq
-           WHERE b.running <= ?
-             OR (b.rn = 1 AND CASE WHEN b.bytes <= ? THEN b.bytes ELSE 0 END <= ?)
+           FROM budget b CROSS JOIN session_message m
+           WHERE m.session_id = ? AND m.seq = b.seq AND m.seq <= ? AND m.seq >= ?
+             AND (b.running <= ?
+               OR (b.rn = 1 AND CASE WHEN b.bytes <= ? THEN b.bytes ELSE 0 END <= ?))
            ORDER BY m.seq ${order.sort} LIMIT ?`,
           [
             o.sessionID,
-            Math.max(first, last),
-            Math.min(first, last),
+            high,
+            low,
             ...fork,
             take,
             ...extra,
             byteCeiling,
             byteCeiling,
             o.sessionID,
+            high,
+            low,
             budget,
             byteCeiling,
             firstCap,
