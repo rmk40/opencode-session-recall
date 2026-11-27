@@ -31,7 +31,8 @@ export const SHORTLIST_MULT = 1.1;
  * Rank drilled sessions' candidates: the broad pass over every pool, the deep
  * pass over the pools of `deepSet` sessions, merged by
  * {@link mergeShortlistHits}. When every pool is in `deepSet` the deep pool is
- * the broad pool, so the broad pass's hits serve as the deep pass's.
+ * the broad pool, so the broad pass's hits serve as the deep pass's. Both
+ * passes take recency against `now` (default the time the rerank starts).
  */
 export function rerankDrilled(
   pools: readonly DrilledCandidates[],
@@ -39,18 +40,17 @@ export function rerankDrilled(
   query: ParsedQuery,
   mode: Bm25Mode,
   explain: boolean,
+  now: number = Date.now(),
 ): Bm25Hit[] {
   const { broadPool, deepPool, allDeep } = splitPools(pools, deepSet);
-  const now = Date.now();
   const broad = bm25Search(broadPool, query, mode, explain, now);
   const deep = allDeep ? broad : bm25Search(deepPool, query, mode, explain, now);
   return mergeShortlistHits(broad, deep, explain);
 }
 
 /** {@link rerankDrilled}, awaiting `pause` every so often (and between the
- *  passes) so a large pool does not hold the event loop in one slice. Both
- *  passes take recency against one clock reading, as there, so the hits are
- *  the same. */
+ *  passes) so a large pool does not hold the event loop in one slice. `now`
+ *  is read before the first pause, so the hits are the same. */
 export async function rerankDrilledPausing(
   pools: readonly DrilledCandidates[],
   deepSet: ReadonlySet<string>,
@@ -58,9 +58,9 @@ export async function rerankDrilledPausing(
   mode: Bm25Mode,
   explain: boolean,
   pause: () => Promise<void>,
+  now: number = Date.now(),
 ): Promise<Bm25Hit[]> {
   const { broadPool, deepPool, allDeep } = splitPools(pools, deepSet);
-  const now = Date.now();
   const broad = await bm25SearchPausing(broadPool, query, mode, explain, pause, now);
   const deep = allDeep
     ? broad

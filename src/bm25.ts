@@ -589,6 +589,10 @@ export function bm25SearchPausing(
  *  ranking's steps, and hits given their metadata between two stops. */
 const STEP_ITEMS = 256;
 const STEP_HITS = 64;
+/** Field-text characters the metadata may read between two stops: a tool
+ *  output's field is not cut to the candidate cap, so 64 hits can hold
+ *  several megabytes of text to tokenize. */
+const STEP_FIELD_CHARS = 1_000_000;
 
 /** The ranking as steps. Recency is taken against the one clock reading
  *  `now`, so where the steps stop cannot change a score. */
@@ -624,10 +628,17 @@ function* bm25Steps(
   const digestCovered = new Map<string, boolean>();
 
   const hits: Bm25Hit[] = [];
+  let sinceStop = { hits: 0, chars: 0 };
   for (const hit of rawHits) {
-    // A hit's matched fields may tokenize its whole field texts.
-    if (hits.length > 0 && hits.length % STEP_HITS === 0) yield;
+    // A hit's matched fields may tokenize its whole field texts, so the
+    // steps stop by text read as well as by hits.
+    if (sinceStop.hits >= STEP_HITS || sinceStop.chars >= STEP_FIELD_CHARS) {
+      yield;
+      sinceStop = { hits: 0, chars: 0 };
+    }
     const candidate = candidates[hit.doc]!;
+    sinceStop.hits++;
+    for (const field of candidate.fieldTexts) sinceStop.chars += field.text.length;
     const base = clamp01(hit.score / maxScore);
     const reasons: string[] = [];
     if (explain) reasons.push(`BM25 relative score: ${base.toFixed(2)}`);

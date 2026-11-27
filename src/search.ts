@@ -330,12 +330,14 @@ function defaultMatchedFields(partType: string): ResultWhy["matchedFields"] {
   return ["text"];
 }
 
-function recencyLabel(time: number): ResultWhy["recency"] {
+/** Whether `time` is within seven days of `now`, the response's one clock
+ *  reading, so equal times get equal labels across a response. */
+function recencyLabel(time: number, now: number): ResultWhy["recency"] {
   if (!Number.isFinite(time) || time <= 0) return "unknown";
-  return Date.now() - time <= 7 * 24 * 60 * 60 * 1000 ? "recent" : "older";
+  return now - time <= 7 * 24 * 60 * 60 * 1000 ? "recent" : "older";
 }
 
-function annotateResult(result: SearchResult): SearchResult {
+function annotateResult(result: SearchResult, now: number): SearchResult {
   const source = result.source ?? sourceForPartType(result.partType);
   const confidence = source === "title" ? "medium" : "high";
   return {
@@ -345,7 +347,7 @@ function annotateResult(result: SearchResult): SearchResult {
       matchedFields: defaultMatchedFields(result.partType),
       matchedTerms: result.matchedTerms,
       directoryRelevance: "unknown",
-      recency: recencyLabel(result.time),
+      recency: recencyLabel(result.time, now),
       confidence,
       ...result.why,
     },
@@ -782,31 +784,35 @@ function candidateResult(
   relevance: DirectoryRelevance,
   matchedField: ResultWhy["matchedFields"][number],
   snip: string,
-  emitAuthorship = false,
+  emitAuthorship: boolean,
+  now: number,
 ): SearchResult {
-  return annotateResult({
-    sessionID: candidate.sessionID,
-    sessionTitle: candidate.sessionTitle,
-    directory: candidate.directory,
-    messageID: candidate.messageID,
-    role: candidate.role,
-    time: candidate.time,
-    partID: candidate.partID,
-    partType: candidate.partType,
-    pruned: candidate.isPruned,
-    snippet: snip,
-    toolName: candidate.toolName,
-    source: candidate.source ?? sourceForPartType(candidate.partType),
-    titleMatch: candidate.titleMatch,
-    why: {
-      matchedFields: [matchedField],
-      directoryRelevance: relevance,
-      recency: recencyLabel(candidate.time),
-      confidence: candidate.partType === "title" ? "medium" : "high",
-      evidenceClass: evidenceClassFor(candidate.partType, candidate.toolName, [matchedField]),
-      ...(emitAuthorship && { authorship: authorshipOf(candidate) }),
+  return annotateResult(
+    {
+      sessionID: candidate.sessionID,
+      sessionTitle: candidate.sessionTitle,
+      directory: candidate.directory,
+      messageID: candidate.messageID,
+      role: candidate.role,
+      time: candidate.time,
+      partID: candidate.partID,
+      partType: candidate.partType,
+      pruned: candidate.isPruned,
+      snippet: snip,
+      toolName: candidate.toolName,
+      source: candidate.source ?? sourceForPartType(candidate.partType),
+      titleMatch: candidate.titleMatch,
+      why: {
+        matchedFields: [matchedField],
+        directoryRelevance: relevance,
+        recency: recencyLabel(candidate.time, now),
+        confidence: candidate.partType === "title" ? "medium" : "high",
+        evidenceClass: evidenceClassFor(candidate.partType, candidate.toolName, [matchedField]),
+        ...(emitAuthorship && { authorship: authorshipOf(candidate) }),
+      },
     },
-  });
+    now,
+  );
 }
 
 function scan(
@@ -814,8 +820,9 @@ function scan(
   relevance: DirectoryRelevance,
   query: string,
   limit: number,
-  width?: number,
-  emitAuthorship = false,
+  width: number | undefined,
+  emitAuthorship: boolean,
+  now: number,
 ): { results: SearchResult[]; total: number } {
   const results: SearchResult[] = [];
   let total = 0;
@@ -839,6 +846,7 @@ function scan(
             field.field,
             snippet(field.text, query, width),
             emitAuthorship,
+            now,
           ),
         );
       }
@@ -853,8 +861,9 @@ function regexScanCandidates(
   relevance: DirectoryRelevance,
   re: RegExp,
   limit: number,
-  width?: number,
-  emitAuthorship = false,
+  width: number | undefined,
+  emitAuthorship: boolean,
+  now: number,
 ): { results: SearchResult[]; total: number } {
   const results: SearchResult[] = [];
   let total = 0;
@@ -877,6 +886,7 @@ function regexScanCandidates(
             field.field,
             regexSnippet(re, field.text, width, matchIndex),
             emitAuthorship,
+            now,
           ),
         );
       }
@@ -900,6 +910,7 @@ async function rankedToSearchResults(
   relevanceBySession: Map<string, DirectoryRelevance>,
   emitAuthorship: boolean,
   pause: () => Promise<void>,
+  now: number,
 ): Promise<SearchResult[]> {
   const results: SearchResult[] = [];
   for (const r of ranked) {
@@ -915,36 +926,39 @@ async function rankedToSearchResults(
     // used directly against rawText without position mapping.
     const snip = smartSnippet(c.rawText, query, width);
 
-    const result: SearchResult = annotateResult({
-      sessionID: c.sessionID,
-      sessionTitle: c.sessionTitle,
-      directory: c.directory,
-      messageID: c.messageID,
-      role: c.role,
-      time: c.time,
-      partID: c.partID,
-      partType: c.partType,
-      pruned: c.isPruned,
-      snippet: snip,
-      toolName: c.toolName,
-      // Ranking scores are unclamped so boosts can beat the relative top;
-      // the public shape stays 0..1.
-      score: clamp01(r.score),
-      matchMode: mode,
-      matchedTerms: r.matchedTerms,
-      source: c.source,
-      why: {
-        ...c.why,
-        directoryRelevance: relevance,
-        evidenceClass: r.evidenceClass,
-        matchedFields:
-          r.matchedFields.length > 0
-            ? r.matchedFields
-            : (c.why?.matchedFields ?? defaultMatchedFields(c.partType)),
-        ...(emitAuthorship && { authorship: authorshipOf(c) }),
+    const result: SearchResult = annotateResult(
+      {
+        sessionID: c.sessionID,
+        sessionTitle: c.sessionTitle,
+        directory: c.directory,
+        messageID: c.messageID,
+        role: c.role,
+        time: c.time,
+        partID: c.partID,
+        partType: c.partType,
+        pruned: c.isPruned,
+        snippet: snip,
+        toolName: c.toolName,
+        // Ranking scores are unclamped so boosts can beat the relative top;
+        // the public shape stays 0..1.
+        score: clamp01(r.score),
+        matchMode: mode,
+        matchedTerms: r.matchedTerms,
+        source: c.source,
+        why: {
+          ...c.why,
+          directoryRelevance: relevance,
+          evidenceClass: r.evidenceClass,
+          matchedFields:
+            r.matchedFields.length > 0
+              ? r.matchedFields
+              : (c.why?.matchedFields ?? defaultMatchedFields(c.partType)),
+          ...(emitAuthorship && { authorship: authorshipOf(c) }),
+        },
+        titleMatch: c.titleMatch,
       },
-      titleMatch: c.titleMatch,
-    });
+      now,
+    );
 
     if (explain && r.matchReasons.length > 0) {
       result.matchReasons = r.matchReasons;
@@ -978,34 +992,38 @@ function semanticRescueResult(
   width: number | undefined,
   mode: MatchMode,
   explain: boolean,
-  emitAuthorship = false,
+  emitAuthorship: boolean,
+  now: number,
 ): SearchResult {
-  const result = annotateResult({
-    sessionID: candidate.sessionID,
-    sessionTitle: candidate.sessionTitle,
-    directory: candidate.directory,
-    messageID: candidate.messageID,
-    role: candidate.role,
-    time: candidate.time,
-    partID: candidate.partID,
-    partType: candidate.partType,
-    pruned: candidate.isPruned,
-    snippet: smartSnippet(candidate.rawText, query, width),
-    toolName: candidate.toolName,
-    score: clamp01(blendedScore),
-    matchMode: mode,
-    source: candidate.source ?? sourceForPartType(candidate.partType),
-    titleMatch: candidate.titleMatch,
-    why: {
-      matchedFields: [],
-      directoryRelevance: relevance,
-      recency: recencyLabel(candidate.time),
-      confidence: "low",
-      evidenceClass: evidenceClassFor(candidate.partType, candidate.toolName, []),
-      ...(emitAuthorship && { authorship: authorshipOf(candidate) }),
-      semanticSimilarity: partSimilarity,
+  const result = annotateResult(
+    {
+      sessionID: candidate.sessionID,
+      sessionTitle: candidate.sessionTitle,
+      directory: candidate.directory,
+      messageID: candidate.messageID,
+      role: candidate.role,
+      time: candidate.time,
+      partID: candidate.partID,
+      partType: candidate.partType,
+      pruned: candidate.isPruned,
+      snippet: smartSnippet(candidate.rawText, query, width),
+      toolName: candidate.toolName,
+      score: clamp01(blendedScore),
+      matchMode: mode,
+      source: candidate.source ?? sourceForPartType(candidate.partType),
+      titleMatch: candidate.titleMatch,
+      why: {
+        matchedFields: [],
+        directoryRelevance: relevance,
+        recency: recencyLabel(candidate.time, now),
+        confidence: "low",
+        evidenceClass: evidenceClassFor(candidate.partType, candidate.toolName, []),
+        ...(emitAuthorship && { authorship: authorshipOf(candidate) }),
+        semanticSimilarity: partSimilarity,
+      },
     },
-  });
+    now,
+  );
   if (explain) {
     result.matchReasons = [
       `Semantic evidence (no lexical hit): cosine similarity ${partSimilarity.toFixed(3)}`,
@@ -1030,6 +1048,8 @@ function rescueZeroHitSessions(input: {
   mode: MatchMode;
   explain: boolean;
   emitAuthorship: boolean;
+  /** The response's clock reading for recency labels. */
+  now: number;
 }): SearchResult[] {
   const embedder = input.semantic?.embedder;
   if (input.reserved.length === 0 || !embedder?.ready) return [];
@@ -1070,6 +1090,7 @@ function rescueZeroHitSessions(input: {
         input.mode,
         input.explain,
         input.emitAuthorship,
+        input.now,
       ),
     );
   }
@@ -2727,6 +2748,10 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
         .describe("continuation from a trimmed result; omit for the start"),
     },
     async execute(args, ctx: ToolContext): Promise<string> {
+      // The response's one clock reading: recency in the rerank and in every
+      // result's label is taken against it, so the yields between them
+      // cannot give two parts of one time different recency.
+      const searchNow = Date.now();
       // Ephemeral cards-lite refresh trigger: fire-and-forget at query entry;
       // this query proceeds on the current snapshot (see lite-refresh.ts).
       maybeRefresh?.();
@@ -4221,6 +4246,7 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
           searchTitles,
           authorship: authorshipFilter,
           abort: ctx.abort,
+          now: searchNow,
         };
         const abortedOutput = (): string => fail("aborted");
 
@@ -4703,11 +4729,20 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
           candidates: Candidate[],
           relevance: DirectoryRelevance,
           remaining: number,
-        ) => scan(candidates, relevance, args.query, remaining, widthArg, emitAuthorship);
+        ) =>
+          scan(candidates, relevance, args.query, remaining, widthArg, emitAuthorship, searchNow);
         const regexMatcher =
           (re: RegExp) =>
           (candidates: Candidate[], relevance: DirectoryRelevance, remaining: number) =>
-            regexScanCandidates(candidates, relevance, re, remaining, widthArg, emitAuthorship);
+            regexScanCandidates(
+              candidates,
+              relevance,
+              re,
+              remaining,
+              widthArg,
+              emitAuthorship,
+              searchNow,
+            );
 
         const loadErrorSuffixOf = (count: number): string =>
           count > 0 ? `, ${count} load error${count !== 1 ? "s" : ""}` : "";
@@ -4781,7 +4816,9 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
               smartMode,
               explain,
               pause,
+              searchNow,
             );
+            if (ctx.abort.aborted) return abortedOutput();
             const allResults = await rankedToSearchResults(
               hits,
               smartMode,
@@ -4791,7 +4828,9 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
               relevanceBySession,
               emitAuthorship,
               pause,
+              searchNow,
             );
+            if (ctx.abort.aborted) return abortedOutput();
             const sliced = applyGroupAndSlice(
               allResults,
               allResults.length,
@@ -4913,7 +4952,9 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
           relevanceBySession,
           emitAuthorship,
           pause,
+          searchNow,
         );
+        if (ctx.abort.aborted) return abortedOutput();
 
         // ── Zero-lexical-hit semantic rescue (Path A) ──
         // A session the reserved-slot band surfaced by embedding similarity but
@@ -4934,6 +4975,7 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
           mode: smartMode,
           explain,
           emitAuthorship,
+          now: searchNow,
         });
         if (rescued.length > 0) {
           allResults = [...allResults, ...rescued].sort(

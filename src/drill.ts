@@ -122,6 +122,9 @@ export type DrillInput = {
    *  once the caller has given up. The session it stopped inside reports
    *  `aborted`, as do those it never reached. */
   abort?: AbortSignal;
+  /** The clock reading the rerank takes recency against (default the time
+   *  it starts), so a caller can label results against the same one. */
+  now?: number;
 };
 
 /** One drilled session's candidate pool (already filtered to the query's
@@ -1308,6 +1311,7 @@ export function createDrill(deps: DrillDeps): Drill {
         input.mode,
         input.explain,
         deps.yieldPoint ?? yieldOnBudget,
+        input.now,
       );
       return { hits, ...collected };
     },
