@@ -902,5 +902,85 @@ describe("relatives the default keeps, ordered against other history", () => {
       expect(relatives(bounded)).toBe(3);
       expect(outsiders(bounded)).toBe(0);
     });
+
+    describe("a relative only the slim-index lookup finds", () => {
+      /** a-root (the caller) has five subagents whose cards rank on "relay"
+       *  and one, a-needle, whose only match is "relay-west.png" in a
+       *  reasoning part. Two hundred code tokens it mentions more often fill
+       *  its card's inventory first, so the card leaves the needle out and
+       *  only the slim index holds it. Ten older outsiders mention "relay"
+       *  too, so the card-ranked sessions fill the twelve drill slots with
+       *  more left to take the family's spare ones. */
+      function needleHarness(): FakeHarness {
+        const filler = Array.from(
+          { length: 200 },
+          (_, i) => `a_${String(i).padStart(3, "0")}`,
+        ).join(" ");
+        const h = makeFakeHarness();
+        addSession(h, { id: "a-root", title: "Map rollout", ago: 120, user: "Split the work." });
+        for (const i of [1, 2, 3, 4, 5]) {
+          addSession(h, {
+            id: `a-r${i}`,
+            title: `Relay provider check ${i}`,
+            parent: "a-root",
+            ago: 10 + i,
+            reply: `Checked the relay provider settings for region ${i}.`,
+          });
+        }
+        addSession(h, {
+          id: "a-needle",
+          title: "Tile audit",
+          parent: "a-root",
+          ago: 60,
+          user: "Audit the broken tiles.",
+          reasoning: `The broken tile is relay-west.png in the image bucket. Checked ${filler}`,
+          reply: `Checked ${filler}`,
+        });
+        for (let i = 1; i <= 10; i++) {
+          addSession(h, {
+            id: `a-o${i}`,
+            title: `Ops notes ${i}`,
+            ago: 30 + i,
+            reply:
+              "Noted the relay timing next to the queue depth, the worker counts and the nightly build schedule.",
+          });
+        }
+        return h;
+      }
+      const args = {
+        query: "relay-west.png",
+        scope: "global",
+        excludeCurrentSession: false,
+        results: 5,
+      };
+
+      it.each([{ match: "literal" }, { match: "smart" }])(
+        "drills it ahead of the card-ranked relatives and returns it first ($match)",
+        async ({ match }) => {
+          const { tool, deps } = await recallOver(needleHarness());
+          // Its card misses the needle; the five card-ranked relatives' cards match it.
+          const ranked = deps.cards
+            .rank(parseQuery(args.query), {})
+            .map((hit) => hit.sessionId)
+            .filter((id) => id.startsWith("a-"));
+          expect(ranked).not.toContain("a-needle");
+          expect(ranked.filter((id) => id.startsWith("a-r")).length).toBe(5);
+
+          const out = await runTool<SearchOutput>(
+            tool,
+            { ...args, match },
+            makeContext({ sessionID: "a-root" }).ctx,
+          );
+          expect(out.coverage?.sessionsSearched).toBe(12);
+          expect(out.results[0]?.sessionID).toBe("a-needle");
+          // The family still holds four drill slots: the needle and the first
+          // three card-ranked relatives.
+          const drilled = new Set(
+            out.coverage?.sessionStops?.sessions.map((s) => s.sessionID) ?? [],
+          );
+          expect(drilled.has("a-r4") || drilled.has("a-r5")).toBe(false);
+        },
+      );
+    });
   });
 });

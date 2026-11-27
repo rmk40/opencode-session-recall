@@ -325,3 +325,144 @@ describe("capAndSlice with the family allowance", () => {
     expect(partIDs(capAndSlice(ordered, 5, true, family))).toEqual(["f1", "o1", "f3", "o2", "o3"]);
   });
 });
+
+// Relatives the slim-index lookup found: a match in the session's own text,
+// which keeps the family's places ahead of a relative only its card ranked.
+describe("relatives the slim-index lookup found", () => {
+  const family = new Set(["f1", "f2", "f3", "f4", "f5"]);
+
+  describe("capFamilySlots", () => {
+    it("keeps them first among the relatives it allows, then the rest in shortlist order", () => {
+      const shortlist = ["f1", "f2", "f3", "f4", "o1", "f5"];
+      const ranked = [...shortlist, "o2", "o3"];
+      expect(capFamilySlots(shortlist, ranked, family, 2, ["f5"])).toEqual([
+        "f1",
+        "o1",
+        "f5",
+        "o2",
+        "o3",
+        "f2",
+      ]);
+    });
+
+    it("brings one in from outside the shortlist in place of a relative it outranks", () => {
+      const shortlist = ["f1", "f2", "f3", "o1"];
+      const ranked = ["f1", "f2", "f3", "o1", "f4", "o2"];
+      expect(capFamilySlots(shortlist, ranked, family, 2, ["f4", "f1"])).toEqual([
+        "f1",
+        "f4",
+        "o1",
+        "o2",
+      ]);
+    });
+
+    it("moves nothing within the cap, and ignores ids outside the family", () => {
+      const shortlist = ["f1", "o1", "f2"];
+      expect(capFamilySlots(shortlist, [...shortlist, "f4"], family, 2, ["f4"])).toBe(shortlist);
+      const over = ["f1", "f2", "f3", "o1"];
+      expect(capFamilySlots(over, [...over, "o2"], family, 2, ["o1", "o9"])).toEqual([
+        "f1",
+        "f2",
+        "o1",
+        "o2",
+      ]);
+    });
+  });
+
+  describe("familyDiversity", () => {
+    const results = [
+      result("f1", "f1"),
+      result("f2", "f2"),
+      result("f3", "f3"),
+      result("o1", "o1"),
+      result("o2", "o2"),
+      result("o3", "o3"),
+      result("o4", "o4"),
+    ];
+    const found =
+      (...ids: string[]) =>
+      (r: SearchResult): boolean =>
+        ids.includes(r.sessionID);
+
+    it("lets one past the share take the place of the lowest relative it outranks", () => {
+      expect(partIDs(familyDiversity(results, family, nothingDelegated, found("f3")))).toEqual([
+        "f1",
+        "f3",
+        "o1",
+        "o2",
+        "o3",
+        "f2",
+        "o4",
+      ]);
+    });
+
+    it("holds one back like any relative when every relative ahead of it was found too", () => {
+      expect(
+        partIDs(familyDiversity(results, family, nothingDelegated, found("f1", "f2", "f3"))),
+      ).toEqual(["f1", "f2", "o1", "o2", "o3", "f3", "o4"]);
+    });
+  });
+
+  describe("capAndSlice", () => {
+    const hit = (sessionID: string, evidenceClass: EvidenceClass): SearchResult => ({
+      ...result(sessionID, sessionID),
+      why: { matchedFields: [], evidenceClass },
+    });
+    const found =
+      (...ids: string[]) =>
+      (r: SearchResult): boolean =>
+        ids.includes(r.sessionID);
+
+    it("lets one a class cap moves up take the place of a relative only its card ranked", () => {
+      const ordered = [
+        hit("o1", "skill-definition"),
+        hit("f1", "human-text"),
+        hit("o2", "skill-definition"),
+        hit("f2", "human-text"),
+        hit("f3", "human-text"),
+        hit("o3", "human-text"),
+        hit("o4", "human-text"),
+      ];
+      expect(partIDs(capAndSlice(ordered, 5, false, family))).toEqual([
+        "o1",
+        "f1",
+        "f2",
+        "o3",
+        "o4",
+      ]);
+      expect(partIDs(capAndSlice(ordered, 5, false, family, found("f3")))).toEqual([
+        "o1",
+        "f1",
+        "f3",
+        "o3",
+        "o4",
+      ]);
+    });
+
+    it("does not promote a relative's tool input into the place of one it found", () => {
+      const ordered = [
+        hit("f1", "human-text"),
+        hit("o1", "human-text"),
+        hit("f2", "human-text"),
+        hit("o2", "human-text"),
+        hit("o3", "human-text"),
+        hit("f3", "tool-input"),
+      ];
+      expect(partIDs(capAndSlice(ordered, 5, true, family, found("f1", "f2")))).toEqual([
+        "f1",
+        "o1",
+        "f2",
+        "o2",
+        "o3",
+      ]);
+      // A found relative's tool input still takes a found relative's place.
+      expect(partIDs(capAndSlice(ordered, 5, true, family, found("f1", "f2", "f3")))).toEqual([
+        "f1",
+        "o1",
+        "f3",
+        "o2",
+        "o3",
+      ]);
+    });
+  });
+});
