@@ -156,6 +156,23 @@ most of them on a store of 12,000 cards.
   to that point changed. In the gates, a tail write to a card of 5,000
   indexed rows took about 180 ms, against about 1.6 s for the session's
   first write, which read it in full.
+- **A full write changes only the rows that differ.** When an indexed session
+  changed, the distiller wrote it again by deleting every row it held in the
+  slim index along with its index entry, then inserting them all in one
+  transaction. On a real session of 5,000 indexed rows, changing one row held
+  the event loop for about 300 ms on a warm file and for seconds while the
+  disk was busy. The write now keeps the stored rows whose parts are still in
+  the same order and overwrites only those whose fields differ. It deletes the
+  rows that are gone and inserts the new ones. The index changes for those
+  rows only. The distiller reads the stored rows before the write, 500 at a
+  time with a pause between reads. The write still commits as one
+  transaction, so a search never sees half a session. A row added before one
+  that stays, or a part that moves, still rewrites every row after it. A tail
+  write over a running turn compares the turn's rows the same way. In the
+  gates, a full write that changed one row of a 5,000-row card, added one and
+  evicted the oldest took 23 to 25 ms from its first read to its commit, with
+  no slice over 8 ms. Before, it took 97 to 100 ms in one slice. It now runs 9
+  row and index statements, against 15,001.
 - **`recall_get` continuations read on from where the output stopped.** On
   opencode v2 a continuation into a message's part rows reads from the row
   of the part where the previous output stopped, about two outputs' worth at

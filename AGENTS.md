@@ -353,13 +353,36 @@ builds the card before the transaction. Inside it the store reads only the rows 
 replaces, after checking that the card still holds the caller's settled base, at
 least its rows and the `write_rev` the caller read them at. Any other state refuses
 the write as `base-changed` with nothing written. The distiller then reads the
-session in full. The previous tail's rows are replaced unless they equal the new
-ones. The rows of the base's newest message are repointed at the tail's first
-message. Under the row cap the card keeps what an append of the same messages
-keeps, which is the aggregates of every message the card has held and the newest
-`ftsRowsPerSession` rows. A longer tail evicts the base's oldest rows. A shorter one
-would need back rows that an earlier write evicted, so the distiller reads in full
-when the store holds exactly the cap (every eviction leaves exactly the cap).
+session in full. The previous tail's rows are diffed against the new ones as a
+full write's are (below). The rows of the base's newest message are repointed at
+the tail's first message. Under the row cap the card keeps what an append of the
+same messages keeps, which is the aggregates of every message the card has held
+and the newest `ftsRowsPerSession` rows. A longer tail evicts the base's oldest
+rows. A shorter one would need back rows that an earlier write evicted, so the
+distiller reads in full when the store holds exactly the cap (every eviction
+leaves exactly the cap).
+
+A changed `replaceSessionParts` writes only the rows that differ (`planRowDiff`).
+While the new rows match stored rows of the same part id in rowid order, each keeps
+its rowid and is overwritten only when a field differs. The other stored rows are
+deleted and the rest of the new rows inserted, with the FTS index kept in step for
+exactly those rows. Readers read rows in rowid order and an insert takes a rowid
+above every stored one, so a new row can only follow the kept ones. Evicting the
+oldest rows, changing rows in place, removing rows and appending touch only those
+rows. A row added before a row that stays, or a part that moves, rewrites every row
+after it. The FTS `'delete'` command needs a row's indexed text, which the write
+reads by rowid inside its transaction.
+
+The distiller reads the stored rows for a full write before the transaction
+(`storedRowsOf`). It reads the card's `write_rev` first and then the rows, 500 at a
+time with a yield between pages. It hands them to the store as `stored`. The
+transaction then reads only the session's rowids. It refuses the rows as
+`base-changed` when the card is gone, its `write_rev` moved or the session holds
+another number of rows. `writeFull` then writes again without them, so the store
+reads the rows inside the transaction.
+A write that stamps no revision (an older build's) passes that check unseen. The
+indexed text is re-read in the transaction, so the index stays whole. The next full
+write compares against the rows as they are.
 
 ## The card runtime applies store changes in place
 
