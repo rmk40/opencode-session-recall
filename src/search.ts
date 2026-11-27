@@ -1272,15 +1272,18 @@ export function capAndSlice(
     const index = lastIndexWhere(final.slice(0, FAMILY_TOP_WINDOW), (held) => {
       return isFamily(held) && !preferred(held);
     });
-    if (index === -1) return undefined;
-    const [displaced] = final.splice(index, 1);
-    taken.delete(displaced!);
-    const cls = displaced!.why?.evidenceClass;
+    return index === -1 ? undefined : removeAt(index);
+  };
+  /** Takes the hit at `index` out of the results and its class count. */
+  function removeAt(index: number): SearchResult {
+    const displaced = final.splice(index, 1)[0]!;
+    taken.delete(displaced);
+    const cls = displaced.why?.evidenceClass;
     if (cls != null && CLASS_CAPS[cls] != null) {
       classCounts.set(cls, (classCounts.get(cls) ?? 1) - 1);
     }
     return displaced;
-  };
+  }
   /** Makes room in the full allowance for a preferred relative's hit. */
   const displaceFor = (hit: SearchResult): boolean => {
     if (!preferred(hit)) return false;
@@ -1319,18 +1322,30 @@ export function capAndSlice(
 
   // A preferred relative's hit still left out (by the limit or a class cap)
   // takes the place of the last one among the first results from a relative
-  // that is not preferred, at its own rank.
+  // that is not preferred, at its own rank, when its class cap still holds
+  // once that hit is out: replacing a hit of its own class frees the room it
+  // needs. Counted over the results themselves, since the backfill above
+  // fills without counting.
+  const classInFinal = (cls: EvidenceClass): number =>
+    final.filter((held) => held.why?.evidenceClass === cls).length;
   for (const found of rest) {
-    if (taken.has(found) || !isFamily(found) || !preferred(found) || classFull(found)) continue;
-    if (!displaceUnpreferred()) break;
+    if (taken.has(found) || !isFamily(found) || !preferred(found)) continue;
+    const firstResults = final.slice(0, FAMILY_TOP_WINDOW);
+    if (!firstResults.some((held) => isFamily(held) && !preferred(held))) break;
+    const cls = found.why?.evidenceClass;
+    const cap = cls != null ? CLASS_CAPS[cls] : undefined;
+    const index = lastIndexWhere(firstResults, (held) => {
+      if (!isFamily(held) || preferred(held)) return false;
+      if (cls == null || cap == null) return true;
+      return classInFinal(cls) - (held.why?.evidenceClass === cls ? 1 : 0) < cap;
+    });
+    if (index === -1) continue;
+    removeAt(index);
     const at = final.findIndex((held) => byPosition(held, found) > 0);
     if (at === -1) final.push(found);
     else final.splice(at, 0, found);
     taken.add(found);
-    const cls = found.why?.evidenceClass;
-    if (cls != null && CLASS_CAPS[cls] != null) {
-      classCounts.set(cls, (classCounts.get(cls) ?? 0) + 1);
-    }
+    if (cls != null && cap != null) classCounts.set(cls, (classCounts.get(cls) ?? 0) + 1);
   }
 
   if (
@@ -3942,13 +3957,24 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
           // lookup ANDs those but ORs plain words, where any word matches and
           // its order favors short rows such as a prompt restating the query.
           // A row in a subagent's first message, the prompt its orchestrator
-          // wrote, does not count either. A subtask part or a later prompt
-          // cannot be told apart from the session's own text by its row.
+          // wrote, does not count either. A row with no previous message is in
+          // the oldest message its card's write read, which is the session's
+          // first unless that read stopped at the per-session row cap. An
+          // opencode v2 write records such a stop as the checkpoint's floor,
+          // so a card with one has no prompt row; a v1 write records none, so
+          // a capped v1 subagent's oldest message read counts as its prompt.
+          // A subtask part or a later prompt cannot be told apart from the
+          // session's own text by its row.
           const familyRanked = [...eligibleIds, ...ftsOnly];
           const candidates = new Set(familyRanked);
-          const promptRow = (row: FtsHit): boolean =>
-            row.prevMessageId === null &&
-            parentageOf(cardById.get(row.sessionId)?.parentId) === "child";
+          const promptRow = (row: FtsHit): boolean => {
+            if (row.prevMessageId !== null) return false;
+            const card = cardById.get(row.sessionId);
+            return (
+              parentageOf(card?.parentId) === "child" &&
+              inspectCheckpoint(card?.distillCursor)?.floor === undefined
+            );
+          };
           const familyFound =
             buildMatch(strongAnchors, []) === null
               ? []

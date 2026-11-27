@@ -497,6 +497,37 @@ describe("relatives the slim-index lookup found", () => {
       ]);
     });
 
+    it("takes a relative's place under a class cap when that relative's hit is of its class", () => {
+      const of = (sessionID: string, evidenceClass: EvidenceClass): SearchResult => ({
+        ...result(sessionID, sessionID),
+        why: { matchedFields: [], evidenceClass },
+      });
+      // Two file reads ahead of f5's fill the file-read cap, so the first pass
+      // leaves f5 out; f1's hit going frees the room it needs.
+      const capped = [
+        of("f1", "file-read"),
+        of("o1", "file-read"),
+        of("f5", "file-read"),
+        of("o2", "human-text"),
+        of("o3", "human-text"),
+        of("o4", "human-text"),
+      ];
+      expect(partIDs(capAndSlice(capped, 5, false, family))).toEqual([
+        "f1",
+        "o1",
+        "o2",
+        "o3",
+        "o4",
+      ]);
+      expect(partIDs(capAndSlice(capped, 5, false, family, found))).toEqual([
+        "o1",
+        "f5",
+        "o2",
+        "o3",
+        "o4",
+      ]);
+    });
+
     it("takes the place of the lowest relative there when capAndSlice reaches its limit", () => {
       expect(partIDs(capAndSlice(ordered, 5, false, family))).toEqual([
         "f1",

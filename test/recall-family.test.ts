@@ -1020,6 +1020,39 @@ describe("relatives the default keeps, ordered against other history", () => {
           expect(sessionsOf(out)).not.toContain("a-echo");
         },
       );
+
+      it("takes the oldest message read for the session's own text when the read stopped at the row cap", async () => {
+        const { tool, deps } = await recallOver(needleHarness({ echo: true }));
+        // An opencode v2 write that stopped at the per-session row cap records
+        // the lowest seq it read as the checkpoint's floor, so the message
+        // with no previous one in the index is not the session's first.
+        const card = deps.store!.getCard("a-echo")!;
+        deps.store!.upsertCard({
+          ...card,
+          distillCursor: JSON.stringify({
+            v: 2,
+            seq: 40,
+            unsettled: null,
+            msgUpdated: 1,
+            sessKey: 1,
+            msgId: null,
+            parts: 0,
+            partsUpdated: 0,
+            fp: "fp",
+            floor: 30,
+          }),
+        });
+
+        const out = await runTool<SearchOutput>(
+          tool,
+          { ...args, match: "literal" },
+          makeContext({ sessionID: "a-root" }).ctx,
+        );
+        // a-echo now counts as found, so it keeps a drill slot and its match
+        // is returned.
+        expect(sessionsOf(out)).toContain("a-echo");
+        expect(sessionsOf(out)).toContain("a-needle");
+      });
     });
 
     describe("a plain-word query", () => {
