@@ -250,6 +250,21 @@ most of them on a store of 12,000 cards.
     message bodies.
   - A session that wrote nothing inside a window with both bounds is not
     read at all.
+- **A history page read costs the page, not the session.** On opencode v2 a
+  page read looked its messages up in a way SQLite could run as a walk of
+  every message in the session for each message on the page. On a real
+  session of 34,333 messages one page of 50 took 120 ms of CPU. Each read now
+  looks its messages up by position. In the gates a page of a
+  35,000-message session takes under 2 ms of CPU whether it is the newest,
+  the oldest or one from the middle, against 1.9 s for the middle one when
+  SQLite had no automatic index to use.
+- **The message poll reads in pages.** On opencode v2 the first poll after a
+  restart grouped every message since its watermark by session in one
+  statement, which SQLite ran over an index of every message in the
+  database. It now reads the new messages 2,000 at a time in order of
+  creation with a pause between pages. Each session is signaled once. In the
+  gates a poll over 200,000 new messages after 600,000 older ones held the
+  event loop for at most 10 ms, against 26 ms in one statement.
 
 ## 3.0.1
 

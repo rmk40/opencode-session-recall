@@ -824,6 +824,22 @@ statement reads `session_part`. There the rule is "every `session_message` and
 a positive integer bound. Any new suite that exercises code reading either table
 must hand it a `limitSpy`-wrapped handle. New code must not add a third reader.
 
+`LIMIT ?` bounds the rows a statement returns, not the rows it walks. A join that
+reaches `session_message` or `session_part` through `session_id=?` alone walks the
+whole session for every row it matches, which on a real 34,333-message session cost
+120 ms of CPU for a 50-row page. SQLite picks that plan when it has no automatic index
+to match against, and the choice also depends on table statistics, so **every join
+over these tables is a `CROSS JOIN` with the page's rows or ids on the left** and the
+lookup bound by seq, id or message id. Statements that walk rows they then group or
+filter are bounded by an index range the same way. The message poll, for example,
+reads the rows past its watermark in `(time_created, id)` pages of 2,000
+(`pollPageRows`) with a yield before each, because grouping them by session in one
+statement leads SQLite to scan a covering index of the whole table.
+`test/history-v2-plans.test.ts` plans every statement the reader and the sync run
+over a long session, with automatic indexes on and off and after `ANALYZE`, and fails
+one that scans either table or reaches it in a join by `session_id=?` alone. A new
+statement belongs in its workload.
+
 A v2 read also stops at bytes. One byte ceiling (`pageByteCeiling`, 4 MiB by
 default) covers a page's message rows and their part rows together. A part-row cap
 (`pagePartRows`, 2,000 by default) covers the part rows. When the first message
