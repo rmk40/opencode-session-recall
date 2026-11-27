@@ -19,7 +19,9 @@ import type {
   RollupFields,
   SettledBase,
   Store,
+  StoredRows,
 } from "./store.js";
+import { appendedRows } from "./store.js";
 import type { FetchGate } from "./fetch-gate.js";
 import { isSelfToolPart, toolNameMatches, isSummarizerTitle } from "./extract.js";
 import { tokenize } from "./normalize.js";
@@ -1147,18 +1149,70 @@ function countInventoryRow(counts: InventoryCounts, row: { class: string; raw: s
 }
 
 function inventoryFromCounts(counts: InventoryCounts, limit: number): string {
-  const byFrequency = (entries: Map<string, number>): string[] =>
-    [...entries.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0])).map(([t]) => t);
+  // Code tokens first, then digest tokens not among them: only the first
+  // `limit` of either list can be reached.
+  const code = topByFrequency(counts.code, limit);
+  const digest = code.length < limit ? topByFrequency(counts.digest, limit) : [];
 
   const out: string[] = [];
   const seen = new Set<string>();
-  for (const token of [...byFrequency(counts.code), ...byFrequency(counts.digest)]) {
+  for (const token of [...code, ...digest]) {
     if (out.length >= limit) break;
     if (seen.has(token)) continue;
     seen.add(token);
     out.push(token);
   }
   return out.join(" ");
+}
+
+/**
+ * The first `n` tokens of `counts` in the order a stable sort by count
+ * (highest first) and then `localeCompare` lists them, without sorting
+ * every token: a session's text can hold hundreds of thousands of distinct
+ * tokens. A bounded heap keeps the `n` first seen so far, so most tokens
+ * cost one comparison of counts. Ties that `localeCompare` cannot break
+ * keep the map's order, as the stable sort does.
+ */
+export function topByFrequency(counts: Map<string, number>, n: number): string[] {
+  if (n <= 0) return [];
+  type Entry = { token: string; count: number; at: number };
+  const before = (a: Entry, b: Entry): number =>
+    b.count - a.count || a.token.localeCompare(b.token) || a.at - b.at;
+  /** A max-heap under `before`: its root is the last of the kept entries. */
+  const heap: Entry[] = [];
+  const swap = (i: number, j: number): void => {
+    const t = heap[i]!;
+    heap[i] = heap[j]!;
+    heap[j] = t;
+  };
+  let at = 0;
+  counts.forEach((count, token) => {
+    const index = at++;
+    // A token below the last kept count never enters a full heap.
+    if (heap.length === n && count < heap[0]!.count) return;
+    const entry = { token, count, at: index };
+    if (heap.length < n) {
+      heap.push(entry);
+      for (let i = heap.length - 1; i > 0; ) {
+        const parent = (i - 1) >> 1;
+        if (before(heap[i]!, heap[parent]!) <= 0) break;
+        swap(i, parent);
+        i = parent;
+      }
+    } else if (before(entry, heap[0]!) < 0) {
+      heap[0] = entry;
+      for (let i = 0; ; ) {
+        const left = 2 * i + 1;
+        let last = i;
+        if (left < heap.length && before(heap[left]!, heap[last]!) > 0) last = left;
+        if (left + 1 < heap.length && before(heap[left + 1]!, heap[last]!) > 0) last = left + 1;
+        if (last === i) break;
+        swap(i, last);
+        i = last;
+      }
+    }
+  });
+  return heap.sort(before).map((entry) => entry.token);
 }
 
 function deriveInventory(rows: Array<{ class: string; raw: string }>, limit: number): string {
@@ -1472,6 +1526,9 @@ export function createDistiller(options: DistillerOptions): Distiller {
   let knownCount = 0;
   let distilledCount = 0;
   let examinedCount = 0;
+  /** Writes the store refused because the rows read for them changed
+   *  before their transaction, each written again another way. */
+  let rowsChangedRetries = 0;
 
   let heartbeatTimer: Timer | undefined;
   let leaseRetryTimer: Timer | undefined;
@@ -2165,6 +2222,11 @@ export function createDistiller(options: DistillerOptions): Distiller {
    * out of the stale set until a projector generation bump clears it. With no
    * card to keep, the card is written and then marked the same way. The
    * read's counts are in the source's drift state already.
+   *
+   * `stored` holds the card's rows as {@link storedRowsOf} read them, which
+   * the store compares against instead of reading them inside the write's
+   * transaction. When it refuses them because a write changed the card
+   * since, the write runs again against the rows stored now.
    */
   function writeFull(
     session: DistillSessionMeta,
@@ -2173,6 +2235,7 @@ export function createDistiller(options: DistillerOptions): Distiller {
     checkpoint: DistillCheckpoint | null,
     moved: boolean,
     digest: Digest | undefined,
+    stored: StoredRows | undefined,
   ): CardWrite & { kept?: string } {
     const loss = lossOf(read.counts);
     if (loss && store.getCard(session.id)) {
@@ -2189,12 +2252,17 @@ export function createDistiller(options: DistillerOptions): Distiller {
       derived.settledBase,
     );
     const rangeHashes = digest ? spansOf(digest, read.floor) : undefined;
-    const result = store.replaceSessionParts(
+    const hashes = rangeHashes ? { rangeHashes, replaceRangeHashes: true } : undefined;
+    let result = store.replaceSessionParts(
       session.id,
       derived.rows,
       card,
-      rangeHashes ? { rangeHashes, replaceRangeHashes: true } : undefined,
+      stored ? { ...hashes, stored } : hashes,
     );
+    if (result.refused === "base-changed") {
+      noteRowsChanged(session.id, "full write", "writing against the rows stored now");
+      result = store.replaceSessionParts(session.id, derived.rows, card, hashes);
+    }
     yieldAfterWrite();
     // An accepted replace clears the repair reason, so the mark follows it.
     if (loss && !result.refused) markLoss(session.id, loss, false);
@@ -2370,13 +2438,15 @@ export function createDistiller(options: DistillerOptions): Distiller {
       ...(boundary !== undefined && { settledThrough: boundary }),
     });
     if (pause) await pause();
+    const stored = await storedRowsOf(session.id);
+    if (stored === null) return { changed: false };
     while (writeYield) await writeYield;
     // Authoritative re-check (live lease row, not the cached flag): a process
     // suspended past the TTL can lose the lease to a rival before its heartbeat
     // callback ever runs; the resumed fetch must not replace the new holder's
     // rows. One leaseStatus() read per write batch.
     if (stopped || !ownsLease()) return { changed: false };
-    return writeFull(session, derived, read, checkpoint, moved, digest);
+    return writeFull(session, derived, read, checkpoint, moved, digest, stored);
   }
 
   /**
@@ -2483,8 +2553,8 @@ export function createDistiller(options: DistillerOptions): Distiller {
     const digest = stored ? await digestFor(session.id, before, stored.seq) : undefined;
     const fetched = await fetchNewMessages(session.id, checkpoint);
     const { checkpoint: tail, moved } = await bracketCheckpoint(session.id, before);
-    // Authoritative ownership check before the append write (see distillFull);
-    // only synchronous derivation sits between here and appendSessionParts.
+    // Authoritative ownership check (see distillFull), made again right
+    // before the append writes.
     if (stopped || !ownsLease()) return { changed: false };
     // If the checkpoint message was never found, the newest pages are NOT a clean
     // append tail (they'd re-insert already-stored parts and hit a UNIQUE
@@ -2554,49 +2624,84 @@ export function createDistiller(options: DistillerOptions): Distiller {
       rangeHashes = [...kept, ...(rangeHashes ?? [])];
       replaceRangeHashes = true;
     }
-    if (writeYield) {
-      while (writeYield) await writeYield;
-      if (stopped || !ownsLease()) return { changed: false };
-    }
     const rootId = resolveRootId(session.id, parentChainOf(session));
     const boundary = { checkpointMessageId: checkpoint, firstNewMessageId: chrono[0]!.info.id };
     /** Rows of the messages past the tail's boundary: the rest of the
      *  surviving rows belong to the settled base. */
     const tailRows = walk.rows.length - (walk.prefix?.rows ?? 0);
-
-    const result = store.appendSessionParts(
-      session.id,
-      walk.rows,
-      caps.ftsRowsPerSession,
-      boundary,
-      (allRows) =>
-        stampCard(
-          buildCard(
-            session,
-            rootId,
-            mergeAggregates(oldCard, aggregatesOf(walk)),
-            allRows,
-            deriveInventory(allRows, caps.inventoryTokens),
-            walk.newestMessageId ?? checkpoint,
-            oldCard.familyRollup,
-          ),
-          tail,
-          info,
-          settled === undefined || !walk.prefix
-            ? undefined
-            : settledBaseOf(
-                settled,
-                {
-                  ...walk.prefix,
-                  aggregates: mergeAggregates(oldCard, walk.prefix.aggregates),
-                  newestMessageId: walk.prefix.newestMessageId ?? checkpoint,
-                  cut: (stored?.cut ?? 0) + walk.prefix.cut,
-                },
-                allRows.length - tailRows,
-              ),
+    const cardOf = (allRows: PartTextRow[], inventory: string): Card =>
+      stampCard(
+        buildCard(
+          session,
+          rootId,
+          mergeAggregates(oldCard, aggregatesOf(walk)),
+          allRows,
+          inventory,
+          walk.newestMessageId ?? checkpoint,
+          oldCard.familyRollup,
         ),
-      rangeHashes ? { rangeHashes, replaceRangeHashes } : undefined,
-    );
+        tail,
+        info,
+        settled === undefined || !walk.prefix
+          ? undefined
+          : settledBaseOf(
+              settled,
+              {
+                ...walk.prefix,
+                aggregates: mergeAggregates(oldCard, walk.prefix.aggregates),
+                newestMessageId: walk.prefix.newestMessageId ?? checkpoint,
+                cut: (stored?.cut ?? 0) + walk.prefix.cut,
+              },
+              allRows.length - tailRows,
+            ),
+      );
+    const recompute = (allRows: PartTextRow[]): Card =>
+      cardOf(allRows, deriveInventory(allRows, caps.inventoryTokens));
+
+    // The stored rows are read, and the card built from the rows the append
+    // leaves, before the write's transaction and with yields, so the
+    // transaction reads no stored row but those it evicts.
+    const prior = await storedRowsOf(session.id);
+    if (prior === null) return { changed: false };
+    let prepared: { stored: StoredRows; card: Card; rows: number } | undefined;
+    if (prior) {
+      const after = appendedRows(prior.rows, walk.rows, caps.ftsRowsPerSession, boundary).rows;
+      const inventory = pause
+        ? await deriveInventoryCooperative(after, caps.inventoryTokens, pause)
+        : deriveInventory(after, caps.inventoryTokens);
+      if (stopped || !leaseHeld) return { changed: false };
+      prepared = { stored: prior, card: cardOf(after, inventory), rows: after.length };
+    }
+    while (writeYield) await writeYield;
+    if (stopped || !ownsLease()) return { changed: false };
+    const hashes = rangeHashes ? { rangeHashes, replaceRangeHashes } : undefined;
+    const ready = prepared;
+    const result = ready
+      ? store.appendSessionParts(
+          session.id,
+          walk.rows,
+          caps.ftsRowsPerSession,
+          boundary,
+          // The store lays the rows out from the same stored rows.
+          (allRows) => (allRows.length === ready.rows ? ready.card : recompute(allRows)),
+          { ...hashes, stored: ready.stored },
+        )
+      : // Without stored rows the append reads them inside its transaction.
+        store.appendSessionParts(
+          session.id,
+          walk.rows,
+          caps.ftsRowsPerSession,
+          boundary,
+          recompute,
+          hashes,
+        );
+    if (result.refused === "base-changed") {
+      // A write changed the card while its rows were read, and it may have
+      // indexed some of the messages read here, so they are not appended
+      // again: the session is read in full against what is stored now.
+      noteRowsChanged(session.id, "append", "reading the session in full");
+      return distillFull(session);
+    }
     yieldAfterWrite();
     noteSettled(session.id, tail, moved);
     return { changed: result.changed };
@@ -2654,7 +2759,8 @@ export function createDistiller(options: DistillerOptions): Distiller {
     );
   }
 
-  /** Slim-index rows a tail write reads from the store per statement. */
+  /** Slim-index rows a tail or full write reads from the store per
+   *  statement before its transaction. */
   const BASE_ROWS_PAGE = 500;
 
   /**
@@ -2686,6 +2792,43 @@ export function createDistiller(options: DistillerOptions): Distiller {
       : kept.map((row) =>
           row.messageId === base.messageId ? { ...row, nextMessageId: firstMessageId } : row,
         );
+  }
+
+  /**
+   * Every stored row of a session, for a full write or an append to compare
+   * against (`stored`), read a page at a time with a yield between pages
+   * after the revision counters and the card's revision. A write that lands
+   * in between moves the card's revision or, for an older build's write that
+   * stamps none, `cards_rev` alone, and the store then refuses the rows.
+   * Undefined when the session holds no rows, so there is nothing to compare
+   * outside the transaction. Null when the distiller stopped or lost the
+   * lease, before the first read or during a yield: the store may be closed
+   * by then.
+   */
+  async function storedRowsOf(sessionID: string): Promise<StoredRows | undefined | null> {
+    if (stopped || !leaseHeld) return null;
+    const { cardsRev, cardsStamped } = store.cardCounters();
+    const writeRev = store.cardWriteRev(sessionID) ?? null;
+    const count = store.sessionRowCount(sessionID);
+    if (count === 0) return undefined;
+    const rows: PartTextRow[] = [];
+    for (let offset = 0; offset < count; offset += BASE_ROWS_PAGE) {
+      if (offset > 0 && pause) {
+        await pause();
+        if (stopped || !leaseHeld) return null;
+      }
+      rows.push(...store.sessionRows(sessionID, offset, Math.min(BASE_ROWS_PAGE, count - offset)));
+    }
+    return { writeRev, unstamped: cardsRev - cardsStamped, rows };
+  }
+
+  /** Log a write the store refused because a write changed the stored rows
+   *  while they were read, with how many this distiller has seen. */
+  function noteRowsChanged(sessionID: string, write: string, then: string): void {
+    rowsChangedRetries++;
+    logMsg(
+      `session ${sessionID} ${write}: the stored rows changed while they were read; ${then} (${rowsChangedRetries} so far)`,
+    );
   }
 
   /**
@@ -2722,6 +2865,10 @@ export function createDistiller(options: DistillerOptions): Distiller {
     base: SettledBase,
   ): Promise<CardWrite & { kept?: string }> {
     const stored = sync?.inspect?.(oldCard.distillCursor) ?? null;
+    // Taken before any read below, so the write refuses what an older
+    // build's write, which stamps no revision on the card, changed since.
+    const counters = store.cardCounters();
+    const unstamped = counters.cardsRev - counters.cardsStamped;
     const before = await fetchCheckpoint(session.id);
     if (stopped || !leaseHeld) return { changed: false };
     if (!before || (settledThrough(before) ?? BEFORE_FIRST_SEQ) < base.seq) {
@@ -2825,13 +2972,16 @@ export function createDistiller(options: DistillerOptions): Distiller {
     if (stopped || !ownsLease()) return { changed: false };
     const result = store.replaceSessionTail(
       session.id,
-      { base, evict: plan.evict, rows: walk.rows, firstMessageId, writeRev },
+      { base, evict: plan.evict, rows: walk.rows, firstMessageId, writeRev, unstamped },
       card,
       rangeHashes ? { rangeHashes, replaceRangeHashes } : undefined,
     );
     yieldAfterWrite();
     // Another write changed the card since its rows were read.
-    if (result.refused === "base-changed") return distillFull(session);
+    if (result.refused === "base-changed") {
+      noteRowsChanged(session.id, "tail write", "reading the session in full");
+      return distillFull(session);
+    }
     noteSettled(session.id, checkpoint, moved);
     return { changed: result.changed };
   }
@@ -3063,9 +3213,11 @@ export function createDistiller(options: DistillerOptions): Distiller {
           // past the TTL loses the lease before the heartbeat callback flips
           // the cached flag — and skip it, counting the session as not
           // distilled.
+          const stored = await storedRowsOf(session.id);
+          if (stored === null) return;
           while (writeYield) await writeYield;
           if (stopped || !ownsLease()) return;
-          const written = writeFull(session, derived, read, checkpoint, moved, digest);
+          const written = writeFull(session, derived, read, checkpoint, moved, digest, stored);
           if (written.kept === undefined) {
             distilled++;
             distilledCount = distilled; // status counts only sessions actually distilled

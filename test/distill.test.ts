@@ -17,11 +17,16 @@ import {
   DERIVE_YIELD_EVERY,
   distillFields,
   resolveRootId,
+  topByFrequency,
   type DeriveCardInput,
   type DistillSessionMeta,
   type DistillSignal,
   type DistillSync,
 } from "../src/distill.js";
+import { isDigestToken } from "../src/digest.js";
+import { tokenize } from "../src/normalize.js";
+import { extractCodeTokens } from "../src/query.js";
+import { mulberry32, perfMessageText } from "./perf-helpers.js";
 import type { HistorySource } from "../src/history/source.js";
 import type { HistorySession } from "../src/history/model.js";
 import { createV1HistorySource } from "../src/history/v1.js";
@@ -472,6 +477,105 @@ describe("deriveCardCooperative", () => {
     expect(JSON.stringify(cooperative)).toBe(JSON.stringify(synchronous));
     // Yields after the sort, through the walk, and through the inventory.
     expect(yields).toBeGreaterThanOrEqual(Math.floor(2_400 / DERIVE_YIELD_EVERY));
+  });
+});
+
+describe("inventory ranking", () => {
+  /** Tokens in the order a stable sort by count (highest first) and then
+   *  `localeCompare` lists them. */
+  const ranked = (counts: Map<string, number>): string[] =>
+    [...counts.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0])).map(([t]) => t);
+
+  it("topByFrequency lists the first tokens a full stable sort lists", () => {
+    // Case variants, and spellings localeCompare finds equal, among them.
+    const variants = ["ab", "a\u200bb", "Ab", "e\u0301", "\u00e9", "x", "x\u00ad"];
+    for (let s = 0; s < 60; s++) {
+      const rand = mulberry32(300 + s);
+      const counts = new Map<string, number>();
+      const size = Math.floor(rand() * 400);
+      for (let i = 0; i < size; i++) {
+        const token =
+          rand() < 0.2
+            ? variants[Math.floor(rand() * variants.length)]!
+            : `t${Math.floor(rand() * 1_000)}`;
+        counts.set(token, (counts.get(token) ?? 0) + 1 + Math.floor(rand() * 3));
+      }
+      for (const n of [0, 1, 7, Math.floor(size / 2), size, size + 5]) {
+        expect(topByFrequency(counts, n), `case ${s}, n ${n}`).toEqual(ranked(counts).slice(0, n));
+      }
+    }
+  });
+
+  it("topByFrequency keeps tokens that tie on count and compare equal in map order, wherever n cuts them", () => {
+    // Each pair compares equal under localeCompare, so only map order
+    // separates its tokens.
+    const counts = new Map([
+      ["x", 1],
+      ["e\u0301", 2],
+      ["a\u200bb", 3],
+      ["\u00e9", 2],
+      ["ab", 3],
+      ["x\u00ad", 1],
+    ]);
+    const order = ["a\u200bb", "ab", "e\u0301", "\u00e9", "x", "x\u00ad"];
+    for (let n = 0; n <= order.length + 1; n++) {
+      expect(topByFrequency(counts, n), `n ${n}`).toEqual(order.slice(0, n));
+    }
+    const reversed = new Map([...counts].reverse());
+    expect(topByFrequency(reversed, 1)).toEqual(["ab"]);
+    expect(topByFrequency(reversed, 3)).toEqual(["ab", "a\u200bb", "\u00e9"]);
+    expect(topByFrequency(counts, -1)).toEqual([]);
+  });
+
+  it("keeps the inventory a full sort of every counted token gives", () => {
+    /** The inventory as ranking every token with a full sort builds it. */
+    const sortedInventory = (rows: Array<{ class: string; raw: string }>, limit: number) => {
+      const digest = new Map<string, number>();
+      const code = new Map<string, number>();
+      for (const row of rows) {
+        if (
+          row.class === "human-text" ||
+          (row.class === "tool-input" && !row.raw.startsWith("{"))
+        ) {
+          for (const token of tokenize(row.raw)) {
+            if (isDigestToken(token)) digest.set(token, (digest.get(token) ?? 0) + 1);
+          }
+        }
+        for (const token of extractCodeTokens(row.raw)) {
+          code.set(token, (code.get(token) ?? 0) + 1);
+        }
+      }
+      const out: string[] = [];
+      const seen = new Set<string>();
+      for (const token of [...ranked(code), ...ranked(digest)]) {
+        if (out.length >= limit) break;
+        if (seen.has(token)) continue;
+        seen.add(token);
+        out.push(token);
+      }
+      return out.join(" ");
+    };
+    for (let s = 0; s < 24; s++) {
+      const rand = mulberry32(500 + s);
+      const sid = `s${s}`;
+      const limit = [0, 1, 5, 40, 200, 5_000][s % 6]!;
+      // Few distinct words, so counts tie, or a real session's spread.
+      const text = (i: number) =>
+        s % 4 === 0
+          ? ["alpha beta", "Alpha launchTerminal", "beta gamma_delta", "src/a/b.ts"][i % 4]!
+          : perfMessageText(s * 1_000 + i, 20 + Math.floor(rand() * 2_400));
+      const messages = Array.from({ length: 5 + Math.floor(rand() * 40) }, (_, i) =>
+        i % 3 === 2
+          ? bundle(assistantMessage(`m${i}`, sid, 1000 + i), [
+              completedToolPart(`p${i}`, sid, `m${i}`, "bash", { command: text(i) }, "ok"),
+            ])
+          : bundle(userMessage(`m${i}`, sid, 1000 + i), [textPart(`p${i}`, sid, `m${i}`, text(i))]),
+      );
+      const derived = deriveCard(deriveInput(sid, messages, { caps: { inventoryTokens: limit } }));
+      expect(derived.card.inventory, `case ${s}, limit ${limit}`).toBe(
+        sortedInventory(derived.rows, limit),
+      );
+    }
   });
 });
 

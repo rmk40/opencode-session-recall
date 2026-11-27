@@ -348,8 +348,75 @@ export type CardWrite = { changed: boolean };
  *  written: `older-generation` when the card's {@link Card.projectorGen} is
  *  below the stored one, so an older projection never overwrites a newer
  *  one; `base-changed` when a tail write finds the stored settled base is no
- *  longer the one it merged with. */
+ *  longer the one it merged with, or a replace finds the stored rows may no
+ *  longer be the ones its caller read ({@link StoredRows}). */
 export type SessionWrite = { changed: boolean; refused?: "older-generation" | "base-changed" };
+
+/** A session's slim-index rows as a caller read them before a
+ *  {@link Store.replaceSessionParts}, for the write to compare against
+ *  instead of reading them inside its transaction. */
+export type StoredRows = {
+  /** The card's {@link Card.writeRev}, read before the rows; null for a card
+   *  no stamped write has touched. */
+  writeRev: number | null;
+  /** How many revisions no write stamped (`cardsRev - cardsStamped` from
+   *  {@link Store.cardCounters}), read before the rows. An older build's
+   *  write moves `cards_rev` alone and leaves `write_rev` as it was, so this
+   *  is what shows it. */
+  unstamped: number;
+  /** Every stored row of the session, oldest first ({@link Store.sessionRows}). */
+  rows: PartTextRow[];
+};
+
+/** The checkpoint (previous newest) message of an append, and the first
+ *  message it appends ({@link Store.appendSessionParts}). */
+export type AppendBoundary = { checkpointMessageId: string; firstNewMessageId: string };
+
+/** The rows a session holds after an append, from {@link appendedRows}. */
+export type AppendLayout = {
+  /** How many of the oldest stored rows the row cap evicts. */
+  evict: number;
+  /** Positions among the stored rows of those repointed at the first
+   *  appended message. */
+  repointed: number[];
+  /** The appended rows the session keeps, oldest first: the row cap skips
+   *  the oldest when they alone exceed it. */
+  inserted: PartTextRow[];
+  /** Every row the session holds after the append, oldest first. */
+  rows: PartTextRow[];
+};
+
+/**
+ * The rows {@link Store.appendSessionParts} leaves when it appends `rows` to
+ * a session's `stored` rows (both oldest first). Under the row cap it keeps
+ * the newest `ftsRowsPerSession` of them, evicting stored rows first, as a
+ * full write of the same messages keeps. Rows of the checkpoint message that
+ * point at no next message point at the first appended one. A caller that
+ * read the stored rows builds the card from these rows before the write.
+ */
+export function appendedRows(
+  stored: PartTextRow[],
+  rows: PartTextRow[],
+  ftsRowsPerSession: number,
+  boundary: AppendBoundary,
+): AppendLayout {
+  const total = stored.length + rows.length;
+  const overflow =
+    ftsRowsPerSession > 0 && total > ftsRowsPerSession ? total - ftsRowsPerSession : 0;
+  const evict = Math.min(overflow, stored.length);
+  const repoint = (row: PartTextRow): PartTextRow =>
+    row.messageId === boundary.checkpointMessageId && (row.nextMessageId ?? null) === null
+      ? { ...row, nextMessageId: boundary.firstNewMessageId }
+      : row;
+  const repointed: number[] = [];
+  const kept = stored.slice(evict).map((row, i) => {
+    const next = repoint(row);
+    if (next !== row) repointed.push(evict + i);
+    return next;
+  });
+  const inserted = rows.slice(overflow - evict).map(repoint);
+  return { evict, repointed, inserted, rows: [...kept, ...inserted] };
+}
 
 /** The tail a {@link Store.replaceSessionTail} writes over a settled base. */
 export type SessionTail = {
@@ -365,6 +432,9 @@ export type SessionTail = {
   /** The card's {@link Card.writeRev} when the caller read its rows, null
    *  for a card no stamped write has touched. */
   writeRev: number | null;
+  /** How many revisions no write stamped when the caller read the card's
+   *  rows, as {@link StoredRows.unstamped} records it. */
+  unstamped: number;
 };
 
 /** A hash over one session's source rows from `startSeq` through `endSeq`
@@ -742,19 +812,33 @@ export type Store = {
    * allocated and the stored vector is kept. The comparison covers every
    * column a card write stores except the vector pair, the checkpoint, the
    * generation and the settled base, and every field of every row in order.
-   * Otherwise the rows and card are rewritten with a
-   * revision. Any accepted replace, suppressed or not, clears the card's
+   * Otherwise the card is rewritten with a revision, and the rows are made
+   * to equal `rows` by writing only the rows that differ: a stored row of
+   * the same part, in order, is kept and overwritten only when a field
+   * differs, every other stored row is deleted, and the rest of `rows` is
+   * inserted, the FTS index kept in step for exactly those rows. Rows that
+   * did not change keep their rowids and index entries; a row added before
+   * a stored row that stays, or a part that moves, rewrites every row after
+   * it. Any accepted replace, suppressed or not, clears the card's
    * {@link Card.repairReason}. `opts.rangeHashes` are stored in the same
    * transaction (see {@link putRangeHashes}), suppressed or not; with
    * `opts.replaceRangeHashes` they replace every hash stored for the session
-   * instead. A refused or failed replace leaves the stored hashes as they
-   * were.
+   * instead. A refused or failed replace leaves the stored rows, index
+   * entries, card and hashes as they were.
+   *
+   * With `opts.stored`, the rows the caller read before the call, the
+   * transaction compares against those and reads only the session's rowids
+   * (and, for the rows it deletes or overwrites, their indexed text). It is
+   * refused with `base-changed`, writing nothing, unless the card is still
+   * stored at the revision `opts.stored.writeRev`, no write that stamps
+   * nothing moved `cards_rev` since ({@link StoredRows.unstamped}) and the
+   * session still holds that many rows.
    */
   replaceSessionParts(
     sessionId: string,
     rows: PartTextRow[],
     card: Card,
-    opts?: { rangeHashes?: RangeHash[]; replaceRangeHashes?: boolean },
+    opts?: { rangeHashes?: RangeHash[]; replaceRangeHashes?: boolean; stored?: StoredRows },
   ): SessionWrite;
   /**
    * Append new slim-index rows to a session's existing rows, enforce the
@@ -781,30 +865,41 @@ export type Store = {
    * does not rebuild the card. `opts` stores range hashes as
    * {@link replaceSessionParts} does, and like it keeps the stored ones when
    * the append is refused or fails.
+   *
+   * With `opts.stored`, the rows the caller read before the call, the
+   * transaction lays the rows out from those ({@link appendedRows}) and
+   * `recompute` receives that layout's rows, which the caller can build the
+   * card from beforehand. The transaction reads the session's rowids and the
+   * indexed text of the rows it evicts, and no other stored row. It is
+   * refused with `base-changed`, writing nothing, as
+   * {@link replaceSessionParts} with `opts.stored` is.
    */
   appendSessionParts(
     sessionId: string,
     rows: PartTextRow[],
     ftsRowsPerSession: number,
-    boundary: { checkpointMessageId: string; firstNewMessageId: string },
+    boundary: AppendBoundary,
     recompute: (allRows: PartTextRow[]) => Card,
-    opts?: { rangeHashes?: RangeHash[]; replaceRangeHashes?: boolean },
+    opts?: { rangeHashes?: RangeHash[]; replaceRangeHashes?: boolean; stored?: StoredRows },
   ): SessionWrite;
   /**
    * Replace the tail of a card distilled against a running tail, keeping its
    * settled base, in one transaction. The session's oldest `tail.base.rows`
    * slim-index rows are the base's: the oldest `tail.evict` of them are
-   * evicted (the row cap), the rest are kept, and every row after them (the
-   * previous tail's) is replaced by `tail.rows` unless they already equal
-   * it. The rows of the base's newest message ({@link SettledBase.messageId})
-   * are repointed at `tail.firstMessageId`, as an append of the same
-   * messages would store them. `card` is the card the caller built from the
+   * evicted (the row cap), the rest are kept, and the rows after them (the
+   * previous tail's) are made to equal `tail.rows`, writing only the rows
+   * that differ as {@link replaceSessionParts} does. The rows of the base's
+   * newest message ({@link SettledBase.messageId}) are repointed at
+   * `tail.firstMessageId`, as an append of the same messages would store
+   * them. `card` is the card the caller built from the
    * rows it read ({@link sessionRows}) with those changes, so the
    * transaction reads only the rows it replaces.
    *
    * Refused with `base-changed`, writing nothing, unless the card still holds
    * exactly `tail.base`, at least its rows and the revision `tail.writeRev`
-   * the caller read them at: another write changed the card since. Refused
+   * the caller read them at, and no write that stamps nothing moved
+   * `cards_rev` since (`tail.unstamped`): another write changed the card
+   * since, or may have. Refused
    * with `older-generation` like {@link appendSessionParts}, whose
    * generation, suppression (no row evicted, replaced or repointed and an
    * unchanged card write only the checkpoint, generation and settled base,
@@ -1208,19 +1303,90 @@ function sameCard(stored: Row, card: Card): boolean {
  *  and in order. */
 function sameRows(stored: Row[], rows: PartTextRow[]): boolean {
   if (stored.length !== rows.length) return false;
-  return rows.every((row, i) => {
+  return rows.every((row, i) => sameRow(stored[i]!, row));
+}
+
+/** Whether a stored slim-index row (read with {@link PART_ROW_COLUMNS})
+ *  holds every field of `row`. */
+function sameRow(old: Row, row: PartTextRow): boolean {
+  return (
+    sameSqlValue(old.part_id, row.partId) &&
+    sameSqlValue(old.message_id, row.messageId) &&
+    sameSqlValue(old.prev_message_id, row.prevMessageId ?? null) &&
+    sameSqlValue(old.next_message_id, row.nextMessageId ?? null) &&
+    sameSqlValue(old.class, row.class) &&
+    sameSqlValue(old.time_created, row.timeCreated) &&
+    sameIndexedText(old, row)
+  );
+}
+
+/** Whether a stored slim-index row holds the text of `row` that the FTS
+ *  index holds. */
+function sameIndexedText(old: Row, row: PartTextRow): boolean {
+  return sameSqlValue(old.raw, row.raw) && sameSqlValue(old.norm, row.norm);
+}
+
+/** A slim-index row a caller read ({@link Store.sessionRows}) as a stored
+ *  row with rowid `id`. */
+function storedRow(id: SqlValue | undefined, row: PartTextRow): Row {
+  return {
+    id: id ?? null,
+    part_id: row.partId,
+    message_id: row.messageId,
+    prev_message_id: row.prevMessageId ?? null,
+    next_message_id: row.nextMessageId ?? null,
+    class: row.class,
+    time_created: row.timeCreated,
+    raw: row.raw,
+    norm: row.norm,
+  };
+}
+
+/** The writes {@link planRowDiff} plans. */
+type RowDiff = {
+  /** Rowids of the stored rows to delete. */
+  removed: number[];
+  /** Stored rows to overwrite in place with the new row of the same part. */
+  updated: Array<{ id: number; row: PartTextRow }>;
+  /** New rows to insert after every stored row left, oldest first. */
+  added: PartTextRow[];
+};
+
+/**
+ * The writes that make a session's stored rows (`stored`, with their rowids,
+ * in rowid order) hold exactly `rows` in order. Rows are read back in rowid
+ * order and an inserted row's rowid is above every stored one, so a stored
+ * row keeps its place only while the rows of `rows` match stored rows of the
+ * same part in rowid order. Each of those is overwritten when a field
+ * differs and left alone otherwise. From the first row of `rows` with no
+ * such match, every row is inserted, and every stored row left unmatched is
+ * deleted. Evicting the oldest rows, changing rows in place, removing rows
+ * and appending rows touch only those rows; a row added before a stored row
+ * that stays, or a part that moves, rewrites every row after it.
+ */
+function planRowDiff(stored: Row[], rows: PartTextRow[]): RowDiff {
+  const at = new Map<string, number>();
+  stored.forEach((row, i) => at.set(asString(row.part_id), i));
+  const kept = new Set<number>();
+  const updated: RowDiff["updated"] = [];
+  let last = -1;
+  let next = 0;
+  for (; next < rows.length; next++) {
+    const row = rows[next]!;
+    const i = at.get(row.partId);
+    if (i === undefined || i <= last) break;
+    last = i;
+    kept.add(i);
     const old = stored[i]!;
-    return (
-      sameSqlValue(old.part_id, row.partId) &&
-      sameSqlValue(old.message_id, row.messageId) &&
-      sameSqlValue(old.prev_message_id, row.prevMessageId ?? null) &&
-      sameSqlValue(old.next_message_id, row.nextMessageId ?? null) &&
-      sameSqlValue(old.class, row.class) &&
-      sameSqlValue(old.time_created, row.timeCreated) &&
-      sameSqlValue(old.raw, row.raw) &&
-      sameSqlValue(old.norm, row.norm)
-    );
-  });
+    if (!sameRow(old, row)) {
+      updated.push({ id: asNumber(old.id), row });
+    }
+  }
+  return {
+    removed: stored.filter((_, i) => !kept.has(i)).map((row) => asNumber(row.id)),
+    updated,
+    added: rows.slice(next),
+  };
 }
 
 /** Whether applying `next` would change any of a card's stored metadata. */
@@ -2149,25 +2315,26 @@ class SqliteStore implements Store {
     sessionId: string,
     rows: PartTextRow[],
     card: Card,
-    opts?: { rangeHashes?: RangeHash[]; replaceRangeHashes?: boolean },
+    opts?: { rangeHashes?: RangeHash[]; replaceRangeHashes?: boolean; stored?: StoredRows },
   ): SessionWrite {
     return this.db.tx((): SessionWrite => {
       const stored = this.db.get(CARD_COMPARE_SQL, [sessionId]);
       if (belowStoredGen(card.projectorGen, stored?.projector_gen)) {
         return { changed: false, refused: "older-generation" };
       }
+      const storedRows = opts?.stored
+        ? this.preparedRows(sessionId, stored, opts.stored)
+        : this.db.all(
+            `SELECT id, ${PART_ROW_COLUMNS} FROM part_text WHERE session_id=? ORDER BY id`,
+            [sessionId],
+          );
+      if (!storedRows) return { changed: false, refused: "base-changed" };
       if (opts?.replaceRangeHashes) {
         this.db.run("DELETE FROM range_hash WHERE session_id=?", [sessionId]);
       }
-      const storedRows = this.db.all(
-        `SELECT id, ${PART_ROW_COLUMNS} FROM part_text WHERE session_id=? ORDER BY id`,
-        [sessionId],
-      );
       const changed = !stored || !sameCard(stored, card) || !sameRows(storedRows, rows);
       if (changed) {
-        this.evictFts(storedRows);
-        this.db.run("DELETE FROM part_text WHERE session_id=?", [sessionId]);
-        for (const row of rows) this.insertRow(sessionId, row);
+        this.writeRowDiff(sessionId, storedRows, rows);
         this.writeStampedCard(card);
       } else {
         this.writeCheckpoint(sessionId, card);
@@ -2185,39 +2352,18 @@ class SqliteStore implements Store {
     sessionId: string,
     rows: PartTextRow[],
     ftsRowsPerSession: number,
-    boundary: { checkpointMessageId: string; firstNewMessageId: string },
+    boundary: AppendBoundary,
     recompute: (allRows: PartTextRow[]) => Card,
-    opts?: { rangeHashes?: RangeHash[]; replaceRangeHashes?: boolean },
+    opts?: { rangeHashes?: RangeHash[]; replaceRangeHashes?: boolean; stored?: StoredRows },
   ): SessionWrite {
     try {
       return this.db.tx((): SessionWrite => {
         const stored = this.db.get(CARD_COMPARE_SQL, [sessionId]);
-        const old = this.db.all(
-          "SELECT id, raw, norm FROM part_text WHERE session_id=? ORDER BY id",
-          [sessionId],
-        );
-        const total = old.length + rows.length;
-        const overflow =
-          ftsRowsPerSession > 0 && total > ftsRowsPerSession ? total - ftsRowsPerSession : 0;
-        // Newest-first cap over old + new (matching capRows): evict the oldest
-        // `overflow` rows — from the existing rows first (front of `old`), and any
-        // remaining overflow simply skips the oldest new rows so they never insert.
-        const evictOld = Math.min(overflow, old.length);
-        this.evictFts(old.slice(0, evictOld));
-        for (let i = 0; i < evictOld; i++) {
-          this.db.run("DELETE FROM part_text WHERE id=?", [asNumber(old[i]!.id)]);
-        }
-        const firstInserted = overflow - evictOld;
-        for (let i = firstInserted; i < rows.length; i++) this.insertRow(sessionId, rows[i]!);
-        // Repoint the checkpoint message's dangling next pointer at the first
-        // appended message (only surviving checkpoint rows still NULL). A no-op
-        // when the checkpoint was evicted by the cap — as it would be in a full
-        // re-distill of the same state.
-        const repointed = this.db.run(
-          "UPDATE part_text SET next_message_id=? WHERE session_id=? AND message_id=? AND next_message_id IS NULL",
-          [boundary.firstNewMessageId, sessionId, boundary.checkpointMessageId],
-        ).changes;
-        const recomputed = recompute(this.readSessionRows(sessionId));
+        const appended = opts?.stored
+          ? this.appendToPrepared(sessionId, stored, opts.stored, rows, ftsRowsPerSession, boundary)
+          : this.appendToStored(sessionId, rows, ftsRowsPerSession, boundary);
+        if (!appended) return { changed: false, refused: "base-changed" };
+        const recomputed = recompute(appended.rows);
         // An append extends the card at its stored generation unless the
         // recomputed card names one.
         const card: Card =
@@ -2227,8 +2373,7 @@ class SqliteStore implements Store {
         if (belowStoredGen(card.projectorGen, stored?.projector_gen)) {
           throw new OlderGenerationRefused();
         }
-        const rowsChanged = evictOld > 0 || firstInserted < rows.length || repointed > 0;
-        const changed = rowsChanged || !stored || !sameCard(stored, card);
+        const changed = appended.rowsChanged || !stored || !sameCard(stored, card);
         if (changed) this.writeStampedCard(card);
         else this.writeCheckpoint(sessionId, card);
         if (opts?.replaceRangeHashes) {
@@ -2245,6 +2390,85 @@ class SqliteStore implements Store {
     }
   }
 
+  /** An append over the rows read inside its transaction: every stored row
+   *  is read, with its text, and then read again for the card. Caller
+   *  supplies the transaction. */
+  private appendToStored(
+    sessionId: string,
+    rows: PartTextRow[],
+    ftsRowsPerSession: number,
+    boundary: AppendBoundary,
+  ): { rowsChanged: boolean; rows: PartTextRow[] } {
+    const old = this.db.all("SELECT id, raw, norm FROM part_text WHERE session_id=? ORDER BY id", [
+      sessionId,
+    ]);
+    const total = old.length + rows.length;
+    const overflow =
+      ftsRowsPerSession > 0 && total > ftsRowsPerSession ? total - ftsRowsPerSession : 0;
+    // Newest-first cap over old + new (matching capRows): evict the oldest
+    // `overflow` rows — from the existing rows first (front of `old`), and any
+    // remaining overflow simply skips the oldest new rows so they never insert.
+    const evictOld = Math.min(overflow, old.length);
+    this.evictFts(old.slice(0, evictOld));
+    for (let i = 0; i < evictOld; i++) {
+      this.db.run("DELETE FROM part_text WHERE id=?", [asNumber(old[i]!.id)]);
+    }
+    const firstInserted = overflow - evictOld;
+    for (let i = firstInserted; i < rows.length; i++) this.insertRow(sessionId, rows[i]!);
+    // Repoint the checkpoint message's dangling next pointer at the first
+    // appended message (only surviving checkpoint rows still NULL). A no-op
+    // when the checkpoint was evicted by the cap — as it would be in a full
+    // re-distill of the same state.
+    const repointed = this.db.run(
+      "UPDATE part_text SET next_message_id=? WHERE session_id=? AND message_id=? AND next_message_id IS NULL",
+      [boundary.firstNewMessageId, sessionId, boundary.checkpointMessageId],
+    ).changes;
+    return {
+      rowsChanged: evictOld > 0 || firstInserted < rows.length || repointed > 0,
+      rows: this.readSessionRows(sessionId),
+    };
+  }
+
+  /** An append over the rows a caller read before its transaction
+   *  (`prepared`), laid out by {@link appendedRows}, or undefined when they
+   *  may no longer be the stored ones, as {@link preparedIds} decides. Reads
+   *  the session's rowids and only the evicted rows' indexed text. Caller
+   *  supplies the transaction. */
+  private appendToPrepared(
+    sessionId: string,
+    card: Row | undefined,
+    prepared: StoredRows,
+    rows: PartTextRow[],
+    ftsRowsPerSession: number,
+    boundary: AppendBoundary,
+  ): { rowsChanged: boolean; rows: PartTextRow[] } | undefined {
+    const ids = this.preparedIds(sessionId, card, prepared);
+    if (!ids) return undefined;
+    const layout = appendedRows(prepared.rows, rows, ftsRowsPerSession, boundary);
+    if (layout.evict > 0) {
+      this.evictFts(
+        this.db.all("SELECT id, raw, norm FROM part_text WHERE session_id=? ORDER BY id LIMIT ?", [
+          sessionId,
+          layout.evict,
+        ]),
+      );
+      for (let i = 0; i < layout.evict; i++) {
+        this.db.run("DELETE FROM part_text WHERE id=?", [ids[i]!]);
+      }
+    }
+    for (const row of layout.inserted) this.insertRow(sessionId, row);
+    for (const i of layout.repointed) {
+      this.db.run("UPDATE part_text SET next_message_id=? WHERE id=?", [
+        boundary.firstNewMessageId,
+        ids[i]!,
+      ]);
+    }
+    return {
+      rowsChanged: layout.evict > 0 || layout.inserted.length > 0 || layout.repointed.length > 0,
+      rows: layout.rows,
+    };
+  }
+
   replaceSessionTail(
     sessionId: string,
     tail: SessionTail,
@@ -2258,6 +2482,7 @@ class SqliteStore implements Store {
         !stored ||
         stored.settled_base !== serializeSettledBase(base) ||
         asNullableNumber(stored.write_rev) !== tail.writeRev ||
+        this.unstampedRevisions() !== tail.unstamped ||
         !Number.isInteger(evict) ||
         evict < 0 ||
         evict > base.rows ||
@@ -2302,9 +2527,8 @@ class SqliteStore implements Store {
               !sameSqlValue(row.next_message_id, tail.firstMessageId),
           );
       const tailChanged = !sameRows(oldTail, tail.rows);
-      const dropped = tailChanged ? [...evicted, ...oldTail] : evicted;
-      this.evictFts(dropped);
-      for (const row of dropped) {
+      this.evictFts(evicted);
+      for (const row of evicted) {
         this.db.run("DELETE FROM part_text WHERE id=?", [asNumber(row.id)]);
       }
       if (repoint) {
@@ -2314,7 +2538,7 @@ class SqliteStore implements Store {
           base.messageId,
         ]);
       }
-      if (tailChanged) for (const row of tail.rows) this.insertRow(sessionId, row);
+      if (tailChanged) this.writeRowDiff(sessionId, oldTail, tail.rows);
       const changed = evict > 0 || repoint || tailChanged || !sameCard(stored, card);
       if (changed) this.writeStampedCard(card);
       else this.writeCheckpoint(sessionId, card);
@@ -2324,6 +2548,101 @@ class SqliteStore implements Store {
       this.writeRangeHashes(sessionId, opts?.rangeHashes);
       return { changed };
     });
+  }
+
+  /** The rows a caller read before this transaction (`prepared`), each with
+   *  the rowid at its place now ({@link preparedIds}). Caller supplies the
+   *  transaction. */
+  private preparedRows(
+    sessionId: string,
+    card: Row | undefined,
+    prepared: StoredRows,
+  ): Row[] | undefined {
+    const ids = this.preparedIds(sessionId, card, prepared);
+    return ids && prepared.rows.map((row, i) => storedRow(ids[i], row));
+  }
+
+  /** How many revisions no write stamped (`cards_rev - cards_stamped`): an
+   *  older build's write moves `cards_rev` alone. */
+  private unstampedRevisions(): number {
+    const { cardsRev, cardsStamped } = this.cardCounters();
+    return cardsRev - cardsStamped;
+  }
+
+  /** The session's rowids in order, one per row a caller read before this
+   *  transaction (`prepared`), or undefined when those rows may no longer be
+   *  the stored ones: the card (`card`, read in this transaction) is gone, a
+   *  stamped write moved its revision, a write that stamps nothing moved
+   *  `cards_rev` ({@link StoredRows.unstamped}), or the session holds another
+   *  number of rows. Reads the counters and the rowids, from the session's
+   *  index. Caller supplies the transaction. */
+  private preparedIds(
+    sessionId: string,
+    card: Row | undefined,
+    prepared: StoredRows,
+  ): number[] | undefined {
+    if (!card || asNullableNumber(card.write_rev) !== prepared.writeRev) return undefined;
+    if (this.unstampedRevisions() !== prepared.unstamped) return undefined;
+    const ids = this.db
+      .all("SELECT id FROM part_text WHERE session_id=? ORDER BY id", [sessionId])
+      .map((row) => asNumber(row.id));
+    return ids.length === prepared.rows.length ? ids : undefined;
+  }
+
+  /**
+   * Make a session's stored rows (`stored`, with their rowids, in rowid
+   * order) hold exactly `rows`, writing only the rows {@link planRowDiff}
+   * plans to delete, overwrite or insert, and keep the FTS index in step for
+   * exactly those rows. Every row it deletes or overwrites is read by rowid
+   * in this transaction: the index entry of a deleted row, or of an
+   * overwritten row whose text differs from what it holds now, is removed
+   * with those values (the FTS `'delete'` command requires them).
+   * Deletes run before inserts because part ids are unique: a part that
+   * moves is deleted from its old place before it is inserted at its new
+   * one. Caller supplies the transaction.
+   */
+  private writeRowDiff(sessionId: string, stored: Row[], rows: PartTextRow[]): void {
+    const diff = planRowDiff(stored, rows);
+    const held = (id: number) =>
+      this.db.get("SELECT id, raw, norm FROM part_text WHERE id=?", [id]);
+    const entries: Row[] = [];
+    for (const id of diff.removed) {
+      const row = held(id);
+      if (row) entries.push(row);
+    }
+    // Whether an overwritten row's index entry changes is decided from the
+    // text it holds now: rows read before the transaction may be older.
+    const updated = diff.updated.map(({ id, row }) => {
+      const now = held(id);
+      const text = now !== undefined && !sameIndexedText(now, row);
+      if (now && text) entries.push(now);
+      return { id, row, text };
+    });
+    this.evictFts(entries);
+    for (const id of diff.removed) this.db.run("DELETE FROM part_text WHERE id=?", [id]);
+    for (const { id, row, text } of updated) {
+      this.db.run(
+        "UPDATE part_text SET message_id=?, prev_message_id=?, next_message_id=?, class=?, time_created=?, raw=?, norm=? WHERE id=?",
+        [
+          row.messageId,
+          row.prevMessageId,
+          row.nextMessageId,
+          row.class,
+          row.timeCreated,
+          row.raw,
+          row.norm,
+          id,
+        ],
+      );
+      if (text) {
+        this.db.run("INSERT INTO part_fts(rowid, raw, norm) VALUES(?, ?, ?)", [
+          id,
+          row.raw,
+          row.norm,
+        ]);
+      }
+    }
+    for (const row of diff.added) this.insertRow(sessionId, row);
   }
 
   /** Insert one slim-index row into `part_text` and mirror it into the

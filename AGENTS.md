@@ -358,15 +358,58 @@ it, so re-indexing a root never clears its rollup.
 rereading its settled base. The caller reads the base's rows (`sessionRows`) and
 builds the card before the transaction. Inside it the store reads only the rows it
 replaces, after checking that the card still holds the caller's settled base, at
-least its rows and the `write_rev` the caller read them at. Any other state refuses
-the write as `base-changed` with nothing written. The distiller then reads the
-session in full. The previous tail's rows are replaced unless they equal the new
-ones. The rows of the base's newest message are repointed at the tail's first
-message. Under the row cap the card keeps what an append of the same messages
-keeps, which is the aggregates of every message the card has held and the newest
-`ftsRowsPerSession` rows. A longer tail evicts the base's oldest rows. A shorter one
-would need back rows that an earlier write evicted, so the distiller reads in full
-when the store holds exactly the cap (every eviction leaves exactly the cap).
+least its rows and the `write_rev` the caller read them at, and that `unstamped`
+(below) has not moved since the distiller began the tail read. Any other state
+refuses the write as `base-changed` with nothing written. The distiller then reads the
+session in full. The previous tail's rows are diffed against the new ones as a
+full write's are (below). The rows of the base's newest message are repointed at
+the tail's first message. Under the row cap the card keeps what an append of the
+same messages keeps, which is the aggregates of every message the card has held
+and the newest `ftsRowsPerSession` rows. A longer tail evicts the base's oldest
+rows. A shorter one would need back rows that an earlier write evicted, so the
+distiller reads in full when the store holds exactly the cap (every eviction
+leaves exactly the cap).
+
+A changed `replaceSessionParts` writes only the rows that differ (`planRowDiff`).
+While the new rows match stored rows of the same part id in rowid order, each keeps
+its rowid and is overwritten only when a field differs. The other stored rows are
+deleted and the rest of the new rows inserted, with the FTS index kept in step for
+exactly those rows. Readers read rows in rowid order and an insert takes a rowid
+above every stored one, so a new row can only follow the kept ones. Evicting the
+oldest rows, changing rows in place, removing rows and appending touch only those
+rows. A row added before a row that stays, or a part that moves, rewrites every row
+after it. The FTS `'delete'` command needs a row's indexed text, which the write
+reads by rowid inside its transaction.
+
+The distiller reads the stored rows for a full write before the transaction
+(`storedRowsOf`). It reads the revision counters and the card's `write_rev` first
+and then the rows, 500 at a time with a yield between pages. It hands them to the
+store as `stored`, with `unstamped`, how far `cards_rev` was ahead of
+`cards_stamped`. The transaction then reads the counters and the session's rowids.
+It refuses the rows as `base-changed` when the card is gone, its `write_rev` moved,
+the session holds another number of rows or `unstamped` changed. The last catches
+an older build's write, which moves `cards_rev` alone and leaves `write_rev` as it
+was. `writeFull` then writes again without the rows, so the store reads them inside
+the transaction. Every row the write deletes or overwrites is read again by rowid
+in the transaction. Its index entry is replaced from that text, so a write that
+moves no counter at all still leaves the index matching `part_text`. The next full
+write compares against the rows as they are.
+
+An append reads the stored rows the same way. It builds its card from
+`appendedRows` before the transaction, with yields while it derives the inventory.
+`appendedRows` is the layout the store applies inside the transaction, which reads
+the session's rowids and the indexed text of the rows it evicts and no other stored
+row. A refused append reads the session in full instead (`distillFull`). The write
+that changed the card may have indexed some of the messages the append read.
+Appending those again would hit the unique part id. Every refused write the
+distiller runs again is logged with a running count.
+
+The card inventory ranks tokens by count and then `localeCompare`. `topByFrequency`
+keeps the first tokens of that order without sorting them all. A session can hold
+hundreds of thousands of distinct code tokens. Sorting them all took over 100 ms in
+one slice. Its order must stay exactly that of a stable full sort, which
+`test/distill.test.ts` checks. Any other order changes the inventory of
+every card on its next write, so each would allocate a revision and lose its vector.
 
 ## The card runtime applies store changes in place
 
