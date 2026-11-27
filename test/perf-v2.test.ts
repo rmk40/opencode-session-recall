@@ -1269,6 +1269,9 @@ describe.skipIf(!ENABLED)("perf: v2 event-loop stalls", () => {
           const member = i < FAMILY_CHILDREN ? { rootId: root, parentId: root } : {};
           fx.store.replaceSessionParts(corpus.id(i), [], { ...card, ...member });
         }
+        // Writes made over time are checkpointed as they come; these came in
+        // one synchronous loop, so their checkpoint happens here.
+        fx.store.checkpoint();
         load = loadAverage();
 
         // The child gets a message: its write recomputes the root's rollup.
