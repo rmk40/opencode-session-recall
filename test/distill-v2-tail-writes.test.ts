@@ -704,8 +704,9 @@ describe("v2 range hashes over a running tail", () => {
 
 describe("v2 full writes over stored rows", () => {
   /** A session of `count` settled user rows, written once by `h`; the
-   *  stored rows are read in pages of 500 before a later full write. */
-  async function written(count: number) {
+   *  stored rows are read in pages of 500 before a later full write or
+   *  append. */
+  async function written(count: number, o: StartOptions = {}) {
     addSession("ses_a");
     v2db.db.tx(() => {
       for (let i = 0; i < count; i++) addUser("ses_a", `filler${i} common`);
@@ -720,6 +721,7 @@ describe("v2 full writes over stored rows", () => {
       return sessionRows(id, offset, limit);
     };
     const h = start({
+      ...o,
       pause: async () => {
         if (!pageRead || !atPage) return;
         const run = atPage;
@@ -728,11 +730,6 @@ describe("v2 full writes over stored rows", () => {
       },
     });
     await redistill(h, "ses_a");
-    // One message changes, and a full read follows.
-    v2db.db.run("UPDATE session_message SET data = ? WHERE id = ?", [
-      JSON.stringify({ text: "changedword common", time: { created: T0 + 3 } }),
-      "msg_ses_a_3",
-    ]);
     return {
       h,
       between: (run: () => void) => {
@@ -742,8 +739,17 @@ describe("v2 full writes over stored rows", () => {
     };
   }
 
+  /** One message changes, for a full read to find. */
+  const changeOne = (): void => {
+    v2db.db.run("UPDATE session_message SET data = ? WHERE id = ?", [
+      JSON.stringify({ text: "changedword common", time: { created: T0 + 3 } }),
+      "msg_ses_a_3",
+    ]);
+  };
+
   it("write again against the rows stored now when a write lands while they are read", async () => {
     const { h, between } = await written(600);
+    changeOne();
     let raced = false;
     between(() => {
       raced = true;
@@ -771,8 +777,39 @@ describe("v2 full writes over stored rows", () => {
     ]);
   }, 20_000);
 
+  it("append again against the rows stored now when a write lands while they are read", async () => {
+    const { h, between } = await written(600, { appendThresholdParts: 0 });
+    addUser("ses_a", "appendedword common");
+    v2db.db.run("UPDATE session_v2 SET time_updated = ? WHERE id = ?", [T0 + 10_000, "ses_a"]);
+    let raced = false;
+    between(() => {
+      raced = true;
+      // A write that changes the rows the append is reading, as in the full
+      // write above.
+      const rows = store.sessionRows("ses_a", 0, 2_000).slice(100);
+      rows[300] = { ...rows[300]!, raw: "racedword", norm: "racedword" };
+      store.replaceSessionParts("ses_a", rows, store.getCard("ses_a")!);
+    });
+    const writes = await redistill(h, "ses_a", "turn-ended", (w) => w.length >= 2);
+    expect(raced).toBe(true);
+    expect(writes).toEqual([
+      { method: "appendSessionParts", result: { changed: false, refused: "base-changed" } },
+      { method: "appendSessionParts", result: { changed: true } },
+    ]);
+    // The append extended the rows stored now: the raced ones and its own.
+    expect(storedText("ses_a")).toHaveLength(501);
+    expect(storedText("ses_a").at(-1)).toBe("appendedword common");
+    expect(hits("racedword")).toEqual(["ses_a"]);
+    expect(hits("filler50")).toEqual([]);
+    expect(store.getCard("ses_a")?.retainedChars).toBe(
+      storedText("ses_a").reduce((sum, raw) => sum + raw.length, 0),
+    );
+    storeDb.run("INSERT INTO part_fts(part_fts, rank) VALUES('integrity-check', 1)");
+  }, 20_000);
+
   it("write nothing when the lease moves while the stored rows are read", async () => {
     const { h, between } = await written(600);
+    changeOne();
     const before = store.getCard("ses_a");
     let stolen = false;
     between(() => {
