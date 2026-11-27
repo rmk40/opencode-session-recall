@@ -288,8 +288,13 @@ Several opencode processes run one plugin instance each and share the file,
 coordinated by a single `distill_lease` row in `meta` (holder, heartbeat, 30s TTL,
 plus the writer's build/gen for diagnosis); only the lease holder writes, stale
 leases are taken over on expiry, and per-session writes are transactional so readers
-never see half a session. Two revision counters drive lazy reader reloads and they
-are NOT interchangeable. `cards_rev` covers lexical card writes and the tier-1
+never see half a session. `acquireLease(..., { takeOver })` may also take a lease
+that has not expired from the one holder it names, a predecessor the caller knows
+has stopped. The row is compared with that holder in the same conditional write as
+the acquire, so a lease another holder took meanwhile is never taken. Without
+`takeOver` (every older build) the acquire is unchanged. Two revision counters
+drive lazy reader reloads and they are NOT interchangeable. `cards_rev` covers
+lexical card writes and the tier-1
 runtime watches it. The store allocates it inside each write's own transaction (see
 the next section), so the distiller and the summarizer never bump it themselves.
 `writeCardEmbeddings` bumps `vectors_rev` instead, because vectors are invisible to
@@ -325,6 +330,67 @@ loses the lease or stops, so a store whose lease nobody holds still checkpoints 
 SQLite's default. The cold pass examines sessions newest first, so its cursor
 (`coldpass_cursor`) moves with nearly every session; it is written at most once a
 second.
+
+## A reader connection to the store never writes or waits
+
+`openStore` always takes the write lock (its fence runs under `BEGIN IMMEDIATE` with a
+5 s `busy_timeout`), so a second connection that only searches would wait behind a
+writer for as long as the writer holds it. `openReadStore(path, identity)` opens a
+connection that never takes it. It returns a `ReadStore`, the `Store` methods that
+only read (cards, card pages and counters, the slim-index lookup, `getMeta` and
+`leaseStatus`). The search deps and the card hook's deps are typed against it. The
+returned object holds those methods alone, and the connection behind them refuses
+`exec`, `run` and `tx` before SQLite sees them.
+
+- **Connection:** it is opened through `openSqliteReadOnly`, with SQLite's read-only
+  flag, `query_only=1` and `busy_timeout=0`. It never sets `journal_mode` or any
+  other pragma that persists.
+- **Fence:** it runs `openStore`'s fence as plain reads with no transaction. The host
+  stamp comes first, then the source stamp and the schema version, with the same
+  refusals for the same states (`newer`, `host-mismatch`, `source-mismatch`). Where
+  `openStore` would migrate or rebuild, it refuses as `needs-migration` or
+  `needs-rebuild`, as `existingOnly` does. For the card-only fallback, `acceptSource`
+  lets the caller accept the stamped spelling of its source.
+- **Side files:** it checks with `stat` that the file and its `-wal` and `-shm` files
+  exist, and refuses as `missing` or `no-wal` otherwise. A read-only connection to a
+  WAL file without them creates both (an empty `-wal`, a 32 KiB `-shm`) and cannot
+  delete them when it closes. In a directory it cannot write it fails instead, with
+  `SQLITE_CANTOPEN` or `SQLITE_READONLY_DIRECTORY`.
+- **When the side files exist:** the last connection to close deletes them on
+  `node:sqlite`. macOS's system SQLite, which `bun:sqlite` uses there, keeps them
+  (an empty `-wal`). A connection running `openStore` creates them at its first
+  statement in WAL mode. On a store it has just created or switched to WAL, that is
+  the statement after `openStore` returns. So a reader opens beside a writer that
+  has run at least one statement, or after a writer that left them.
+- **The `-shm` file:** a WAL reader writes its read mark into the `-shm` when it may
+  write the file, and after a crash it rebuilds the WAL index there. One it may not
+  write still serves reads beside a live writer. The database file and the `-wal`
+  are never written.
+- **Busy reads:** with `busy_timeout=0`, a read that finds another connection's lock
+  throws `SqliteBusyError` (from `src/sqlite.ts`) at once. That covers
+  `SQLITE_BUSY_RECOVERY` while another process rebuilds the WAL index after a crash,
+  and an exclusive-mode connection elsewhere. The open itself retries through
+  `retryOnBusy`, five attempts with waits of 1, 2, 4 and 8 ms spent in `macrotask`
+  turns, then refuses as `busy`. Async callers use the same helper. Sync callers get
+  the error.
+- **Locks:** a read during a writer's open transaction does not wait and sees the
+  state before that transaction.
+- **Close:** closing never checkpoints and never deletes the WAL. Measured on both
+  drivers, a reader that closed last over 5,188 frames took 0.15 to 0.25 ms and left
+  every frame. While it is open, a writer that closes, in this process or another,
+  sees its shared lock and leaves the WAL as well.
+- **SQLITE_PROTOCOL:** SQLite's own retry loop for a WAL index header it cannot
+  read, while another connection holds the WAL write lock, ignores `busy_timeout`
+  and ends after about 10 s with `SQLITE_PROTOCOL`. A writer updates the header
+  under that lock in an instant, so only a corrupted `-shm` beside a live writer
+  holds a reader there. The open then refuses as `error`.
+
+Never read the store file, its `-wal` or its `-shm` in-process with `fs` while a
+connection is open, a test helper included (`storeFileState` reads them from a
+child process). Closing any descriptor of a file drops every POSIX lock the process
+holds on it, the SQLite connections' included. Another process's closing
+connection could then checkpoint and delete the WAL under a reader that is still
+open. `stat` opens no descriptor.
 
 ## Schema 5 card writes account for their own revisions
 
