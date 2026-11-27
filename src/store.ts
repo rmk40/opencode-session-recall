@@ -351,6 +351,56 @@ export type StoredRows = {
   rows: PartTextRow[];
 };
 
+/** The checkpoint (previous newest) message of an append, and the first
+ *  message it appends ({@link Store.appendSessionParts}). */
+export type AppendBoundary = { checkpointMessageId: string; firstNewMessageId: string };
+
+/** The rows a session holds after an append, from {@link appendedRows}. */
+export type AppendLayout = {
+  /** How many of the oldest stored rows the row cap evicts. */
+  evict: number;
+  /** Positions among the stored rows of those repointed at the first
+   *  appended message. */
+  repointed: number[];
+  /** The appended rows the session keeps, oldest first: the row cap skips
+   *  the oldest when they alone exceed it. */
+  inserted: PartTextRow[];
+  /** Every row the session holds after the append, oldest first. */
+  rows: PartTextRow[];
+};
+
+/**
+ * The rows {@link Store.appendSessionParts} leaves when it appends `rows` to
+ * a session's `stored` rows (both oldest first). Under the row cap it keeps
+ * the newest `ftsRowsPerSession` of them, evicting stored rows first, as a
+ * full write of the same messages keeps. Rows of the checkpoint message that
+ * point at no next message point at the first appended one. A caller that
+ * read the stored rows builds the card from these rows before the write.
+ */
+export function appendedRows(
+  stored: PartTextRow[],
+  rows: PartTextRow[],
+  ftsRowsPerSession: number,
+  boundary: AppendBoundary,
+): AppendLayout {
+  const total = stored.length + rows.length;
+  const overflow =
+    ftsRowsPerSession > 0 && total > ftsRowsPerSession ? total - ftsRowsPerSession : 0;
+  const evict = Math.min(overflow, stored.length);
+  const repoint = (row: PartTextRow): PartTextRow =>
+    row.messageId === boundary.checkpointMessageId && (row.nextMessageId ?? null) === null
+      ? { ...row, nextMessageId: boundary.firstNewMessageId }
+      : row;
+  const repointed: number[] = [];
+  const kept = stored.slice(evict).map((row, i) => {
+    const next = repoint(row);
+    if (next !== row) repointed.push(evict + i);
+    return next;
+  });
+  const inserted = rows.slice(overflow - evict).map(repoint);
+  return { evict, repointed, inserted, rows: [...kept, ...inserted] };
+}
+
 /** The tail a {@link Store.replaceSessionTail} writes over a settled base. */
 export type SessionTail = {
   /** The settled base the tail was merged with, as read from the card. */
@@ -772,14 +822,23 @@ export type Store = {
    * does not rebuild the card. `opts` stores range hashes as
    * {@link replaceSessionParts} does, and like it keeps the stored ones when
    * the append is refused or fails.
+   *
+   * With `opts.stored`, the rows the caller read before the call, the
+   * transaction lays the rows out from those ({@link appendedRows}) and
+   * `recompute` receives that layout's rows, which the caller can build the
+   * card from beforehand. The transaction reads the session's rowids and the
+   * indexed text of the rows it evicts, and no other stored row. It is
+   * refused with `base-changed`, writing nothing, unless the card is still
+   * stored at the revision `opts.stored.writeRev` and the session still
+   * holds that many rows.
    */
   appendSessionParts(
     sessionId: string,
     rows: PartTextRow[],
     ftsRowsPerSession: number,
-    boundary: { checkpointMessageId: string; firstNewMessageId: string },
+    boundary: AppendBoundary,
     recompute: (allRows: PartTextRow[]) => Card,
-    opts?: { rangeHashes?: RangeHash[]; replaceRangeHashes?: boolean },
+    opts?: { rangeHashes?: RangeHash[]; replaceRangeHashes?: boolean; stored?: StoredRows },
   ): SessionWrite;
   /**
    * Replace the tail of a card distilled against a running tail, keeping its
@@ -2226,39 +2285,18 @@ class SqliteStore implements Store {
     sessionId: string,
     rows: PartTextRow[],
     ftsRowsPerSession: number,
-    boundary: { checkpointMessageId: string; firstNewMessageId: string },
+    boundary: AppendBoundary,
     recompute: (allRows: PartTextRow[]) => Card,
-    opts?: { rangeHashes?: RangeHash[]; replaceRangeHashes?: boolean },
+    opts?: { rangeHashes?: RangeHash[]; replaceRangeHashes?: boolean; stored?: StoredRows },
   ): SessionWrite {
     try {
       return this.db.tx((): SessionWrite => {
         const stored = this.db.get(CARD_COMPARE_SQL, [sessionId]);
-        const old = this.db.all(
-          "SELECT id, raw, norm FROM part_text WHERE session_id=? ORDER BY id",
-          [sessionId],
-        );
-        const total = old.length + rows.length;
-        const overflow =
-          ftsRowsPerSession > 0 && total > ftsRowsPerSession ? total - ftsRowsPerSession : 0;
-        // Newest-first cap over old + new (matching capRows): evict the oldest
-        // `overflow` rows — from the existing rows first (front of `old`), and any
-        // remaining overflow simply skips the oldest new rows so they never insert.
-        const evictOld = Math.min(overflow, old.length);
-        this.evictFts(old.slice(0, evictOld));
-        for (let i = 0; i < evictOld; i++) {
-          this.db.run("DELETE FROM part_text WHERE id=?", [asNumber(old[i]!.id)]);
-        }
-        const firstInserted = overflow - evictOld;
-        for (let i = firstInserted; i < rows.length; i++) this.insertRow(sessionId, rows[i]!);
-        // Repoint the checkpoint message's dangling next pointer at the first
-        // appended message (only surviving checkpoint rows still NULL). A no-op
-        // when the checkpoint was evicted by the cap — as it would be in a full
-        // re-distill of the same state.
-        const repointed = this.db.run(
-          "UPDATE part_text SET next_message_id=? WHERE session_id=? AND message_id=? AND next_message_id IS NULL",
-          [boundary.firstNewMessageId, sessionId, boundary.checkpointMessageId],
-        ).changes;
-        const recomputed = recompute(this.readSessionRows(sessionId));
+        const appended = opts?.stored
+          ? this.appendToPrepared(sessionId, stored, opts.stored, rows, ftsRowsPerSession, boundary)
+          : this.appendToStored(sessionId, rows, ftsRowsPerSession, boundary);
+        if (!appended) return { changed: false, refused: "base-changed" };
+        const recomputed = recompute(appended.rows);
         // An append extends the card at its stored generation unless the
         // recomputed card names one.
         const card: Card =
@@ -2268,8 +2306,7 @@ class SqliteStore implements Store {
         if (belowStoredGen(card.projectorGen, stored?.projector_gen)) {
           throw new OlderGenerationRefused();
         }
-        const rowsChanged = evictOld > 0 || firstInserted < rows.length || repointed > 0;
-        const changed = rowsChanged || !stored || !sameCard(stored, card);
+        const changed = appended.rowsChanged || !stored || !sameCard(stored, card);
         if (changed) this.writeStampedCard(card);
         else this.writeCheckpoint(sessionId, card);
         if (opts?.replaceRangeHashes) {
@@ -2284,6 +2321,85 @@ class SqliteStore implements Store {
       }
       throw error;
     }
+  }
+
+  /** An append over the rows read inside its transaction: every stored row
+   *  is read, with its text, and then read again for the card. Caller
+   *  supplies the transaction. */
+  private appendToStored(
+    sessionId: string,
+    rows: PartTextRow[],
+    ftsRowsPerSession: number,
+    boundary: AppendBoundary,
+  ): { rowsChanged: boolean; rows: PartTextRow[] } {
+    const old = this.db.all("SELECT id, raw, norm FROM part_text WHERE session_id=? ORDER BY id", [
+      sessionId,
+    ]);
+    const total = old.length + rows.length;
+    const overflow =
+      ftsRowsPerSession > 0 && total > ftsRowsPerSession ? total - ftsRowsPerSession : 0;
+    // Newest-first cap over old + new (matching capRows): evict the oldest
+    // `overflow` rows — from the existing rows first (front of `old`), and any
+    // remaining overflow simply skips the oldest new rows so they never insert.
+    const evictOld = Math.min(overflow, old.length);
+    this.evictFts(old.slice(0, evictOld));
+    for (let i = 0; i < evictOld; i++) {
+      this.db.run("DELETE FROM part_text WHERE id=?", [asNumber(old[i]!.id)]);
+    }
+    const firstInserted = overflow - evictOld;
+    for (let i = firstInserted; i < rows.length; i++) this.insertRow(sessionId, rows[i]!);
+    // Repoint the checkpoint message's dangling next pointer at the first
+    // appended message (only surviving checkpoint rows still NULL). A no-op
+    // when the checkpoint was evicted by the cap — as it would be in a full
+    // re-distill of the same state.
+    const repointed = this.db.run(
+      "UPDATE part_text SET next_message_id=? WHERE session_id=? AND message_id=? AND next_message_id IS NULL",
+      [boundary.firstNewMessageId, sessionId, boundary.checkpointMessageId],
+    ).changes;
+    return {
+      rowsChanged: evictOld > 0 || firstInserted < rows.length || repointed > 0,
+      rows: this.readSessionRows(sessionId),
+    };
+  }
+
+  /** An append over the rows a caller read before its transaction
+   *  (`prepared`), laid out by {@link appendedRows}, or undefined when they
+   *  may no longer be the stored ones, as {@link preparedIds} decides. Reads
+   *  the session's rowids and only the evicted rows' indexed text. Caller
+   *  supplies the transaction. */
+  private appendToPrepared(
+    sessionId: string,
+    card: Row | undefined,
+    prepared: StoredRows,
+    rows: PartTextRow[],
+    ftsRowsPerSession: number,
+    boundary: AppendBoundary,
+  ): { rowsChanged: boolean; rows: PartTextRow[] } | undefined {
+    const ids = this.preparedIds(sessionId, card, prepared);
+    if (!ids) return undefined;
+    const layout = appendedRows(prepared.rows, rows, ftsRowsPerSession, boundary);
+    if (layout.evict > 0) {
+      this.evictFts(
+        this.db.all("SELECT id, raw, norm FROM part_text WHERE session_id=? ORDER BY id LIMIT ?", [
+          sessionId,
+          layout.evict,
+        ]),
+      );
+      for (let i = 0; i < layout.evict; i++) {
+        this.db.run("DELETE FROM part_text WHERE id=?", [ids[i]!]);
+      }
+    }
+    for (const row of layout.inserted) this.insertRow(sessionId, row);
+    for (const i of layout.repointed) {
+      this.db.run("UPDATE part_text SET next_message_id=? WHERE id=?", [
+        boundary.firstNewMessageId,
+        ids[i]!,
+      ]);
+    }
+    return {
+      rowsChanged: layout.evict > 0 || layout.inserted.length > 0 || layout.repointed.length > 0,
+      rows: layout.rows,
+    };
   }
 
   replaceSessionTail(
@@ -2367,20 +2483,33 @@ class SqliteStore implements Store {
   }
 
   /** The rows a caller read before this transaction (`prepared`), each with
-   *  the rowid at its place now, or undefined when they may no longer be
-   *  the stored ones: the card (`card`, read in this transaction) is gone,
-   *  a stamped write moved its revision, or the session holds another
-   *  number of rows. Reads only the session's rowids, from its index.
-   *  Caller supplies the transaction. */
+   *  the rowid at its place now ({@link preparedIds}). Caller supplies the
+   *  transaction. */
   private preparedRows(
     sessionId: string,
     card: Row | undefined,
     prepared: StoredRows,
   ): Row[] | undefined {
+    const ids = this.preparedIds(sessionId, card, prepared);
+    return ids && prepared.rows.map((row, i) => storedRow(ids[i], row));
+  }
+
+  /** The session's rowids in order, one per row a caller read before this
+   *  transaction (`prepared`), or undefined when those rows may no longer be
+   *  the stored ones: the card (`card`, read in this transaction) is gone, a
+   *  stamped write moved its revision, or the session holds another number
+   *  of rows. Reads only the rowids, from the session's index. Caller
+   *  supplies the transaction. */
+  private preparedIds(
+    sessionId: string,
+    card: Row | undefined,
+    prepared: StoredRows,
+  ): number[] | undefined {
     if (!card || asNullableNumber(card.write_rev) !== prepared.writeRev) return undefined;
-    const ids = this.db.all("SELECT id FROM part_text WHERE session_id=? ORDER BY id", [sessionId]);
-    if (ids.length !== prepared.rows.length) return undefined;
-    return prepared.rows.map((row, i) => storedRow(ids[i]!.id, row));
+    const ids = this.db
+      .all("SELECT id FROM part_text WHERE session_id=? ORDER BY id", [sessionId])
+      .map((row) => asNumber(row.id));
+    return ids.length === prepared.rows.length ? ids : undefined;
   }
 
   /**

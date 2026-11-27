@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openSqlite, type SqliteDb } from "../src/sqlite.js";
 import {
+  appendedRows,
   boundWeakAnchors,
   buildMatch,
   openStore,
@@ -2235,7 +2236,7 @@ describe("replace suppression", () => {
   });
 });
 
-describe("diffed replaces", () => {
+describe("writes over stored rows", () => {
   const WORDS = ["alpha", "beta", "gamma", "delta", "epsilon", "zeta", "theta", "kappa"];
   const CLASSES = ["human-text", "assistant-text", "tool-input", "tool-output"];
   const MESSAGES = ["m-1", "m-2", "m-3", "m-4", "m-5"];
@@ -2367,7 +2368,7 @@ describe("diffed replaces", () => {
     { name: "nothing", run: (rows) => rows },
   ];
 
-  it("leave the rows, index and card a delete-all and insert-all write leaves, writing only the rows that differ", async () => {
+  it("diffed replaces leave the rows, index and card a delete-all and insert-all write leaves, writing only the rows that differ", async () => {
     // Replaced with rows read inside the transaction, with rows read before
     // it, and by deleting the session and writing every row again.
     const inTx = await recordedStore();
@@ -2514,7 +2515,7 @@ describe("diffed replaces", () => {
       name: "the session holds another number of rows",
       read: (stored) => ({ ...stored, rows: stored.rows.slice(1) }),
     },
-  ])("refuses rows read before $name, writing nothing", async (o) => {
+  ])("a replace refuses rows read before $name, writing nothing", async (o) => {
     const ctx = await seeded();
     const stored = (o.read ?? ((rows: StoredRows) => rows))(preRead(ctx.store, "s1"));
     o.race?.(ctx);
@@ -2550,7 +2551,7 @@ describe("diffed replaces", () => {
     ctx.db.close();
   });
 
-  it("removes index entries with the text the rows hold when it writes, not the text read before", async () => {
+  it("a replace removes index entries with the text the rows hold when it writes, not the text read before", async () => {
     const ctx = await seeded();
     const stored = preRead(ctx.store, "s1");
     // A write that stamps no revision (an older build's) rewrites a row the
@@ -2580,7 +2581,7 @@ describe("diffed replaces", () => {
     { name: "a row's insertion", statement: /^INSERT INTO part_text\(/ },
     { name: "an index entry's insertion", statement: /^INSERT INTO part_fts\(rowid,/ },
     { name: "the card's write", statement: /^INSERT INTO card\(/ },
-  ])("rolls a diffed replace back whole when $name fails", async ({ statement }) => {
+  ])("a diffed replace rolls back whole when $name fails", async ({ statement }) => {
     for (const readFirst of [false, true]) {
       const db = await openSqlite(freshDbPath());
       if (!db) throw new Error("openSqlite returned null");
@@ -2628,6 +2629,243 @@ describe("diffed replaces", () => {
       db.close();
     }
   });
+
+  /** A fresh store whose connection lists, while recording, every statement
+   *  it reads with, and every row it writes ({@link recordRowMutations}). */
+  async function readingStore() {
+    const raw = await openSqlite(freshDbPath());
+    if (!raw) throw new Error("openSqlite returned null");
+    const reads: string[] = [];
+    let on = false;
+    const recorded = recordRowMutations({
+      ...raw,
+      all: (sql, params) => {
+        if (on) reads.push(sql);
+        return raw.all(sql, params);
+      },
+      get: (sql, params) => {
+        if (on) reads.push(sql);
+        return raw.get(sql, params);
+      },
+    });
+    const store = openV1Store(recorded.db);
+    if (!store) throw new Error("openStore returned null");
+    const record = (value: boolean) => {
+      on = value;
+      if (value) reads.length = 0;
+      recorded.record(value);
+    };
+    return { db: raw, store, reads, mutations: recorded.mutations, record };
+  }
+
+  /** The card an append's `recompute` builds in these tests: the surviving
+   *  rows' part ids and next pointers, in order, stand in for its content. */
+  const appendedCard = (sid: string, all: PartTextRow[]): Card =>
+    makeCard(sid, {
+      distillState: "full",
+      partCount: all.length,
+      retainedChars: all.reduce((sum, row) => sum + row.raw.length, 0),
+      inventory: all.map((row) => `${row.partId}>${row.nextMessageId}`).join(" "),
+    });
+
+  /** Rows of `messages` in order, one to three each, each pointing at its
+   *  neighbouring messages; the newest's rows point at no next message, or
+   *  now and then at another one. */
+  const messageRows = (rand: () => number, messages: string[], before: string | null) =>
+    messages.flatMap((messageId, m) =>
+      Array.from({ length: 1 + Math.floor(rand() * 3) }, () => ({
+        ...newRow(rand),
+        messageId,
+        prevMessageId: m > 0 ? messages[m - 1]! : before,
+        nextMessageId: m + 1 < messages.length ? messages[m + 1]! : rand() < 0.7 ? null : "m-other",
+      })),
+    );
+
+  const IDS_READ = "SELECT id FROM part_text WHERE session_id=? ORDER BY id";
+  const EVICTED_READ = "SELECT id, raw, norm FROM part_text WHERE session_id=? ORDER BY id LIMIT ?";
+
+  it("appends over rows read before the write store what appends over the rows read inside it store, reading only the evicted rows' text", async () => {
+    const inTx = await recordedStore();
+    const prepared = await readingStore();
+    const tally = { evicted: 0, skipped: 0, repointed: 0 };
+    for (let c = 0; c < 40; c++) {
+      const rand = mulberry32(9_000 + c);
+      const sid = `a${c}`;
+      const old = Array.from({ length: 3 + Math.floor(rand() * 10) }, (_, i) => `${sid}-m${i}`);
+      const added = Array.from({ length: 1 + Math.floor(rand() * 4) }, (_, i) => `${sid}-n${i}`);
+      const storedRows = messageRows(rand, old, null);
+      const rows = messageRows(rand, added, old.at(-1)!);
+      for (const { store } of [inTx, prepared]) {
+        store.replaceSessionParts(sid, storedRows, appendedCard(sid, storedRows));
+      }
+      const boundary = { checkpointMessageId: old.at(-1)!, firstNewMessageId: added[0]! };
+      // Room for every row, for some stored rows less, or for fewer than the
+      // new rows alone.
+      const total = storedRows.length + rows.length;
+      const cap = pick(rand, [
+        0,
+        total + 2,
+        total - 1 - Math.floor(rand() * storedRows.length),
+        Math.max(1, rows.length - 1),
+      ]);
+      const where = `case ${c}, cap ${cap}`;
+      const seen: PartTextRow[][] = [];
+      const recompute = (all: PartTextRow[]) => {
+        seen.push(all);
+        return appendedCard(sid, all);
+      };
+
+      const result = inTx.store.appendSessionParts(sid, rows, cap, boundary, recompute);
+      const stored = preRead(prepared.store, sid);
+      const layout = appendedRows(stored.rows, rows, cap, boundary);
+      prepared.record(true);
+      expect(
+        prepared.store.appendSessionParts(sid, rows, cap, boundary, recompute, { stored }),
+        where,
+      ).toEqual(result);
+      prepared.record(false);
+
+      expect(seen[1], where).toEqual(seen[0]);
+      expect(seen[1], where).toEqual(layout.rows);
+      expect(rowsOf(prepared.db, sid), where).toEqual(rowsOf(inTx.db, sid));
+      expect(prepared.store.getCard(sid), where).toEqual({
+        ...inTx.store.getCard(sid),
+        writeRev: prepared.store.getCard(sid)?.writeRev,
+      });
+      expect(ftsView(prepared.store), where).toEqual(ftsView(inTx.store));
+      checkIndex(prepared.db);
+      // The slim index is read for the session's rowids and, when the cap
+      // evicts rows, for those rows' indexed text, and for nothing else.
+      expect(
+        [...new Set(prepared.reads.filter((sql) => /\bpart_text\b/.test(sql)))],
+        where,
+      ).toEqual(layout.evict > 0 ? [IDS_READ, EVICTED_READ] : [IDS_READ]);
+      if (layout.evict > 0) tally.evicted++;
+      if (layout.inserted.length < rows.length) tally.skipped++;
+      if (layout.repointed.length > 0) tally.repointed++;
+    }
+    // Appends that evict stored rows, skip new ones and repoint the
+    // checkpoint's rows all ran.
+    expect(tally.evicted).toBeGreaterThan(0);
+    expect(tally.skipped).toBeGreaterThan(0);
+    expect(tally.repointed).toBeGreaterThan(0);
+    inTx.db.close();
+    prepared.db.close();
+  });
+
+  it.each<{
+    name: string;
+    race?: (ctx: Awaited<ReturnType<typeof seeded>>) => void;
+    read?: (stored: StoredRows) => StoredRows;
+  }>([
+    {
+      name: "a stamped write moved the card's revision",
+      race: ({ store }) => store.writeSummary("s1", "Summary.", "h1"),
+    },
+    {
+      name: "another replace changed the rows, keeping their number",
+      race: ({ store, rows, card }) =>
+        store.replaceSessionParts(
+          "s1",
+          rows.map((row) => ({ ...row, raw: `${row.raw} kappa` })),
+          card,
+        ),
+    },
+    { name: "the session was deleted", race: ({ store }) => store.deleteSession("s1") },
+    {
+      name: "the session holds another number of rows",
+      read: (stored) => ({ ...stored, rows: stored.rows.slice(1) }),
+    },
+  ])("an append refuses rows read before $name, writing nothing", async (o) => {
+    const ctx = await seeded();
+    const stored = (o.read ?? ((rows: StoredRows) => rows))(preRead(ctx.store, "s1"));
+    o.race?.(ctx);
+    const before = state(ctx.db, ctx.store);
+    let recomputed = 0;
+    const append = (extra?: { stored: StoredRows }) =>
+      ctx.store.appendSessionParts(
+        "s1",
+        [makePart("q9", "omega", { messageId: "m-9", prevMessageId: "m-5" })],
+        6,
+        { checkpointMessageId: "m-5", firstNewMessageId: "m-9" },
+        (all) => {
+          recomputed++;
+          return appendedCard("s1", all);
+        },
+        { rangeHashes: [rangeHash(500)], replaceRangeHashes: true, ...extra },
+      );
+
+    ctx.recorded.record(true);
+    expect(append({ stored })).toEqual({ changed: false, refused: "base-changed" });
+    ctx.recorded.record(false);
+    expect(recomputed).toBe(0);
+    expect(ctx.recorded.mutations).toEqual([]);
+    expect(state(ctx.db, ctx.store)).toEqual(before);
+
+    // The same append over the rows stored now is accepted.
+    expect(append()).toEqual({ changed: true });
+    expect(recomputed).toBe(1);
+    checkIndex(ctx.db);
+    ctx.db.close();
+  });
+
+  it.each([
+    { name: "an index entry's removal", statement: /VALUES\('delete'/ },
+    { name: "a row's deletion", statement: /^DELETE FROM part_text WHERE id=\?/ },
+    { name: "a row's insertion", statement: /^INSERT INTO part_text\(/ },
+    { name: "an index entry's insertion", statement: /^INSERT INTO part_fts\(rowid,/ },
+    {
+      name: "a row's repointing",
+      statement: /^UPDATE part_text SET next_message_id=\? WHERE id=\?/,
+    },
+    { name: "the card's write", statement: /^INSERT INTO card\(/ },
+  ])(
+    "an append over rows read before it rolls back whole when $name fails",
+    async ({ statement }) => {
+      const db = await openSqlite(freshDbPath());
+      if (!db) throw new Error("openSqlite returned null");
+      let failing = false;
+      let failed = 0;
+      const store = openV1Store({
+        ...db,
+        run(sql, params) {
+          if (failing && statement.test(sql)) {
+            failed++;
+            throw new Error("injected failure");
+          }
+          return db.run(sql, params);
+        },
+      });
+      if (!store) throw new Error("openStore returned null");
+      const rows = WORDS.slice(0, 6).map((word, i) =>
+        makePart(`q${i}`, word, { messageId: `m-${i}` }),
+      );
+      store.replaceSessionParts("s1", rows, appendedCard("s1", rows), {
+        rangeHashes: [rangeHash(0)],
+      });
+      const before = state(db, store);
+      const stored = preRead(store, "s1");
+      const append = () =>
+        store.appendSessionParts(
+          "s1",
+          [makePart("q9", "omega", { messageId: "m-9", prevMessageId: "m-5" })],
+          6,
+          { checkpointMessageId: "m-5", firstNewMessageId: "m-9" },
+          (all) => appendedCard("s1", all),
+          { stored, rangeHashes: [rangeHash(500)], replaceRangeHashes: true },
+        );
+
+      failing = true;
+      expect(append).toThrow("injected failure");
+      failing = false;
+      expect(failed).toBe(1);
+      expect(state(db, store)).toEqual(before);
+      checkIndex(db);
+      expect(append()).toEqual({ changed: true });
+      checkIndex(db);
+      db.close();
+    },
+  );
 });
 
 describe("append suppression", () => {
