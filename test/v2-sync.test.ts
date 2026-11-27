@@ -461,9 +461,10 @@ describe("v2 poll queries", () => {
     meta.set(POLL_WATERMARK_KEY, String(at - 5_000));
     const first = await pollOnce(sync, meta);
     expect(first.map((s) => s.sessionID)).toEqual(["ses_a"]);
-    // A full poll keeps the watermark and records the last row it read.
+    // A full poll keeps the watermark and records the last row it read and
+    // the window's cutoff, the poll's start.
     expect(meta.values.get(POLL_WATERMARK_KEY)).toBe(String(at - 5_000));
-    expect(meta.values.get(POLL_ROW_CURSOR_KEY)).toBe(JSON.stringify([at - 3_000, fromA]));
+    expect(meta.values.get(POLL_ROW_CURSOR_KEY)).toBe(JSON.stringify([at - 3_000, fromA, at]));
     const second = await pollOnce(sync, meta);
     expect(second.map((s) => s.sessionID)).toEqual(["ses_b"]);
     // Drained: the watermark moves to the poll's start.
@@ -855,6 +856,52 @@ describe("v2 poll queries", () => {
       const meta = memoryMeta();
       meta.set(POLL_WATERMARK_KEY, String(at - 4_000));
       expect(turnEnded(await pollOnce(sync, meta))).toEqual(["ses_a", "ses_b", "ses_c"]);
+      expect(turnEnded(await pollOnce(sync, meta))).toContain("ses_late");
+    });
+
+    it("keeps a capped window's cutoff across later polls, so a row committed behind its position is signaled once it drains", async () => {
+      const at = Date.now();
+      seed(
+        at,
+        ["ses_a", "ses_b", "ses_c", "ses_d", "ses_late", "ses_next"],
+        [
+          ["ses_a", -3_000],
+          ["ses_b", -2_500],
+          ["ses_c", -2_000],
+          ["ses_d", -1_500],
+        ],
+      );
+      let clock = at;
+      let yields = 0;
+      const sync = createV2Sync(reader, {
+        pollPageRows: 1,
+        pollPages: 2,
+        overlapMs: 5_000,
+        sessionScanEveryMs: 1e12,
+        now: () => clock,
+        yieldBetween: bounded(() => {
+          // Before the first poll's second page, its first has read past
+          // at - 3_100: a row lands there.
+          if (++yields === 2) addRow("ses_late", "user", user("late", at - 3_100), at - 3_100);
+        }),
+      });
+      const meta = memoryMeta();
+      meta.set(POLL_WATERMARK_KEY, String(at - 4_000));
+      expect(turnEnded(await pollOnce(sync, meta))).toEqual(["ses_a", "ses_b"]);
+      // The later polls start long after the window's cutoff, a row of the
+      // next window lands, and an older build's poll moves the watermark
+      // past the late row.
+      clock = at + 30_000;
+      addRow("ses_next", "user", user("next", at + 10_000), at + 10_000);
+      meta.set(POLL_WATERMARK_KEY, String(at + 20_000));
+      meta.set(POLL_CURSOR_KEY, "");
+      expect(turnEnded(await pollOnce(sync, meta))).toEqual(["ses_c", "ses_d"]);
+      // The window drains at its cutoff, the first poll's start, and leaves
+      // the next window's row to it.
+      expect(turnEnded(await pollOnce(sync, meta))).toEqual([]);
+      expect(meta.values.get(POLL_WATERMARK_KEY)).toBe(String(at));
+      expect(meta.values.get(POLL_ROW_CURSOR_KEY)).toBe("");
+      // The next window starts the overlap before the cutoff.
       expect(turnEnded(await pollOnce(sync, meta))).toContain("ses_late");
     });
 

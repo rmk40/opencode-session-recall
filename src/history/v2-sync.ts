@@ -41,13 +41,15 @@ import { inspectV2Schema, type V2SchemaInfo } from "./v2.js";
  *   while those rows are unchanged, only the rows past the boundary need
  *   reading again (`tail`).
  * - **The poll** (lease holder only): every 30 s the message window reads
- *   the rows created past a persisted watermark and up to the poll's start
- *   through the indexed `session_message_time_created_idx`, in pages of
- *   `pollPageRows` rows keyed by `(time_created, id)` with a yield before
- *   each, at most `pollPages` of them, and signals the sessions they belong
- *   to, at most `pollSessionLimit` per poll. Once drained, the window moves
- *   its watermark to the poll's start, so a row committed behind the
- *   position while the pages were read is read again next time. Every 5
+ *   the rows created past a persisted watermark and up to its cutoff, the
+ *   start of the poll that began the window, through the indexed
+ *   `session_message_time_created_idx`, in pages of `pollPageRows` rows
+ *   keyed by `(time_created, id)` with a yield before each, at most
+ *   `pollPages` of them a poll, and signals the sessions they belong to, at
+ *   most `pollSessionLimit` per poll. A window resumed by later polls keeps
+ *   its cutoff. Once drained, it sets its watermark to the cutoff, so a row
+ *   committed behind the position while the pages were read is read again
+ *   by the next window. Every 5
  *   minutes a bounded scan of `session_v2`, one page keyed by `(time,
  *   session id)`, catches renames, moves, archiving and other metadata-only
  *   changes. Both watermarks carry an overlap for late commits. A window
@@ -81,8 +83,10 @@ export const POLL_CURSOR_KEY = "v2_poll_cursor";
 /** The session scan's keyset position `[time, sessionId]` inside a window
  *  being drained; empty when the window starts fresh. */
 export const SESSION_CURSOR_KEY = "v2_session_cursor";
-/** The message poll's position `[time_created, messageId]`, the last row it
- *  read inside a window being drained; empty when the window starts fresh. */
+/** The message poll's position `[time_created, messageId, cutoff]` inside a
+ *  window being drained: the last row it read and the start of the poll that
+ *  began the window, which every poll of the window reads up to. Empty when
+ *  the window starts fresh. */
 export const POLL_ROW_CURSOR_KEY = "v2_poll_row_cursor";
 
 export type V2SyncOptions = {
@@ -209,6 +213,15 @@ function parsePos(stored: string | undefined): KeysetPos | null {
     // A garbled position restarts the window.
   }
   return null;
+}
+
+/** The message poll's row position, with the cutoff of the window it is in
+ *  when the position records one (`[time, messageId, cutoff]`). */
+function parseRowPos(stored: string | undefined): (KeysetPos & { cutoff?: number }) | null {
+  const pos = parsePos(stored);
+  if (!pos) return null;
+  const cutoff = (JSON.parse(stored!) as unknown[])[2];
+  return typeof cutoff === "number" && Number.isFinite(cutoff) ? { ...pos, cutoff } : pos;
 }
 
 function isNumber(value: unknown): value is number {
@@ -737,13 +750,15 @@ export function createV2Sync(db: ReadOnlyDb, opts: V2SyncOptions = {}): DistillS
 
   /**
    * The message window: sessions with rows created past `mark - overlap` and
-   * at or before `at`, the poll's start, found by reading those rows in
+   * at or before the window's cutoff, found by reading those rows in
    * `(time_created, id)` order through the `time_created` index,
-   * {@link pollPageRows} per statement with a yield before each. It stops
-   * once it holds {@link pollSessionLimit} sessions and the next row would
-   * add another, or after {@link pollPages} full pages, recording the last
-   * row read as its position. Otherwise a short page shows the window
-   * drained, which moves the watermark to `at`. Each session is listed once,
+   * {@link pollPageRows} per statement with a yield before each. The cutoff
+   * is `at`, the start of the poll that began the window, and every poll
+   * that resumes the window reads up to it. A poll stops once it holds
+   * {@link pollSessionLimit} sessions and the next row would add another, or
+   * after {@link pollPages} full pages, recording the last row read and the
+   * cutoff as its position. Otherwise a short page shows the window drained,
+   * which sets the watermark to the cutoff. Each session is listed once,
    * where its first row in the window is. Null when `live` turned false at a
    * yield.
    */
@@ -758,24 +773,28 @@ export function createV2Sync(db: ReadOnlyDb, opts: V2SyncOptions = {}): DistillS
     // row. An older build's position by session bounds the window from below
     // only, so everything from its time on is read again (keys are integer
     // milliseconds, so `older.t - 1` admits rows at exactly older.t).
-    let after = parsePos(meta.get(POLL_ROW_CURSOR_KEY));
+    const resumed = parseRowPos(meta.get(POLL_ROW_CURSOR_KEY));
+    let after: KeysetPos | null = resumed && { t: resumed.t, id: resumed.id };
     const older = parsePos(meta.get(POLL_CURSOR_KEY));
     const lower = older ? Math.min(mark - overlapMs, older.t - 1) : mark - overlapMs;
+    // The window ends at the start of the poll that began it, however many
+    // polls read it, and once drained it sets the watermark there, never to
+    // the newest row read. The pages are read over time, so a row committed
+    // meanwhile behind the position is then inside the next window's
+    // overlap, as it would be after one statement read at the start. The
+    // watermark is set, not raised, so a window an older build moved it past
+    // meanwhile still leaves that overlap to be read.
+    const cutoff = resumed?.cutoff ?? at;
     const sessions: string[] = [];
     const seen = new Set<string>();
-    // The window ends at the poll's start, and a drained window moves the
-    // watermark to it, never to the newest row read: the pages are read
-    // over time, so a row committed meanwhile behind the position is read
-    // again by the next poll, which starts `overlapMs` before the watermark,
-    // as it would be after one statement read at the start.
     const drained = (): Array<[string, string]> => [
-      [POLL_WATERMARK_KEY, String(Math.max(mark, at))],
+      [POLL_WATERMARK_KEY, String(cutoff)],
       [POLL_ROW_CURSOR_KEY, ""],
       [POLL_CURSOR_KEY, ""],
     ];
-    /** Where the next poll goes on from, the last row read. */
+    /** Where the next poll goes on from: the last row read, and the cutoff. */
     const resume = (): Array<[string, string]> => [
-      [POLL_ROW_CURSOR_KEY, JSON.stringify([after!.t, after!.id])],
+      [POLL_ROW_CURSOR_KEY, JSON.stringify([after!.t, after!.id, cutoff])],
     ];
     for (let pages = 0; ; pages++) {
       // A poll holds a fetch permit throughout, so a long window is left to
@@ -789,13 +808,13 @@ export function createV2Sync(db: ReadOnlyDb, opts: V2SyncOptions = {}): DistillS
             `SELECT id, session_id, time_created FROM session_message
              WHERE time_created >= ? AND time_created <= ? AND (time_created > ? OR id > ?)
              ORDER BY time_created ASC, id ASC LIMIT ?`,
-            [position.t, at, position.t, position.id, pollPageRows],
+            [position.t, cutoff, position.t, position.id, pollPageRows],
           )
         : db.all(
             `SELECT id, session_id, time_created FROM session_message
              WHERE time_created > ? AND time_created <= ?
              ORDER BY time_created ASC, id ASC LIMIT ?`,
-            [lower, at, pollPageRows],
+            [lower, cutoff, pollPageRows],
           );
       for (const row of rows) {
         const t = num(row.time_created);

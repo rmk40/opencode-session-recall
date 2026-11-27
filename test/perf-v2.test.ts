@@ -1997,7 +1997,8 @@ describe.skipIf(!ENABLED)("perf: v2 event-loop stalls", () => {
       console.log("slowest synchronous calls:", JSON.stringify(slow.top(4)));
 
       expect(results.failures).toBe(0);
-      // Every session, and the window drained to the polls' start.
+      // Every session, and the window drained to its cutoff, the first
+      // poll's start.
       expect(results.sessions).toBe(POLL_SESSIONS);
       expect(newest).toBeLessThanOrEqual(at);
       expect(values.get(POLL_WATERMARK_KEY)).toBe(String(at));
