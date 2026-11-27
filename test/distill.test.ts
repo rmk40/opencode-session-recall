@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Event, OpencodeClient, Part, Session } from "@opencode-ai/sdk/v2";
 import { openSqlite, type Row, type SqliteDb } from "../src/sqlite.js";
-import { type Card, type FamilyRollup, type Store } from "../src/store.js";
+import { openStore, type Card, type FamilyRollup, type Store } from "../src/store.js";
 import { createFetchGate, type FetchGate } from "../src/fetch-gate.js";
 import {
   COLD_PASS_COMPLETE_KEY,
@@ -26,6 +26,17 @@ import type { HistorySource } from "../src/history/source.js";
 import type { HistorySession } from "../src/history/model.js";
 import { createV1HistorySource } from "../src/history/v1.js";
 import { v1EventToSignal } from "../src/history/v1-events.js";
+import { createV2HistorySource, openOpencodeDb } from "../src/history/v2.js";
+import { V2_PROJECTOR_GEN } from "../src/history/v2-project.js";
+import { createV2Sync } from "../src/history/v2-sync.js";
+import {
+  insertMessage,
+  insertPart,
+  insertProject,
+  insertSession,
+  limitSpy,
+  makeV2PartsDb,
+} from "./v2-db.js";
 
 /** A v1 history source over one fake client (tests that hand-roll a client). */
 const v1 = (client: OpencodeClient): HistorySource =>
@@ -3317,7 +3328,7 @@ describe("session writes from concurrent workers", () => {
    * has run: two writes in one slice of the loop.
    */
   function pacedStore(store: Store) {
-    const counts = { writes: 0, backToBack: 0, appends: 0 };
+    const counts = { writes: 0, backToBack: 0, appends: 0, tails: 0 };
     let tickPending = false;
     const writes = new Set(["replaceSessionParts", "appendSessionParts", "replaceSessionTail"]);
     const wrapped = new Proxy(store, {
@@ -3329,6 +3340,7 @@ describe("session writes from concurrent workers", () => {
           if (tickPending) counts.backToBack++;
           counts.writes++;
           if (prop === "appendSessionParts") counts.appends++;
+          if (prop === "replaceSessionTail") counts.tails++;
           try {
             return method.apply(target, args);
           } finally {
@@ -3424,4 +3436,108 @@ describe("session writes from concurrent workers", () => {
       db.close();
     },
   );
+
+  it("never commits two tail writes in one slice of the loop", async () => {
+    const v2 = await makeV2PartsDb();
+    const T0 = 1_000_000;
+    const ids = Array.from({ length: 8 }, (_, i) => `ses_tail_${i}`);
+    /** Each session's running reply: a user row and a settled reply before
+     *  it, so a write records the settled base a tail write starts from. */
+    const running = new Map<string, string>();
+    insertProject(v2.db, { id: "prj", worktree: "/workspace/tail" });
+    for (const id of ids) {
+      insertSession(v2.db, {
+        id,
+        project_id: "prj",
+        directory: "/workspace/tail",
+        title: `Title ${id}`,
+        time_created: T0,
+        time_updated: T0,
+      });
+      const reply = (seq: number, settled: boolean) => {
+        const message = `msg_${id}_${seq}`;
+        const at = T0 + seq;
+        insertMessage(v2.db, {
+          id: message,
+          session_id: id,
+          type: "assistant",
+          seq,
+          time_created: at,
+          time_updated: settled ? at : Date.now(),
+          data: {
+            agent: "build",
+            model: { id: "m", providerID: "p" },
+            content: [],
+            time: settled ? { created: at, completed: at + 1 } : { created: at },
+          },
+        });
+        insertPart(v2.db, {
+          message_id: message,
+          session_id: id,
+          ordinal: 0,
+          time_created: at,
+          time_updated: settled ? at : Date.now(),
+          data: { type: "text", text: `reply ${seq} of ${id}` },
+        });
+        return message;
+      };
+      insertMessage(v2.db, {
+        id: `msg_${id}_1`,
+        session_id: id,
+        type: "user",
+        seq: 1,
+        time_created: T0 + 1,
+        data: { text: `question for ${id}`, time: { created: T0 + 1 } },
+      });
+      reply(2, true);
+      running.set(id, reply(3, false));
+    }
+    const opened = await openOpencodeDb(v2.path);
+    if (!opened.ok) throw new Error(opened.reason);
+    const reader = limitSpy(opened.db);
+    const db = await openSqlite(freshDbPath());
+    if (!db) throw new Error("no sqlite");
+    const result = openStore(db, { host: "opencode-v2", source: v2.path });
+    if (!result.ok) throw new Error(result.reason);
+    const store = result.store;
+    const paced = pacedStore(store);
+    const distiller = createDistiller({
+      source: createV2HistorySource(reader),
+      store: paced.store,
+      gate: makeSpyGate().gate,
+      limits: { ...TEST_LIMITS, coldPass: false, distillConcurrency: 2, distillDelayMs: 0 },
+      instanceId: "paced-tail",
+      sync: createV2Sync(reader, {
+        pollIntervalMs: 1e9,
+        sessionScanEveryMs: 1e12,
+        reconcileEveryMs: 1e12,
+      }),
+      projectorGen: V2_PROJECTOR_GEN,
+      idleDebounceMs: 1,
+      yieldBetween: macrotask,
+      log: () => {},
+    });
+    try {
+      distiller.start();
+      // The first writes read in full and record each settled base.
+      for (const id of ids) distiller.onEvent({ type: "turn-ended", sessionID: id });
+      await waitFor(() => ids.every((id) => store.getCard(id)?.settledBase !== undefined));
+
+      // Every running reply grows: each session is read again from its base.
+      for (const [id, message] of running) {
+        v2.db.run(
+          "UPDATE session_part SET data = ?, time_updated = ? WHERE message_id = ? AND ordinal = 0",
+          [JSON.stringify({ type: "text", text: `grown reply of ${id}` }), Date.now(), message],
+        );
+      }
+      for (const id of ids) distiller.onEvent({ type: "turn-ended", sessionID: id });
+      await waitFor(() => paced.counts.tails === ids.length);
+      expect(paced.counts.backToBack).toBe(0);
+    } finally {
+      await distiller.stop();
+      reader.close();
+      db.close();
+      v2.cleanup();
+    }
+  });
 });

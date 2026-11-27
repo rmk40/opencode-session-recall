@@ -14,6 +14,9 @@ function gcHandle(): () => void {
   }
 }
 
+// Runs in the normal suite, not behind RECALL_PERF=1: it asserts how the
+// probe classifies a forced collection, which holds on any machine, and sets
+// no wall-clock budget.
 describe("stallProbe", () => {
   it.each([
     ["a timer", (run: () => void) => setTimeout(run, 0)],
