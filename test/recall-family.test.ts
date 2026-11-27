@@ -18,6 +18,7 @@ import {
   TEST_LIMITS,
   assistantMessage,
   bundle,
+  errorToolPart,
   globalSessionFrom,
   makeContext,
   makeFakeHarness,
@@ -901,6 +902,258 @@ describe("relatives the default keeps, ordered against other history", () => {
       expect(bounded.coverage?.sessionsSearched).toBe(3);
       expect(relatives(bounded)).toBe(3);
       expect(outsiders(bounded)).toBe(0);
+    });
+
+    describe("a relative only the slim-index lookup finds", () => {
+      /** a-root (the caller) has five subagents whose cards rank on "relay"
+       *  and one, a-needle, whose only match is "relay-west.png" in a
+       *  reasoning part. Two hundred code tokens it mentions more often fill
+       *  its card's inventory first, so the card leaves the needle out and
+       *  only the slim index holds it. Ten older outsiders mention "relay"
+       *  too, so the card-ranked sessions fill the twelve drill slots with
+       *  more left to take the family's spare ones. */
+      function needleHarness(opts: { echo?: boolean } = {}): FakeHarness {
+        const filler = Array.from(
+          { length: 200 },
+          (_, i) => `a_${String(i).padStart(3, "0")}`,
+        ).join(" ");
+        const h = makeFakeHarness();
+        if (opts.echo) {
+          // A subagent whose prompt, the first message its orchestrator wrote,
+          // names the needle past the opening statement its card keeps; the
+          // tokens it mentions more often leave the needle out of the card's
+          // inventory as well.
+          addSession(h, {
+            id: "a-echo",
+            title: "Image lookup",
+            parent: "a-root",
+            ago: 50,
+            user:
+              "Read the image bucket listing and the tile manifest and compare every " +
+              "entry with the render log and the mirror sync report from last night " +
+              "before the regional mirrors and the cache layer pick up the next map " +
+              "release. Then find where relay-west.png is used.",
+            reasoning: `Checked ${filler}`,
+            reply: `Checked ${filler}`,
+          });
+        }
+        addSession(h, { id: "a-root", title: "Map rollout", ago: 120, user: "Split the work." });
+        for (const i of [1, 2, 3, 4, 5]) {
+          addSession(h, {
+            id: `a-r${i}`,
+            title: `Relay provider check ${i}`,
+            parent: "a-root",
+            ago: 10 + i,
+            reply: `Checked the relay provider settings for region ${i}.`,
+          });
+        }
+        addSession(h, {
+          id: "a-needle",
+          title: "Tile audit",
+          parent: "a-root",
+          ago: 60,
+          user: "Audit the broken tiles.",
+          reasoning: `The broken tile is relay-west.png in the image bucket. Checked ${filler}`,
+          reply: `Checked ${filler}`,
+        });
+        for (let i = 1; i <= 10; i++) {
+          addSession(h, {
+            id: `a-o${i}`,
+            title: `Ops notes ${i}`,
+            ago: 30 + i,
+            reply:
+              "Noted the relay timing next to the queue depth, the worker counts and the nightly build schedule.",
+          });
+        }
+        return h;
+      }
+      const args = {
+        query: "relay-west.png",
+        scope: "global",
+        excludeCurrentSession: false,
+        results: 5,
+      };
+
+      it.each([{ match: "literal" }, { match: "smart" }])(
+        "drills it ahead of the card-ranked relatives and returns it first ($match)",
+        async ({ match }) => {
+          const { tool, deps } = await recallOver(needleHarness());
+          // Its card misses the needle; the five card-ranked relatives' cards match it.
+          const ranked = deps.cards
+            .rank(parseQuery(args.query), {})
+            .map((hit) => hit.sessionId)
+            .filter((id) => id.startsWith("a-"));
+          expect(ranked).not.toContain("a-needle");
+          expect(ranked.filter((id) => id.startsWith("a-r")).length).toBe(5);
+
+          const out = await runTool<SearchOutput>(
+            tool,
+            { ...args, match },
+            makeContext({ sessionID: "a-root" }).ctx,
+          );
+          expect(out.coverage?.sessionsSearched).toBe(12);
+          expect(out.results[0]?.sessionID).toBe("a-needle");
+          // The family still holds four drill slots: the needle and the first
+          // three card-ranked relatives.
+          const drilled = new Set(
+            out.coverage?.sessionStops?.sessions.map((s) => s.sessionID) ?? [],
+          );
+          expect(drilled.has("a-r4") || drilled.has("a-r5")).toBe(false);
+        },
+      );
+
+      it.each([{ match: "literal" }, { match: "smart" }])(
+        "does not prefer a relative the lookup found only in its delegated prompt ($match)",
+        async ({ match }) => {
+          const { tool, deps } = await recallOver(needleHarness({ echo: true }));
+          const ranked = deps.cards.rank(parseQuery(args.query), {}).map((hit) => hit.sessionId);
+          expect(ranked).not.toContain("a-echo");
+
+          const out = await runTool<SearchOutput>(
+            tool,
+            { ...args, match },
+            makeContext({ sessionID: "a-root" }).ctx,
+          );
+          // The family's four slots go to a-needle and three card-ranked
+          // relatives, so a-echo's prompt is never drilled.
+          expect(out.results[0]?.sessionID).toBe("a-needle");
+          expect(sessionsOf(out)).not.toContain("a-echo");
+        },
+      );
+
+      it("takes the oldest message read for the session's own text when the read stopped at the row cap", async () => {
+        const { tool, deps } = await recallOver(needleHarness({ echo: true }));
+        // An opencode v2 write that stopped at the per-session row cap records
+        // the lowest seq it read as the checkpoint's floor, so the message
+        // with no previous one in the index is not the session's first.
+        const card = deps.store!.getCard("a-echo")!;
+        deps.store!.upsertCard({
+          ...card,
+          distillCursor: JSON.stringify({
+            v: 2,
+            seq: 40,
+            unsettled: null,
+            msgUpdated: 1,
+            sessKey: 1,
+            msgId: null,
+            parts: 0,
+            partsUpdated: 0,
+            fp: "fp",
+            floor: 30,
+          }),
+        });
+
+        const out = await runTool<SearchOutput>(
+          tool,
+          { ...args, match: "literal" },
+          makeContext({ sessionID: "a-root" }).ctx,
+        );
+        // a-echo now counts as found, so it keeps a drill slot and its match
+        // is returned.
+        expect(sessionsOf(out)).toContain("a-echo");
+        expect(sessionsOf(out)).toContain("a-needle");
+      });
+    });
+
+    describe("a plain-word query", () => {
+      /** p-root (the caller) has two subagents whose only match is in a
+       *  tool's error output, which their cards hold and the slim index does
+       *  not, and a third, p-echo, whose reply restates the query in a
+       *  message its card's opening and closing statements leave out; the
+       *  code tokens it mentions more often fill its card's inventory, so
+       *  only the slim index matches it. */
+      function plainHarness(): FakeHarness {
+        const filler = Array.from(
+          { length: 200 },
+          (_, i) => `p_${String(i).padStart(3, "0")}`,
+        ).join(" ");
+        const h = makeFakeHarness();
+        addSession(h, { id: "p-root", title: "Gateway work", ago: 120, user: "Split the work." });
+        for (const i of [1, 2]) {
+          const id = `p-r${i}`;
+          const updated = NOW - (10 + i) * MINUTE;
+          const s = session(
+            id,
+            `Relay provider timeout fix ${i}`,
+            PROJECT_DIR,
+            updated,
+            undefined,
+            "p-root",
+          );
+          h.sessions.push(s);
+          h.globalSessions.push(globalSessionFrom(s));
+          h.messagesBySession[id] = [
+            bundle(userMessage(`m-${id}-u`, id, updated - 2_000), [
+              textPart(`p-${id}-u`, id, `m-${id}-u`, "Fix the gateway."),
+            ]),
+            bundle(assistantMessage(`m-${id}-a`, id, updated - 1_000), [
+              errorToolPart(
+                `p-${id}-a`,
+                id,
+                `m-${id}-a`,
+                "bash",
+                { command: "make check" },
+                "relay provider timeout after 30s",
+              ),
+            ]),
+          ];
+        }
+        const echoAt = NOW - 100 * MINUTE;
+        const echo = session(
+          "p-echo",
+          "Delegated lookup",
+          PROJECT_DIR,
+          echoAt,
+          undefined,
+          "p-root",
+        );
+        h.sessions.push(echo);
+        h.globalSessions.push(globalSessionFrom(echo));
+        h.messagesBySession[echo.id] = [
+          bundle(userMessage("m-echo-1", echo.id, echoAt - 3_000), [
+            textPart("p-echo-1", echo.id, "m-echo-1", "Check the edge proxies first."),
+          ]),
+          bundle(assistantMessage("m-echo-2", echo.id, echoAt - 2_000), [
+            textPart(
+              "p-echo-2",
+              echo.id,
+              "m-echo-2",
+              "Looking for the relay provider timeout setting.",
+            ),
+          ]),
+          bundle(assistantMessage("m-echo-3", echo.id, echoAt - 1_000), [
+            reasoningPart("p-echo-3r", echo.id, "m-echo-3", `Checked ${filler}`),
+            textPart("p-echo-3", echo.id, "m-echo-3", `Checked ${filler}`),
+          ]),
+        ];
+        addSession(h, {
+          id: "p-out",
+          title: "Ops log",
+          ago: 90,
+          reply: "Noted the relay timing next to the queue depth and the worker counts.",
+        });
+        return h;
+      }
+
+      it("keeps the card-ranked relatives ahead of a reply restating the query", async () => {
+        const { tool, deps } = await recallOver(plainHarness());
+        const query = "relay provider timeout";
+        const ranked = deps.cards.rank(parseQuery(query), {}).map((hit) => hit.sessionId);
+        // The cards rank both failing subagents; only the slim index finds the echo.
+        expect(ranked).toContain("p-r1");
+        expect(ranked).toContain("p-r2");
+        expect(ranked).not.toContain("p-echo");
+
+        // Three drill slots, of which the family may take two.
+        const out = await runTool<SearchOutput>(
+          tool,
+          { query, match: "smart", group: "session", sessionLimit: 3 },
+          makeContext({ sessionID: "p-root" }).ctx,
+        );
+        expect(out.coverage?.sessionsSearched).toBe(3);
+        expect(sessionsOf(out)).toEqual(expect.arrayContaining(["p-r1", "p-r2"]));
+        expect(sessionsOf(out)).not.toContain("p-echo");
+      });
     });
   });
 });

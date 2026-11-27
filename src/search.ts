@@ -67,7 +67,7 @@ import {
   type DrillTargetStats,
   type DrilledPool,
 } from "./drill.js";
-import type { Store, FtsHit, Card } from "./store.js";
+import { buildMatch, type Store, type FtsHit, type Card } from "./store.js";
 import type { FetchGate } from "./fetch-gate.js";
 import { fetchMessageWindow, type FetchRunner } from "./fetch-window.js";
 import type { HistoryMessage } from "./history/model.js";
@@ -1220,15 +1220,24 @@ const NO_FAMILY: ReadonlySet<string> = new Set();
  * a promotion replaces one, so either could otherwise put a third relative
  * among the first {@link FAMILY_TOP_WINDOW} results. A relative the allowance
  * holds back comes right after those results, and fills in among them only
- * when no other hit is left. A promoted relative takes the slot of the last
- * relative there instead of the last slot when the family already holds its
- * share of them.
+ * when no other hit is left. A `preferred` relative's hit (see
+ * {@link familyDiversity}) the allowance, the limit or a class cap would
+ * leave out takes the place of the last hit among those results from a
+ * relative that is not preferred, in rank order.
+ *
+ * A promoted hit takes the last slot it may: not one among the first results
+ * that would put a third relative there, never a preferred relative's hit
+ * when it comes from a relative that is not preferred, and never a preferred
+ * relative's only hit when it comes from outside the family. When no slot
+ * qualifies the next held-back tool input is tried, and failing that none is
+ * promoted.
  */
 export function capAndSlice(
   ordered: SearchResult[],
   limit: number,
   commandLike: boolean,
   family: ReadonlySet<string> = NO_FAMILY,
+  preferred: (hit: SearchResult) => boolean = () => false,
 ): SearchResult[] {
   const classCounts = new Map<string, number>();
   const final: SearchResult[] = [];
@@ -1254,17 +1263,46 @@ export function capAndSlice(
     final.push(hit);
     taken.add(hit);
   };
+  const position = new Map(ordered.map((hit, index) => [hit, index] as const));
+  const byPosition = (a: SearchResult, b: SearchResult): number =>
+    (position.get(a) ?? 0) - (position.get(b) ?? 0);
+  /** Removes the last hit among the first results from a relative that is
+   *  not preferred, for a preferred one to take its place. */
+  const displaceUnpreferred = (): SearchResult | undefined => {
+    const index = lastIndexWhere(final.slice(0, FAMILY_TOP_WINDOW), (held) => {
+      return isFamily(held) && !preferred(held);
+    });
+    return index === -1 ? undefined : removeAt(index);
+  };
+  /** Takes the hit at `index` out of the results and its class count. */
+  function removeAt(index: number): SearchResult {
+    const displaced = final.splice(index, 1)[0]!;
+    taken.delete(displaced);
+    const cls = displaced.why?.evidenceClass;
+    if (cls != null && CLASS_CAPS[cls] != null) {
+      classCounts.set(cls, (classCounts.get(cls) ?? 1) - 1);
+    }
+    return displaced;
+  }
+  /** Makes room in the full allowance for a preferred relative's hit. */
+  const displaceFor = (hit: SearchResult): boolean => {
+    if (!preferred(hit)) return false;
+    const displaced = displaceUnpreferred();
+    if (!displaced) return false;
+    deferred.push(displaced);
+    return true;
+  };
   const offer = (hit: SearchResult): void => {
     if (final.length >= limit || classFull(hit)) heldBack.push(hit);
-    else if (windowFull(hit)) deferred.push(hit);
-    else take(hit);
+    else if (!windowFull(hit) || displaceFor(hit)) take(hit);
+    else deferred.push(hit);
   };
 
   for (const hit of ordered) {
     offer(hit);
     // Once the first results are full, the relatives they held back are next.
     if (final.length >= FAMILY_TOP_WINDOW && deferred.length > 0) {
-      for (const held of deferred.splice(0)) offer(held);
+      for (const held of deferred.splice(0).sort(byPosition)) offer(held);
     }
   }
 
@@ -1272,10 +1310,7 @@ export function capAndSlice(
   // per-session diversity semantics: caps yield rather than return less).
   // A relative the family allowance still refuses waits for a second pass,
   // so it fills in only after every other held-back hit.
-  const position = new Map(ordered.map((hit, index) => [hit, index] as const));
-  const rest = [...heldBack, ...deferred].sort(
-    (a, b) => (position.get(a) ?? 0) - (position.get(b) ?? 0),
-  );
+  const rest = [...heldBack, ...deferred].sort(byPosition);
   for (const keepAllowance of [true, false]) {
     for (const hit of rest) {
       if (final.length >= limit) break;
@@ -1285,19 +1320,62 @@ export function capAndSlice(
     }
   }
 
+  // A preferred relative's hit still left out (by the limit or a class cap)
+  // takes the place of the last one among the first results from a relative
+  // that is not preferred, at its own rank, when its class cap still holds
+  // once that hit is out: replacing a hit of its own class frees the room it
+  // needs. Counted over the results themselves, since the backfill above
+  // fills without counting.
+  const classInFinal = (cls: EvidenceClass): number =>
+    final.filter((held) => held.why?.evidenceClass === cls).length;
+  for (const found of rest) {
+    if (taken.has(found) || !isFamily(found) || !preferred(found)) continue;
+    const firstResults = final.slice(0, FAMILY_TOP_WINDOW);
+    if (!firstResults.some((held) => isFamily(held) && !preferred(held))) break;
+    const cls = found.why?.evidenceClass;
+    const cap = cls != null ? CLASS_CAPS[cls] : undefined;
+    const index = lastIndexWhere(firstResults, (held) => {
+      if (!isFamily(held) || preferred(held)) return false;
+      if (cls == null || cap == null) return true;
+      return classInFinal(cls) - (held.why?.evidenceClass === cls ? 1 : 0) < cap;
+    });
+    if (index === -1) continue;
+    removeAt(index);
+    const at = final.findIndex((held) => byPosition(held, found) > 0);
+    if (at === -1) final.push(found);
+    else final.splice(at, 0, found);
+    taken.add(found);
+    if (cls != null && cap != null) classCounts.set(cls, (classCounts.get(cls) ?? 0) + 1);
+  }
+
   if (
     commandLike &&
     final.length > 0 &&
     !final.some((hit) => hit.why?.evidenceClass === "tool-input")
   ) {
-    const promoted = rest.find((hit) => hit.why?.evidenceClass === "tool-input" && !taken.has(hit));
-    if (promoted) {
-      let slot = final.length - 1;
-      if (isFamily(promoted) && slot < FAMILY_TOP_WINDOW && !isFamily(final[slot]!)) {
-        const window = final.slice(0, FAMILY_TOP_WINDOW).map(isFamily);
-        if (window.filter(Boolean).length >= FAMILY_TOP_MAX) slot = window.lastIndexOf(true);
+    const familyInWindow = (): number => final.slice(0, FAMILY_TOP_WINDOW).filter(isFamily).length;
+    /** Whether `by` may take slot `slot` (see the rules above). */
+    const canTake = (slot: number, by: SearchResult): boolean => {
+      const target = final[slot]!;
+      if (
+        slot < FAMILY_TOP_WINDOW &&
+        isFamily(by) &&
+        !isFamily(target) &&
+        familyInWindow() >= FAMILY_TOP_MAX
+      ) {
+        return false;
       }
+      if (!isFamily(target) || !preferred(target)) return true;
+      if (isFamily(by)) return preferred(by);
+      return final.some((other, index) => index !== slot && other.sessionID === target.sessionID);
+    };
+    for (const promoted of rest) {
+      if (promoted.why?.evidenceClass !== "tool-input" || taken.has(promoted)) continue;
+      let slot = final.length - 1;
+      while (slot >= 0 && !canTake(slot, promoted)) slot--;
+      if (slot === -1) continue;
       final[slot] = promoted;
+      break;
     }
   }
 
@@ -1364,13 +1442,19 @@ export function familyDrillSlots(cap: number): number {
  * removes one. Then the family holds at most
  * {@link FAMILY_TOP_MAX} of the first {@link FAMILY_TOP_WINDOW} results; the
  * results it would have held there move down behind them, and fill in only
- * when no other result is left. Without a result from outside the family
- * nothing moves. Exported for direct unit tests.
+ * when no other result is left. A `preferred` result (one from a relative
+ * the slim-index lookup found, as {@link capFamilySlots} prefers) the
+ * allowance held back, or ranked anywhere below those first results, takes
+ * the place there of the lowest-ranked family result that is not preferred,
+ * keeping rank order among them; the one it displaces moves down behind
+ * them. Without a result from outside the family nothing moves. Exported for
+ * direct unit tests.
  */
 export function familyDiversity(
   results: SearchResult[],
   family: ReadonlySet<string>,
   delegated: (result: SearchResult) => boolean,
+  preferred: (result: SearchResult) => boolean = () => false,
 ): SearchResult[] {
   if (family.size === 0) return results;
   const isFamily = (result: SearchResult): boolean => family.has(result.sessionID);
@@ -1414,37 +1498,78 @@ export function familyDiversity(
     }
     top.push(result);
   }
+
+  // Preferred results the allowance held back or the window never reached
+  // take the places of the lowest-ranked family results there that are not
+  // preferred, which move down to lead the held ones.
+  const swappedIn = new Set<SearchResult>();
+  const swappedOut: SearchResult[] = [];
+  for (const found of [...held, ...ordered.slice(next)]) {
+    if (!isFamily(found) || !preferred(found)) continue;
+    const index = lastIndexWhere(top, (r) => isFamily(r) && !preferred(r));
+    if (index === -1) break;
+    swappedOut.unshift(top.splice(index, 1)[0]!);
+    top.push(found);
+    swappedIn.add(found);
+  }
+  if (swappedIn.size > 0) {
+    const position = new Map(ordered.map((r, index) => [r, index] as const));
+    top.sort((a, b) => position.get(a)! - position.get(b)!);
+    return [
+      ...top,
+      ...swappedOut,
+      ...held.filter((r) => !swappedIn.has(r)),
+      ...ordered.slice(next).filter((r) => !swappedIn.has(r)),
+    ];
+  }
   if (held.length === 0) return ordered;
   return [...top, ...held, ...ordered.slice(next)];
 }
 
+/** The index of the last item of `items` matching `test`, or -1. */
+function lastIndexWhere<T>(items: readonly T[], test: (item: T) => boolean): number {
+  for (let i = items.length - 1; i >= 0; i--) if (test(items[i]!)) return i;
+  return -1;
+}
+
 /**
- * Caps the family sessions in a drill shortlist at `max`, keeping the first
- * ones in order. The freed slots go to the next ids of `ranked` (the ranked
- * card ids, then the slim-index sessions) from outside the family; when none
- * is left, the capped family ids take them back, so the shortlist never
- * shrinks. Exported for direct unit tests.
+ * Caps the family sessions in a drill shortlist at `max`. The relatives it
+ * keeps are those in `preferred` first, in its order, then the shortlist's
+ * other relatives in shortlist order. `preferred` holds the relatives the
+ * slim-index lookup matched on the query's code tokens or phrases outside a
+ * delegated prompt, in its order: such a row is evidence about the session
+ * itself, while a card can rank a relative on words its prompt shares with
+ * the query. When the cap drops relatives, a preferred relative outside the
+ * shortlist takes the slot of the first one it outranks. The freed slots go
+ * to the next ids of `ranked` (the ranked card ids, then the slim-index
+ * sessions) from outside the family; when none is left, the capped family ids
+ * take them back, so the shortlist never shrinks. Within the cap nothing
+ * moves, and no preferred relative is brought in. Exported for direct unit
+ * tests.
  */
 export function capFamilySlots(
   shortlist: string[],
   ranked: readonly string[],
   family: ReadonlySet<string>,
   max: number,
+  preferred: readonly string[] = [],
 ): string[] {
+  const relatives = shortlist.filter((id) => family.has(id));
+  if (relatives.length <= max) return shortlist;
+  const order = [...new Set([...preferred.filter((id) => family.has(id)), ...relatives])];
+  const keep = new Set(order.slice(0, max));
+  const pulled = order.slice(0, max).filter((id) => !shortlist.includes(id));
   const kept: string[] = [];
   const dropped: string[] = [];
-  let familyKept = 0;
   for (const id of shortlist) {
-    if (family.has(id)) {
-      if (familyKept >= max) {
-        dropped.push(id);
-        continue;
-      }
-      familyKept++;
+    if (!family.has(id) || keep.has(id)) {
+      kept.push(id);
+      continue;
     }
-    kept.push(id);
+    const next = pulled.shift();
+    if (next !== undefined) kept.push(next);
+    else dropped.push(id);
   }
-  if (dropped.length === 0) return shortlist;
   const seen = new Set(shortlist);
   for (const id of ranked) {
     if (kept.length >= shortlist.length) break;
@@ -3143,6 +3268,10 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
          *  time-bounded search asks for what happened in that window wherever
          *  it happened, the current session's subagents included. */
         let diversityFamily = new Set<string>();
+        /** The relatives in {@link diversityFamily} the slim-index lookup
+         *  found, which keep the family's drill slots and first results ahead
+         *  of the others. */
+        let familyIndexed = new Set<string>();
         /** Excluded sessions that matched, measured by tier-1 ranking. */
         let excludedMatches: ExcludedMatches | undefined;
         /** Sessions the authorship root-only restriction removed from selection,
@@ -3747,11 +3876,12 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
 
           // ── Tier 1.5: FTS needle lookup — inject sessions whose card missed the anchor ──
           const ftsOnly: string[] = [];
+          const strongAnchors = [...queryMeta.codeTokens, ...queryMeta.phrases];
+          /** The lookup's rows in its order, kept for the family's preference. */
+          let ftsRows: FtsHit[] = [];
           if (store) {
-            const rows = store.ftsSearch({
-              strong: [...queryMeta.codeTokens, ...queryMeta.phrases],
-              weak: queryMeta.tokens,
-            });
+            const rows = store.ftsSearch({ strong: strongAnchors, weak: queryMeta.tokens });
+            ftsRows = rows;
             ftsBySession = new Map<string, FtsHit[]>();
             for (const row of rows) {
               const list = ftsBySession.get(row.sessionId);
@@ -3819,11 +3949,57 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
           if (after == null && before == null) diversityFamily = relatives();
           // The current session's relatives take at most a share of the drill
           // slots, so subagents that echo the query cannot crowd out other
-          // history.
+          // history. The ones the slim-index lookup found keep those slots
+          // first, in its order: a card ranks a relative on the words it
+          // shares with the query, which a subagent's prompt often does, while
+          // a slim-index row is a match in the session's own text. Only rows
+          // matched on the query's code tokens or phrases count, since the
+          // lookup ANDs those but ORs plain words, where any word matches and
+          // its order favors short rows such as a prompt restating the query.
+          // A row in a subagent's first message, the prompt its orchestrator
+          // wrote, does not count either. A row with no previous message is in
+          // the oldest message its card's write read, which is the session's
+          // first unless that read stopped at the per-session row cap. An
+          // opencode v2 write records such a stop as the checkpoint's floor,
+          // so a card with one has no prompt row; a v1 write records none, so
+          // a capped v1 subagent's oldest message read counts as its prompt.
+          // A subtask part or a later prompt cannot be told apart from the
+          // session's own text by its row.
           const familyRanked = [...eligibleIds, ...ftsOnly];
+          const candidates = new Set(familyRanked);
+          const promptRow = (row: FtsHit): boolean => {
+            if (row.prevMessageId !== null) return false;
+            const card = cardById.get(row.sessionId);
+            return (
+              parentageOf(card?.parentId) === "child" &&
+              inspectCheckpoint(card?.distillCursor)?.floor === undefined
+            );
+          };
+          const familyFound =
+            buildMatch(strongAnchors, []) === null
+              ? []
+              : [
+                  ...new Set(
+                    ftsRows
+                      .filter(
+                        (row) =>
+                          diversityFamily.has(row.sessionId) &&
+                          candidates.has(row.sessionId) &&
+                          !promptRow(row),
+                      )
+                      .map((row) => row.sessionId),
+                  ),
+                ];
+          familyIndexed = new Set(familyFound);
           const capFamily = (ids: string[]): string[] =>
             diversityFamily.size > 0
-              ? capFamilySlots(ids, familyRanked, diversityFamily, familyDrillSlots(cap))
+              ? capFamilySlots(
+                  ids,
+                  familyRanked,
+                  diversityFamily,
+                  familyDrillSlots(cap),
+                  familyFound,
+                )
               : ids;
           const mergedIds = capFamily(
             mergeShortlist(eligibleIds, ftsOnly, semanticIds, cap, semanticSlots),
@@ -4374,6 +4550,10 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
           resultsArg * DIVERSITY_SCAN_MULTIPLIER,
         );
 
+        /** A result from a relative the slim-index lookup found. */
+        const indexedRelative = (result: SearchResult): boolean =>
+          familyIndexed.has(result.sessionID);
+
         /** Family diversity over ordered results, judged on the candidates
          *  of the drilled `pools` the results came from. Runs after the
          *  directory-fallback re-sort, which is family-blind and would undo
@@ -4394,7 +4574,7 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
             const candidate = byPart.get(`${result.sessionID}\u0000${result.partID}`);
             return candidate !== undefined && authorshipOf(candidate) === "delegated";
           };
-          return familyDiversity(ordered, diversityFamily, delegated);
+          return familyDiversity(ordered, diversityFamily, delegated, indexedRelative);
         };
 
         const applyGroupAndSlice = (
@@ -4423,7 +4603,13 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
             orderForDirectoryFallback(diversified, Boolean(bucketDirectory && fallback)),
             pools,
           );
-          const final = capAndSlice(ordered, resultsArg, commandLikeQuery, diversityFamily);
+          const final = capAndSlice(
+            ordered,
+            resultsArg,
+            commandLikeQuery,
+            diversityFamily,
+            indexedRelative,
+          );
           return { final, total: partTotal, truncated: earlyExit || partTotal > final.length };
         };
 

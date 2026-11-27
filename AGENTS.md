@@ -219,7 +219,7 @@ wrong path. The live tool output is ground truth; the transcript is not.
 ## Relevance is gated — don't change ranking blind
 
 `test/eval/` is a labeled relevance harness wired into `npm run check`.
-`baseline.json` locks MRR/recall@5 = 1.0 over 19 rank-scored cases. On top of
+`baseline.json` locks MRR/recall@5 = 1.0 over 20 rank-scored cases. On top of
 those, `relevance.test.ts` adds two behavioral assertions: an output-only needle
 that must be an honest miss without `deep` and a hit with a scoped deep sweep,
 and a virgin degraded-mode query that must return metadata-quality results with

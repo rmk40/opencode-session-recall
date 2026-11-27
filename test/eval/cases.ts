@@ -156,6 +156,23 @@ export const EVAL_CASES: EvalCase[] = [
     },
   },
   {
+    // The needle sits only in the slim index, in one of e-scout's subagents;
+    // two others rank on the query's first word by card. With three drill
+    // slots the family may take two, and the subagent the slim index found
+    // must keep one of them.
+    name: "slim-index needle in a subagent keeps its drill slot over card-ranked relatives",
+    args: {
+      query: "skyhook-qorv.webp",
+      match: "smart",
+      group: "session",
+      scope: "global",
+      sessionLimit: 3,
+    },
+    ctxSessionID: "e-scout",
+    relevantSessionIDs: ["e-scout-needle"],
+    expect: { notInResults: ["e-scout"] },
+  },
+  {
     // Field report: an exact tool query must surface concrete actions (bash
     // tool inputs), not the skill payload that mentions the tool everywhere.
     name: "field-report: exact tool query prefers tool-input evidence",

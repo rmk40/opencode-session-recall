@@ -457,7 +457,7 @@ RECALL_PERF=1 npx vitest run test/perf.test.ts test/perf-v2.test.ts --reporter=v
 
 The large-store gates build their cards with `perfCorpus()` from `test/perf-helpers.ts`, which draws inventories from a Zipf vocabulary of 20,000 words plus code identifiers, paths and rare id tokens. Slices are measured with `stallProbe()` from the same file. It ticks a 0 ms interval and subtracts the garbage-collection pauses V8 reported inside each gap. Each gate asserts the slice without GC pauses and logs the raw stall and the longest GC pause beside it, along with the load average. A major collection of a heap of a few hundred MB can pause the loop past 50 ms on its own on a loaded machine, so the raw stall is too noisy to assert. The heap ceilings catch the retained memory that lengthens those pauses. Run these when a change touches the store, the card runtime, the distiller or the drill. When one fails, fix the code it names rather than loosen its budget.
 
-When changing ranking, re-run the relevance eval (`test/eval/`), which gates MRR, recall@5 and per-case `expect` clauses (excluded sessions, evidence classes in the top ranks, a session that must rank below another) against `baseline.json` over a labeled corpus of 19 rank-scored cases, plus an honest-miss and a degraded-mode assertion, so regressions fail the build.
+When changing ranking, re-run the relevance eval (`test/eval/`), which gates MRR, recall@5 and per-case `expect` clauses (excluded sessions, evidence classes in the top ranks, a session that must rank below another) against `baseline.json` over a labeled corpus of 20 rank-scored cases, plus an honest-miss and a degraded-mode assertion, so regressions fail the build.
 
 #### Tuning ranking
 
