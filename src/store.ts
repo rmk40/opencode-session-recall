@@ -1,7 +1,14 @@
-import type { Row, SqliteDb, SqlValue } from "./sqlite.js";
-import { loadFs, loadPath, loadOs } from "./node-import.js";
+import {
+  openSqliteReadOnly,
+  SqliteBusyError,
+  type ReadOnlyDb,
+  type Row,
+  type SqliteDb,
+  type SqlValue,
+} from "./sqlite.js";
+import { loadFs, loadPath, loadOs, type FsLike } from "./node-import.js";
 import { EMBED_REPRESENTATION } from "./embedding-text.js";
-import { runSteps, runStepsPausing, type Steps } from "./yield.js";
+import { macrotask, runSteps, runStepsPausing, type Steps } from "./yield.js";
 
 /**
  * Card + slim-part-index store over a {@link SqliteDb}.
@@ -1015,8 +1022,20 @@ export type Store = {
    * The conditional-write SEMANTICS are unchanged (absent / same-holder / expired
    * wins); the extra fields are pure observability so a mixed-version store can be
    * diagnosed with one {@link Store.leaseStatus} read instead of a process hunt.
+   *
+   * `opts.takeOver` names one more holder whose lease this call may take
+   * although its heartbeat has not expired: a predecessor the caller knows
+   * has stopped. The lease row must name exactly that holder, compared in
+   * the same conditional write, so a lease another holder took meanwhile is
+   * never taken. An empty or non-string `takeOver` is ignored.
    */
-  acquireLease(holder: string, ttlMs: number, build: string, gen: number): boolean;
+  acquireLease(
+    holder: string,
+    ttlMs: number,
+    build: string,
+    gen: number,
+    opts?: { takeOver?: string },
+  ): boolean;
   heartbeatLease(holder: string): boolean;
   releaseLease(holder: string): boolean;
   /** Current lease holder info parsed from the lease row, or `undefined` when no
@@ -1025,6 +1044,29 @@ export type Store = {
    *  field existed. Read-only; never mutates. */
   leaseStatus(): LeaseInfo | undefined;
 };
+
+/**
+ * The {@link Store} methods that only read, which the main thread's searches,
+ * browsing, hooks, coverage and card-runtime refreshes call. None of them
+ * writes, begins a transaction, checkpoints or sets a pragma, so a connection
+ * opened read-only ({@link openReadStore}) serves every one. Every `Store` is
+ * a `ReadStore`.
+ */
+export type ReadStore = Pick<
+  Store,
+  | "getCard"
+  | "cardWriteRev"
+  | "allCards"
+  | "cardsSince"
+  | "cardsPage"
+  | "cardVectorsPage"
+  | "cardCounters"
+  | "cardSessionIds"
+  | "ftsSearch"
+  | "ftsSearchPausing"
+  | "getMeta"
+  | "leaseStatus"
+>;
 
 /** Result of {@link Store.writeCardEmbeddings}: the `vectors_rev` value after the
  *  call, and whether this call actually committed a write (`false` when a
@@ -1626,14 +1668,18 @@ function rankedMatch(
 
 // ── Schema management ────────────────────────────────────────────────────────
 
-function hasMetaTable(db: SqliteDb): boolean {
+/** What the fence reads through: single-row statements, which both a full
+ *  connection and a read-only one ({@link ReadOnlyDb}) serve. */
+type RowReader = Pick<SqliteDb, "get">;
+
+function hasMetaTable(db: RowReader): boolean {
   return (
     db.get("SELECT 1 AS present FROM sqlite_master WHERE type='table' AND name='meta'") !==
     undefined
   );
 }
 
-function readSchemaVersion(db: SqliteDb): number | null {
+function readSchemaVersion(db: RowReader): number | null {
   if (!hasMetaTable(db)) return null;
   const value = readMetaValue(db, SCHEMA_VERSION_KEY);
   if (value === undefined) return null;
@@ -1642,7 +1688,7 @@ function readSchemaVersion(db: SqliteDb): number | null {
 }
 
 /** One `meta` value over the raw connection (the table must exist). */
-function readMetaValue(db: SqliteDb, key: string): string | undefined {
+function readMetaValue(db: RowReader, key: string): string | undefined {
   const row = db.get("SELECT value FROM meta WHERE key=?", [key]);
   return row && typeof row.value === "string" ? row.value : undefined;
 }
@@ -1757,7 +1803,7 @@ function isMigratable(version: number | null): boolean {
 }
 
 /** The identity stamps, if the file has a `meta` table at all. */
-function readStampedIdentity(db: SqliteDb): { host?: string; source?: string } {
+function readStampedIdentity(db: RowReader): { host?: string; source?: string } {
   if (!hasMetaTable(db)) return {};
   return {
     host: readMetaValue(db, STORE_HOST_KEY),
@@ -1770,9 +1816,9 @@ function readStampedIdentity(db: SqliteDb): { host?: string; source?: string } {
  * rebuilding or writing anything (a missing `meta` table reads as no stamp).
  * Lets an opener learn which exact source string {@link openStore} would
  * accept before it opens the store. Never throws: an unreadable file reads
- * as no stamp.
+ * as no stamp. A read-only handle ({@link ReadOnlyDb}) serves it as well.
  */
-export function peekStoreIdentity(db: SqliteDb): { host?: string; source?: string } {
+export function peekStoreIdentity(db: RowReader): { host?: string; source?: string } {
   try {
     return readStampedIdentity(db);
   } catch {
@@ -1787,7 +1833,7 @@ export function peekStoreIdentity(db: SqliteDb): { host?: string; source?: strin
  * identity must match exactly, absent on both sides for the v1 host.
  */
 function checkIdentity(
-  db: SqliteDb,
+  db: RowReader,
   preFence: boolean,
   host: StoreHost,
   source: string | undefined,
@@ -1896,7 +1942,7 @@ type StoredCardMeta = {
  * pre-fence) can lead to rebuilding or migrating another host's file.
  */
 function fenceRefusal(
-  db: SqliteDb,
+  db: RowReader,
   host: StoreHost,
   source: string | undefined,
 ): FenceRefusal | null {
@@ -1915,6 +1961,288 @@ function fenceRefusal(
     return checkIdentity(db, isPreFence(current), host, source);
   }
   return null;
+}
+
+// ── Read-only store connection ───────────────────────────────────────────────
+
+/** How many times {@link retryOnBusy} runs a read by default. */
+export const BUSY_READ_ATTEMPTS = 5;
+
+/** The longest wait {@link retryOnBusy} makes between two attempts, in ms. */
+const BUSY_BACKOFF_MAX_MS = 16;
+
+/** The most turns one wait of {@link retryOnBusy} takes, so a clock that
+ *  stops or runs backwards cannot hold it. */
+const BUSY_BACKOFF_MAX_TURNS = 10_000;
+
+/** How {@link retryOnBusy} retries. */
+export type BusyRetryOptions = {
+  /** How many times the read runs in all: a positive integer, anything
+   *  else reads as {@link BUSY_READ_ATTEMPTS}. */
+  attempts?: number;
+  /** One turn of the wait between attempts (default {@link macrotask}). */
+  pause?: () => Promise<void>;
+  /** Clock in milliseconds (default `performance.now`). */
+  now?: () => number;
+};
+
+/**
+ * Run `read` and, while it throws a {@link SqliteBusyError} (another
+ * connection held a lock it needed, such as during WAL recovery after a
+ * crash), run it again after a short wait, at most `attempts` times in all.
+ * The last busy error is thrown when every attempt was busy; any other error
+ * is thrown at once, unretried. The wait after attempt `n` lasts at least
+ * `2 ** (n - 1)` ms, at most 16 (1, 2, 4, 8 and then 16 ms), and is spent in
+ * `pause` turns, at least one and at most 10,000, never in a wait on the
+ * lock itself, so the
+ * thread keeps running while the lock is held: `macrotask` resolves in far
+ * less than a millisecond, so a wait counted in turns alone would end
+ * before a recovery could. For async callers of a {@link ReadStore} from
+ * {@link openReadStore}, whose connection never waits on a lock: a sync
+ * caller gets the busy error.
+ */
+export async function retryOnBusy<T>(
+  read: () => T | Promise<T>,
+  opts: BusyRetryOptions = {},
+): Promise<T> {
+  const attempts =
+    typeof opts.attempts === "number" && Number.isInteger(opts.attempts) && opts.attempts >= 1
+      ? opts.attempts
+      : BUSY_READ_ATTEMPTS;
+  const pause = opts.pause ?? macrotask;
+  const now = opts.now ?? (() => performance.now());
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await read();
+    } catch (error) {
+      if (!(error instanceof SqliteBusyError) || attempt >= attempts) throw error;
+    }
+    const until = now() + Math.min(2 ** (attempt - 1), BUSY_BACKOFF_MAX_MS);
+    let turns = 0;
+    do await pause();
+    while (now() < until && ++turns < BUSY_BACKOFF_MAX_TURNS);
+  }
+}
+
+/** Why {@link openReadStore} refused a store. No refusal writes anything.
+ *  - `newer`, `host-mismatch`, `source-mismatch`: as {@link openStore}.
+ *  - `needs-migration` / `needs-rebuild`: {@link openStore} would migrate or
+ *    rebuild the store, as with `existingOnly`.
+ *  - `missing`: no file at the path (`:memory:` and an empty path included).
+ *  - `no-wal`: the file has no `-wal` or no `-shm` file beside it. Either it
+ *    is not in WAL mode, or the last connection to close deleted them (as
+ *    `node:sqlite` does; macOS's system SQLite keeps them), or a connection
+ *    switched it to WAL and has run no statement since, which is when SQLite
+ *    creates them. A read-only connection would create both files and could
+ *    not delete them when it closed, so the reader opens only once a
+ *    connection in WAL mode has made them.
+ *  - `busy`: the open's reads found a lock another connection held, on every
+ *    attempt ({@link retryOnBusy}); a later open may succeed.
+ *  - `error`: the file could not be opened or read (not a database, a
+ *    directory it cannot read, a failed statement). */
+export type ReadStoreRefusal = FenceRefusal | "missing" | "no-wal" | "busy" | "error";
+
+export type ReadStoreOptions = {
+  /**
+   * For a v2 identity whose `source` may name the stamped file by another
+   * spelling (the card-only fallback, whose source path cannot be
+   * canonicalized): called with the store's `source_db` stamp when the host
+   * stamp matches and the source stamp differs from `identity.source`. When
+   * it returns true, the fence runs with the stamp as the source, so its
+   * exact-string comparison holds; otherwise the store is refused as
+   * `source-mismatch`.
+   */
+  acceptSource?: (stamped: string) => boolean | Promise<boolean>;
+  /** How the open retries reads that find a lock (default
+   *  {@link BUSY_READ_ATTEMPTS} attempts). */
+  busyRetry?: BusyRetryOptions;
+};
+
+export type OpenReadStoreResult =
+  /** `source` is the source the fence accepted (undefined for the v1 host),
+   *  `identity.source` or the stamp `acceptSource` accepted. `close` closes
+   *  the connection; calling it again does nothing. */
+  | { ok: true; store: ReadStore; source: string | undefined; close: () => void }
+  /** `detail` is the driver's message, for `busy` and `error`. */
+  | { ok: false; reason: ReadStoreRefusal; detail?: string };
+
+/**
+ * Open a {@link ReadStore} over its own connection to the store at `path`,
+ * which takes no write lock and never writes. The connection is opened with
+ * SQLite's read-only flag ({@link openSqliteReadOnly}), with `query_only` and
+ * `busy_timeout` 0, so no read on it waits on another connection's lock: a
+ * read that finds one throws a {@link SqliteBusyError}. Its reads are the
+ * {@link ReadStore} methods alone, and closing it never checkpoints.
+ *
+ * The fence is {@link openStore}'s, as plain reads with no transaction: the
+ * host stamp first, then the source stamp and the schema version, refusing
+ * with the same reasons for the same states. Where {@link openStore} would
+ * migrate or rebuild, it refuses with `needs-migration` or `needs-rebuild`,
+ * as {@link openStore} does with `existingOnly`. Before it opens the file it
+ * checks that the file and its `-wal` and `-shm` files exist (`missing`,
+ * `no-wal`), so the open never creates them; a connection elsewhere that
+ * closes last in between can still delete them before SQLite reads, and
+ * SQLite then creates them again, empty, as any opener would. It never sets
+ * `journal_mode`. Never throws: every failure is a refusal.
+ */
+export async function openReadStore(
+  path: string,
+  identity: StoreIdentity,
+  opts: ReadStoreOptions = {},
+): Promise<OpenReadStoreResult> {
+  if (path === ":memory:" || path.trim() === "") return { ok: false, reason: "missing" };
+  const files = await storeFiles(path);
+  if (files !== "present") return files;
+  try {
+    return await retryOnBusy(() => openReadStoreOnce(path, identity, opts), opts.busyRetry);
+  } catch (error) {
+    return {
+      ok: false,
+      reason: error instanceof SqliteBusyError ? "busy" : "error",
+      detail: error instanceof Error ? error.message : String(error),
+    };
+  }
+}
+
+/**
+ * Whether the store file and its `-wal` and `-shm` files exist, from `stat`
+ * alone. A file is never opened here: closing any descriptor of a file drops
+ * every POSIX lock this process holds on it, a writer connection's included.
+ */
+async function storeFiles(path: string): Promise<"present" | OpenReadStoreResult> {
+  let fs: FsLike;
+  try {
+    fs = await loadFs();
+  } catch (error) {
+    return { ok: false, reason: "error", detail: String(error) };
+  }
+  const exists = async (file: string): Promise<boolean | Error> => {
+    try {
+      await fs.promises.stat(file);
+      return true;
+    } catch (error) {
+      const code = (error as { code?: unknown }).code;
+      if (code === "ENOENT" || code === "ENOTDIR") return false;
+      return error instanceof Error ? error : new Error(String(error));
+    }
+  };
+  const [db, wal, shm] = await Promise.all([
+    exists(path),
+    exists(`${path}-wal`),
+    exists(`${path}-shm`),
+  ]);
+  for (const found of [db, wal, shm]) {
+    if (found instanceof Error) return { ok: false, reason: "error", detail: found.message };
+  }
+  if (!db) return { ok: false, reason: "missing" };
+  if (!wal || !shm) return { ok: false, reason: "no-wal" };
+  return "present";
+}
+
+/** One attempt of {@link openReadStore} after its file checks. Throws a
+ *  {@link SqliteBusyError} when a read found a lock, for the caller to retry;
+ *  the connection is closed first. */
+async function openReadStoreOnce(
+  path: string,
+  identity: StoreIdentity,
+  opts: ReadStoreOptions,
+): Promise<OpenReadStoreResult> {
+  const opened = await openSqliteReadOnly(path, { busyTimeoutMs: 0, busyError: true });
+  if (!opened.ok) {
+    if (opened.busy !== undefined) throw new SqliteBusyError(opened.busy, opened.reason);
+    return { ok: false, reason: "error", detail: opened.reason };
+  }
+  const db = opened.db;
+  try {
+    const fence = await readFence(db, identity, opts.acceptSource);
+    if ("refusal" in fence) {
+      closeQuietly(db);
+      return { ok: false, reason: fence.refusal };
+    }
+    const store = readOnlyView(new SqliteStore(readOnlySqliteDb(db), Date.now));
+    let closed = false;
+    const close = (): void => {
+      if (closed) return;
+      closed = true;
+      db.close();
+    };
+    return { ok: true, store, source: fence.source, close };
+  } catch (error) {
+    closeQuietly(db);
+    if (error instanceof SqliteBusyError) throw error;
+    return {
+      ok: false,
+      reason: "error",
+      detail: error instanceof Error ? error.message : String(error),
+    };
+  }
+}
+
+/** {@link openStore}'s fence and its `existingOnly` check, as plain reads
+ *  over a read-only handle: the source it accepts, or why it refuses. */
+async function readFence(
+  db: RowReader,
+  identity: StoreIdentity,
+  acceptSource: ReadStoreOptions["acceptSource"],
+): Promise<{ source: string | undefined } | { refusal: FenceRefusal }> {
+  const host = identity.host;
+  let source = identity.host === "opencode-v2" ? identity.source : undefined;
+  if (identity.host === "opencode-v2" && acceptSource) {
+    const stamped = readStampedIdentity(db);
+    if (
+      stamped.host === host &&
+      stamped.source !== undefined &&
+      stamped.source !== source &&
+      (await acceptSource(stamped.source))
+    ) {
+      source = stamped.source;
+    }
+  }
+  const refusal = fenceRefusal(db, host, source);
+  if (refusal) return { refusal };
+  const current = readSchemaVersion(db);
+  if (current !== SCHEMA_VERSION) {
+    return { refusal: isMigratable(current) ? "needs-migration" : "needs-rebuild" };
+  }
+  return { source };
+}
+
+/** A {@link SqliteDb} over a read-only handle, for the store
+ *  {@link openReadStore} builds: statements that return rows go to the
+ *  handle, and anything that would write throws before it reaches SQLite.
+ *  No {@link ReadStore} method calls `exec`, `run` or `tx`. */
+function readOnlySqliteDb(db: ReadOnlyDb): SqliteDb {
+  const refuse = (): never => {
+    throw new Error("a read-only store connection cannot write");
+  };
+  return { get: db.get, all: db.all, close: db.close, exec: refuse, run: refuse, tx: refuse };
+}
+
+/** The {@link ReadStore} methods of `store`, and nothing else. */
+function readOnlyView(store: Store): ReadStore {
+  return {
+    getCard: store.getCard.bind(store),
+    cardWriteRev: store.cardWriteRev.bind(store),
+    allCards: store.allCards.bind(store),
+    cardsSince: store.cardsSince.bind(store),
+    cardsPage: store.cardsPage.bind(store),
+    cardVectorsPage: store.cardVectorsPage.bind(store),
+    cardCounters: store.cardCounters.bind(store),
+    cardSessionIds: store.cardSessionIds.bind(store),
+    ftsSearch: store.ftsSearch.bind(store),
+    ftsSearchPausing: store.ftsSearchPausing.bind(store),
+    getMeta: store.getMeta.bind(store),
+    leaseStatus: store.leaseStatus.bind(store),
+  };
+}
+
+/** Close a handle, keeping the error that led here rather than the close's. */
+function closeQuietly(db: Pick<SqliteDb, "close">): void {
+  try {
+    db.close();
+  } catch {
+    // The caller reports why it closed.
+  }
 }
 
 // ── Store implementation ─────────────────────────────────────────────────────
@@ -3020,24 +3348,42 @@ class SqliteStore implements Store {
    * Acquire or take over the distill lease as a single conditional write,
    * verified via the changes count — never an application-level
    * read-check-write. Succeeds when the row is absent, already held by this
-   * holder, or expired (heartbeat older than `ttlMs` ago).
+   * holder, held by `opts.takeOver` (a non-empty string), or expired
+   * (heartbeat older than `ttlMs` ago).
    */
-  acquireLease(holder: string, ttlMs: number, build: string, gen: number): boolean {
+  acquireLease(
+    holder: string,
+    ttlMs: number,
+    build: string,
+    gen: number,
+    opts?: { takeOver?: string },
+  ): boolean {
     const now = this.now();
     const cutoff = now - ttlMs;
-    // `build`/`gen` ride the value for diagnosis only; the WHERE clause below is
-    // unchanged, so acquire semantics (absent / same-holder / expired) are too.
-    // A heartbeat updates only `$.heartbeat` (json_set), so they survive renewals.
+    // `build`/`gen` ride the value for diagnosis only. A heartbeat updates
+    // only `$.heartbeat` (json_set), so they survive renewals.
     const value = JSON.stringify({ holder, heartbeat: now, ttl: ttlMs, build, gen });
+    // The empty holder is the released sentinel's, which the expiry clause
+    // already covers, so an empty `takeOver` names no holder.
+    const takeOver =
+      typeof opts?.takeOver === "string" && opts.takeOver !== "" ? opts.takeOver : undefined;
     return this.db.tx(() => {
       this.db.run("INSERT OR IGNORE INTO meta(key, value) VALUES(?, ?)", [
         LEASE_KEY,
         EXPIRED_SENTINEL,
       ]);
-      const res = this.db.run(
-        `UPDATE meta SET value=? WHERE key=? AND (json_extract(value,'$.holder')=? OR json_extract(value,'$.heartbeat') < ?)`,
-        [value, LEASE_KEY, holder, cutoff],
-      );
+      // The predecessor is compared in the same conditional write, so a
+      // lease another holder took after the predecessor is never taken.
+      const res =
+        takeOver === undefined
+          ? this.db.run(
+              `UPDATE meta SET value=? WHERE key=? AND (json_extract(value,'$.holder')=? OR json_extract(value,'$.heartbeat') < ?)`,
+              [value, LEASE_KEY, holder, cutoff],
+            )
+          : this.db.run(
+              `UPDATE meta SET value=? WHERE key=? AND (json_extract(value,'$.holder') IN (?, ?) OR json_extract(value,'$.heartbeat') < ?)`,
+              [value, LEASE_KEY, holder, takeOver, cutoff],
+            );
       return res.changes > 0;
     });
   }

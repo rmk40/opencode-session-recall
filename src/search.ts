@@ -69,7 +69,7 @@ import {
   type DrilledPool,
   type TimeWindow,
 } from "./drill.js";
-import { buildMatch, type Store, type FtsHit, type Card } from "./store.js";
+import { buildMatch, type ReadStore, type FtsHit, type Card } from "./store.js";
 import type { FetchGate } from "./fetch-gate.js";
 import { fetchMessageWindow, type FetchRunner } from "./fetch-window.js";
 import type { HistoryMessage } from "./history/model.js";
@@ -114,7 +114,7 @@ export type SemanticSearchConfig = { embedder: SearchEmbedder; weight: number };
  *  hooks. */
 export type SearchDeps = {
   gate: FetchGate;
-  store: Store | null;
+  store: ReadStore | null;
   cards: CardsRuntime;
   drill: Drill;
   /** Awaited between the slim-index lookup's statements, while a deep

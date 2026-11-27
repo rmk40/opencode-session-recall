@@ -4,6 +4,7 @@ import type { ToolDefinition } from "../src/host/opencode-v1-types.js";
 import { buildSuggestions, search, type SearchDeps } from "../src/search.js";
 import { encodeDeepCursor } from "../src/drill.js";
 import { parseQuery } from "../src/query.js";
+import type { Store } from "../src/store.js";
 import type {
   ErrorOutput,
   Limits,
@@ -54,10 +55,10 @@ const MINUTE = 60_000;
 async function recallOver(
   h: FakeHarness,
   limits: Limits = TEST_LIMITS,
-): Promise<{ tool: ToolDefinition; deps: SearchDeps }> {
-  const { deps, cleanup } = await makeRecallDeps(h, limits);
+): Promise<{ tool: ToolDefinition; deps: SearchDeps; store: Store }> {
+  const { deps, store, cleanup } = await makeRecallDeps(h, limits);
   cleanups.push(cleanup);
-  return { tool: search(h.source, true, limits, deps), deps };
+  return { tool: search(h.source, true, limits, deps), deps, store };
 }
 
 type SessionSpec = {
@@ -1022,12 +1023,12 @@ describe("relatives the default keeps, ordered against other history", () => {
       );
 
       it("takes the oldest message read for the session's own text when the read stopped at the row cap", async () => {
-        const { tool, deps } = await recallOver(needleHarness({ echo: true }));
+        const { tool, store } = await recallOver(needleHarness({ echo: true }));
         // An opencode v2 write that stopped at the per-session row cap records
         // the lowest seq it read as the checkpoint's floor, so the message
         // with no previous one in the index is not the session's first.
-        const card = deps.store!.getCard("a-echo")!;
-        deps.store!.upsertCard({
+        const card = store.getCard("a-echo")!;
+        store.upsertCard({
           ...card,
           distillCursor: JSON.stringify({
             v: 2,

@@ -195,8 +195,67 @@ export async function openSqlite(path: string): Promise<SqliteDb | null> {
 export type ReadOnlyDb = Pick<SqliteDb, "get" | "all" | "close">;
 
 /** The outcome of {@link openSqliteReadOnly}: a verified read-only handle, or
- *  why the file cannot be read. */
-export type ReadOnlyOpenResult = { ok: true; db: ReadOnlyDb } | { ok: false; reason: string };
+ *  why the file cannot be read. `busy` names the busy code when the probe
+ *  statement found a lock another connection held ({@link SqliteBusyError}),
+ *  which may be gone on a later attempt. */
+export type ReadOnlyOpenResult =
+  | { ok: true; db: ReadOnlyDb }
+  | { ok: false; reason: string; busy?: string };
+
+/** SQLite's primary result code for a lock another connection holds. Its
+ *  extended codes keep it in their low byte. */
+const SQLITE_BUSY = 5;
+
+/** The names of `SQLITE_BUSY` and its extended codes, by number. */
+const BUSY_CODE_NAMES: Readonly<Record<number, string>> = {
+  5: "SQLITE_BUSY",
+  261: "SQLITE_BUSY_RECOVERY",
+  517: "SQLITE_BUSY_SNAPSHOT",
+  773: "SQLITE_BUSY_TIMEOUT",
+};
+
+/**
+ * A statement SQLite refused because another connection held a lock it
+ * needed: `SQLITE_BUSY` or one of its extended codes (`SQLITE_BUSY_RECOVERY`
+ * while another connection rebuilds the WAL index after a crash,
+ * `SQLITE_BUSY_SNAPSHOT`, `SQLITE_BUSY_TIMEOUT`). Raised in place of the
+ * driver's error by a handle opened with `busyError` set
+ * ({@link openSqliteReadOnly}). The same statement may succeed once the lock
+ * is released. `code` names the code and `cause` is the driver's error.
+ */
+export class SqliteBusyError extends Error {
+  readonly code: string;
+  constructor(code: string, cause: unknown) {
+    const message = cause instanceof Error ? cause.message : String(cause);
+    super(message.includes(code) ? message : `${message} (${code})`, { cause });
+    this.name = "SqliteBusyError";
+    this.code = code;
+  }
+}
+
+/** The busy code an error from either driver carries, or undefined when it is
+ *  not a busy error. `bun:sqlite` names the extended code in `code`;
+ *  `node:sqlite` sets `code` to `ERR_SQLITE_ERROR` and numbers the extended
+ *  code in `errcode`. */
+function busyCodeOf(error: unknown): string | undefined {
+  if (typeof error !== "object" || error === null) return undefined;
+  const { code, errcode } = error as { code?: unknown; errcode?: unknown };
+  if (typeof code === "string" && code.startsWith("SQLITE_")) {
+    return code.startsWith("SQLITE_BUSY") ? code : undefined;
+  }
+  if (code === "ERR_SQLITE_ERROR" && typeof errcode === "number") {
+    if ((errcode & 0xff) !== SQLITE_BUSY) return undefined;
+    return BUSY_CODE_NAMES[errcode] ?? "SQLITE_BUSY";
+  }
+  return undefined;
+}
+
+/** `error` as a {@link SqliteBusyError} when it is a busy error, else as is. */
+function typedBusy(error: unknown): unknown {
+  if (error instanceof SqliteBusyError) return error;
+  const code = busyCodeOf(error);
+  return code === undefined ? error : new SqliteBusyError(code, error);
+}
 
 /** How long a read waits on a lock before failing. Short on purpose: a WAL
  *  reader almost never waits, and a stalled read would stall the host. */
@@ -228,11 +287,17 @@ function describeError(error: unknown): string {
  * `SQLITE_CANTOPEN`, a non-database file, a missing file) surfaces only on the
  * first statement. `:memory:` is rejected by name: an in-memory database is a
  * different, empty database, never the one another process uses. Never
- * throws; every failure is a `{ ok: false, reason }`.
+ * throws; every failure is a `{ ok: false, reason }`, with `busy` naming the
+ * code when the probe found another connection's lock.
+ *
+ * With `busyError`, the handle's `get` and `all` throw a
+ * {@link SqliteBusyError} in place of the driver's error whenever SQLite
+ * reports `SQLITE_BUSY` or one of its extended codes; every other error is
+ * thrown as the driver raised it.
  */
 export async function openSqliteReadOnly(
   path: string,
-  opts: { busyTimeoutMs?: number } = {},
+  opts: { busyTimeoutMs?: number; busyError?: boolean } = {},
 ): Promise<ReadOnlyOpenResult> {
   if (path === ":memory:") {
     return { ok: false, reason: "in-memory database (:memory:) has no file to read" };
@@ -267,7 +332,30 @@ export async function openSqliteReadOnly(
     } catch {
       // The probe's error is the one worth reporting.
     }
-    return { ok: false, reason: `cannot read ${path}: ${describeError(error)}` };
+    const reason = `cannot read ${path}: ${describeError(error)}`;
+    const busyCode = busyCodeOf(error);
+    return busyCode === undefined ? { ok: false, reason } : { ok: false, reason, busy: busyCode };
   }
-  return { ok: true, db: { get: db.get, all: db.all, close: db.close } };
+  if (opts.busyError !== true)
+    return { ok: true, db: { get: db.get, all: db.all, close: db.close } };
+  return {
+    ok: true,
+    db: {
+      get: (sql, params) => {
+        try {
+          return db.get(sql, params);
+        } catch (error) {
+          throw typedBusy(error);
+        }
+      },
+      all: (sql, params) => {
+        try {
+          return db.all(sql, params);
+        } catch (error) {
+          throw typedBusy(error);
+        }
+      },
+      close: db.close,
+    },
+  };
 }

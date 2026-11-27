@@ -1,4 +1,5 @@
 import { expect } from "vitest";
+import { execFileSync } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -15,7 +16,15 @@ import type {
 } from "@opencode-ai/sdk/v2";
 import type { Limits } from "../src/types.js";
 import { openSqlite, type SqliteDb } from "../src/sqlite.js";
-import { openStore, type Store, type StoreOptions } from "../src/store.js";
+import {
+  openReadStore,
+  openStore,
+  type OpenReadStoreResult,
+  type ReadStoreOptions,
+  type Store,
+  type StoreIdentity,
+  type StoreOptions,
+} from "../src/store.js";
 import { deriveCard, type DistillSessionMeta } from "../src/distill.js";
 import { createFetchGate, type FetchGate } from "../src/fetch-gate.js";
 import { createCardsRuntime, cardsLiteFromSessions, storeCardSource } from "../src/cards.js";
@@ -59,6 +68,94 @@ type MetadataCall = { title?: string; metadata?: Record<string, unknown> };
 export function openV1Store(db: SqliteDb, opts?: StoreOptions): Store | null {
   const opened = openStore(db, { host: "opencode-v1" }, opts);
   return opened.ok ? opened.store : null;
+}
+
+/** A scratch store with its writer open and a read-only connection beside it
+ *  ({@link openScratchReader}). */
+export type ScratchReader = {
+  /** The store file. */
+  path: string;
+  /** The writer: the store as `openStore` opened it, and its connection. */
+  writer: Store;
+  writerDb: SqliteDb;
+  /** The {@link openReadStore} result over the same file. */
+  opened: OpenReadStoreResult;
+  /** Close the reader (when it opened), then the writer, and delete the
+   *  directory. */
+  cleanup: () => void;
+};
+
+/**
+ * Create a store in a new temporary directory, open it for writing as
+ * `identity` (default the v1 host) and keep that connection open, then run
+ * one read on it, which creates the `-wal` and `-shm` files, and open a
+ * reader on it with {@link openReadStore}. `seed` runs on the writer before
+ * the reader opens. The caller MUST invoke `cleanup()`.
+ */
+export async function openScratchReader(
+  opts: {
+    identity?: StoreIdentity;
+    /** The identity the reader opens as (default `identity`). */
+    readerIdentity?: StoreIdentity;
+    seed?: (writer: Store, db: SqliteDb) => void;
+    readOptions?: ReadStoreOptions;
+  } = {},
+): Promise<ScratchReader> {
+  const identity = opts.identity ?? { host: "opencode-v1" };
+  const dir = mkdtempSync(join(tmpdir(), "recall-reader-"));
+  const path = join(dir, "store.db");
+  const writerDb = await openSqlite(path);
+  if (!writerDb) throw new Error("openSqlite returned null in test helper");
+  const writerOpened = openStore(writerDb, identity);
+  if (!writerOpened.ok) throw new Error(`openStore refused: ${writerOpened.reason}`);
+  opts.seed?.(writerOpened.store, writerDb);
+  // SQLite creates the -wal and -shm files at a connection's first statement
+  // in WAL mode, and openStore switches a new store to WAL as its last step.
+  writerOpened.store.cardCounters();
+  const opened = await openReadStore(path, opts.readerIdentity ?? identity, opts.readOptions);
+  return {
+    path,
+    writer: writerOpened.store,
+    writerDb,
+    opened,
+    cleanup: () => {
+      if (opened.ok) opened.close();
+      writerDb.close();
+      rmSync(dir, { recursive: true, force: true });
+    },
+  };
+}
+
+/** One store file as {@link storeFileState} saw it: size and a SHA-256 of
+ *  its bytes, or `"absent"`. */
+export type FileState = { size: number; sha256: string } | "absent";
+
+/**
+ * The size and content hash of a store file and its `-wal` and `-shm` files,
+ * read by a child process. Reading them in this process would open and close
+ * descriptors on the store file, and closing any descriptor of a file drops
+ * every POSIX lock this process holds on it, a SQLite connection's included,
+ * which would let another process's closing connection checkpoint and delete
+ * the WAL under a reader that is still open.
+ */
+export function storeFileState(path: string): { db: FileState; wal: FileState; shm: FileState } {
+  const script = `
+const { createHash } = require("node:crypto");
+const { readFileSync } = require("node:fs");
+const state = (p) => {
+  try {
+    const bytes = readFileSync(p);
+    return { size: bytes.length, sha256: createHash("sha256").update(bytes).digest("hex") };
+  } catch (error) {
+    if (error.code === "ENOENT") return "absent";
+    throw error;
+  }
+};
+const p = process.argv[1];
+process.stdout.write(JSON.stringify({ db: state(p), wal: state(p + "-wal"), shm: state(p + "-shm") }));
+`;
+  const out = execFileSync(process.execPath, ["-e", script, path], { encoding: "utf8" });
+  return JSON.parse(out) as { db: FileState; wal: FileState; shm: FileState };
 }
 
 // ── Strict no-limit enforcement ─────────────────────────────────────────────

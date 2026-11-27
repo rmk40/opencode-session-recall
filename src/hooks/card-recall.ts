@@ -1,5 +1,5 @@
 import type { CardsRuntime, CardFilters } from "../cards.js";
-import type { Card, Store } from "../store.js";
+import type { Card, ReadStore } from "../store.js";
 import { parseQuery } from "../query.js";
 import { isSummarizerTitle } from "../extract.js";
 
@@ -23,7 +23,7 @@ export type CardRecallHit = {
 
 export type CardRecallDeps = {
   cards: CardsRuntime;
-  store: Store | null;
+  store: ReadStore | null;
   /** Ephemeral cards-lite refresh trigger (fire-and-forget at query entry);
    *  flows through from SearchDeps. See lite-refresh.ts. */
   maybeRefresh?: () => void;
