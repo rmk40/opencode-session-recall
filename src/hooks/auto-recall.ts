@@ -5,11 +5,11 @@ import { cardRecall, type CardRecallHit } from "./card-recall.js";
 import { partId } from "./part-id.js";
 
 /**
- * R1b — gated automatic recall on `chat.message`.
+ * Gated automatic recall on `chat.message` (the `autoRecall` option).
  *
  * On each user message, a cheap trigger check decides whether to run a bounded
- * recall. Round 4 makes this a pure CARD-TIER query (see {@link cardRecall}):
- * no drill, no `session.messages` fetch. If the gate fires and cards match, a
+ * recall. It is a pure CARD-TIER query (see {@link cardRecall}): no drill, no
+ * `session.messages` fetch. If the gate fires and cards match, a
  * compact cited synthetic text part is appended so the model sees the lead
  * inline (verified injection shape from opencode core: session/prompt.ts uses
  * `{ type: "text", synthetic: true, text }`).

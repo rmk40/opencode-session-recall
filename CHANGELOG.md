@@ -4,6 +4,141 @@ All notable changes to this project are documented here. This project follows
 [Conventional Commits](https://www.conventionalcommits.org/) and
 [Semantic Versioning](https://semver.org/).
 
+## Unreleased
+
+The store stays at schema 5, so upgrading needs no migration. Restart every
+OpenCode process after upgrading, the opencode v2 background service included
+(`opencode service restart`), since a running process keeps the version it
+loaded.
+
+### Changed
+
+- **`recall` excludes only the current session by default.** Project- and
+  global-scope searches used to leave out the current session's whole
+  family, its parent, siblings and subagents. They now leave out the current
+  session alone, so an orchestrator can find what its own subagents found.
+  `excludeFamily: true` leaves out the whole family again. It is refused
+  with `scope: "session"`, with `excludeCurrentSession: false` and with a
+  `sessionID` in the family, since each of those asks for a session the flag
+  excludes. Under `excludeFamily: true` a `sessions` list (with or without
+  `deep`) and a deep cursor drop the relatives they name and count each one
+  under `coverage.skippedByReason.excludedSession`.
+  - Without a time bound, a relative whose best match is the prompt its
+    orchestrator wrote ranks just below the best result from outside the
+    family. Relatives hold at most two of the first five results and a third
+    of the drill slots (never fewer than two). A time-bounded search keeps
+    their order, as do a search of one session and a search of a named list.
+    A relative whose reply only restates the query is not demoted, so
+    `excludeFamily: true` is the way to leave it out.
+  - On zero or few results (fewer than three, or fewer than `results` when
+    that is smaller), a suggestion names the excluded sessions that matched
+    the query and the argument that brings them back. An empty result after
+    the current session was excluded always names that exclusion.
+  - The opencode v1 `autoRecall` hook still leaves out the current session's
+    whole family.
+- **`recall_messages` with `role` or `query` reads on until `limit` messages
+  match.** The filters used to apply only to the one page a call read, so a
+  narrow filter could return nothing from a session full of matches. A call
+  now reads page after page. It stops once `limit` messages match, once it
+  has read `scan` messages (default 500, at most 2,000) or 40 pages, once its
+  matches fill the output budget or at the end of the session. `pagination`
+  reports `scanned`, `matched`, `returned`, `order` and the `stop` reason
+  (`limit`, `scanBudget`, `outputBudget` or `end`). `nextCursor` resumes
+  right after the last message the call read, or inside the message where a
+  trimmed output stopped. It finds its place even when the next call changes
+  `limit`, `role` or `query`. Cursors from 3.0 still work.
+  `maxMessages` still caps `limit`.
+
+### Added
+
+- **`order: "oldest"` on `recall_messages`** starts at a session's first
+  message and reads forward. It needs opencode v2. On v1 the tool returns an
+  error that says oldest-first browsing is unsupported there. A cursor keeps
+  the order it was made in. Passed with the other order, it is refused.
+- **`toolName` aliases.** `bash`/`shell`, `task`/`subagent` and
+  `apply_patch`/`patch` (tools opencode v2 renamed) each count as one tool,
+  whatever the case. Any other name still matches exactly, case included.
+- **`coverage.toolNames` when a `toolName` search finds nothing.** When the
+  searched sessions hold tool parts, the response describes the tool parts
+  the drill read that pass every other filter. It gives the names the filter
+  accepts, how many parts it matched, the total, the number of distinct
+  names and the ten most frequent names with their counts. A suggestion
+  offers the closest name as the retry. After a deep sweep that stopped
+  before covering its scope, the suggestion says to continue the sweep
+  first. When the authorship filter removed every part of the named tool
+  (`excludedByAuthorship`), it says to widen `authorship` instead.
+- **`coverage.cards.pending`** counts the cards a search left out of card
+  ranking because the index had yet to take their latest content. It
+  appears only when the search stopped waiting for the index with such cards
+  left.
+
+### Fixed
+
+- **A rename, move, archive or unarchive made while its session is being
+  distilled is no longer lost.** A re-distill, a repair sweep or a cold pass
+  that read the session before the change wrote the old metadata back over
+  it. The distiller now reads the session's metadata again once the last
+  such write has finished, on both hosts. A failed read is retried up to five
+  times with a doubling delay.
+- **Archiving or unarchiving a session without new messages updates its
+  card.** The card kept its old archived state until the session changed
+  again. The opencode v2 session scan and archive events update it, as does
+  `session.updated` on v1.
+- **Family exclusion covers a subagent's own subagents.** When the current
+  session had a parent, the family walk never visited it as a child, so its
+  own subagents stayed in the results. This affected the v1 `autoRecall`
+  hook and the family exclusion that was `recall`'s default, which
+  `excludeFamily: true` now applies.
+
+### Performance
+
+The measured numbers below come from the `RECALL_PERF=1` gates
+(`test/perf.test.ts`, `test/perf-v2.test.ts`), which run on synthetic data,
+most of them on a store of 12,000 cards.
+
+- **The card index is updated in place.** A process used to reload every
+  card and rebuild the whole card index on the event loop at its first
+  search after any card write. It now checks the store at most every 5
+  seconds, applies only the cards written since its last check and replaces
+  each changed card's entry in the index. It loads every card only on a cold
+  start, after the store was reset and after an older build wrote cards
+  without recording a revision for them. That load reads 250 cards at a time
+  with a pause between pages, while a full index build works in slices of
+  about 8 ms, so neither holds up other work in the process. A search of one
+  session or of a named list never waits for the index. A stored vector is
+  reused only when the current model wrote it for the card version the
+  process holds, so a model switch neither reuses the old model's vectors nor
+  embeds current cards again.
+  - Over 24 searches with card writes between them, the card tier took a
+    median of 32 to 42 ms of each search and the whole search 65 to 81 ms.
+    Applying 400 changed cards took 0.7 to 1.1 s, with no slice of the event
+    loop over 23 ms. A cold build of the lexical index took under 11 s, with
+    no code slice over 25 ms once garbage-collection pauses are left out.
+- **Family rollups are read one family at a time.** Each child write or
+  deletion used to read every card in the store to recompute its root's
+  rollup. The distiller now reads only that root's family, in pages of 500
+  cards with a pause between them. It runs one recompute per root at a time.
+  The full rollup pass after a cold pass reads only the rollup columns, in
+  pages of the same size. In the gates, the longest event-loop
+  slice of a repair sweep over 400 stale cards in the 12,000-card store was
+  22 to 36 ms, against 107 to 122 ms while each write read every card.
+- **On opencode v2 a streaming session's tail is re-read alone.** While a
+  session's last turn was still running, each poll re-read the session in
+  full. The distiller now re-reads only the messages past the newest settled
+  one and merges them with what the card already holds. It skips the read
+  when nothing past that point changed and reads in full when a message up
+  to that point changed. In the gates, a tail write to a card of 5,000
+  indexed rows took about 180 ms, against about 1.6 s for the session's
+  first write, which read it in full.
+- **`recall_get` continuations read on from where the output stopped.** On
+  opencode v2 a continuation into a message's part rows reads from the row
+  of the part where the previous output stopped, about two outputs' worth at
+  a time, instead of reading the message again from the start.
+- **Concurrent distiller writes yield to the event loop between them.**
+  Cold-pass workers, repair-sweep workers and concurrent re-distills pause
+  after each session write before the next one runs, so one slice of the
+  event loop holds at most one session's write transaction.
+
 ## 3.0.1
 
 ### Fixed

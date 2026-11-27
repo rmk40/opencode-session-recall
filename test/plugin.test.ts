@@ -260,9 +260,8 @@ describe("plugin entry", () => {
       0,
     );
 
-    // Raised from 9,000/5,000 with the retrieval-efficiency plan (a decision,
-    // not drift): the recall description now carries the exclusion default,
-    // the prior-workflow recipe, and the new parameters.
+    // The recall description carries the exclusion default, the
+    // prior-workflow recipe and its parameters, so it takes most of the total.
     expect(totalChars).toBeLessThan(11_000);
     expect(llmFacingChars(mustTool(hooks.tool?.recall))).toBeLessThan(6_500);
   });

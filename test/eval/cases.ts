@@ -213,7 +213,7 @@ export const EVAL_CASES: EvalCase[] = [
     relevantSessionIDs: ["e-flow"],
   },
 
-  // ── Round-4 distill-then-search tier probes ──────────────────────────
+  // ── Distill-then-search tier probes ──────────────────────────────────
   {
     // Tier-1 card inventory: a distinctive token that lands in the card
     // inventory via a tool INPUT (never the title) is found by card ranking.
@@ -230,7 +230,7 @@ export const EVAL_CASES: EvalCase[] = [
     // Tier-1.5 FTS needle: "florplaxle" lives only in a reasoning part, so the
     // card carries nothing the query matches and e-fts is one of the three
     // oldest sessions the tier-1 recency near-miss drops. Only the FTS tier can
-    // surface it into the shortlist — the needle-backbone the plan relies on.
+    // surface it into the shortlist, which is the job of the needle backbone.
     name: "tier-1.5 fts needle: florplaxle (absent from cards)",
     args: {
       query: "florplaxle",

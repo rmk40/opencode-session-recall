@@ -1316,8 +1316,9 @@ describe("cold pass", () => {
   });
 
   it("skips a session whose fetch keeps failing, so the pass reaches older sessions", async () => {
-    // The live v1 case: the host fails every read of one session (its project
-    // directory cannot boot), and the pass used to retry it forever.
+    // The host fails every read of one session (on v1, when its project
+    // directory cannot boot). Retrying it on every pass would keep the pass
+    // from ever reaching older sessions.
     const graph: Graph = {
       sessions: [
         session("s1", "One", PROJECT_DIR, 4000),
@@ -3019,6 +3020,8 @@ describe("cold-pass progress reporting", () => {
 
 describe("family rollups read a page at a time", () => {
   const macrotask = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0));
+  /** Cards per rollup page: a few dozen cards span several pages. */
+  const PAGE = 8;
 
   /** A card of `rootId`'s family (the root itself when the ids match). */
   const member = (id: string, rootId: string, t: number, over: Partial<Card> = {}): Card => ({
@@ -3123,7 +3126,11 @@ describe("family rollups read a page at a time", () => {
 
   async function setup(o: { coldPass: boolean; cards: Card[] }) {
     const { db, store } = await freshStore();
-    for (const card of o.cards) store.upsertCard(card);
+    // One transaction: a commit per card makes the seeding slow when the
+    // disk is.
+    db.tx(() => {
+      for (const card of o.cards) store.upsertCard(card);
+    });
     const h = holding(store);
     const distiller = createDistiller({
       source: makeDistillFake({ sessions: [], messagesBySession: {} }).source,
@@ -3133,14 +3140,15 @@ describe("family rollups read a page at a time", () => {
       instanceId: "rollups",
       discover: async () => [],
       yieldBetween: h.yieldBetween,
+      rollupPage: PAGE,
       log: () => {},
     });
     return { db, store, h, distiller };
   }
 
   it("rebuilds a family of several pages after a child deletion as from every card at once", async () => {
-    const family = children("R", 1_200, 5_000);
-    const other = children("S", 300, 6_000);
+    const family = children("R", 40, 5_000);
+    const other = children("S", 10, 6_000);
     // The families' cards interleave in the card table.
     const cards = [member("R", "R", 1_000), member("S", "S", 1_000)];
     family.forEach((card, i) => cards.push(card, ...(i < other.length ? [other[i]!] : [])));
@@ -3159,14 +3167,14 @@ describe("family rollups read a page at a time", () => {
   it("builds every root's rollup over a store of several pages as from every card at once", async () => {
     const cards = [
       member("R", "R", 1_000),
-      ...children("R", 700, 5_000),
+      ...children("R", 30, 5_000),
       member("S", "S", 1_000),
       ...children("S", 5, 4_000),
       // A root whose children are gone keeps no rollup.
       member("T", "T", 1_000, { familyRollup: [{ sessionId: "T-gone", messageId: "m" }] }),
       // A child whose root has no card.
       member("U-child", "U", 1_000),
-      ...Array.from({ length: 300 }, (_, i) => member(`solo-${i}`, `solo-${i}`, 2_000)),
+      ...Array.from({ length: 20 }, (_, i) => member(`solo-${i}`, `solo-${i}`, 2_000)),
     ];
     const { db, store, distiller } = await setup({ coldPass: true, cards });
     distiller.start();
@@ -3181,7 +3189,7 @@ describe("family rollups read a page at a time", () => {
   });
 
   it("recomputes a family again when a child is deleted while a recompute of it waits", async () => {
-    const family = children("R", 600, 5_000);
+    const family = children("R", 30, 5_000);
     const { db, store, h, distiller } = await setup({
       coldPass: false,
       cards: [member("R", "R", 1_000), ...family],
@@ -3212,7 +3220,7 @@ describe("family rollups read a page at a time", () => {
         member("R-c", "R", 3_000),
         member("R-d", "R", 2_000),
         // Enough cards that the pass reads two pages; R's family is on the first.
-        ...Array.from({ length: 600 }, (_, i) => member(`solo-${i}`, `solo-${i}`, 2_000)),
+        ...Array.from({ length: 10 }, (_, i) => member(`solo-${i}`, `solo-${i}`, 2_000)),
       ],
     });
     const hold = h.arm("rollupFieldsPage");
@@ -3229,15 +3237,15 @@ describe("family rollups read a page at a time", () => {
   });
 
   it("recomputes a family again after a full pass that found a recompute of it running", async () => {
-    // R-new is on the recompute's first page (inserted early) and on the
-    // pass's second page (its id sorts after every solo card).
+    // R-z-new is on the recompute's first page (inserted early) and on the
+    // pass's last page (its id sorts after every other card).
     const { db, store, h, distiller } = await setup({
       coldPass: true,
       cards: [
         member("R", "R", 1_000),
         member("R-z-new", "R", 9_000, { title: "old title" }),
-        ...children("R", 600, 5_000),
-        ...Array.from({ length: 300 }, (_, i) => member(`R-solo-${i}`, `R-solo-${i}`, 2_000)),
+        ...children("R", 30, 5_000),
+        ...Array.from({ length: 10 }, (_, i) => member(`R-solo-${i}`, `R-solo-${i}`, 2_000)),
       ],
     });
     const pass = h.arm("rollupFieldsPage");
@@ -3263,7 +3271,7 @@ describe("family rollups read a page at a time", () => {
   it("writes no rollup when the lease moves while a recompute of a family waits", async () => {
     const { db, store, h, distiller } = await setup({
       coldPass: false,
-      cards: [member("R", "R", 1_000), ...children("R", 600, 5_000)],
+      cards: [member("R", "R", 1_000), ...children("R", 30, 5_000)],
     });
     distiller.start();
     const hold = h.arm("familyPage");
@@ -3286,7 +3294,7 @@ describe("family rollups read a page at a time", () => {
       cards: [
         member("R", "R", 1_000),
         member("R-c", "R", 3_000),
-        ...Array.from({ length: 600 }, (_, i) => member(`solo-${i}`, `solo-${i}`, 2_000)),
+        ...Array.from({ length: 10 }, (_, i) => member(`solo-${i}`, `solo-${i}`, 2_000)),
       ],
     });
     const hold = h.arm("rollupFieldsPage");
@@ -3306,7 +3314,7 @@ describe("family rollups read a page at a time", () => {
   it("reads nothing more from the store once the distiller stops during a recompute", async () => {
     const { db, h, distiller } = await setup({
       coldPass: false,
-      cards: [member("R", "R", 1_000), ...children("R", 600, 5_000)],
+      cards: [member("R", "R", 1_000), ...children("R", 30, 5_000)],
     });
     distiller.start();
     const hold = h.arm("familyPage");
@@ -3444,8 +3452,13 @@ describe("session writes from concurrent workers", () => {
     /** Each session's running reply: a user row and a settled reply before
      *  it, so a write records the settled base a tail write starts from. */
     const running = new Map<string, string>();
-    insertProject(v2.db, { id: "prj", worktree: "/workspace/tail" });
-    for (const id of ids) {
+    // One transaction: a commit per row makes the fixture slow when the disk
+    // is.
+    v2.db.tx(() => {
+      insertProject(v2.db, { id: "prj", worktree: "/workspace/tail" });
+      for (const id of ids) seedSession(id);
+    });
+    function seedSession(id: string): void {
       insertSession(v2.db, {
         id,
         project_id: "prj",
@@ -3524,12 +3537,14 @@ describe("session writes from concurrent workers", () => {
       await waitFor(() => ids.every((id) => store.getCard(id)?.settledBase !== undefined));
 
       // Every running reply grows: each session is read again from its base.
-      for (const [id, message] of running) {
-        v2.db.run(
-          "UPDATE session_part SET data = ?, time_updated = ? WHERE message_id = ? AND ordinal = 0",
-          [JSON.stringify({ type: "text", text: `grown reply of ${id}` }), Date.now(), message],
-        );
-      }
+      v2.db.tx(() => {
+        for (const [id, message] of running) {
+          v2.db.run(
+            "UPDATE session_part SET data = ?, time_updated = ? WHERE message_id = ? AND ordinal = 0",
+            [JSON.stringify({ type: "text", text: `grown reply of ${id}` }), Date.now(), message],
+          );
+        }
+      });
       for (const id of ids) distiller.onEvent({ type: "turn-ended", sessionID: id });
       await waitFor(() => paced.counts.tails === ids.length);
       expect(paced.counts.backToBack).toBe(0);

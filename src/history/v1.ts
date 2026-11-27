@@ -243,11 +243,10 @@ export function createV1HistorySource(clients: V1Clients): HistorySource {
               o.archived === "include" ? { ...params, archived: true } : params,
             )
           : await scoped.session.list(params);
-      // v1 compatibility: the sessions tool used to iterate the body with
-      // for-of, so a truthy non-array body threw a TypeError that the tool's
-      // outer catch turned into `{ ok: false, error }`, while a falsy body was
-      // an empty listing. `strict` reproduces that throw; discovery (not
-      // strict) kept `Array.isArray(data) ? data : []` and still gets that.
+      // `strict` keeps the sessions tool's contract: a truthy non-array body
+      // throws a TypeError, which the tool's outer catch turns into
+      // `{ ok: false, error }`, and a falsy body is an empty listing.
+      // Discovery (not strict) reads `Array.isArray(data) ? data : []`.
       if (o.strict && !resp.error && resp.data && !Array.isArray(resp.data)) {
         throw new TypeError("session listing response was not an array");
       }

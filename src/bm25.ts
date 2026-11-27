@@ -56,8 +56,8 @@ const POOR_COVERAGE_MULT = 0.92; // was −0.08
 const TOOL_INPUT_MULT = 1.1;
 const SKILL_DEFINITION_MULT = 0.85;
 const FILE_READ_MULT = 0.9;
-/** Fetched web content is reference material, same tier as skill payloads —
- *  exactly the class round-2 dogfooding saw dominating workflow queries. */
+/** Fetched web content is reference material, same tier as skill payloads,
+ *  and a class that otherwise dominates workflow queries. */
 const WEB_FETCH_MULT = 0.85;
 
 /** Verbatim presence of a code-like compound query token (tokenization splits
@@ -98,7 +98,7 @@ const MAX_FUZZY = 6;
 /**
  * Max edit distance MiniSearch would allow for a term in this mode, matching its
  * `fuzzy: fraction` + `maxFuzzy` behavior. Used so matched-term metadata agrees
- * with what the index actually matched (reviewer-flagged consistency).
+ * with what the index actually matched.
  */
 function maxEditDistance(term: string, mode: Bm25Mode): number {
   if (term.length < 4) return 0;

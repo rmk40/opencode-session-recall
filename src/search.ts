@@ -1069,9 +1069,9 @@ function rescueZeroHitSessions(input: {
  *  the session's best. */
 const MAX_GROUP_TRACKED = 4;
 /** A tracked hit qualifies as representative when its score is within this
- *  fraction of the session's best score. Loosened from 0.85 after round-2
- *  dogfooding: the utility ordering rarely got to act while topEvidence
- *  held the right material. */
+ *  fraction of the session's best score. At a tighter tolerance (0.85) the
+ *  utility ordering rarely gets to act, and the right material shows only in
+ *  topEvidence. */
 const REPRESENTATIVE_TOLERANCE = 0.7;
 const TOP_EVIDENCE_SNIPPET_CHARS = 120;
 const MAX_TOP_EVIDENCE = 2;
@@ -1743,7 +1743,7 @@ export function buildSuggestions(input: {
    *  for the default `"any"`, so the hint below cannot fire on a plain query. */
   authorship?: Authorship[];
 }): SearchSuggestion[] | undefined {
-  // Suggestions are ranked before the MAX_SUGGESTIONS slice so plan-mandated
+  // Suggestions are ranked before the MAX_SUGGESTIONS slice so the required
   // guidance (exact code tokens, shortlisted-but-unranked sessions) cannot be
   // displaced by softer composition hints. Lower priority sorts first; equal
   // priorities keep insertion order (stable sort).
@@ -1921,7 +1921,7 @@ export function buildSuggestions(input: {
     });
   }
 
-  // Plan-mandated hints (priority 1): must survive the cap when triggered.
+  // Required hints (priority 1): must survive the cap when triggered.
   if (input.codeTokens.length > 0 && (input.matchMode === "smart" || input.matchMode === "fuzzy")) {
     add(1, {
       reason: "The query contains exact code-like tokens.",
@@ -3466,8 +3466,7 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
             // Without this split a resume would bypass every uncarded guard.
             // Snapshot carded-ness ONCE before the await: cards.get refreshes
             // the card map, so two reads straddling the probe could disagree
-            // (present→absent would drop an id with no warning — the round-1
-            // dual-source bug in miniature).
+            // (present→absent would drop an id with no warning).
             const cardedIds = new Set(kept.filter((id) => cards.get(id) != null));
             const explicitOnly = uncardedShortlist(kept.filter((id) => !cardedIds.has(id)));
             const { resolved } = await resolveUncarded(explicitOnly, explicitOnly.length);
