@@ -15,7 +15,11 @@
  * Budget: no code slice over 50 ms, GC pauses excluded.
  *
  * The other gates measure, each on its own database: a tail write over a
- * 5,000-row card; a repair sweep over 400 stale cards (half of them with part
+ * 5,000-row card; a full write that changes, appends and evicts one row of a
+ * 5,000-row card, whose longest slice (the transaction included) has a
+ * budget of 35 ms and its total, from the first read of the stored rows to
+ * the commit, one of 150 ms, and which must write only the rows that
+ * differ; a repair sweep over 400 stale cards (half of them with part
  * rows an older build never read, the rest rebuilt by suppressed writes) in a
  * 12,000-card store; a child session's write and then its deletion in a
  * 12,000-card store whose root has 2,400 other children, each of which
@@ -39,9 +43,11 @@
  * and the calls inside the worst stall, so the offending path is visible
  * rather than the budget being loosened. Every gate logs the load average.
  *
- * The longest slice of the cold pass is one session's write: the
- * replaceSessionParts transaction of a 4,000-row session, which stays whole so
- * readers never see half a session. The derivation before it yields
+ * The longest slice of the cold pass is one session's first write: the
+ * replaceSessionParts transaction that inserts a 4,000-row session's rows,
+ * which stays whole so readers never see half a session. A later full write
+ * reads the stored rows a page at a time before its transaction, which writes
+ * only the rows that differ. The derivation before it yields
  * cooperatively (deriveCardCooperative), and concurrent workers yield between
  * their writes, so one slice holds at most one such transaction. The longest
  * slice of the append is likewise its one appendSessionParts transaction,
@@ -89,6 +95,7 @@ import {
   makeV2PartsDb,
   type V2TestDb,
 } from "./v2-db.js";
+import { changedParts, recordRowMutations, rowsByPart, touchedParts } from "./row-mutations.js";
 
 /**
  * The first-search gate opens opencode.db inside the runtime, through
@@ -138,6 +145,11 @@ vi.mock("../src/history/v2.js", async (importOriginal) => {
 
 const ENABLED = process.env.RECALL_PERF === "1";
 const BUDGET_MS = 50;
+/** The slice budget of a full write over a card that already holds the
+ *  session's rows. */
+const DIFF_BUDGET_MS = 35;
+/** Its total, from the first read of the stored rows to the commit. */
+const DIFF_TOTAL_BUDGET_MS = 150;
 
 const SMALL_SESSIONS = 3_000;
 const RECENT_SESSIONS = 600;
@@ -714,6 +726,190 @@ describe.skipIf(!ENABLED)("perf: v2 event-loop stalls", () => {
       expect(results.tailWriteMaxSliceMs).toBeLessThan(BUDGET_MS);
       expect(results.tailWriteTotalMs).toBeLessThan(TAIL_BUDGET_TOTAL_MS);
       expect(results.unchangedMaxSliceMs).toBeLessThan(BUDGET_MS);
+    } finally {
+      v2.cleanup();
+      rmSync(storeDir, { recursive: true, force: true });
+    }
+  }, 300_000);
+
+  it(`a full write that changes, appends and evicts one row of a 5,000-row card keeps each code slice under ${DIFF_BUDGET_MS} ms excluding GC pauses`, async () => {
+    const ROWS = DEFAULTS.ftsRowsPerSession;
+    const v2 = await makeV2Db();
+    const storeDir = mkdtempSync(join(tmpdir(), "recall-perf-v2-diff-"));
+    try {
+      const at = Date.now();
+      const w = v2.db;
+      const sid = "ses_rewritten";
+      let seq = 0;
+      const add = (text: string, t: number) => {
+        const id = `msg_${++seq}`;
+        w.run(
+          `INSERT INTO session_message (id, session_id, type, seq, time_created, time_updated, data)
+           VALUES (?, ?, ?, ?, ?, ?, ?)`,
+          [id, sid, "user", seq, t, t, JSON.stringify(userData(text, t))],
+        );
+        return id;
+      };
+      // A full card: one settled row of about 1,800 characters per message.
+      const t0 = at - 10_000_000;
+      w.tx(() => {
+        insertProject(w, { id: "prj", worktree: "/workspace/perf" });
+        insertSession(w, {
+          id: sid,
+          project_id: "prj",
+          directory: "/workspace/perf",
+          time_created: t0,
+          time_updated: t0,
+        });
+        for (let r = 0; r < ROWS; r++) add(sentence(r, 200), t0 + r);
+      });
+
+      const slow = slowLog();
+      const opened = await openOpencodeDb(v2.path);
+      if (!opened.ok) throw new Error(opened.reason);
+      const reader = limitSpy(timedReader(opened.db, slow));
+      const rawStoreDb = await openSqlite(join(storeDir, "store.db"));
+      if (!rawStoreDb) throw new Error("no sqlite");
+      const recorded = recordRowMutations(rawStoreDb);
+      const openedStore = openStore(timedStoreDb(recorded.db, slow), {
+        host: "opencode-v2",
+        source: v2.path,
+      });
+      if (!openedStore.ok) throw new Error(openedStore.reason);
+      const store = openedStore.store;
+      let fullWrites = 0;
+      /** When the write began: its first read of the stored card or rows,
+       *  or the replace itself. */
+      let writeStart: number | undefined;
+      let writeEnd = 0;
+      const startWrite = () => (writeStart ??= performance.now());
+      const replaceParts = store.replaceSessionParts.bind(store);
+      store.replaceSessionParts = (...args) => {
+        startWrite();
+        try {
+          return replaceParts(...args);
+        } finally {
+          writeEnd = performance.now();
+          fullWrites++;
+        }
+      };
+      for (const read of ["cardWriteRev", "sessionRowCount", "sessionRows"] as const) {
+        const inner = store[read].bind(store) as (...args: unknown[]) => unknown;
+        (store as unknown as Record<string, unknown>)[read] = (...args: unknown[]) => {
+          startWrite();
+          return inner(...args);
+        };
+      }
+      const distiller = createDistiller({
+        source: createV2HistorySource(reader),
+        store,
+        gate: createFetchGate({ concurrency: DEFAULTS.concurrency }),
+        limits: { ...DEFAULTS, coldPass: false, distillDelayMs: 0 },
+        instanceId: "perf-v2-diff",
+        sync: createV2Sync(reader, { pollIntervalMs: 3_600_000 }),
+        projectorGen: V2_PROJECTOR_GEN,
+        idleDebounceMs: 1,
+        yieldBetween: macrotask,
+        log: () => {},
+      });
+      const probe = stallProbe();
+      const results: Record<string, number> = {};
+      const load = loadAverage();
+      const written = async (writes: number, what: string) => {
+        const start = performance.now();
+        while (fullWrites < writes) {
+          if (performance.now() - start > 120_000) throw new Error(`no ${what}`);
+          await new Promise((resolve) => setTimeout(resolve, 1));
+        }
+      };
+      /** The part ids of the rows the write wrote, and of those it changed. */
+      let touched = {
+        rows: [] as string[] | "session",
+        fts: [] as string[] | "session",
+        changed: [] as string[],
+        changedText: [] as string[],
+        expected: [] as unknown[],
+      };
+      try {
+        distiller.start();
+        const firstStart = performance.now();
+        distiller.onEvent({ type: "turn-ended", sessionID: sid });
+        await written(1, "first write");
+        results.firstWriteMs = performance.now() - firstStart;
+
+        // One row among the newest 64 changes, which the checkpoint's
+        // fingerprint covers, so the re-read is a full one. One message is
+        // added, so the row cap evicts the oldest row.
+        const changedText = "rewritten sprocket paragraph";
+        w.run("UPDATE session_message SET data = ?, time_updated = ? WHERE id = ?", [
+          JSON.stringify(userData(changedText, t0 + ROWS - 10)),
+          at + 1,
+          `msg_${ROWS - 10}`,
+        ]);
+        const appended = add("appended websocket paragraph", at + 2);
+        w.run("UPDATE session_v2 SET time_updated = ? WHERE id = ?", [at + 2, sid]);
+        const before = rowsByPart(rawStoreDb, sid);
+        writeStart = undefined;
+        recorded.record(true);
+        probe.reset();
+        const redistillStart = performance.now();
+        distiller.onEvent({ type: "turn-ended", sessionID: sid });
+        await written(2, "full write");
+        results.redistillTotalMs = performance.now() - redistillStart;
+        results.writeTotalMs = writeEnd - (writeStart ?? writeEnd);
+        // What runs after the write's transaction in the same slice counts
+        // toward it, so the window stays open until the re-distill is done.
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        recorded.record(false);
+        Object.assign(results, stallFields("redistill", await probe.stalls()));
+        Object.assign(
+          results,
+          stallFields("write", await probe.stalls({ from: writeStart ?? writeEnd, to: Infinity })),
+        );
+        const after = rowsByPart(rawStoreDb, sid);
+        results.storedRows = after.size;
+        results.rowMutations = recorded.mutations.length;
+        const partOf = (messageId: string) =>
+          [...after.values(), ...before.values()].find((row) => row.message_id === messageId)
+            ?.part_id;
+        touched = {
+          rows: touchedParts(recorded.mutations, "part_text", before, after),
+          fts: touchedParts(recorded.mutations, "part_fts", before, after),
+          changed: changedParts(before, after),
+          changedText: changedParts(before, after, ["raw", "norm"]),
+          expected: [`msg_1`, `msg_2`, `msg_${ROWS - 10}`, `msg_${ROWS}`, appended]
+            .map(partOf)
+            .sort(),
+        };
+        const rows = store.sessionRows(sid, 0, ROWS);
+        expect(rows[0]?.messageId).toBe("msg_2");
+        expect(rows.at(-1)?.messageId).toBe(appended);
+        expect(rows.find((row) => row.messageId === `msg_${ROWS - 10}`)?.raw).toContain(
+          changedText,
+        );
+      } finally {
+        await distiller.stop();
+        probe.stop();
+        reader.close();
+        rawStoreDb.close();
+      }
+      console.log(`v2 diffed full write perf (load ${load}):`, JSON.stringify(rounded(results)));
+      console.log("slowest synchronous calls:", JSON.stringify(slow.top(8)));
+      const rowsWritten = touched.rows === "session" ? "session" : touched.rows.length;
+      const ftsWritten = touched.fts === "session" ? "session" : touched.fts.length;
+      console.log("rows written:", JSON.stringify({ rows: rowsWritten, fts: ftsWritten }));
+
+      expect(results.storedRows).toBe(ROWS);
+      // Only the rows that differ were written: the evicted oldest row, the
+      // oldest row left (the capped read stops at its message, so it names
+      // no previous one), the changed row, the appended one and the row
+      // before it, whose next pointer now names the appended message. Of
+      // those, the index entries of the three whose text differs.
+      expect(touched.changed).toEqual(touched.expected);
+      expect(touched.rows).toEqual(touched.changed);
+      expect(touched.fts).toEqual(touched.changedText);
+      expect(results.writeMaxSliceMs).toBeLessThan(DIFF_BUDGET_MS);
+      expect(results.writeTotalMs).toBeLessThan(DIFF_TOTAL_BUDGET_MS);
     } finally {
       v2.cleanup();
       rmSync(storeDir, { recursive: true, force: true });
