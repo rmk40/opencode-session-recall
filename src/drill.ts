@@ -874,10 +874,12 @@ export function createDrill(deps: DrillDeps): Drill {
    * as `targetsCut` and the drill's as `queryBudget`. Pages before the
    * first one holding a message in the window do not count for the anchor
    * stop; after it, a page holding none counts as one that matched no
-   * anchor. Past the lower bound the walk ends as `end` only once it has read
-   * down to the window's floor ({@link floorAt}, asked when it first meets
-   * an older message), since only then is no unread message inside the
-   * window. A fired `abort` ends it as `aborted` before its next read. The
+   * anchor. A window with a lower bound asks for its floor ({@link floorAt})
+   * before anything else, and a session with nothing created inside the
+   * window is not read at all. Past the lower bound the walk ends as `end`
+   * only once it has met an older message and read down to the floor, since
+   * only then is no unread message inside the window. A fired `abort` ends
+   * it as `aborted` before its next read. The
    * signature also names the start and the window, the two things besides
    * the pages walked that decide which messages the slice holds.
    */
@@ -909,8 +911,14 @@ export function createDrill(deps: DrillDeps): Drill {
       outsideQuery.messages++;
     };
 
+    // A session with nothing created inside the window (a null floor) is
+    // not read; the floor of any other ends the walk past the lower bound.
+    const floor =
+      window?.after !== undefined
+        ? await floorAt(entry, target, { ...window, after: window.after }, reads)
+        : undefined;
     // Untargeted: bounded newest-first paging, from the window's upper bound.
-    const start = await seekAt(entry, target, window?.before, reads);
+    const start = floor === null ? null : await seekAt(entry, target, window?.before, reads);
     let cursor = start ?? undefined;
     let pagesWalked = 0;
     let stop: SliceStop = "end";
@@ -919,8 +927,7 @@ export function createDrill(deps: DrillDeps): Drill {
       /** The lowest seq read, and whether every message read carried one. */
       let lowest = Number.POSITIVE_INFINITY;
       let ordered = true;
-      let floor: number | null | undefined;
-      let floorAsked = false;
+      let metOlder = false;
       for (;;) {
         if (abort?.aborted) {
           stop = "aborted";
@@ -959,13 +966,8 @@ export function createDrill(deps: DrillDeps): Drill {
         outsideQuery.messages += passed;
         cursor = page.nextCursor ?? undefined;
         if (!cursor) break;
-        if (older && !floorAsked && window?.after !== undefined) {
-          floorAsked = true;
-          floor = await floorAt(entry, target, { ...window, after: window.after }, reads);
-        }
-        if (floorAsked && (floor === null || (floor !== undefined && ordered && lowest <= floor))) {
-          break;
-        }
+        if (older) metOlder = true;
+        if (metOlder && floor != null && ordered && lowest <= floor) break;
         if (inside.length > 0) windowPages++;
         // Stop once a non-first page of the window stops matching any anchor
         // (nothing more to gain). Ending as `anchor` on a page with nothing
@@ -1345,10 +1347,12 @@ export function createDrill(deps: DrillDeps): Drill {
        *  Always fetches at least one page so the sweep makes progress, unless
        *  the session holds nothing at or before the upper bound. Messages
        *  outside the window are counted as fetched but kept out of the pool
-       *  and the budget. Past the lower bound the session is complete only
-       *  once the sweep has read down to the window's floor (asked when it
-       *  first meets an older message), as the drill's walk ends there; a
-       *  source without one is swept on to the session's start. */
+       *  and the budget. A window with a lower bound asks for its floor
+       *  first: a session with nothing created inside the window is covered
+       *  without reading a page. Past the lower bound the session is complete
+       *  only once the sweep has met an older message and read down to the
+       *  floor, as the drill's walk ends there; a source without one is swept
+       *  on to the session's start. */
       const sweepSession = async (
         target: DeepTarget,
         startBefore: string | null,
@@ -1363,7 +1367,16 @@ export function createDrill(deps: DrillDeps): Drill {
         let cursor: string | undefined = startBefore ?? undefined;
         let stopped: SweepStop | undefined;
         let fetchedAny = false;
-        if (startBefore === null && !input.abort?.aborted) {
+        let floor: number | null | undefined;
+        if (window?.after !== undefined && !input.abort?.aborted) {
+          const answer = await askFloor(target.sessionId, { ...window, after: window.after });
+          if (answer.answered) floor = answer.value;
+        }
+        if (floor === null) {
+          // Nothing inside the window: fetchedAny keeps the loop from reading.
+          fetchedAny = true;
+          cursor = undefined;
+        } else if (startBefore === null && !input.abort?.aborted) {
           const start = await sweepStart(target);
           // Nothing to sweep: fetchedAny keeps the loop from reading a page.
           if (start === null) fetchedAny = true;
@@ -1371,8 +1384,7 @@ export function createDrill(deps: DrillDeps): Drill {
         }
         let lowest = Number.POSITIVE_INFINITY;
         let ordered = true;
-        let floor: number | null | undefined;
-        let floorAsked = false;
+        let metOlder = false;
         while (!(fetchedAny && cursor === undefined)) {
           stopped = fetchedAny ? overBudget() : input.abort?.aborted ? "aborted" : undefined;
           if (stopped) break;
@@ -1404,15 +1416,10 @@ export function createDrill(deps: DrillDeps): Drill {
           // A page with nothing inside counts as at least one message passed.
           outside.messages += passed === page.items.length ? Math.max(1, passed) : passed;
           cursor = page.nextCursor ?? undefined;
-          if (older && !floorAsked && window?.after !== undefined) {
-            floorAsked = true;
-            const answer = await askFloor(target.sessionId, { ...window, after: window.after });
-            if (answer.answered) floor = answer.value;
-          }
+          if (older) metOlder = true;
           // Fully swept: the session's end, or the window's floor, below
           // which nothing is inside the window.
-          const pastFloor =
-            floorAsked && (floor === null || (floor !== undefined && ordered && lowest <= floor));
+          const pastFloor = metOlder && floor != null && ordered && lowest <= floor;
           if (!cursor || pastFloor) {
             cursor = undefined;
             break;

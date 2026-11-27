@@ -2518,9 +2518,10 @@ describe("drill time window order and outside bounds", () => {
     };
     const drill = newDrill(source, { drillPageMessages: 1 });
     const sessions = [revised("s-a"), revised("s-b"), revised("s-c")];
+    // A window with a lower bound asks for its floor before the first read.
     await drill.pools(windowed(sessions, "alpha", { after: 500, before: 4500 }));
     await drill.pools(windowed(sessions, "alpha", { after: 500, before: 5500 }));
-    expect(asked).toEqual({ seek: 1, floor: 0 });
+    expect(asked).toEqual({ seek: 1, floor: 1 });
     await drill.pools(windowed(sessions, "alpha", { after: 4500 }));
     expect(asked).toEqual({ seek: 1, floor: 1 });
   });
@@ -2579,5 +2580,58 @@ describe("drill time window order and outside bounds", () => {
     expect(out.targets).toEqual([
       { sessionId: "s-a", fetched: 4, candidate: 2, eligible: 2, stop: "queryBudget" },
     ]);
+  });
+
+  /** s-a wrote nothing inside a window of (4500, 9000); s-b did. */
+  const oneEmpty = (): Graph => ({
+    messagesBySession: {
+      "s-a": [1000, 2000, 3000, 4000].map((created, i) =>
+        note("s-a", `a${i + 1}`, created, `alpha ${i + 1}`),
+      ),
+      "s-b": [1000, 5000, 6000].map((created, i) =>
+        note("s-b", `b${i + 1}`, created, `alpha ${i + 1}`),
+      ),
+    },
+  });
+
+  it("reads nothing from a session with nothing created inside the window, and caches that", async () => {
+    const { source, ctl } = makeControlledSource(oneEmpty(), { seek: true, floor: true });
+    const drill = newDrill(source, { drillPageMessages: 1 });
+    const input = windowed([revised("s-a"), revised("s-b")], "alpha", {
+      after: 4500,
+      before: 9000,
+    });
+    const out = await drill.pools(input);
+    expect(ctl.pages.filter((p) => p.sessionID === "s-a")).toEqual([]);
+    expect(ctl.seeks.map((s) => s.sessionID)).toEqual(["s-b"]);
+    expect(out.targets[0]).toEqual({
+      sessionId: "s-a",
+      fetched: 0,
+      candidate: 0,
+      eligible: 0,
+      stop: "end",
+    });
+    expect(poolTexts(out, "s-b")).toEqual(["alpha 3", "alpha 2"]);
+
+    const again = await drill.pools(input);
+    expect(ctl.floors.filter((f) => f.sessionID === "s-a")).toHaveLength(1);
+    expect(again.targets[0]).toMatchObject({ sessionId: "s-a", fetched: 0, cached: true });
+  });
+
+  it("covers a session with nothing created inside the window without reading it in a deep sweep", async () => {
+    const { source, ctl } = makeControlledSource(oneEmpty(), { seek: true, floor: true });
+    const out = await newDrill(source).deep({
+      sessions: [revised("s-a"), revised("s-b")],
+      query: parseQuery("alpha"),
+      charsPerQuery: 1_000_000,
+      window: { after: 4500, before: 9000 },
+    });
+    expect(ctl.floors.map((f) => f.sessionID)).toEqual(["s-a", "s-b"]);
+    expect(ctl.pages.map((p) => p.sessionID)).toEqual(["s-b"]);
+    expect(out.targets).toEqual([
+      { sessionId: "s-a", fetched: 0, candidate: 0, eligible: 0, stop: "end" },
+      { sessionId: "s-b", fetched: 3, candidate: 2, eligible: 2, stop: "end" },
+    ]);
+    expect(out.coverage).toMatchObject({ sessionsCovered: 2, sessionsPartial: 0 });
   });
 });
