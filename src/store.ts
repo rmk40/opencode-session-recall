@@ -383,6 +383,25 @@ export type CardVectorRow = {
   writeRev?: number;
 };
 
+/** The fields of a card that a family rollup is built from
+ *  ({@link Store.rollupFieldsPage}, {@link Store.familyPage}). The stored
+ *  rollup is read for a root only, a card whose `rootId` is its own id; any
+ *  other card lists it empty. */
+export type RollupFields = Pick<
+  Card,
+  | "sessionId"
+  | "rootId"
+  | "title"
+  | "summaryHead"
+  | "timeUpdated"
+  | "distilledThrough"
+  | "familyRollup"
+>;
+
+/** A page of {@link Store.familyPage}. `next` continues the walk and is
+ *  absent from the last page. */
+export type FamilyPage = { cards: RollupFields[]; next?: number };
+
 /** The store file's page accounting from {@link Store.spaceStats}. Reclaimable
  *  bytes are `freelistCount * pageSize`. */
 export type SpaceStats = { pageCount: number; freelistCount: number; pageSize: number };
@@ -498,6 +517,24 @@ export type Store = {
    * is gone.
    */
   cardVectorsPage(after: string | undefined, limit: number): CardVectorRow[];
+  /**
+   * The {@link RollupFields} of every card in session-id order after `after`,
+   * at most `limit` of them, read as {@link cardsPage} pages.
+   */
+  rollupFieldsPage(after: string | undefined, limit: number): RollupFields[];
+  /**
+   * The {@link RollupFields} of the cards whose root is `rootId`, the root's
+   * own card included, at most `limit` of them (a positive integer; anything
+   * else reads as 1): from the start of the family when `after` is undefined,
+   * otherwise from the previous page's `next`. The walk follows the
+   * `card_root` index in the order the cards were inserted, so a page reads
+   * only its own rows however large the family is. A card rewritten during a
+   * walk keeps its place. A card deleted or first written during the walk may
+   * or may not be listed, and one deleted and written again may be listed
+   * twice, the newer listing last. `next` is a rowid, which `VACUUM` can
+   * renumber, so a walk assumes no `VACUUM` runs during it (the store runs none).
+   */
+  familyPage(rootId: string, after: number | undefined, limit: number): FamilyPage;
   /** Card counts plus the revision counters, from one statement. */
   cardStats(): CardStats;
   /** The store file's page count, free-list pages and page size. Read-only. */
@@ -826,6 +863,10 @@ const CARD_STORE_COLUMNS = ["write_rev", "repair_reason"] as const;
 const CARD_READ_COLUMNS = [...CARD_COLUMNS, ...CARD_STORE_COLUMNS];
 const CARD_COLUMNS_ALL = CARD_READ_COLUMNS.join(", ");
 const CARD_COLUMNS_NO_EMBEDDING = CARD_READ_COLUMNS.filter((c) => c !== "embedding").join(", ");
+/** The columns of {@link RollupFields}, the stored rollup for roots only. */
+const ROLLUP_FIELD_COLUMNS =
+  "session_id, root_id, title, summary_head, time_updated, distilled_through, " +
+  "CASE WHEN root_id = session_id THEN family_rollup END AS family_rollup";
 const CARD_PLACEHOLDERS = CARD_COLUMNS.map(() => "?").join(", ");
 const CARD_UPSERT_SET = CARD_COLUMNS.filter(
   (c) => c !== "session_id" && !STORE_OWNED_COLUMNS.has(c),
@@ -971,6 +1012,18 @@ function serializeSettledBase(base: SettledBase): string {
     errors: base.errors,
     cut: base.cut,
   });
+}
+
+function rowToRollupFields(row: Row): RollupFields {
+  return {
+    sessionId: asString(row.session_id),
+    rootId: asString(row.root_id),
+    title: asString(row.title),
+    summaryHead: asString(row.summary_head),
+    timeUpdated: asNumber(row.time_updated),
+    distilledThrough: asNullableString(row.distilled_through),
+    familyRollup: parseRollup(row.family_rollup),
+  };
 }
 
 function rowToCard(row: Row): Card {
@@ -1558,6 +1611,30 @@ class SqliteStore implements Store {
         ...(writeRev !== null && { writeRev }),
       };
     });
+  }
+
+  rollupFieldsPage(after: string | undefined, limit: number): RollupFields[] {
+    return this.keysetPage(ROLLUP_FIELD_COLUMNS, after, limit).map(rowToRollupFields);
+  }
+
+  familyPage(rootId: string, after: number | undefined, limit: number): FamilyPage {
+    const take = pageLimit(limit);
+    // The rowid is the last key of every index, so `root_id=? AND rowid>?`
+    // is one range of card_root, already in rowid order; paging by session
+    // id instead would sort the whole family for every page.
+    const rows =
+      after === undefined
+        ? this.db.all(
+            `SELECT rowid AS row_key, ${ROLLUP_FIELD_COLUMNS} FROM card WHERE root_id=? ORDER BY rowid LIMIT ?`,
+            [rootId, take],
+          )
+        : this.db.all(
+            `SELECT rowid AS row_key, ${ROLLUP_FIELD_COLUMNS} FROM card WHERE root_id=? AND rowid>? ORDER BY rowid LIMIT ?`,
+            [rootId, after, take],
+          );
+    const cards = rows.map(rowToRollupFields);
+    const next = rows.length === take ? asNullableNumber(rows[rows.length - 1]!.row_key) : null;
+    return next === null ? { cards } : { cards, next };
   }
 
   cardStats(): CardStats {

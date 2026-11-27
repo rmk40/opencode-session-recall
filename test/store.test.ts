@@ -2780,6 +2780,102 @@ describe("change listing and stats", () => {
     db.close();
   });
 
+  describe("rollup reads", () => {
+    const rollup = [{ sessionId: "c1", messageId: "m1", snippet: "hint" }];
+    /** A root and two children, the child `c1` holding a rollup from when it
+     *  was a root, and another family's child inserted between them. */
+    async function family() {
+      const opened = await fresh();
+      const { store } = opened;
+      store.upsertCard(makeCard("r", { title: "Root", familyRollup: rollup }));
+      store.upsertCard(
+        makeCard("c1", {
+          rootId: "r",
+          parentId: "r",
+          title: "Child one",
+          summaryHead: "head one",
+          timeUpdated: 2000,
+          distilledThrough: "m1",
+          familyRollup: rollup,
+        }),
+      );
+      store.upsertCard(makeCard("x", { rootId: "other", parentId: "other" }));
+      store.upsertCard(makeCard("c0", { rootId: "r", parentId: "r", summaryHead: "head zero" }));
+      return opened;
+    }
+
+    it("rollupFieldsPage lists every card's rollup fields in id order, the stored rollup for roots only", async () => {
+      const { db, store } = await family();
+      expect(store.rollupFieldsPage(undefined, 2)).toEqual([
+        {
+          sessionId: "c0",
+          rootId: "r",
+          title: "",
+          summaryHead: "head zero",
+          timeUpdated: 1000,
+          distilledThrough: null,
+          familyRollup: [],
+        },
+        {
+          sessionId: "c1",
+          rootId: "r",
+          title: "Child one",
+          summaryHead: "head one",
+          timeUpdated: 2000,
+          distilledThrough: "m1",
+          familyRollup: [],
+        },
+      ]);
+      const rest = store.rollupFieldsPage("c1", 10);
+      expect(sessions(rest)).toEqual(["r", "x"]);
+      expect(rest[0]?.familyRollup).toEqual(rollup);
+      db.close();
+    });
+
+    it("familyPage lists one root's family, the root included, a page at a time", async () => {
+      const { db, store } = await family();
+      const first = store.familyPage("r", undefined, 2);
+      expect(sessions(first.cards)).toEqual(["r", "c1"]);
+      expect(first.cards[0]?.familyRollup).toEqual(rollup);
+      expect(first.next).toBeDefined();
+      const second = store.familyPage("r", first.next, 2);
+      expect(sessions(second.cards)).toEqual(["c0"]);
+      expect(second).not.toHaveProperty("next");
+      expect(store.familyPage("none", undefined, 2)).toEqual({ cards: [] });
+      db.close();
+    });
+
+    it("familyPage ends with an empty page when the last page is full", async () => {
+      const { db, store } = await family();
+      const first = store.familyPage("r", undefined, 3);
+      expect(sessions(first.cards)).toEqual(["r", "c1", "c0"]);
+      expect(store.familyPage("r", first.next, 3)).toEqual({ cards: [] });
+      db.close();
+    });
+
+    it("familyPage keeps a rewritten card's place and lists one written again after a delete last", async () => {
+      const { db, store } = await family();
+      const first = store.familyPage("r", undefined, 1);
+      store.patchCardMeta("r", { title: "Renamed" });
+      store.deleteSession("c1");
+      store.upsertCard(makeCard("c1", { rootId: "r", parentId: "r", title: "Back again" }));
+      const rest = store.familyPage("r", first.next, 10);
+      expect(sessions([...first.cards, ...rest.cards])).toEqual(["r", "c0", "c1"]);
+      expect(rest.cards.at(-1)?.title).toBe("Back again");
+      db.close();
+    });
+
+    it.each([0, -3, Number.NaN, 1.5])(
+      "rollupFieldsPage and familyPage read a limit of %s as one card",
+      async (limit) => {
+        const { db, store } = await family();
+        expect(sessions(store.rollupFieldsPage(undefined, limit))).toEqual(["c0"]);
+        expect(sessions(store.familyPage("r", undefined, limit).cards)).toEqual(["r"]);
+        db.close();
+      },
+    );
+  });
+
   it("cardStats counts cards, full cards and repair-pending cards, reading unset counters as zero", async () => {
     const { db, store } = await fresh();
     expect(store.cardStats()).toEqual({

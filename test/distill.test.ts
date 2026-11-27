@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { Event, OpencodeClient, Part, Session } from "@opencode-ai/sdk/v2";
 import { openSqlite, type Row, type SqliteDb } from "../src/sqlite.js";
-import { type Card, type Store } from "../src/store.js";
+import { openStore, type Card, type FamilyRollup, type Store } from "../src/store.js";
 import { createFetchGate, type FetchGate } from "../src/fetch-gate.js";
 import {
   COLD_PASS_COMPLETE_KEY,
@@ -26,6 +26,17 @@ import type { HistorySource } from "../src/history/source.js";
 import type { HistorySession } from "../src/history/model.js";
 import { createV1HistorySource } from "../src/history/v1.js";
 import { v1EventToSignal } from "../src/history/v1-events.js";
+import { createV2HistorySource, openOpencodeDb } from "../src/history/v2.js";
+import { V2_PROJECTOR_GEN } from "../src/history/v2-project.js";
+import { createV2Sync } from "../src/history/v2-sync.js";
+import {
+  insertMessage,
+  insertPart,
+  insertProject,
+  insertSession,
+  limitSpy,
+  makeV2PartsDb,
+} from "./v2-db.js";
 
 /** A v1 history source over one fake client (tests that hand-roll a client). */
 const v1 = (client: OpencodeClient): HistorySource =>
@@ -3003,5 +3014,530 @@ describe("cold-pass progress reporting", () => {
     await waitFor(() => distiller.status().coldPass === "done");
     await distiller.stop();
     db.close();
+  });
+});
+
+describe("family rollups read a page at a time", () => {
+  const macrotask = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0));
+
+  /** A card of `rootId`'s family (the root itself when the ids match). */
+  const member = (id: string, rootId: string, t: number, over: Partial<Card> = {}): Card => ({
+    ...fullCard(id, t),
+    rootId,
+    parentId: id === rootId ? null : rootId,
+    ...over,
+  });
+
+  /**
+   * `n` children of `rootId`. Their times repeat, so the newest are chosen by
+   * id; ids come in pairs that differ only in case, which a locale comparison
+   * orders differently from SQLite's byte order. Hints come from the title,
+   * from the summary head (some titles are longer than a hint) or from
+   * neither, and some children have no distilled message.
+   */
+  function children(rootId: string, n: number, t0: number): Card[] {
+    return Array.from({ length: n }, (_, i) => {
+      const id = `${rootId}-${i % 2 === 0 ? "a" : "A"}${String(i >> 1).padStart(4, "0")}`;
+      const variant = i % 4;
+      return member(id, rootId, t0 + (i % 3), {
+        title: variant === 0 ? `Child ${i}` : variant === 1 ? `Long ${"x".repeat(200)}` : "",
+        summaryHead: variant === 2 ? `head of ${id}` : "",
+        distilledThrough: i % 5 === 0 ? null : `m-${id}`,
+      });
+    });
+  }
+
+  /** `rootId`'s rollup computed from every card in the store at once. */
+  function rollupFromAll(store: Store, rootId: string): FamilyRollup[] {
+    return store
+      .allCards()
+      .filter((card) => card.rootId === rootId && card.sessionId !== rootId)
+      .sort((a, b) => b.timeUpdated - a.timeUpdated || a.sessionId.localeCompare(b.sessionId))
+      .slice(0, 12)
+      .map((child) => {
+        const hint = (child.title || child.summaryHead).slice(0, 120);
+        const base = { sessionId: child.sessionId, messageId: child.distilledThrough ?? "" };
+        return hint ? { ...base, snippet: hint } : base;
+      });
+  }
+
+  /**
+   * A store whose next yield after a call of an armed method waits until
+   * that hold is released. Every store call is recorded in `calls`, and
+   * those made while `closed` is set in `after` too.
+   */
+  function holding(store: Store) {
+    type Hold = { method: string; held: boolean; release: () => void; wait: Promise<void> };
+    const armed: Hold[] = [];
+    let next: Hold | undefined;
+    const calls: string[] = [];
+    const after: string[] = [];
+    let closed = false;
+    const wrapped = new Proxy(store, {
+      get(target, prop, receiver) {
+        const value: unknown = Reflect.get(target, prop, receiver);
+        if (typeof value !== "function") return value;
+        const method = value as (...args: unknown[]) => unknown;
+        return (...args: unknown[]) => {
+          calls.push(String(prop));
+          if (closed) after.push(String(prop));
+          const hold = armed.find((h) => h.method === prop);
+          if (hold) {
+            armed.splice(armed.indexOf(hold), 1);
+            next = hold;
+          }
+          return method.apply(target, args);
+        };
+      },
+    });
+    return {
+      store: wrapped,
+      yieldBetween: async (): Promise<void> => {
+        const hold = next;
+        next = undefined;
+        if (!hold) return macrotask();
+        hold.held = true;
+        await hold.wait;
+      },
+      arm(method: keyof Store): Hold {
+        let release = (): void => {};
+        const wait = new Promise<void>((resolve) => (release = resolve));
+        const hold: Hold = { method, held: false, release, wait };
+        armed.push(hold);
+        return hold;
+      },
+      close(): void {
+        closed = true;
+      },
+      calls,
+      after,
+    };
+  }
+
+  /** Put a rival's name on the lease row, as a takeover does. */
+  const takeLease = (store: Store): void =>
+    store.setMeta(
+      "distill_lease",
+      JSON.stringify({ holder: "rival", heartbeat: Date.now(), ttl: 30_000, build: "x", gen: 1 }),
+    );
+
+  async function setup(o: { coldPass: boolean; cards: Card[] }) {
+    const { db, store } = await freshStore();
+    for (const card of o.cards) store.upsertCard(card);
+    const h = holding(store);
+    const distiller = createDistiller({
+      source: makeDistillFake({ sessions: [], messagesBySession: {} }).source,
+      store: h.store,
+      gate: makeSpyGate().gate,
+      limits: { ...TEST_LIMITS, coldPass: o.coldPass, distillDelayMs: 0 },
+      instanceId: "rollups",
+      discover: async () => [],
+      yieldBetween: h.yieldBetween,
+      log: () => {},
+    });
+    return { db, store, h, distiller };
+  }
+
+  it("rebuilds a family of several pages after a child deletion as from every card at once", async () => {
+    const family = children("R", 1_200, 5_000);
+    const other = children("S", 300, 6_000);
+    // The families' cards interleave in the card table.
+    const cards = [member("R", "R", 1_000), member("S", "S", 1_000)];
+    family.forEach((card, i) => cards.push(card, ...(i < other.length ? [other[i]!] : [])));
+    const { db, store, distiller } = await setup({ coldPass: false, cards });
+    distiller.start();
+    const before = rollupFromAll(store, "R");
+    distiller.onEvent({ type: "deleted", sessionID: before[0]!.sessionId });
+    await waitFor(() => store.getCard("R")!.familyRollup.length > 0);
+    const expected = rollupFromAll(store, "R");
+    expect(expected[0]).not.toEqual(before[0]);
+    expect(store.getCard("R")!.familyRollup).toEqual(expected);
+    await distiller.stop();
+    db.close();
+  });
+
+  it("builds every root's rollup over a store of several pages as from every card at once", async () => {
+    const cards = [
+      member("R", "R", 1_000),
+      ...children("R", 700, 5_000),
+      member("S", "S", 1_000),
+      ...children("S", 5, 4_000),
+      // A root whose children are gone keeps no rollup.
+      member("T", "T", 1_000, { familyRollup: [{ sessionId: "T-gone", messageId: "m" }] }),
+      // A child whose root has no card.
+      member("U-child", "U", 1_000),
+      ...Array.from({ length: 300 }, (_, i) => member(`solo-${i}`, `solo-${i}`, 2_000)),
+    ];
+    const { db, store, distiller } = await setup({ coldPass: true, cards });
+    distiller.start();
+    await waitFor(() => distiller.status().coldPass === "done");
+    expect(store.getCard("R")!.familyRollup).toEqual(rollupFromAll(store, "R"));
+    expect(store.getCard("R")!.familyRollup).toHaveLength(12);
+    expect(store.getCard("S")!.familyRollup).toEqual(rollupFromAll(store, "S"));
+    expect(store.getCard("S")!.familyRollup).toHaveLength(5);
+    expect(store.getCard("T")!.familyRollup).toEqual([]);
+    await distiller.stop();
+    db.close();
+  });
+
+  it("recomputes a family again when a child is deleted while a recompute of it waits", async () => {
+    const family = children("R", 600, 5_000);
+    const { db, store, h, distiller } = await setup({
+      coldPass: false,
+      cards: [member("R", "R", 1_000), ...family],
+    });
+    distiller.start();
+    const [first, second] = rollupFromAll(store, "R");
+    // The first recompute waits after its first page, which lists `second`.
+    const hold = h.arm("familyPage");
+    distiller.onEvent({ type: "deleted", sessionID: first!.sessionId });
+    await waitFor(() => hold.held);
+    distiller.onEvent({ type: "deleted", sessionID: second!.sessionId });
+    // Time for a second recompute running beside the first to finish first.
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    hold.release();
+    const ids = () => store.getCard("R")!.familyRollup.map((entry) => entry.sessionId);
+    await waitFor(() => ids().length > 0 && !ids().includes(second!.sessionId));
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    expect(store.getCard("R")!.familyRollup).toEqual(rollupFromAll(store, "R"));
+    await distiller.stop();
+    db.close();
+  });
+
+  it("keeps a rollup that a recompute started during a full pass wrote", async () => {
+    const { db, store, h, distiller } = await setup({
+      coldPass: true,
+      cards: [
+        member("R", "R", 1_000),
+        member("R-c", "R", 3_000),
+        member("R-d", "R", 2_000),
+        // Enough cards that the pass reads two pages; R's family is on the first.
+        ...Array.from({ length: 600 }, (_, i) => member(`solo-${i}`, `solo-${i}`, 2_000)),
+      ],
+    });
+    const hold = h.arm("rollupFieldsPage");
+    distiller.start();
+    await waitFor(() => hold.held);
+    // The pass has read R-c; deleting it recomputes R's rollup without it.
+    distiller.onEvent({ type: "deleted", sessionID: "R-c" });
+    expect(store.getCard("R")!.familyRollup.map((entry) => entry.sessionId)).toEqual(["R-d"]);
+    hold.release();
+    await waitFor(() => distiller.status().coldPass === "done");
+    expect(store.getCard("R")!.familyRollup.map((entry) => entry.sessionId)).toEqual(["R-d"]);
+    await distiller.stop();
+    db.close();
+  });
+
+  it("recomputes a family again after a full pass that found a recompute of it running", async () => {
+    // R-new is on the recompute's first page (inserted early) and on the
+    // pass's second page (its id sorts after every solo card).
+    const { db, store, h, distiller } = await setup({
+      coldPass: true,
+      cards: [
+        member("R", "R", 1_000),
+        member("R-z-new", "R", 9_000, { title: "old title" }),
+        ...children("R", 600, 5_000),
+        ...Array.from({ length: 300 }, (_, i) => member(`R-solo-${i}`, `R-solo-${i}`, 2_000)),
+      ],
+    });
+    const pass = h.arm("rollupFieldsPage");
+    distiller.start();
+    await waitFor(() => pass.held);
+    // A recompute of R reads its first page, then waits.
+    const recompute = h.arm("familyPage");
+    distiller.onEvent({ type: "deleted", sessionID: "R-a0000" });
+    await waitFor(() => recompute.held);
+    // A change no recompute is asked for: the pass reads it, the waiting
+    // recompute already read the card before it.
+    store.patchCardMeta("R-z-new", { title: "new title" });
+    pass.release();
+    await waitFor(() => distiller.status().coldPass === "done");
+    recompute.release();
+    await waitFor(() => store.getCard("R")!.familyRollup[0]?.snippet === "new title");
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    expect(store.getCard("R")!.familyRollup).toEqual(rollupFromAll(store, "R"));
+    await distiller.stop();
+    db.close();
+  });
+
+  it("writes no rollup when the lease moves while a recompute of a family waits", async () => {
+    const { db, store, h, distiller } = await setup({
+      coldPass: false,
+      cards: [member("R", "R", 1_000), ...children("R", 600, 5_000)],
+    });
+    distiller.start();
+    const hold = h.arm("familyPage");
+    distiller.onEvent({ type: "deleted", sessionID: "R-a0000" });
+    await waitFor(() => hold.held);
+    takeLease(store);
+    const mark = h.calls.length;
+    hold.release();
+    await waitFor(() => !distiller.status().leaseHeld);
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    expect(h.calls.slice(mark)).not.toContain("setFamilyRollup");
+    expect(store.getCard("R")!.familyRollup).toEqual([]);
+    await distiller.stop();
+    db.close();
+  });
+
+  it("writes no rollup when the lease moves while a full pass waits between pages", async () => {
+    const { db, store, h, distiller } = await setup({
+      coldPass: true,
+      cards: [
+        member("R", "R", 1_000),
+        member("R-c", "R", 3_000),
+        ...Array.from({ length: 600 }, (_, i) => member(`solo-${i}`, `solo-${i}`, 2_000)),
+      ],
+    });
+    const hold = h.arm("rollupFieldsPage");
+    distiller.start();
+    await waitFor(() => hold.held);
+    takeLease(store);
+    const mark = h.calls.length;
+    hold.release();
+    await waitFor(() => !distiller.status().leaseHeld && distiller.status().coldPass !== "running");
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    expect(h.calls.slice(mark)).not.toContain("setFamilyRollup");
+    expect(store.getCard("R")!.familyRollup).toEqual([]);
+    await distiller.stop();
+    db.close();
+  });
+
+  it("reads nothing more from the store once the distiller stops during a recompute", async () => {
+    const { db, h, distiller } = await setup({
+      coldPass: false,
+      cards: [member("R", "R", 1_000), ...children("R", 600, 5_000)],
+    });
+    distiller.start();
+    const hold = h.arm("familyPage");
+    distiller.onEvent({ type: "deleted", sessionID: "R-a0000" });
+    await waitFor(() => hold.held);
+    const stopping = distiller.stop();
+    h.close();
+    hold.release();
+    await stopping;
+    expect(h.after).toEqual([]);
+    db.close();
+  });
+});
+
+describe("session writes from concurrent workers", () => {
+  /**
+   * A store that, after each session write, schedules a timer like a stall
+   * probe's tick, and counts a write made before the previous write's timer
+   * has run: two writes in one slice of the loop.
+   */
+  function pacedStore(store: Store) {
+    const counts = { writes: 0, backToBack: 0, appends: 0, tails: 0 };
+    let tickPending = false;
+    const writes = new Set(["replaceSessionParts", "appendSessionParts", "replaceSessionTail"]);
+    const wrapped = new Proxy(store, {
+      get(target, prop, receiver) {
+        const value: unknown = Reflect.get(target, prop, receiver);
+        if (typeof value !== "function" || !writes.has(String(prop))) return value;
+        const method = value as (...args: unknown[]) => unknown;
+        return (...args: unknown[]) => {
+          if (tickPending) counts.backToBack++;
+          counts.writes++;
+          if (prop === "appendSessionParts") counts.appends++;
+          if (prop === "replaceSessionTail") counts.tails++;
+          try {
+            return method.apply(target, args);
+          } finally {
+            tickPending = true;
+            setTimeout(() => (tickPending = false), 0);
+          }
+        };
+      },
+    });
+    return { store: wrapped, counts };
+  }
+
+  const macrotask = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0));
+
+  /** Eight sessions of one message each. */
+  function graph(): Graph {
+    const sessions = Array.from({ length: 8 }, (_, i) =>
+      session(`s${i}`, `Session ${i}`, PROJECT_DIR, 9_000 - i),
+    );
+    const messagesBySession: Record<string, MessageBundle[]> = {};
+    for (const s of sessions) {
+      messagesBySession[s.id] = [
+        bundle(userMessage(`m-${s.id}`, s.id, 100), [
+          textPart(`p-${s.id}`, s.id, `m-${s.id}`, `work in ${s.id}`),
+        ]),
+      ];
+    }
+    return { sessions, messagesBySession };
+  }
+
+  async function setup(g: Graph, appendThresholdParts?: number, distillConcurrency = 2) {
+    const { source } = makeDistillFake(g);
+    const { db, store } = await freshStore();
+    const paced = pacedStore(store);
+    const distiller = createDistiller({
+      source,
+      store: paced.store,
+      gate: makeSpyGate().gate,
+      limits: { ...TEST_LIMITS, distillConcurrency, distillDelayMs: 0 },
+      instanceId: "paced",
+      idleDebounceMs: 1,
+      yieldBetween: macrotask,
+      log: () => {},
+      ...(appendThresholdParts !== undefined && { appendThresholdParts }),
+    });
+    return { db, store, paced, distiller };
+  }
+
+  it.each([2, 4])(
+    "never commits two cold-pass writes of %i workers in one slice of the loop",
+    async (workers) => {
+      const g = graph();
+      const { sessions } = g;
+      const { db, store, paced, distiller } = await setup(g, undefined, workers);
+      distiller.start();
+      await waitFor(() => distiller.status().coldPass === "done");
+      expect(paced.counts.writes).toBe(sessions.length);
+      expect(paced.counts.backToBack).toBe(0);
+      // Every session is indexed as before.
+      for (const s of sessions) expect(store.getCard(s.id)?.distillState).toBe("full");
+      await distiller.stop();
+      db.close();
+    },
+  );
+
+  it.each([
+    ["full reads", undefined, 0],
+    ["appends", 0, 8],
+  ])(
+    "never commits two re-distill writes in one slice of the loop, for %s",
+    async (_, threshold, appends) => {
+      const g = graph();
+      const { db, store, paced, distiller } = await setup(g, threshold);
+      distiller.start();
+      await waitFor(() => distiller.status().coldPass === "done");
+      const coldWrites = paced.counts.writes;
+      for (const s of g.sessions) {
+        s.time.updated += 1_000;
+        g.messagesBySession[s.id]!.push(
+          bundle(userMessage(`m2-${s.id}`, s.id, 200), [
+            textPart(`p2-${s.id}`, s.id, `m2-${s.id}`, `more ${s.id}`),
+          ]),
+        );
+      }
+      for (const s of g.sessions) feed(distiller, idleEvent(s.id));
+      await waitFor(() =>
+        g.sessions.every((s) => store.getCard(s.id)?.distilledThrough === `m2-${s.id}`),
+      );
+      expect(paced.counts.writes - coldWrites).toBe(g.sessions.length);
+      expect(paced.counts.appends).toBe(appends);
+      expect(paced.counts.backToBack).toBe(0);
+      await distiller.stop();
+      db.close();
+    },
+  );
+
+  it("never commits two tail writes in one slice of the loop", async () => {
+    const v2 = await makeV2PartsDb();
+    const T0 = 1_000_000;
+    const ids = Array.from({ length: 8 }, (_, i) => `ses_tail_${i}`);
+    /** Each session's running reply: a user row and a settled reply before
+     *  it, so a write records the settled base a tail write starts from. */
+    const running = new Map<string, string>();
+    insertProject(v2.db, { id: "prj", worktree: "/workspace/tail" });
+    for (const id of ids) {
+      insertSession(v2.db, {
+        id,
+        project_id: "prj",
+        directory: "/workspace/tail",
+        title: `Title ${id}`,
+        time_created: T0,
+        time_updated: T0,
+      });
+      const reply = (seq: number, settled: boolean) => {
+        const message = `msg_${id}_${seq}`;
+        const at = T0 + seq;
+        insertMessage(v2.db, {
+          id: message,
+          session_id: id,
+          type: "assistant",
+          seq,
+          time_created: at,
+          time_updated: settled ? at : Date.now(),
+          data: {
+            agent: "build",
+            model: { id: "m", providerID: "p" },
+            content: [],
+            time: settled ? { created: at, completed: at + 1 } : { created: at },
+          },
+        });
+        insertPart(v2.db, {
+          message_id: message,
+          session_id: id,
+          ordinal: 0,
+          time_created: at,
+          time_updated: settled ? at : Date.now(),
+          data: { type: "text", text: `reply ${seq} of ${id}` },
+        });
+        return message;
+      };
+      insertMessage(v2.db, {
+        id: `msg_${id}_1`,
+        session_id: id,
+        type: "user",
+        seq: 1,
+        time_created: T0 + 1,
+        data: { text: `question for ${id}`, time: { created: T0 + 1 } },
+      });
+      reply(2, true);
+      running.set(id, reply(3, false));
+    }
+    const opened = await openOpencodeDb(v2.path);
+    if (!opened.ok) throw new Error(opened.reason);
+    const reader = limitSpy(opened.db);
+    const db = await openSqlite(freshDbPath());
+    if (!db) throw new Error("no sqlite");
+    const result = openStore(db, { host: "opencode-v2", source: v2.path });
+    if (!result.ok) throw new Error(result.reason);
+    const store = result.store;
+    const paced = pacedStore(store);
+    const distiller = createDistiller({
+      source: createV2HistorySource(reader),
+      store: paced.store,
+      gate: makeSpyGate().gate,
+      limits: { ...TEST_LIMITS, coldPass: false, distillConcurrency: 2, distillDelayMs: 0 },
+      instanceId: "paced-tail",
+      sync: createV2Sync(reader, {
+        pollIntervalMs: 1e9,
+        sessionScanEveryMs: 1e12,
+        reconcileEveryMs: 1e12,
+      }),
+      projectorGen: V2_PROJECTOR_GEN,
+      idleDebounceMs: 1,
+      yieldBetween: macrotask,
+      log: () => {},
+    });
+    try {
+      distiller.start();
+      // The first writes read in full and record each settled base.
+      for (const id of ids) distiller.onEvent({ type: "turn-ended", sessionID: id });
+      await waitFor(() => ids.every((id) => store.getCard(id)?.settledBase !== undefined));
+
+      // Every running reply grows: each session is read again from its base.
+      for (const [id, message] of running) {
+        v2.db.run(
+          "UPDATE session_part SET data = ?, time_updated = ? WHERE message_id = ? AND ordinal = 0",
+          [JSON.stringify({ type: "text", text: `grown reply of ${id}` }), Date.now(), message],
+        );
+      }
+      for (const id of ids) distiller.onEvent({ type: "turn-ended", sessionID: id });
+      await waitFor(() => paced.counts.tails === ids.length);
+      expect(paced.counts.backToBack).toBe(0);
+    } finally {
+      await distiller.stop();
+      reader.close();
+      db.close();
+      v2.cleanup();
+    }
   });
 });

@@ -74,7 +74,7 @@ function runFingerprint(items: readonly SessionItem[]): string {
 /** Every child of `parentID`, paged in id order so a child updated during the
  *  walk is neither skipped nor listed twice, up to
  *  `CHILDREN_PAGE * CHILDREN_PAGES_MAX` of them. */
-async function listAllChildren(
+export async function listAllChildren(
   source: HistorySource,
   parentID: string,
 ): Promise<
