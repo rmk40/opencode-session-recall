@@ -31,10 +31,52 @@ import {
  * build in the foreground, so a search waiting at the same time goes first.
  * The two points stand in for the event loop here: each counts its calls and
  * resolves at once.
+ *
+ * The v2 runtime opens opencode.db through `openOpencodeDb`, which is wrapped
+ * here so that the history readers and the sync read through the LIMIT spy.
+ * A violation would surface only as an error inside the runtime, so the
+ * spy's throws are recorded and checked after each v2 test.
  */
 
 const yields = vi.hoisted(() => ({ foreground: 0, background: 0 }));
+const history = vi.hoisted(() => ({ reads: 0, violations: [] as string[] }));
 const createOpencodeClient = vi.hoisted(() => vi.fn((options: unknown) => options));
+
+vi.mock("../src/history/v2.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../src/history/v2.js")>();
+  const { limitSpy } = await import("./v2-db.js");
+  return {
+    ...actual,
+    openOpencodeDb: async (path: string) => {
+      const opened = await actual.openOpencodeDb(path);
+      if (!opened.ok) return opened;
+      const spy = limitSpy(opened.db);
+      const checked = <T>(sql: string, run: () => T): T => {
+        if (/\bsession_(message|part)\b/.test(sql)) history.reads++;
+        try {
+          return run();
+        } catch (error) {
+          history.violations.push(error instanceof Error ? error.message : String(error));
+          throw error;
+        } finally {
+          // Only violations matter here, so the spy's statement log is
+          // emptied rather than kept for every statement of a cold pass.
+          spy.statements.length = 0;
+        }
+      };
+      return {
+        ...opened,
+        db: {
+          get: (sql: string, params?: unknown[]) =>
+            checked(sql, () => spy.get(sql, params as Parameters<typeof spy.get>[1])),
+          all: (sql: string, params?: unknown[]) =>
+            checked(sql, () => spy.all(sql, params as Parameters<typeof spy.all>[1])),
+          close: () => spy.close(),
+        },
+      };
+    },
+  };
+});
 
 vi.mock("../src/yield.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../src/yield.js")>();
@@ -69,6 +111,7 @@ let dir: string;
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), "recall-yield-hosts-"));
   reset();
+  Object.assign(history, { reads: 0, violations: [] });
 });
 afterEach(() => {
   rmSync(dir, { recursive: true, force: true });
@@ -177,12 +220,15 @@ describe("v2 runtime yield points", () => {
     await settled();
     expect(yields.background).toBeGreaterThan(0);
     expect(yields.foreground).toBe(0);
+    expect(history.reads).toBeGreaterThan(0);
+    expect(history.violations).toEqual([]);
   }, 30_000);
 
   it("yields a search's card build and reads, and the facades the tools and the drill read through, in the foreground only", async () => {
     const runtime = await settled();
     await runtime.distiller.stop();
     reset();
+    history.reads = 0;
     const tool = search(runtime.sourceFor("prj"), true, runtime.options.limits, runtime.deps);
     const out = JSON.parse(
       toolResultText(await tool.execute({ query: "zephyr" } as never, makeContext().ctx)),
@@ -190,14 +236,19 @@ describe("v2 runtime yield points", () => {
     expect(out.results.map((r) => r.sessionID)).toContain("ses_1");
     expect(yields.foreground).toBeGreaterThan(0);
     expect(yields.background).toBe(0);
+    expect(history.reads).toBeGreaterThan(0);
 
     for (const facade of [runtime.globalSource, runtime.sourceFor("prj")]) {
       reset();
+      history.reads = 0;
       const page = await facade.messagePage({ sessionID: "ses_2", limit: 5 });
       expect(page.items).toHaveLength(2);
       expect(yields.foreground).toBeGreaterThan(0);
       expect(yields.background).toBe(0);
+      expect(history.reads).toBeGreaterThan(0);
     }
+    // Every read since the runtime opened: its cold pass, polls and search.
+    expect(history.violations).toEqual([]);
   }, 30_000);
 });
 
