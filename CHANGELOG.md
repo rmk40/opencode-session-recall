@@ -4,7 +4,7 @@ All notable changes to this project are documented here. This project follows
 [Conventional Commits](https://www.conventionalcommits.org/) and
 [Semantic Versioning](https://semver.org/).
 
-## Unreleased
+## 3.1.0
 
 Upgrading needs no migration, since the store stays at schema 5. Restart
 every OpenCode process after upgrading, because a running process keeps the
