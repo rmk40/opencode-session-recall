@@ -16,6 +16,7 @@ import {
   type StoreOptions,
   type StoreRefusal,
 } from "../src/store.js";
+import { parseQuery } from "../src/query.js";
 import { openV1Store } from "./helpers.js";
 
 // These tests run against the REAL node:sqlite driver (Node >= 22.5). Under
@@ -1471,6 +1472,87 @@ describe("fts query construction", () => {
       "short",
       "long",
     ]);
+    db.close();
+  });
+});
+
+describe("plain-word slim-index lookup", () => {
+  // Eight filler sessions whose 480 rows all hold common words ("app" in
+  // every row, "desktop", "sign" and "in" in half), and a tenth of them
+  // "inference"; three target sessions hold the rare words. Under a 100-row
+  // budget the common words are never ORed.
+  const BUDGET = 100;
+
+  async function wordStore(): Promise<{ db: SqliteDb; store: Store; scored: string[] }> {
+    const db = await openSqlite(freshDbPath());
+    if (!db) throw new Error("openSqlite returned null");
+    // The MATCH expression of every lookup statement that scores rows.
+    const scored: string[] = [];
+    const recording: SqliteDb = {
+      ...db,
+      all: (sql, params) => {
+        if (sql.includes("bm25(part_fts)")) scored.push(String(params?.[0]));
+        return db.all(sql, params);
+      },
+    };
+    const store = openV1Store(recording);
+    if (!store) throw new Error("openStore returned null");
+    for (let s = 0; s < 8; s++) {
+      const rows = Array.from({ length: 60 }, (_, r) =>
+        makePart(
+          `f${s}-${r}`,
+          `${r % 2 === 0 ? "desktop app" : "sign in to the app"} ${r % 10 === 0 ? "inference" : "notes"} ${s}`,
+        ),
+      );
+      store.replaceSessionParts(`filler-${s}`, rows, makeCard(`filler-${s}`));
+    }
+    store.replaceSessionParts(
+      "gov",
+      [makePart("g1", "the governed rollout plan")],
+      makeCard("gov"),
+    );
+    store.replaceSessionParts(
+      "launch",
+      [makePart("l1", "launcher crash on sign in")],
+      makeCard("launch"),
+    );
+    store.replaceSessionParts(
+      "both",
+      [makePart("b1", "governed inference in the desktop launcher")],
+      makeCard("both"),
+    );
+    return { db, store, scored };
+  }
+
+  const lookup = (store: Store, query: string) =>
+    new Set(
+      sessions(
+        store.ftsSearch({ strong: [], weak: parseQuery(query).tokens, weakRowBudget: BUDGET }),
+      ),
+    );
+
+  it("still finds the sessions holding a query's distinctive words", async () => {
+    const { db, store } = await wordStore();
+    const prose = lookup(store, "desktop app launcher sign in governed inference");
+    for (const target of ["gov", "launch", "both"]) expect(prose.has(target)).toBe(true);
+    expect([...lookup(store, "app launcher")].sort()).toEqual(["both", "launch"]);
+    expect([...lookup(store, "governed")].sort()).toEqual(["both", "gov"]);
+    // Every word is common: none is distinctive, so nothing is looked up.
+    expect(lookup(store, "sign in app").size).toBe(0);
+    // A strong anchor is looked up whatever its frequency.
+    expect(store.ftsSearch({ strong: ["app"], weak: [], weakRowBudget: BUDGET })).toHaveLength(200);
+    db.close();
+  });
+
+  it("scores at most the budget's rows where an OR of every word matches the index", async () => {
+    const { db, store, scored } = await wordStore();
+    const words = parseQuery("desktop app launcher sign in governed inference").tokens;
+    store.ftsSearch({ strong: [], weak: words, weakRowBudget: BUDGET });
+    const matched = (match: string): number =>
+      Number(db.get("SELECT count(*) AS n FROM part_fts WHERE part_fts MATCH ?", [match])?.n);
+    expect(scored).toHaveLength(1);
+    expect(matched(scored[0]!)).toBeLessThanOrEqual(BUDGET);
+    expect(matched(words.map((word) => `"${word}"`).join(" OR "))).toBe(483);
     db.close();
   });
 });

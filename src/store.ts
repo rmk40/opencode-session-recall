@@ -109,6 +109,11 @@ export const CARDS_STAMPED_KEY = "cards_stamped";
  *  something, so a reader knows when to diff its card id set. */
 export const CARDS_DELETED_KEY = "cards_deleted";
 const DEFAULT_FTS_LIMIT = 200;
+/** Default bound on the slim-index rows a plain-word lookup matches (see
+ *  {@link boundWeakAnchors}). `bm25()` scores, and the lookup joins and sorts,
+ *  every matched row before its LIMIT applies, so an OR over common words
+ *  would touch a large share of the index. */
+export const WEAK_MATCH_ROWS = 20_000;
 
 // A lease whose heartbeat predates any realistic (or injected) cutoff, so a
 // freshly created lease row is always immediately acquirable.
@@ -427,6 +432,17 @@ export type PartTextRow = {
   timeCreated: number;
   raw: string;
   norm: string;
+};
+
+/** A slim-index lookup. `strong` anchors (code tokens and phrases) are all
+ *  required; without one, the lookup ORs the `weak` anchors (plain words)
+ *  that {@link boundWeakAnchors} keeps under `weakRowBudget` (default
+ *  {@link WEAK_MATCH_ROWS}). `limit` caps the rows returned (default 200). */
+export type FtsQuery = {
+  strong: string[];
+  weak: string[];
+  limit?: number;
+  weakRowBudget?: number;
 };
 
 /** One FTS match, carrying the drill-down targets captured during distillation. */
@@ -759,7 +775,7 @@ export type Store = {
     card: Card,
     opts?: { rangeHashes?: RangeHash[]; replaceRangeHashes?: boolean },
   ): SessionWrite;
-  ftsSearch(input: { strong: string[]; weak: string[]; limit?: number }): FtsHit[];
+  ftsSearch(input: FtsQuery): FtsHit[];
   getMeta(key: string): string | undefined;
   setMeta(key: string, value: string): void;
   /**
@@ -1215,6 +1231,33 @@ export function buildMatch(strong: string[], weak: string[]): string | null {
   const weakQuoted = weak.map(quoteAnchor).filter((a): a is string => a !== null);
   if (weakQuoted.length > 0) return weakQuoted.join(" OR ");
   return null;
+}
+
+/**
+ * The weak anchors a plain-word lookup ORs, in their given order: the rarest
+ * first, as long as the rows they match add up to at most `budget`, and none
+ * that matches `budget` rows or more. `rowsOf` counts the rows an anchor
+ * matches, stopping at `budget`. The lookup is there to find sessions holding
+ * the query's distinctive words, and a word that common is not one: it would
+ * add little to `bm25()` and make the OR match most of the index. When every
+ * anchor is that common, none is kept and the lookup matches nothing. On an
+ * index where the anchors' rows fit the budget together, all are kept.
+ */
+export function boundWeakAnchors(
+  anchors: readonly string[],
+  rowsOf: (anchor: string) => number,
+  budget: number,
+): string[] {
+  const counted = anchors.map((anchor, index) => ({ anchor, index, rows: rowsOf(anchor) }));
+  const rarestFirst = [...counted].sort((a, b) => a.rows - b.rows || a.index - b.index);
+  const kept = new Set<number>();
+  let total = 0;
+  for (const { index, rows } of rarestFirst) {
+    if (rows >= budget || total + rows > budget) break;
+    kept.add(index);
+    total += rows;
+  }
+  return counted.filter(({ index }) => kept.has(index)).map(({ anchor }) => anchor);
 }
 
 // ── Schema management ────────────────────────────────────────────────────────
@@ -2218,8 +2261,18 @@ class SqliteStore implements Store {
     }
   }
 
-  ftsSearch(input: { strong: string[]; weak: string[]; limit?: number }): FtsHit[] {
-    const match = buildMatch(input.strong ?? [], input.weak ?? []);
+  ftsSearch(input: FtsQuery): FtsHit[] {
+    const budget =
+      input.weakRowBudget != null && Number.isFinite(input.weakRowBudget) && input.weakRowBudget > 0
+        ? Math.floor(input.weakRowBudget)
+        : WEAK_MATCH_ROWS;
+    // Strong anchors as before; only a plain-word lookup is bounded.
+    const match =
+      buildMatch(input.strong ?? [], []) ??
+      buildMatch(
+        [],
+        boundWeakAnchors(input.weak ?? [], (anchor) => this.matchRows(anchor, budget), budget),
+      );
     if (!match) return [];
     const limit =
       input.limit != null && Number.isFinite(input.limit) && input.limit > 0
@@ -2242,6 +2295,18 @@ class SqliteStore implements Store {
       class: asString(row.class),
       score: asNumber(row.score),
     }));
+  }
+
+  /** The slim-index rows `anchor` matches as one quoted phrase, counted up to
+   *  `cap`: FTS5 yields matches lazily, so the count reads at most `cap`. */
+  private matchRows(anchor: string, cap: number): number {
+    const quoted = quoteAnchor(anchor);
+    if (!quoted) return 0;
+    const row = this.db.get(
+      "SELECT count(*) AS n FROM (SELECT 1 FROM part_fts WHERE part_fts MATCH ? LIMIT ?)",
+      [quoted, cap],
+    );
+    return asNumber(row?.n);
   }
 
   getMeta(key: string): string | undefined {
