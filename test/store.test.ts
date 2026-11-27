@@ -3681,6 +3681,7 @@ describe("tail writes", () => {
     rows: [tailRow("p3", "gammaold")],
     firstMessageId: "m-3",
     writeRev: current?.cardWriteRev("s1") ?? null,
+    unstamped: current ? unstampedOf(current) : 0,
     ...over,
   });
   const found = (store: Store, word: string): string[] =>
@@ -3938,6 +3939,9 @@ describe("tail writes", () => {
     { name: "the eviction passes the base", tail: { evict: 3 } },
     { name: "the eviction is not a whole row count", tail: { evict: 0.5 } },
     { name: "the card was written since its rows were read", tail: { writeRev: 0 } },
+    // The caller read one revision fewer that no write stamped than the
+    // store holds now: an older build wrote since, moving cards_rev alone.
+    { name: "an older build wrote since its rows were read", tail: { unstamped: -1 } },
   ])("refuses as base-changed and writes nothing when $name", async ({ setup, tail: over }) => {
     const { db, store, card, rows } = await seeded();
     setup?.(store, card);

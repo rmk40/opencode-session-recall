@@ -2865,6 +2865,10 @@ export function createDistiller(options: DistillerOptions): Distiller {
     base: SettledBase,
   ): Promise<CardWrite & { kept?: string }> {
     const stored = sync?.inspect?.(oldCard.distillCursor) ?? null;
+    // Taken before any read below, so the write refuses what an older
+    // build's write, which stamps no revision on the card, changed since.
+    const counters = store.cardCounters();
+    const unstamped = counters.cardsRev - counters.cardsStamped;
     const before = await fetchCheckpoint(session.id);
     if (stopped || !leaseHeld) return { changed: false };
     if (!before || (settledThrough(before) ?? BEFORE_FIRST_SEQ) < base.seq) {
@@ -2968,7 +2972,7 @@ export function createDistiller(options: DistillerOptions): Distiller {
     if (stopped || !ownsLease()) return { changed: false };
     const result = store.replaceSessionTail(
       session.id,
-      { base, evict: plan.evict, rows: walk.rows, firstMessageId, writeRev },
+      { base, evict: plan.evict, rows: walk.rows, firstMessageId, writeRev, unstamped },
       card,
       rangeHashes ? { rangeHashes, replaceRangeHashes } : undefined,
     );

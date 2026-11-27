@@ -477,6 +477,59 @@ describe("v2 tail re-reads falling back to a full read", () => {
     expect(store.getCard("ses_a")?.settledBase).toMatchObject({ seq: 1 });
   });
 
+  it("when an older build wrote a base row after the tail read the card's rows", async () => {
+    addSession("ses_a");
+    addUser("ses_a", "openingword");
+    const reply = addReply("ses_a", ["draftword"], { running: true });
+    let interfere = false;
+    const h = start({
+      beforeTail: () => {
+        if (!interfere) return;
+        interfere = false;
+        // It rewrites the base row's text and keeps the index whole, the
+        // settled base, the row count and the card's revision as they were,
+        // and moves cards_rev alone.
+        const row = storeDb.get(
+          "SELECT id, raw, norm FROM part_text WHERE session_id = ? ORDER BY id LIMIT 1",
+          ["ses_a"],
+        )!;
+        storeDb.run("INSERT INTO part_fts(part_fts, rowid, raw, norm) VALUES('delete', ?, ?, ?)", [
+          row.id!,
+          row.raw!,
+          row.norm!,
+        ]);
+        storeDb.run("UPDATE part_text SET raw = 'olderword', norm = 'olderword' WHERE id = ?", [
+          row.id!,
+        ]);
+        storeDb.run("INSERT INTO part_fts(rowid, raw, norm) VALUES(?, 'olderword', 'olderword')", [
+          row.id!,
+        ]);
+        storeDb.run("UPDATE meta SET value = CAST(value AS INTEGER) + 1 WHERE key = 'cards_rev'");
+      },
+    });
+    await redistill(h, "ses_a");
+
+    addPart(reply, "ses_a", 1, "grownword");
+    interfere = true;
+    const writes = await redistill(h, "ses_a", "turn-ended", (w) =>
+      w.some((write) => write.method === "replaceSessionParts"),
+    );
+    expect(writes).toEqual([
+      { method: "replaceSessionTail", result: { changed: false, refused: "base-changed" } },
+      { method: "replaceSessionParts", result: { changed: true } },
+    ]);
+    // The full read put the base row back as the history holds it.
+    expect(hits("olderword")).toEqual([]);
+    expect(hits("openingword")).toEqual(["ses_a"]);
+    expect(hits("grownword")).toEqual(["ses_a"]);
+    expect(h.logs).toContainEqual(
+      expect.stringContaining(
+        "session ses_a tail write: the stored rows changed while they were read; reading the session in full",
+      ),
+    );
+    storeDb.run("INSERT INTO part_fts(part_fts, rank) VALUES('integrity-check', 1)");
+  });
+
   it("when a row below the base runs again", async () => {
     // Against this clock a reply updated more than 5 s ago is abandoned, so
     // it counts as settled.

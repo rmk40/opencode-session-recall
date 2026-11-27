@@ -432,6 +432,9 @@ export type SessionTail = {
   /** The card's {@link Card.writeRev} when the caller read its rows, null
    *  for a card no stamped write has touched. */
   writeRev: number | null;
+  /** How many revisions no write stamped when the caller read the card's
+   *  rows, as {@link StoredRows.unstamped} records it. */
+  unstamped: number;
 };
 
 /** A hash over one session's source rows from `startSeq` through `endSeq`
@@ -894,7 +897,9 @@ export type Store = {
    *
    * Refused with `base-changed`, writing nothing, unless the card still holds
    * exactly `tail.base`, at least its rows and the revision `tail.writeRev`
-   * the caller read them at: another write changed the card since. Refused
+   * the caller read them at, and no write that stamps nothing moved
+   * `cards_rev` since (`tail.unstamped`): another write changed the card
+   * since, or may have. Refused
    * with `older-generation` like {@link appendSessionParts}, whose
    * generation, suppression (no row evicted, replaced or repointed and an
    * unchanged card write only the checkpoint, generation and settled base,
@@ -2477,6 +2482,7 @@ class SqliteStore implements Store {
         !stored ||
         stored.settled_base !== serializeSettledBase(base) ||
         asNullableNumber(stored.write_rev) !== tail.writeRev ||
+        this.unstampedRevisions() !== tail.unstamped ||
         !Number.isInteger(evict) ||
         evict < 0 ||
         evict > base.rows ||
@@ -2556,6 +2562,13 @@ class SqliteStore implements Store {
     return ids && prepared.rows.map((row, i) => storedRow(ids[i], row));
   }
 
+  /** How many revisions no write stamped (`cards_rev - cards_stamped`): an
+   *  older build's write moves `cards_rev` alone. */
+  private unstampedRevisions(): number {
+    const { cardsRev, cardsStamped } = this.cardCounters();
+    return cardsRev - cardsStamped;
+  }
+
   /** The session's rowids in order, one per row a caller read before this
    *  transaction (`prepared`), or undefined when those rows may no longer be
    *  the stored ones: the card (`card`, read in this transaction) is gone, a
@@ -2569,8 +2582,7 @@ class SqliteStore implements Store {
     prepared: StoredRows,
   ): number[] | undefined {
     if (!card || asNullableNumber(card.write_rev) !== prepared.writeRev) return undefined;
-    const { cardsRev, cardsStamped } = this.cardCounters();
-    if (cardsRev - cardsStamped !== prepared.unstamped) return undefined;
+    if (this.unstampedRevisions() !== prepared.unstamped) return undefined;
     const ids = this.db
       .all("SELECT id FROM part_text WHERE session_id=? ORDER BY id", [sessionId])
       .map((row) => asNumber(row.id));

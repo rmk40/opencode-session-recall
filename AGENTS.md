@@ -358,8 +358,9 @@ it, so re-indexing a root never clears its rollup.
 rereading its settled base. The caller reads the base's rows (`sessionRows`) and
 builds the card before the transaction. Inside it the store reads only the rows it
 replaces, after checking that the card still holds the caller's settled base, at
-least its rows and the `write_rev` the caller read them at. Any other state refuses
-the write as `base-changed` with nothing written. The distiller then reads the
+least its rows and the `write_rev` the caller read them at, and that `unstamped`
+(below) has not moved since the distiller began the tail read. Any other state
+refuses the write as `base-changed` with nothing written. The distiller then reads the
 session in full. The previous tail's rows are diffed against the new ones as a
 full write's are (below). The rows of the base's newest message are repointed at
 the tail's first message. Under the row cap the card keeps what an append of the
