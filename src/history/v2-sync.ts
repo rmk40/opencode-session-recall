@@ -41,10 +41,13 @@ import { inspectV2Schema, type V2SchemaInfo } from "./v2.js";
  *   while those rows are unchanged, only the rows past the boundary need
  *   reading again (`tail`).
  * - **The poll** (lease holder only): every 30 s the message window reads
- *   the rows created past a persisted watermark through the indexed
- *   `session_message_time_created_idx`, in pages of `pollPageRows` rows keyed
- *   by `(time_created, id)` with a yield before each, and signals the
- *   sessions they belong to, at most `pollSessionLimit` per poll. Every 5
+ *   the rows created past a persisted watermark and up to the poll's start
+ *   through the indexed `session_message_time_created_idx`, in pages of
+ *   `pollPageRows` rows keyed by `(time_created, id)` with a yield before
+ *   each, at most `pollPages` of them, and signals the sessions they belong
+ *   to, at most `pollSessionLimit` per poll. Once drained, the window moves
+ *   its watermark to the poll's start, so a row committed behind the
+ *   position while the pages were read is read again next time. Every 5
  *   minutes a bounded scan of `session_v2`, one page keyed by `(time,
  *   session id)`, catches renames, moves, archiving and other metadata-only
  *   changes. Both watermarks carry an overlap for late commits. A window
@@ -99,6 +102,9 @@ export type V2SyncOptions = {
   pollSessionLimit?: number;
   /** Message rows one statement of the message poll reads. Default 2,000. */
   pollPageRows?: number;
+  /** Statements one message poll runs at most; the next poll goes on from
+   *  where it stopped. Default 10. */
+  pollPages?: number;
   /** Sessions returned by one `session_v2` scan (one page). Default 2,000. */
   sessionScanLimit?: number;
   /** Rows inspected for an unsettled tail. Default 20. */
@@ -332,6 +338,7 @@ export function createV2Sync(db: ReadOnlyDb, opts: V2SyncOptions = {}): DistillS
   const maxLookbackMs = opts.maxLookbackMs ?? 3_600_000;
   const pollSessionLimit = Math.max(1, Math.floor(opts.pollSessionLimit ?? 500));
   const pollPageRows = Math.max(1, Math.floor(opts.pollPageRows ?? 2_000));
+  const pollPages = Math.max(1, Math.floor(opts.pollPages ?? 10));
   const sessionScanLimit = opts.sessionScanLimit ?? 2_000;
   const tailRows = opts.tailRows ?? 20;
   const abandonAfterMs = opts.abandonAfterMs ?? 3_600_000;
@@ -684,7 +691,8 @@ export function createV2Sync(db: ReadOnlyDb, opts: V2SyncOptions = {}): DistillS
    * window is drained, so the watermark moves to the newest key seen and the
    * position clears. Every poll therefore moves forward, even when one
    * timestamp is shared by more rows than a page holds. The updates are
-   * returned, not written: the caller commits them after dispatch.
+   * returned, not written: the caller commits them after dispatch. Null when
+   * `live` turned false at its yield.
    */
   async function page(
     meta: PollMeta,
@@ -693,7 +701,8 @@ export function createV2Sync(db: ReadOnlyDb, opts: V2SyncOptions = {}): DistillS
     limit: number,
     query: (lower: number, pos: KeysetPos | null, limit: number) => Row[],
     keyOf: (row: Row) => { t: number | null; id: string | null },
-  ): Promise<Page> {
+    live: () => boolean,
+  ): Promise<Page | null> {
     const mark = watermark(meta, keys.mark, at);
     const pos = parsePos(meta.get(keys.pos));
     // A clamped watermark (after long downtime) must not outrun a window that
@@ -702,6 +711,7 @@ export function createV2Sync(db: ReadOnlyDb, opts: V2SyncOptions = {}): DistillS
     // which the keyset tie-break (same time, larger id) still needs.
     const lower = pos ? Math.min(mark - overlapMs, pos.t - 1) : mark - overlapMs;
     await pause();
+    if (!live()) return null;
     // One row past the page tells a full page from a drained window.
     const fetched = query(lower, pos, limit + 1);
     const rows = fetched.slice(0, limit);
@@ -726,14 +736,16 @@ export function createV2Sync(db: ReadOnlyDb, opts: V2SyncOptions = {}): DistillS
   }
 
   /**
-   * The message window: sessions with rows created past `mark - overlap`,
-   * found by reading those rows in `(time_created, id)` order through the
-   * `time_created` index, {@link pollPageRows} per statement with a yield
-   * before each. It stops once it holds {@link pollSessionLimit} sessions
-   * and the next row would add another, recording that row's predecessor as
-   * its position, or once a short page shows the window drained, moving the
-   * watermark to the newest row read. Each session is listed once, where its
-   * first row in the window is. Null when `live` turned false at a yield.
+   * The message window: sessions with rows created past `mark - overlap` and
+   * at or before `at`, the poll's start, found by reading those rows in
+   * `(time_created, id)` order through the `time_created` index,
+   * {@link pollPageRows} per statement with a yield before each. It stops
+   * once it holds {@link pollSessionLimit} sessions and the next row would
+   * add another, or after {@link pollPages} full pages, recording the last
+   * row read as its position. Otherwise a short page shows the window
+   * drained, which moves the watermark to `at`. Each session is listed once,
+   * where its first row in the window is. Null when `live` turned false at a
+   * yield.
    */
   async function messageWindow(
     meta: PollMeta,
@@ -751,27 +763,39 @@ export function createV2Sync(db: ReadOnlyDb, opts: V2SyncOptions = {}): DistillS
     const lower = older ? Math.min(mark - overlapMs, older.t - 1) : mark - overlapMs;
     const sessions: string[] = [];
     const seen = new Set<string>();
-    let newest: number | null = null;
+    // The window ends at the poll's start, and a drained window moves the
+    // watermark to it, never to the newest row read: the pages are read
+    // over time, so a row committed meanwhile behind the position is read
+    // again by the next poll, which starts `overlapMs` before the watermark,
+    // as it would be after one statement read at the start.
     const drained = (): Array<[string, string]> => [
-      [POLL_WATERMARK_KEY, String(Math.max(mark, newest ?? after?.t ?? mark))],
+      [POLL_WATERMARK_KEY, String(Math.max(mark, at))],
       [POLL_ROW_CURSOR_KEY, ""],
       [POLL_CURSOR_KEY, ""],
     ];
-    for (;;) {
+    /** Where the next poll goes on from, the last row read. */
+    const resume = (): Array<[string, string]> => [
+      [POLL_ROW_CURSOR_KEY, JSON.stringify([after!.t, after!.id])],
+    ];
+    for (let pages = 0; ; pages++) {
+      // A poll holds a fetch permit throughout, so a long window is left to
+      // the next polls past `pollPages` pages.
+      if (pages >= pollPages) return { sessions, commit: resume() };
       await pause();
       if (!live()) return null;
       const position = after;
       const rows = position
         ? db.all(
             `SELECT id, session_id, time_created FROM session_message
-             WHERE time_created >= ? AND (time_created > ? OR id > ?)
+             WHERE time_created >= ? AND time_created <= ? AND (time_created > ? OR id > ?)
              ORDER BY time_created ASC, id ASC LIMIT ?`,
-            [position.t, position.t, position.id, pollPageRows],
+            [position.t, at, position.t, position.id, pollPageRows],
           )
         : db.all(
             `SELECT id, session_id, time_created FROM session_message
-             WHERE time_created > ? ORDER BY time_created ASC, id ASC LIMIT ?`,
-            [lower, pollPageRows],
+             WHERE time_created > ? AND time_created <= ?
+             ORDER BY time_created ASC, id ASC LIMIT ?`,
+            [lower, at, pollPageRows],
           );
       for (const row of rows) {
         const t = num(row.time_created);
@@ -784,17 +808,11 @@ export function createV2Sync(db: ReadOnlyDb, opts: V2SyncOptions = {}): DistillS
           throw new Error("poll page ended on a row without a key");
         }
         if (!seen.has(sessionID)) {
-          if (seen.size >= pollSessionLimit) {
-            return {
-              sessions,
-              commit: [[POLL_ROW_CURSOR_KEY, JSON.stringify([after!.t, after!.id])]],
-            };
-          }
+          if (seen.size >= pollSessionLimit) return { sessions, commit: resume() };
           seen.add(sessionID);
           sessions.push(sessionID);
         }
         after = { t, id };
-        newest = t;
       }
       if (rows.length < pollPageRows) return { sessions, commit: drained() };
     }
@@ -822,6 +840,7 @@ export function createV2Sync(db: ReadOnlyDb, opts: V2SyncOptions = {}): DistillS
 
     // Metadata-only changes, through a bounded scan of session_v2.
     if (at - lastScanAt >= sessionScanEveryMs) {
+      const scannedBefore = lastScanAt;
       lastScanAt = at;
       try {
         const expr = recency();
@@ -839,7 +858,13 @@ export function createV2Sync(db: ReadOnlyDb, opts: V2SyncOptions = {}): DistillS
               pos ? [lower, pos.t, pos.t, pos.id, n] : [lower, n],
             ),
           (row) => ({ t: num(row.r), id: str(row.id) }),
+          live,
         );
+        if (!sessions) {
+          // Stopped before the scan read anything: the next poll scans.
+          lastScanAt = scannedBefore;
+          return stopped;
+        }
         for (const row of sessions.rows) {
           const id = str(row.id);
           if (!id) continue;

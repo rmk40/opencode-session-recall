@@ -454,6 +454,7 @@ describe("v2 poll queries", () => {
       pollSessionLimit: 1,
       sessionScanEveryMs: 1e12,
       overlapMs: 0,
+      now: () => at,
       yieldBetween: async () => {},
     });
     const meta = memoryMeta();
@@ -465,7 +466,8 @@ describe("v2 poll queries", () => {
     expect(meta.values.get(POLL_ROW_CURSOR_KEY)).toBe(JSON.stringify([at - 3_000, fromA]));
     const second = await pollOnce(sync, meta);
     expect(second.map((s) => s.sessionID)).toEqual(["ses_b"]);
-    expect(meta.values.get(POLL_WATERMARK_KEY)).toBe(String(at - 1_000));
+    // Drained: the watermark moves to the poll's start.
+    expect(meta.values.get(POLL_WATERMARK_KEY)).toBe(String(at));
     expect(meta.values.get(POLL_ROW_CURSOR_KEY)).toBe("");
   });
 
@@ -497,12 +499,13 @@ describe("v2 poll queries", () => {
       pollSessionLimit: 1,
       sessionScanEveryMs: 1e12,
       overlapMs: 5_000,
+      now: () => at,
       yieldBetween: async () => {},
     });
     const meta = memoryMeta();
     meta.set(POLL_WATERMARK_KEY, String(at - 4_000));
     expect(await drain(sync, meta, "turn-ended", ids)).toEqual(ids);
-    expect(Number(meta.values.get(POLL_WATERMARK_KEY))).toBe(at - 1_000);
+    expect(Number(meta.values.get(POLL_WATERMARK_KEY))).toBe(at);
   });
 
   it("never stalls the session scan on equal recency either", async () => {
@@ -593,7 +596,7 @@ describe("v2 poll queries", () => {
     // Not yet committed: a crash before dispatch would re-read the window.
     expect(meta.values.get(POLL_WATERMARK_KEY)).toBe(String(at - 5_000));
     result.commit();
-    expect(meta.values.get(POLL_WATERMARK_KEY)).toBe(String(at - 2_000));
+    expect(meta.values.get(POLL_WATERMARK_KEY)).toBe(String(at));
     // The failed scan's window did not move.
     expect(meta.values.get(SESSION_WATERMARK_KEY)).toBe(String(at - 5_000));
   });
@@ -721,7 +724,7 @@ describe("v2 poll queries", () => {
       events.forEach((event, i) => {
         if (event.startsWith("read")) expect(events[i - 1]).toBe("yield");
       });
-      expect(meta.values.get(POLL_WATERMARK_KEY)).toBe(String(at - 1_000));
+      expect(meta.values.get(POLL_WATERMARK_KEY)).toBe(String(at));
       expect(meta.values.get(POLL_ROW_CURSOR_KEY)).toBe("");
     });
 
@@ -759,7 +762,7 @@ describe("v2 poll queries", () => {
           ["ses_c", "ses_b"],
           ["ses_d"],
         ]);
-        expect(meta.values.get(POLL_WATERMARK_KEY)).toBe(String(at - 1_000));
+        expect(meta.values.get(POLL_WATERMARK_KEY)).toBe(String(at));
         expect(meta.values.get(POLL_ROW_CURSOR_KEY)).toBe("");
       }
     });
@@ -786,7 +789,7 @@ describe("v2 poll queries", () => {
       expect(turnEnded(await pollOnce(sync, meta))).toEqual(ids.slice(0, 4));
       expect(meta.values.get(POLL_WATERMARK_KEY)).toBe(String(at - 5_000));
       expect(turnEnded(await pollOnce(sync, meta))).toEqual(ids.slice(4));
-      expect(meta.values.get(POLL_WATERMARK_KEY)).toBe(String(at - 2_000));
+      expect(meta.values.get(POLL_WATERMARK_KEY)).toBe(String(at));
       expect(meta.values.get(POLL_ROW_CURSOR_KEY)).toBe("");
     });
 
@@ -820,7 +823,42 @@ describe("v2 poll queries", () => {
       expect([...first, ...second]).toContain("ses_late");
     });
 
-    it("moves the watermark to a drained window's position, and keeps it when nothing was read", async () => {
+    it("signals, by the next poll, a row committed at a time it had passed while newer writes arrived", async () => {
+      const at = Date.now();
+      seed(
+        at,
+        ["ses_a", "ses_b", "ses_c", "ses_late", "ses_new"],
+        [
+          ["ses_a", -3_000],
+          ["ses_b", -2_500],
+          ["ses_c", -2_000],
+        ],
+      );
+      let yields = 0;
+      const sync = createV2Sync(reader, {
+        pollPageRows: 2,
+        overlapMs: 5_000,
+        sessionScanEveryMs: 1e12,
+        now: () => at,
+        yieldBetween: bounded(() => {
+          // Before the second page, the first has read past at - 2_800. A row
+          // lands there, and so do writes more than the overlap newer than it.
+          if (++yields !== 2) return;
+          v2db.db.tx(() => {
+            addRow("ses_late", "user", user("late", at - 2_800), at - 2_800);
+            for (const t of [6_000, 7_000, 8_000]) {
+              addRow("ses_new", "user", user("new", at + t), at + t);
+            }
+          });
+        }),
+      });
+      const meta = memoryMeta();
+      meta.set(POLL_WATERMARK_KEY, String(at - 4_000));
+      expect(turnEnded(await pollOnce(sync, meta))).toEqual(["ses_a", "ses_b", "ses_c"]);
+      expect(turnEnded(await pollOnce(sync, meta))).toContain("ses_late");
+    });
+
+    it("moves the watermark to the poll's start once a window drains, whether or not it read a row", async () => {
       const at = Date.now();
       seed(at, ["ses_a"], [["ses_a", -3_000, "msg_a"]]);
       const sync = createV2Sync(reader, {
@@ -834,13 +872,13 @@ describe("v2 poll queries", () => {
       resumed.set(POLL_WATERMARK_KEY, String(at - 5_000));
       resumed.set(POLL_ROW_CURSOR_KEY, JSON.stringify([at - 3_000, "msg_a"]));
       expect(turnEnded(await pollOnce(sync, resumed))).toEqual([]);
-      expect(resumed.values.get(POLL_WATERMARK_KEY)).toBe(String(at - 3_000));
+      expect(resumed.values.get(POLL_WATERMARK_KEY)).toBe(String(at));
       expect(resumed.values.get(POLL_ROW_CURSOR_KEY)).toBe("");
       // A fresh window with nothing past its watermark.
       const fresh = memoryMeta();
       fresh.set(POLL_WATERMARK_KEY, String(at - 2_000));
       expect(turnEnded(await pollOnce(sync, fresh))).toEqual([]);
-      expect(fresh.values.get(POLL_WATERMARK_KEY)).toBe(String(at - 2_000));
+      expect(fresh.values.get(POLL_WATERMARK_KEY)).toBe(String(at));
       expect(fresh.values.get(POLL_ROW_CURSOR_KEY)).toBe("");
     });
 
@@ -868,7 +906,7 @@ describe("v2 poll queries", () => {
       const polls: string[][] = [];
       for (let i = 0; i < 3; i++) polls.push(turnEnded(await pollOnce(sync, meta)));
       expect(polls).toEqual([["ses_a"], ["ses_b"], ["ses_c"]]);
-      expect(meta.values.get(POLL_WATERMARK_KEY)).toBe(String(at - 1_000));
+      expect(meta.values.get(POLL_WATERMARK_KEY)).toBe(String(at));
     });
 
     describe("an older build's position by session", () => {
@@ -896,7 +934,7 @@ describe("v2 poll queries", () => {
         meta.set(POLL_WATERMARK_KEY, String(at - 5_000));
         meta.set(POLL_CURSOR_KEY, JSON.stringify([at - 2_000, "ses_z"]));
         expect(turnEnded(await pollOnce(sync, meta))).toEqual(["ses_a", "ses_b", "ses_c"]);
-        expect(meta.values.get(POLL_WATERMARK_KEY)).toBe(String(at - 1_000));
+        expect(meta.values.get(POLL_WATERMARK_KEY)).toBe(String(at));
         expect(meta.values.get(POLL_CURSOR_KEY)).toBe("");
       });
 
@@ -928,7 +966,7 @@ describe("v2 poll queries", () => {
         expect(turnEnded(await pollOnce(sync, meta))).toEqual(["ses_b"]);
         expect(meta.values.get(POLL_CURSOR_KEY)).toBe("");
         expect(meta.values.get(POLL_ROW_CURSOR_KEY)).toBe("");
-        expect(meta.values.get(POLL_WATERMARK_KEY)).toBe(String(at - 2_000));
+        expect(meta.values.get(POLL_WATERMARK_KEY)).toBe(String(at));
       });
     });
 
@@ -986,6 +1024,41 @@ describe("v2 poll queries", () => {
           expect(new Set(next), `after check ${k}`).toEqual(new Set(["ses_a", "ses_b", "ses_c"]));
         }
       });
+
+      it("ends the poll with no signals when it turns false at the session scan's yield", async () => {
+        const at = Date.now();
+        seed(
+          at,
+          ["ses_a", "ses_b", "ses_c"],
+          [
+            ["ses_a", -900],
+            ["ses_b", -800],
+            ["ses_c", -700],
+            ["ses_a", -600],
+            ["ses_b", -500],
+          ],
+          -1_000,
+        );
+        let alive = true;
+        let yields = 0;
+        const sync = createV2Sync(reader, {
+          pollPageRows: 2,
+          overlapMs: 0,
+          sessionScanEveryMs: 0,
+          now: () => at,
+          // The message window's three pages of two yield first; the fourth
+          // yield is the session scan's.
+          yieldBetween: bounded(() => {
+            if (++yields === 4) alive = false;
+          }),
+        });
+        const meta = memoryMeta();
+        meta.set(POLL_WATERMARK_KEY, String(at - 5_000));
+        meta.set(SESSION_WATERMARK_KEY, String(at - 5_000));
+        const result = await sync.poll(meta, () => alive);
+        expect(yields).toBe(4);
+        expect(result.signals).toEqual([]);
+      });
     });
 
     describe("at the default page size and session limit", () => {
@@ -1008,7 +1081,7 @@ describe("v2 poll queries", () => {
         return ids;
       }
 
-      it("signals 500 sessions in one poll, once each, with the watermark at the newest row", async () => {
+      it("signals 500 sessions in one poll, once each, with the watermark at the poll's start", async () => {
         const at = Date.now();
         // Each session's rows spread over both 2,000-row pages of the window.
         many(at, 500, (s, round) => -10_000 + round * 500 + s);
@@ -1037,9 +1110,7 @@ describe("v2 poll queries", () => {
         expect(new Set(signals).size).toBe(signals.length);
         expect([...signals].sort()).toEqual(grouped.map((row) => String(row.session_id)).sort());
         expect(signals).toHaveLength(500);
-        expect(meta.values.get(POLL_WATERMARK_KEY)).toBe(
-          String(Math.max(...grouped.map((row) => Number(row.t)))),
-        );
+        expect(meta.values.get(POLL_WATERMARK_KEY)).toBe(String(at));
         expect(meta.values.get(POLL_ROW_CURSOR_KEY)).toBe("");
         expect(limits).toEqual([2_000, 2_000]);
       });
@@ -1059,7 +1130,7 @@ describe("v2 poll queries", () => {
         expect(turnEnded(await pollOnce(sync, meta))).toEqual(ids.slice(0, 500));
         expect(meta.values.get(POLL_WATERMARK_KEY)).toBe(String(at - 20_000));
         expect(turnEnded(await pollOnce(sync, meta))).toEqual([ids[500]]);
-        expect(meta.values.get(POLL_WATERMARK_KEY)).toBe(String(at - 10_000 + 500 * 4 + 3));
+        expect(meta.values.get(POLL_WATERMARK_KEY)).toBe(String(at));
         expect(meta.values.get(POLL_ROW_CURSOR_KEY)).toBe("");
       });
     });

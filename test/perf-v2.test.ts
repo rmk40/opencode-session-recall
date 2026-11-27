@@ -33,8 +33,9 @@
  * work than the search, and bounds how much the pass slows the search. Two
  * more bound what grows with history: the CPU of one page read of a
  * 35,000-message session, newest, oldest and from its middle, at 10 ms with
- * automatic indexes on and off; and the slices of a poll over 200,000
- * messages written since its watermark, after 600,000 older ones, at 35 ms.
+ * automatic indexes on and off; and the slices of the polls that drain
+ * 200,000 messages written since their watermark, after 600,000 older ones,
+ * at 35 ms.
  *
  * Every gate asserts its longest slice with V8's garbage-collection pauses
  * taken out (`…MaxSliceMs`) and logs the raw stall (`…MaxStallMs`) and the
@@ -1896,7 +1897,7 @@ describe.skipIf(!ENABLED)("perf: v2 event-loop stalls", () => {
     }
   }, 300_000);
 
-  it(`a poll over ${POLL_MESSAGES} new messages after ${POLL_OLDER_MESSAGES} older ones keeps each code slice under ${POLL_SLICE_BUDGET_MS} ms excluding GC pauses`, async () => {
+  it(`the polls that drain ${POLL_MESSAGES} new messages after ${POLL_OLDER_MESSAGES} older ones keep each code slice under ${POLL_SLICE_BUDGET_MS} ms excluding GC pauses`, async () => {
     const v2 = await makeV2Db();
     v2.db.exec("PRAGMA synchronous = OFF");
     const slow = slowLog();
@@ -1966,15 +1967,26 @@ describe.skipIf(!ENABLED)("perf: v2 event-loop stalls", () => {
       const results: Record<string, number> = {};
       const probe = stallProbe();
       const load = loadAverage();
+      const signaled = new Set<string>();
       try {
+        // A poll reads at most ten pages, so the window drains over several
+        // polls, each going on from where the last one stopped.
         probe.reset();
         const start = performance.now();
-        const polled = await sync.poll(meta);
+        let polls = 0;
+        let failures = 0;
+        do {
+          if (++polls > POLL_MESSAGES / 1_000) throw new Error("the window never drained");
+          const polled = await sync.poll(meta);
+          polled.commit();
+          failures += polled.failures.length;
+          for (const signal of polled.signals) signaled.add(signal.sessionID);
+        } while (values.get(POLL_ROW_CURSOR_KEY) !== "");
         results.pollTotalMs = performance.now() - start;
         Object.assign(results, stallFields("poll", await probe.stalls()));
-        polled.commit();
-        results.signals = polled.signals.length;
-        results.failures = polled.failures.length;
+        results.polls = polls;
+        results.sessions = signaled.size;
+        results.failures = failures;
         results.statements = statements;
       } finally {
         probe.stop();
@@ -1985,10 +1997,11 @@ describe.skipIf(!ENABLED)("perf: v2 event-loop stalls", () => {
       console.log("slowest synchronous calls:", JSON.stringify(slow.top(4)));
 
       expect(results.failures).toBe(0);
-      // Every session, once, and the window drained to its newest row.
-      expect(results.signals).toBe(POLL_SESSIONS);
-      expect(values.get(POLL_WATERMARK_KEY)).toBe(String(newest));
-      expect(values.get(POLL_ROW_CURSOR_KEY)).toBe("");
+      // Every session, and the window drained to the polls' start.
+      expect(results.sessions).toBe(POLL_SESSIONS);
+      expect(newest).toBeLessThanOrEqual(at);
+      expect(values.get(POLL_WATERMARK_KEY)).toBe(String(at));
+      expect(results.polls).toBe(POLL_MESSAGES / 20_000 + 1);
       expect(results.statements).toBeGreaterThanOrEqual(POLL_MESSAGES / 2_000);
       expect(results.pollMaxSliceMs).toBeLessThan(POLL_SLICE_BUDGET_MS);
     } finally {
