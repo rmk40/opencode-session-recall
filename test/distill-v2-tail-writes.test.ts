@@ -27,7 +27,9 @@ import {
  * a real opencode 2.4-shaped database: which reads re-read only the tail past
  * its settled boundary and which fall back to a full read, the settled base
  * full and append writes record, the checkpoint a read whose tail moved
- * keeps, and the range hashes writes over a running tail take. No poll runs
+ * keeps, and the range hashes writes over a running tail take; and how a
+ * full write treats the stored rows it reads before its transaction when a
+ * write lands or the lease moves while it reads them. No poll runs
  * unless a test starts one: each step signals the distiller itself. Every
  * history statement goes through the LIMIT spy.
  */
@@ -217,6 +219,8 @@ type StartOptions = {
   wrapSource?: (inner: HistorySource) => HistorySource;
   /** Runs before each tail write reaches the store. */
   beforeTail?: () => void;
+  /** The distiller's yield (`yieldBetween`); none by default. */
+  pause?: () => Promise<void>;
 };
 
 type Started = {
@@ -290,7 +294,7 @@ function start(o: StartOptions = {}): Started {
     sync: o.wrapSync ? o.wrapSync(countedSync) : countedSync,
     projectorGen: GEN,
     idleDebounceMs: 1,
-    yieldBetween: noYield,
+    yieldBetween: o.pause ?? noYield,
     log: (message) => logs.push(message),
     ...(o.pageMessages !== undefined && { pageMessages: o.pageMessages }),
     ...(o.appendThresholdParts !== undefined && { appendThresholdParts: o.appendThresholdParts }),
@@ -694,4 +698,97 @@ describe("v2 range hashes over a running tail", () => {
     expect(rangeSweeps(checker.logs)[0]).toEqual({ ranges: 2, changed: 0 });
     expect(checker.logs.filter((line) => line.includes("re-indexing"))).toEqual([]);
   });
+});
+
+// ── Full writes over stored rows ─────────────────────────────────────────────
+
+describe("v2 full writes over stored rows", () => {
+  /** A session of `count` settled user rows, written once by `h`; the
+   *  stored rows are read in pages of 500 before a later full write. */
+  async function written(count: number) {
+    addSession("ses_a");
+    v2db.db.tx(() => {
+      for (let i = 0; i < count; i++) addUser("ses_a", `filler${i} common`);
+    });
+    /** Runs at the distiller's first yield after the stored rows' first
+     *  page is read. */
+    let atPage: (() => void) | undefined;
+    let pageRead = false;
+    const sessionRows = store.sessionRows.bind(store);
+    store.sessionRows = (id, offset, limit) => {
+      if (offset === 0) pageRead = true;
+      return sessionRows(id, offset, limit);
+    };
+    const h = start({
+      pause: async () => {
+        if (!pageRead || !atPage) return;
+        const run = atPage;
+        atPage = undefined;
+        run();
+      },
+    });
+    await redistill(h, "ses_a");
+    // One message changes, and a full read follows.
+    v2db.db.run("UPDATE session_message SET data = ? WHERE id = ?", [
+      JSON.stringify({ text: "changedword common", time: { created: T0 + 3 } }),
+      "msg_ses_a_3",
+    ]);
+    return {
+      h,
+      between: (run: () => void) => {
+        pageRead = false;
+        atPage = run;
+      },
+    };
+  }
+
+  it("write again against the rows stored now when a write lands while they are read", async () => {
+    const { h, between } = await written(600);
+    let raced = false;
+    between(() => {
+      raced = true;
+      // A write that changes the rows the full write is reading: the rows
+      // after the first page move into it, so as many rows are read as are
+      // stored, and one holds new text.
+      const rows = store.sessionRows("ses_a", 0, 2_000).slice(100);
+      rows[300] = { ...rows[300]!, raw: "racedword", norm: "racedword" };
+      store.replaceSessionParts("ses_a", rows, store.getCard("ses_a")!);
+    });
+    const writes = await redistill(h, "ses_a", "removal", (w) => w.length >= 2);
+    expect(raced).toBe(true);
+    expect(writes).toEqual([
+      { method: "replaceSessionParts", result: { changed: false, refused: "base-changed" } },
+      { method: "replaceSessionParts", result: { changed: true } },
+    ]);
+    expect(storedText("ses_a")).toHaveLength(600);
+    expect(hits("changedword")).toEqual(["ses_a"]);
+    expect(hits("racedword")).toEqual([]);
+    storeDb.run("INSERT INTO part_fts(part_fts, rank) VALUES('integrity-check', 1)");
+    // The rows stored are those the read derives: reading again writes
+    // nothing.
+    expect(await redistill(h, "ses_a", "removal")).toEqual([
+      { method: "replaceSessionParts", result: { changed: false } },
+    ]);
+  }, 20_000);
+
+  it("write nothing when the lease moves while the stored rows are read", async () => {
+    const { h, between } = await written(600);
+    const before = store.getCard("ses_a");
+    let stolen = false;
+    between(() => {
+      stolen = true;
+      store.setMeta(
+        "distill_lease",
+        JSON.stringify({ holder: "rival", heartbeat: Date.now(), ttl: 30_000, build: "x", gen: 1 }),
+      );
+    });
+    const from = h.writes.length;
+    h.distiller.onEvent({ type: "removal", sessionID: "ses_a" });
+    await waitFor(() => stolen);
+    await sleep(50);
+    expect(h.writes.slice(from)).toEqual([]);
+    expect(store.getCard("ses_a")).toEqual(before);
+    expect(hits("changedword")).toEqual([]);
+    store.releaseLease("rival");
+  }, 20_000);
 });
