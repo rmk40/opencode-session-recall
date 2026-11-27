@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -742,6 +742,37 @@ describe("v2 repair sweep", () => {
     expect(store.getCard("ses_a")?.projectorGen).toBe(GEN);
     expect(store.getMeta(REPAIR_GEN_KEY)).toBe(String(GEN));
     expect(h.distiller.repair()?.sweep).toMatchObject({ pending: 0, repairPending: 0, done: 1 });
+  });
+
+  it("counts repair-pending cards for its progress from the store's count of them, never whole-table stats", async () => {
+    addSession("ses_a", { time_updated: T0 + 200 });
+    addUser("ses_a", "a prompt");
+    addSession("ses_b", { time_updated: T0 + 100 });
+    addUser("ses_b", "b prompt");
+    await built();
+    store.markRepairPending("ses_a", "an earlier failure");
+    store.setMeta(REPAIR_GEN_KEY, String(GEN));
+    store.setMeta(REPAIR_PROGRESS_KEY, "");
+    const counted = vi.spyOn(store, "repairPendingCount");
+    const wholeTable = vi.spyOn(store, "cardStats");
+
+    // Nothing stale: the sweep only reports.
+    let h = startDistiller();
+    await waitFor(() => h.distiller.repair()?.sweep?.running === false);
+    expect(h.distiller.repair()?.sweep).toMatchObject({ pending: 0, repairPending: 1, done: 0 });
+    await h.distiller.stop();
+
+    // A stale card: the running sweep's progress carries the count too.
+    makeStale(["ses_b"]);
+    store.setMeta(REPAIR_PROGRESS_KEY, "");
+    h = startDistiller();
+    await waitFor(
+      () =>
+        h.distiller.repair()?.sweep?.done === 1 && h.distiller.repair()?.sweep?.running === false,
+    );
+    expect(h.distiller.repair()?.sweep).toMatchObject({ pending: 0, repairPending: 1, done: 1 });
+    expect(counted).toHaveBeenCalled();
+    expect(wholeTable).not.toHaveBeenCalled();
   });
 });
 

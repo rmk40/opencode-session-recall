@@ -2,16 +2,21 @@ import { afterAll, describe, expect, it } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { openSqlite, type Row, type SqliteDb } from "../src/sqlite.js";
+import { openSqlite, type Row, type SqliteDb, type SqlValue } from "../src/sqlite.js";
 import {
   appendedRows,
   boundWeakAnchors,
   buildMatch,
+  CARDS_DELETED_KEY,
+  CARDS_REV_KEY,
+  CARDS_STAMPED_KEY,
   openStore,
   pluginBuild,
+  VECTORS_REV_KEY,
   WEAK_MATCH_ROWS,
   type AppendLayout,
   type Card,
+  type CardCounters,
   type FtsHit,
   type PartTextRow,
   type RangeHash,
@@ -219,6 +224,58 @@ function snapshot(db: SqliteDb): unknown {
     schema: db.all("SELECT type, name, sql FROM sqlite_master ORDER BY type, name"),
     cards: db.all("SELECT session_id FROM card ORDER BY session_id"),
     parts: db.get("SELECT COUNT(*) AS n FROM part_text"),
+  };
+}
+
+/** Whether the file holds `card_repair_pending`, the index behind
+ *  {@link Store.repairPendingCount}. */
+function hasRepairIndex(db: SqliteDb): boolean {
+  return (
+    db.get("SELECT name FROM sqlite_master WHERE type='index' AND name='card_repair_pending'") !==
+    undefined
+  );
+}
+
+/** Drop the repair-pending index from the store at `path`, as a build that
+ *  does not know it leaves the file. Throws when the index is not there. */
+async function dropRepairIndex(path: string): Promise<void> {
+  const db = await openSqlite(path);
+  if (!db) throw new Error("open failed");
+  db.exec("DROP INDEX card_repair_pending");
+  db.close();
+}
+
+/** A connection that records every read statement (`get` and `all`) and runs
+ *  `afterRead`, once, right after the next one returns. */
+function watchReads(db: SqliteDb): {
+  db: SqliteDb;
+  reads: Array<{ sql: string; params?: SqlValue[] }>;
+  afterNextRead: (fn: () => void) => void;
+} {
+  const reads: Array<{ sql: string; params?: SqlValue[] }> = [];
+  let pending: (() => void) | undefined;
+  const after = <T>(result: T): T => {
+    const run = pending;
+    pending = undefined;
+    run?.();
+    return result;
+  };
+  return {
+    reads,
+    afterNextRead: (fn) => {
+      pending = fn;
+    },
+    db: {
+      ...db,
+      get(sql, params) {
+        reads.push({ sql, params });
+        return after(db.get(sql, params));
+      },
+      all(sql, params) {
+        reads.push({ sql, params });
+        return after(db.all(sql, params));
+      },
+    },
   };
 }
 
@@ -1173,6 +1230,106 @@ describe("store migration", () => {
     expect(store.getMeta("schema_version")).toBe("5");
     expect(store.getCard("R")?.familyRollup).toEqual(V4_ROLLUP);
     retry.close();
+  });
+});
+
+describe("the repair-pending index across opens", () => {
+  it.each<{
+    name: string;
+    identity: StoreIdentity;
+    build?: (path: string) => Promise<void>;
+    cards: number;
+  }>([
+    { name: "a new file", identity: V1, cards: 0 },
+    {
+      name: "a v4 store it migrates",
+      identity: V1,
+      build: (path) => buildV4Store(path, V1),
+      cards: 2,
+    },
+    {
+      name: "a current store without it",
+      identity: v2("/data/opencode.db"),
+      build: async (path) => {
+        await buildCurrentStore(path, v2("/data/opencode.db"));
+        await dropRepairIndex(path);
+      },
+      cards: 1,
+    },
+  ])(
+    "an open creates it on $name, keeping the cards and the schema version",
+    async ({ identity, build, cards }) => {
+      const path = freshDbPath();
+      await build?.(path);
+      const db = await openSqlite(path);
+      if (!db) throw new Error("open failed");
+      const opened = openStore(db, identity);
+      if (!opened.ok) throw new Error(opened.reason);
+      expect(hasRepairIndex(db)).toBe(true);
+      expect(opened.store.getMeta("schema_version")).toBe("5");
+      expect(opened.store.allCards()).toHaveLength(cards);
+      db.close();
+    },
+  );
+
+  it.each<{ reason: StoreRefusal; owner: StoreIdentity; opener: StoreIdentity; edit?: string }>([
+    {
+      reason: "newer",
+      owner: V1,
+      opener: V1,
+      edit: "UPDATE meta SET value='6' WHERE key='schema_version'",
+    },
+    { reason: "host-mismatch", owner: V1, opener: v2("/data/opencode.db") },
+    {
+      reason: "source-mismatch",
+      owner: v2("/data/a/opencode.db"),
+      opener: v2("/data/b/opencode.db"),
+    },
+  ])(
+    "a $reason refusal leaves a store without it as it was",
+    async ({ reason, owner, opener, edit }) => {
+      const path = freshDbPath();
+      await buildCurrentStore(path, owner);
+      await dropRepairIndex(path);
+      if (edit) {
+        const raw = await openSqlite(path);
+        if (!raw) throw new Error("reopen failed");
+        raw.run(edit);
+        raw.close();
+      }
+      await expectRefusal(path, opener, reason);
+      const db = await openSqlite(path);
+      if (!db) throw new Error("reopen failed");
+      expect(hasRepairIndex(db)).toBe(false);
+      db.close();
+    },
+  );
+
+  it("an existingOnly open takes a current store without it as it is, and still counts repair-pending cards", async () => {
+    const path = freshDbPath();
+    const identity = v2("/data/opencode.db");
+    const seed = await openSqlite(path);
+    if (!seed) throw new Error("open failed");
+    const seeded = openStore(seed, identity);
+    if (!seeded.ok) throw new Error(seeded.reason);
+    for (const id of ["s1", "s2"]) seeded.store.replaceSessionParts(id, [], makeCard(id));
+    seeded.store.markRepairPending("s1", "malformed");
+    seed.close();
+    await dropRepairIndex(path);
+    const probe = await openSqlite(path);
+    if (!probe) throw new Error("probe open failed");
+    const before = snapshot(probe);
+    probe.close();
+
+    const db = await openSqlite(path);
+    if (!db) throw new Error("reopen failed");
+    const opened = openStore(db, identity, { existingOnly: true });
+    if (!opened.ok) throw new Error(opened.reason);
+    expect(opened.store.repairPendingCount()).toBe(1);
+    expect(hasRepairIndex(db)).toBe(false);
+    expect(db.get("SELECT total_changes() AS n")?.n).toBe(0);
+    expect(snapshot(db)).toEqual(before);
+    db.close();
   });
 });
 
@@ -4394,6 +4551,169 @@ describe("change listing and stats", () => {
       vectorsRev: 1,
     });
     db.close();
+  });
+
+  it("cardCounters reads the counters cardStats reports, unset ones as zero, an older build's revisions included", async () => {
+    const { db, store } = await fresh();
+    const statsCounters = (): CardCounters => {
+      const { cardsRev, cardsStamped, cardsDeleted, vectorsRev } = store.cardStats();
+      return { cardsRev, cardsStamped, cardsDeleted, vectorsRev };
+    };
+    expect(store.cardCounters()).toEqual({
+      cardsRev: 0,
+      cardsStamped: 0,
+      cardsDeleted: 0,
+      vectorsRev: 0,
+    });
+    store.replaceSessionParts("s1", [], makeCard("s1"));
+    store.replaceSessionParts("gone", [], makeCard("gone"));
+    store.deleteSession("gone");
+    embed(store, "s1");
+    expect(store.cardCounters()).toEqual({
+      cardsRev: 3,
+      cardsStamped: 3,
+      cardsDeleted: 1,
+      vectorsRev: 1,
+    });
+    expect(store.cardCounters()).toEqual(statsCounters());
+
+    // An older build bumps cards_rev alone: each of its writes widens the gap
+    // to cards_stamped, and a stamped write between them leaves it as it is.
+    const olderWrite = (): void =>
+      store.setMeta(CARDS_REV_KEY, String(store.cardCounters().cardsRev + 1));
+    olderWrite();
+    store.patchCardMeta("s1", { title: "Stamped" });
+    olderWrite();
+    expect(store.cardCounters()).toEqual({
+      cardsRev: 6,
+      cardsStamped: 4,
+      cardsDeleted: 1,
+      vectorsRev: 1,
+    });
+    expect(store.cardCounters()).toEqual(statsCounters());
+    db.close();
+  });
+
+  it("cardCounters reads every counter at one moment while another connection writes", async () => {
+    const path = freshDbPath();
+    const raw = await openSqlite(path);
+    if (!raw) throw new Error("open failed");
+    const watched = watchReads(raw);
+    const store = openV1Store(watched.db);
+    if (!store) throw new Error("openStore returned null");
+    store.replaceSessionParts("s1", [], makeCard("s1"));
+    store.replaceSessionParts("gone", [], makeCard("gone"));
+    store.deleteSession("gone");
+    embed(store, "s1");
+    const other = await openSqlite(path);
+    if (!other) throw new Error("second open failed");
+    /** Another process moves every counter on by 10. */
+    const writeElsewhere = (): void => {
+      other.run("UPDATE meta SET value = CAST(value AS INTEGER) + 10 WHERE key IN (?, ?, ?, ?)", [
+        CARDS_REV_KEY,
+        CARDS_STAMPED_KEY,
+        CARDS_DELETED_KEY,
+        VECTORS_REV_KEY,
+      ]);
+    };
+    const before = store.cardCounters();
+
+    watched.afterNextRead(writeElsewhere);
+    expect(store.cardCounters()).toEqual(before);
+    const moved: CardCounters = {
+      cardsRev: before.cardsRev + 10,
+      cardsStamped: before.cardsStamped + 10,
+      cardsDeleted: before.cardsDeleted + 10,
+      vectorsRev: before.vectorsRev + 10,
+    };
+    expect(store.cardCounters()).toEqual(moved);
+
+    // Two separate reads straddle the same write.
+    watched.afterNextRead(writeElsewhere);
+    const rev = Number(store.getMeta(CARDS_REV_KEY));
+    const stamped = Number(store.getMeta(CARDS_STAMPED_KEY));
+    expect([rev, stamped]).toEqual([moved.cardsRev, moved.cardsStamped + 10]);
+    other.close();
+    raw.close();
+  });
+
+  it.each([
+    { name: "with its index", dropIndex: false },
+    {
+      name: "without its index, as a build that does not know it leaves the file",
+      dropIndex: true,
+    },
+  ])(
+    "repairPendingCount counts the cards with a repair reason $name, however the reason is set or cleared",
+    async ({ dropIndex }) => {
+      const { db, store } = await fresh();
+      for (const id of ["s1", "s2", "s3", "s4"]) store.replaceSessionParts(id, [], makeCard(id));
+      if (dropIndex) db.exec("DROP INDEX card_repair_pending");
+      const steps: Array<{ name: string; act: () => unknown; pending: number }> = [
+        { name: "no reason yet", act: () => undefined, pending: 0 },
+        {
+          name: "two marked",
+          act: () => {
+            store.markRepairPending("s1", "malformed");
+            store.markRepairPending("s2", "missing");
+          },
+          pending: 2,
+        },
+        {
+          name: "a raw update sets one",
+          act: () => db.run("UPDATE card SET repair_reason = 'lost' WHERE session_id = 's3'"),
+          pending: 3,
+        },
+        {
+          name: "a marked card marked again",
+          act: () => store.markRepairPending("s1", "malformed again"),
+          pending: 3,
+        },
+        {
+          name: "a raw update clears one",
+          act: () => db.run("UPDATE card SET repair_reason = NULL WHERE session_id = 's2'"),
+          pending: 2,
+        },
+        {
+          name: "a replace clears one",
+          act: () => store.replaceSessionParts("s3", [], makeCard("s3", { title: "Rebuilt" })),
+          pending: 1,
+        },
+        {
+          name: "a marked card deleted",
+          act: () => {
+            store.markRepairPending("s4", "malformed");
+            store.deleteSession("s4");
+          },
+          pending: 1,
+        },
+        { name: "every reason cleared", act: () => store.clearRepairReasons(), pending: 0 },
+      ];
+      for (const step of steps) {
+        step.act();
+        expect(store.repairPendingCount(), step.name).toBe(step.pending);
+        expect(store.cardStats().repairPending, step.name).toBe(step.pending);
+      }
+      expect(hasRepairIndex(db)).toBe(!dropIndex);
+      db.close();
+    },
+  );
+
+  it("repairPendingCount reads the index over cards with a repair reason, not the card table", async () => {
+    const raw = await openSqlite(freshDbPath());
+    if (!raw) throw new Error("open failed");
+    const watched = watchReads(raw);
+    const store = openV1Store(watched.db);
+    if (!store) throw new Error("openStore returned null");
+    for (const id of ["s1", "s2", "s3"]) store.replaceSessionParts(id, [], makeCard(id));
+    store.markRepairPending("s2", "malformed");
+    watched.reads.length = 0;
+    expect(store.repairPendingCount()).toBe(1);
+    expect(watched.reads).toHaveLength(1);
+    const [{ sql, params }] = watched.reads as [{ sql: string; params?: SqlValue[] }];
+    const plan = raw.all(`EXPLAIN QUERY PLAN ${sql}`, params).map((row) => String(row.detail));
+    expect(plan).toEqual([expect.stringMatching(/ USING (COVERING )?INDEX card_repair_pending\b/)]);
+    raw.close();
   });
 
   it("spaceStats reports the file's pages and the free pages a delete leaves", async () => {

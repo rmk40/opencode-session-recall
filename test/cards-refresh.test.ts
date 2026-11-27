@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { openSqlite } from "../src/sqlite.js";
+import { openSqlite, type SqliteDb } from "../src/sqlite.js";
 import {
   CARDS_DELETED_KEY,
   CARDS_REV_KEY,
@@ -36,6 +36,32 @@ async function freshStore(): Promise<Store> {
   const store = openV1Store(db);
   if (!store) throw new Error("openStore returned null");
   return store;
+}
+
+/** A fresh store whose connection records the SQL of every read it makes. */
+async function recordedStore(): Promise<{ store: Store; statements: string[] }> {
+  const db = await openSqlite(":memory:");
+  if (!db) throw new Error("openSqlite returned null");
+  const statements: string[] = [];
+  const recorded: SqliteDb = {
+    ...db,
+    get(sql, params) {
+      statements.push(sql);
+      return db.get(sql, params);
+    },
+    all(sql, params) {
+      statements.push(sql);
+      return db.all(sql, params);
+    },
+  };
+  const store = openV1Store(recorded);
+  if (!store) throw new Error("openStore returned null");
+  return { store, statements };
+}
+
+/** Bump `cards_rev` without stamping anything, as an older build's write does. */
+function olderBump(store: Store): void {
+  store.setMeta(CARDS_REV_KEY, String(Number(store.getMeta(CARDS_REV_KEY) ?? 0) + 1));
 }
 
 function makeCard(sessionId: string, over: Partial<Card> = {}): Card {
@@ -236,6 +262,58 @@ describe("card map refresh from a store", () => {
     await runtime.ready();
     expect(ids(runtime.list({})).sort()).toEqual(["s-quiet", "s1", "s2"]);
     expect(reads.fullLoads).toBe(2);
+  });
+
+  it("reloads every card after each write an older build counts without stamping, and applies stamped writes between them in place", async () => {
+    const store = await freshStore();
+    put(store, "s1");
+    put(store, "s2");
+    const { source, reads } = countedSource(store);
+    const runtime = createCardsRuntime({ source, refreshIntervalMs: 0 });
+    await runtime.ready();
+
+    store.upsertCard(makeCard("s1", { title: "Older" }));
+    olderBump(store);
+    await runtime.ready();
+    expect(runtime.get("s1")?.title).toBe("Older");
+    expect(reads.fullLoads).toBe(2);
+
+    // The gap that write left between cards_rev and cards_stamped stays open.
+    put(store, "s2", { title: "Stamped" });
+    await runtime.ready();
+    expect(runtime.get("s2")?.title).toBe("Stamped");
+    expect(reads.fullLoads).toBe(2);
+
+    store.upsertCard(makeCard("s2", { title: "Older again" }));
+    olderBump(store);
+    await runtime.ready();
+    expect(runtime.get("s2")?.title).toBe("Older again");
+    expect(reads.fullLoads).toBe(3);
+    const counters = store.cardCounters();
+    expect(counters.cardsRev - counters.cardsStamped).toBe(2);
+  });
+
+  it("checks the store for changes without reading a card or whole-table counts, and counts coverage from its map", async () => {
+    const { store, statements } = await recordedStore();
+    put(store, "s1");
+    put(store, "s2", { distillState: "metadata" });
+    const wholeTable = vi.spyOn(store, "cardStats");
+    const runtime = createCardsRuntime({ source: storeCardSource(store), refreshIntervalMs: 0 });
+    await runtime.ready();
+    // A card written without moving any counter: only the store has it.
+    store.upsertCard(makeCard("s-quiet"));
+
+    statements.length = 0;
+    await runtime.ready();
+    expect(runtime.coverage()).toMatchObject({ totalCards: 2, fullCards: 1 });
+    expect(statements.length).toBeGreaterThan(0);
+    expect(statements.filter((sql) => /\bcard\b/i.test(sql))).toEqual([]);
+
+    // A full reload takes it in, and coverage follows the new map.
+    olderBump(store);
+    await runtime.ready();
+    expect(runtime.coverage()).toMatchObject({ totalCards: 3, fullCards: 2 });
+    expect(wholeTable).not.toHaveBeenCalled();
   });
 
   it("reads the store's card ids only when a refresh finds a deletion", async () => {

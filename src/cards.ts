@@ -5,7 +5,7 @@ import {
   VECTORS_REV_KEY,
   type Card,
   type CardEmbeddingWrite,
-  type CardStats,
+  type CardCounters,
   type CardVectorRow,
   type Store,
 } from "./store.js";
@@ -250,8 +250,11 @@ export type SemanticStatus = {
  * {@link storeCardSource}).
  */
 export type CardStoreReads = {
-  /** Card counts and the revision counters, read in one statement. */
-  stats: () => CardStats;
+  /** The revision counters, read in one statement that touches no card
+   *  ({@link Store.cardCounters}). Read at every refresh check, so it must
+   *  stay as cheap however many cards the store holds. Counts the runtime
+   *  reports come from its own card map. */
+  stats: () => CardCounters;
   /** Cards stamped after revision `rev`, oldest first ({@link Store.cardsSince}). */
   cardsSince: (rev: number, limit: number, opts?: { withEmbeddings?: boolean }) => Card[];
   /** Every card's session id. */
@@ -609,7 +612,7 @@ export function storeCardSource(store: Store): CardSource {
     semanticModel: () => store.getMeta(SEMANTIC_MODEL_KEY),
     writeEmbeddings: (model, gen, rows) => store.writeCardEmbeddings(model, gen, rows),
     store: {
-      stats: () => store.cardStats(),
+      stats: () => store.cardCounters(),
       cardsSince: (rev, limit, opts) => store.cardsSince(rev, limit, opts),
       cardIds: () => store.cardSessionIds(),
       cardsPage: (after, limit, opts) => store.cardsPage(after, limit, opts),
@@ -653,7 +656,7 @@ export function createCardsRuntime(deps: CardsRuntimeDeps): CardsRuntime {
   let metaWantHard = 0;
   let lastCheck = -Infinity;
   /** Store counters as of the last applied refresh (store-backed sources). */
-  let counters: CardStats | undefined;
+  let counters: CardCounters | undefined;
   /** Highest `writeRev` applied; `cardsSince` resumes after it. */
   let appliedRev = 0;
   /** `revision()` as of the last load (sources without store reads). */
@@ -842,7 +845,7 @@ export function createCardsRuntime(deps: CardsRuntimeDeps): CardsRuntime {
    * slice, then drop deleted cards when the store counted a deletion, and
    * record `stats` (sampled before the reads) as the applied counters.
    */
-  function* applySteps(store: CardStoreReads, stats: CardStats): Generator<void, void> {
+  function* applySteps(store: CardStoreReads, stats: CardCounters): Generator<void, void> {
     const loadedAt = metaInstalledAt;
     for (;;) {
       const read = stampedRead(() => store.cardsSince(appliedRev, LOAD_PAGE, cardOpts));
@@ -873,7 +876,7 @@ export function createCardsRuntime(deps: CardsRuntimeDeps): CardsRuntime {
   type MetaPlan =
     | { kind: "fresh" }
     | { kind: "load"; hard: boolean }
-    | { kind: "apply"; store: CardStoreReads; stats: CardStats; revisions: number };
+    | { kind: "apply"; store: CardStoreReads; stats: CardCounters; revisions: number };
 
   /**
    * What the map needs before it serves. A full load when it was never
