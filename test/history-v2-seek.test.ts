@@ -84,12 +84,13 @@ describe("v2 seekPage", () => {
     // A message created exactly at the bound starts the walk.
     expect(await firstPage(source, "ses_a", 7_000)).toEqual(["ses_a-7", "ses_a-6", "ses_a-5"]);
 
-    // Three bounded statements for five later rows: the creation-time index,
-    // the newest row and one range over seqs 6 to 10. None reads row data.
+    // Two bounded statements: the creation-time index, which holds all five
+    // rows at or before the bound in one page, and the newest row. None reads
+    // row data.
     spy.statements.length = 0;
     await source.seekPage!({ sessionID: "ses_a", until: 5_500 });
     const reads = spy.statements.filter((sql) => /\bsession_message\b/.test(sql));
-    expect(reads).toHaveLength(3);
+    expect(reads).toHaveLength(2);
     for (const sql of reads) expect(sql).not.toMatch(/\bdata\b/);
   });
 
@@ -185,8 +186,9 @@ describe("v2 seekPage", () => {
         yields++;
       },
     });
-    // Later rows (whose range read is a third statement), the newest row,
-    // and nothing at or before the bound.
+    // Later rows, the newest row, and nothing at or before the bound. The
+    // creation-time index holds every row at or before each bound in one
+    // page, so no range read runs.
     const counts: Array<{ yields: number; reads: number }> = [];
     for (const until of [2_500, 4_000, 500]) {
       yields = 0;
@@ -196,7 +198,7 @@ describe("v2 seekPage", () => {
       counts.push({ yields, reads });
     }
     expect(counts).toEqual([
-      { yields: 3, reads: 3 },
+      { yields: 2, reads: 2 },
       { yields: 2, reads: 2 },
       { yields: 1, reads: 1 },
     ]);
@@ -228,23 +230,55 @@ describe("v2 seekPage over creation times out of row order", () => {
     expect(await firstPage(source, "ses_a", 3_000)).toEqual(["ses_a-17", "ses_a-16", "ses_a-15"]);
   });
 
-  it("walks a long run of later rows a range at a time, without reading row data", async () => {
+  it("walks the later rows a range at a time when more rows came before the bound, without reading row data", async () => {
+    // 6,000 rows at or before the bound and 3,000 after it: two range reads
+    // reach the highest seq the creation-time pages found before those pages
+    // could read every earlier row.
     const t = await fresh();
     session(t, "ses_a");
     t.db.exec("BEGIN");
-    row(t, "ses_a", 1, 1_000);
-    for (let seq = 2; seq <= 4_501; seq++) row(t, "ses_a", seq, 10_000 + seq);
+    for (let seq = 1; seq <= 6_000; seq++) row(t, "ses_a", seq, seq);
+    for (let seq = 6_001; seq <= 9_000; seq++) row(t, "ses_a", seq, 100_000 + seq);
     t.db.exec("COMMIT");
     const { source, spy } = await open(t);
     spy.statements.length = 0;
-    await source.seekPage!({ sessionID: "ses_a", until: 5_000 });
+    await source.seekPage!({ sessionID: "ses_a", until: 50_000 });
     const reads = spy.statements.filter((sql) => /\bsession_message\b/.test(sql));
-    // The creation-time index, the newest row and three ranges of up to
-    // 2,000 seqs.
+    // A creation-time page, the newest row, a range, a second page and the
+    // range that reaches seq 6,000.
     expect(reads).toHaveLength(5);
     for (const sql of reads) expect(sql).not.toMatch(/\bdata\b/);
-    expect(await firstPage(source, "ses_a", 5_000)).toEqual(["ses_a-1"]);
+    expect(await firstPage(source, "ses_a", 50_000)).toEqual([
+      "ses_a-6000",
+      "ses_a-5999",
+      "ses_a-5998",
+    ]);
   });
+
+  it("finds the start from the creation-time index when far more rows came after the bound", async () => {
+    // A long-running session: its newest row before the bound is seq 4,896
+    // and 60,000 rows follow it, more than the range reads alone may walk.
+    const t = await fresh();
+    session(t, "ses_a");
+    t.db.exec("BEGIN");
+    for (let seq = 1; seq <= 4_896; seq++) row(t, "ses_a", seq, seq);
+    for (let seq = 4_897; seq <= 64_896; seq++) row(t, "ses_a", seq, 100_000 + seq);
+    t.db.exec("COMMIT");
+    const { source, spy } = await open(t);
+    spy.statements.length = 0;
+    const sought = await source.seekPage!({ sessionID: "ses_a", until: 50_000 });
+    expect(sought).toMatchObject({ ok: true, value: expect.any(String) });
+    const reads = spy.statements.filter((sql) => /\bsession_message\b/.test(sql));
+    // Five creation-time pages read every row at or before the bound, with
+    // the newest row and four range reads between them.
+    expect(reads).toHaveLength(10);
+    for (const sql of reads) expect(sql).not.toMatch(/\bdata\b/);
+    expect(await firstPage(source, "ses_a", 50_000)).toEqual([
+      "ses_a-4896",
+      "ses_a-4895",
+      "ses_a-4894",
+    ]);
+  }, 30_000);
 });
 
 describe("v2 seqFloor", () => {
