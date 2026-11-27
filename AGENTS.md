@@ -13,9 +13,9 @@ argument object** straight through. It validates against the Zod schema but
 transform you declared in the schema is **never materialized** in `args`.
 
 Concretely: if the model omits an optional arg, your `execute` sees it as
-`undefined`, not the default. This caused a shipped bug where `recall_messages`
-got `role: undefined`, the filter `if (role !== "all")` ran, matched zero
-messages, and returned `total: 0` on a fully-loaded session.
+`undefined`, not the default. A `recall_messages` that trusted its `role`
+default would get `role: undefined`, run the filter `if (role !== "all")`,
+match zero messages and return `total: 0` on a fully-loaded session.
 
 **Rule: never trust `args.x` to be defaulted/validated. Coerce every optional
 arg defensively at the top of `execute`.** Helpers exist for this:
@@ -208,9 +208,8 @@ reproduce live** rather than theorize:
   literal `node:` import outside `src/sqlite.ts` and `src/node-import.ts`, so
   this instrumentation cannot be committed by accident. Rebuild, restart the
   session, reproduce, then `cat` the file.
-- This is how the defaults bug was nailed: the debug showed `dataLen: 590,
-filteredLen: 0` with `role` absent — proving the SDK returned 590 messages and
-  the filter (not the fetch) dropped them.
+- A line such as `dataLen: 590, filteredLen: 0` with `role` absent proves the
+  SDK returned 590 messages and the filter (not the fetch) dropped them.
 - Remove the instrumentation with `git checkout <file>` before committing.
 
 Don't over-trust a session transcript (`.md` export): it can elide/reformat JSON
@@ -291,8 +290,9 @@ runtime watches it. The store allocates it inside each write's own transaction (
 the next section), so the distiller and the summarizer never bump it themselves.
 `writeCardEmbeddings` bumps `vectors_rev` instead, because vectors are invisible to
 the lexical index, so bumping `cards_rev` for them would churn every reader for
-nothing. Allocate the wrong one, or none, and the reader serves a stale snapshot
-until its time-gated refresh fires.
+nothing. A lexical write that allocates no revision stays invisible to readers. The
+card runtime applies only the cards stamped since its last refresh (see the card
+runtime section below), so it keeps serving the old card until its next full load.
 
 ## Schema 5 card writes account for their own revisions
 
@@ -357,17 +357,110 @@ keeps, which is the aggregates of every message the card has held and the newest
 would need back rows that an earlier write evicted, so the distiller reads in full
 when the store holds exactly the cap (every eviction leaves exactly the cap).
 
+## The card runtime applies store changes in place
+
+`src/cards.ts` keeps two layers per process. The card map (`cardById`) holds every
+card and serves `list`, `get`, `exclusionFamily`, `familyOf`, `coverage` and
+`semanticStatus`. The search index (the MiniSearch index and the card vectors) is
+brought up to date only by `rank()` and `ready({ index: true })`, so a call that
+reads only the map never waits on index work. Both hosts build the card source
+with `storeCardSource(store)`, which adds the reads an incremental refresh needs
+(`cardStats`, `cardsSince`, `cardSessionIds`, `cardsPage`, `cardVectorsPage`). A
+source without them (cards-lite, the static sources in tests) reloads every card
+whenever its revision changes.
+
+The runtime reads the store's counters at most every 5 seconds
+(`REFRESH_INTERVAL_MS`) and picks one of three things to do.
+
+- Nothing, when `cards_rev` and `cards_deleted` have not moved.
+- An apply, which reads the cards stamped after the highest `write_rev` it applied
+  (`cardsSince`, 250 per page) and diffs the card id set when `cards_deleted`
+  moved. An apply of up to 250 revisions runs in place. A larger one runs as a
+  chunked job while the current map serves.
+- A full load, on a cold start, after `invalidate()`, when a counter went
+  backwards (the store was reset or replaced) and when `cards_rev` advanced
+  further than `cards_stamped` (an older build wrote without stamping). It reads
+  `cardsPage` keyset pages of 250 with a macrotask between them. The one
+  exception is a map that was never loaded or was invalidated. A synchronous
+  accessor that reaches it first loads it in place, since nothing may serve
+  before it. `rank()` may then rebuild the index in place too.
+
+Every card the map changes, adds or drops lands in `dirty`. `rank()` applies up to
+64 dirty cards to the index in place (`MAX_SYNC_DOCS`). It removes each old
+document and adds the new one, which keeps document frequencies exact. A card
+whose document did not change costs no index work. More dirty cards are applied
+the same way by a chunked job. More than half the index takes a full build
+instead. Both work in slices of 8 ms (`SLICE_MS`) while `rank()` serves the index
+it has. A card still in `dirty` is scored neither lexically nor semantically.
+`rank()` counts the ones that passed its filters in `RankStats.pending`, which
+`recall` reports as `coverage.cards.pending`. With no index at all `rank()` builds
+one in place on the caller's turn, so an async caller awaits
+`ready({ index: true })` first, as `recall`'s tier-1 branch and the hooks'
+`cardRecall` do. `ready()` waits through at most 8 jobs (`MAX_READY_ROUNDS`), so a
+store that keeps changing cannot hold a caller forever.
+
+The runtime has two job slots. At most one map job (a load or an apply) and one
+index job (a build, an in-place apply or a vector reload) run at a time. The two
+may run side by side. One `tick()` clock orders them. A load or a build installs
+only over state that an older start produced, so a slow build never replaces a
+newer one. A full load records in `dirty` every card whose content changed,
+whether or not an index exists yet. A build that took its snapshot before the load
+then installs with those cards still marked. Any new path that changes the map
+must mark `dirty` the same way, or the index keeps serving the old document.
+
+A stored vector is reused only when three things hold. It was read under this
+process's model stamp with no vector write landing during the read
+(`stampedRead`), its `embedding_gen` is the current `EMBED_REPRESENTATION` and it
+belongs to the card version the map holds. A vector the process computed itself
+is kept until its card's content changes, so a full build or another process's
+model switch embeds nothing that is still current. A foreign `vectors_rev` change
+reloads only the vectors (`vectorReloadSteps`), never the cards. `stampedRead`
+can trust an unmoved `vectors_rev` because `writeCardEmbeddings` bumps it in the
+same transaction as every vector it writes and clears every stored vector before
+it changes the model stamp. **Write a card vector or `meta.semantic_model` only
+through `writeCardEmbeddings`.** A write that set `embedding` without that bump
+would let another process reuse the vector under the wrong model's stamp. A
+lexical write may clear a vector (`embedding = NULL`, as a re-distill or
+`writeSummary` does). Readers learn of the card through its new `write_rev` and
+keep their in-memory vector only while the content it came from is unchanged.
+
+## Distiller write paths stay in short slices
+
+`store.allCards()` reads every row of `card` in one synchronous call. On the perf
+gates' 12,000-card store that call took 80 to 100 ms. On v2 such a call stalls
+every session the shared service runs. **Never call `allCards()` on a path that
+runs per session write.** A child's write or deletion recomputes its root's
+rollup from `store.familyPage(rootId, after, 500)`, which walks the `card_root`
+index a page of rowids at a time and reads only the columns a rollup needs.
+`recomputeRootRollup` pauses between pages and re-checks `stopped` and the lease
+after each pause. One recompute runs per root at a time. A change that arrives
+meanwhile makes it run once more. The full pass after a cold pass pages
+`store.rollupFieldsPage` by session id with the same checks. It skips a root that
+a recompute wrote during the pass and asks a running recompute to run again
+instead of writing over it. `familyPage`'s `next` is a rowid, which `VACUUM` can
+renumber, so a walk assumes no `VACUUM` runs during it (the store runs none). A
+new write path that needs cards beyond the session it writes pages through one of
+these reads, or a keyset read such as `cardsPage`, with a yield between pages.
+
+Concurrent distiller workers (cold-pass workers, repair-sweep workers and
+concurrent re-distills) each yield before a write. Those yields can end in the
+same turn of the event loop, so after each session write (a replace, an append or
+a tail write) the distiller starts a yield (`yieldAfterWrite`) that the next write
+waits for, then re-checks `stopped` and the lease. One slice then holds at most
+one session's write transaction. A new session write path calls
+`yieldAfterWrite()` after its write and waits out `writeYield` before it.
+
 ## Embedding representation changes MUST ride a schema bump
 
 `EMBED_REPRESENTATION` in `embedding-text.ts` is a monotonic integer stamping what a
 persisted card vector _means_: the projection `embeddingTextOf` builds, the model,
 and how vectors are compared. It folds into the vector stamp (`meta.semantic_model`
 = `model:gen`) and into each row's `embedding_gen`. **Any change to representation
-semantics must bump `SCHEMA_VERSION` (store.ts) in the same change-set.** This is a
-scar, not a style preference: `rep4` changed the projection without a schema bump, so
-it slipped past the store's version fence. A rep3 build and a rep4 build shared one
-store, raced the global `semantic_model` stamp, and each cleared and rewrote every
-vector to its own representation on a loop. The schema bump fences the older build out
+semantics must bump `SCHEMA_VERSION` (store.ts) in the same change-set.** A
+representation change without a schema bump passes the store's version fence. Two
+builds at different representations then share one store and race the global
+`semantic_model` stamp. Each clears and rewrites every vector to its own
+representation on a loop. The schema bump fences the older build out
 of the lease and all writes (a newer stamp makes its `openStore` refuse, so that
 process degrades to cards-lite). The fence only reaches a build that **opens** the
 store after the bump: an older process whose connection is already open keeps its
@@ -609,14 +702,62 @@ backstop is there for a path that forgets.
 
 ## Perf gates are behind `RECALL_PERF=1`
 
-`test/perf.test.ts` is `describe.skipIf`'d off by default because it measures
-machine-dependent wall-clock time. Run it deliberately:
-`RECALL_PERF=1 npx vitest run test/perf.test.ts`. The budgets it defends: tier-1
-card rank p95 under 50ms over 20 queries on ~4,700 cards; single-session
-distill+replace p50 under 150ms; `ftsSearch` over ~50k slim-index rows under
-100ms; a drilled smart query end-to-end under 1.5s on a ~100-session store; and
-heap under 150MB after those runs. If a change makes the store or the query path
-heavier, run these before assuming it's fine.
+`test/perf.test.ts` and `test/perf-v2.test.ts` are `describe.skipIf`'d off by
+default because they measure machine-dependent wall-clock time. Run them
+deliberately, with the verbose reporter so passing gates print their numbers:
+
+```bash
+RECALL_PERF=1 npx vitest run test/perf.test.ts test/perf-v2.test.ts --reporter=verbose
+```
+
+`test/perf.test.ts` holds these budgets.
+
+- Tier-1 card rank p95 under 50 ms over 20 queries on about 4,700 cards.
+- Single-session distill plus replace p50 under 150 ms, with the suppressed
+  replace of the same sessions p50 under 50 ms.
+- `ftsSearch` over about 50,000 slim-index rows under 100 ms.
+- A drilled smart query end to end under 1.5 s on a store of about 100 sessions.
+- Heap under 150 MB after those runs.
+- On a 12,000-card store with realistic inventories (`perfCorpus` in
+  `test/perf-helpers.ts`), a cold index build in each of three setups (semantic
+  off, semantic on, semantic on reusing persisted vectors). Each keeps every code
+  slice under 50 ms and finishes under 60 s. The heap after the lexical and the
+  reused build stays under 600 MB.
+- On the same store, 400 changed cards applied through `ready({ index: true })`
+  with no full load, no code slice over 50 ms and under 3 s in total.
+- On the same store, 24 `recall` searches with card writes between them, with no
+  full load, a card-tier p50 under 250 ms and a whole-search p50 under 1 s.
+
+`test/perf-v2.test.ts` holds every gate to no code slice over 50 ms.
+
+- A full v2 cold pass over a large synthetic `opencode.db`, one poll cycle, a
+  `listSessions` call and an append re-distill of a 4,000-row session.
+- A tail write over a 5,000-row card, under 1 s.
+- A repair sweep over 400 stale cards in a 12,000-card store, under 30 s.
+- A child session's write and then its deletion in a 12,000-card store whose root
+  has 2,400 other children, each under 1 s.
+- Paged discovery of 10,501 sessions and of a root's 2,400 children through the
+  runtime's own paging (`discoverSessions`, `listAllChildren`), each under 1 s.
+- A range check over a 500-row session, run eight times, each check under 250 ms.
+
+The slice budgets leave out V8's garbage-collection pauses. `stallProbe()` in
+`test/perf-helpers.ts` ticks a 0 ms interval and splits each gap between ticks
+into the code that ran and the GC pauses a `PerformanceObserver` reported inside
+it. It first drains the entries still on their way, since a collection's entry
+reaches the observer only after two immediates. Each gate asserts the GC-free
+slice (`…MaxSliceMs`) and logs the raw stall (`…MaxStallMs`) and the longest GC
+pause beside it. On a loaded machine a major collection of a heap of a few
+hundred MB can pause the loop past 50 ms on its own, so a gate on the raw stall
+would fail on machine load rather than on the code. A pause still lasts longer
+the more heap the process retains. The heap ceilings catch that growth. A raw
+stall that grows from run to run while the slices pass points at retained memory.
+Every gate logs the load average (`loadAverage()`), since a wall-clock number
+means little without it on a shared machine. A failing v2 gate names the slowest
+synchronous calls it could attribute and the calls inside the worst stall.
+
+If a change makes the store, the card runtime, the distiller or the query path
+heavier, run these before assuming it's fine. When one fails, fix the code it
+names rather than loosen the budget.
 
 ## Tokenizer split is load-bearing
 
@@ -626,8 +767,8 @@ heavier, run these before assuming it's fine.
   frequency is meaningful.
 - `tokenize()` — **deduplicated**, used for set-membership / matched-term checks.
 
-Using the deduped one for the index silently degrades BM25 ranking (a real
-regression caught in review). Pick the right one for the job.
+Using the deduped one for the index silently degrades BM25 ranking, because
+every term then counts once per document. Pick the right one for the job.
 
 ## Testing the host-bypass path
 
