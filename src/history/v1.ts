@@ -217,6 +217,7 @@ const NO_PART_ORDINALS =
   "the v1 history source has no part ordinals, so it cannot continue a message";
 const NO_SEEK =
   "the v1 history source pages newest first from the session's end only, so it cannot seek";
+const NO_FLOOR = "the v1 history source has no row order, so it cannot find a window's floor";
 
 export function createV1HistorySource(clients: V1Clients): HistorySource {
   const { scoped, unscoped } = clients;
@@ -285,6 +286,12 @@ export function createV1HistorySource(clients: V1Clients): HistorySource {
     // bounded above reads from the newest message and skips what it must.
     async seekPage(): Promise<Lookup<string | null | undefined>> {
       return { ok: false, reason: "unsupported", error: NO_SEEK };
+    },
+
+    // v1 messages carry no row order beside their times, so a walk bounded
+    // below cannot tell where the window ends.
+    async seqFloor(): Promise<Lookup<number | null | undefined>> {
+      return { ok: false, reason: "unsupported", error: NO_FLOOR };
     },
 
     async getMessage(sessionID, messageID, o = {}): Promise<Lookup<HistoryMessage>> {

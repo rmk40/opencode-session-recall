@@ -293,15 +293,31 @@ export interface HistorySource {
   /**
    * Where a newest-first walk that leaves out the messages created after
    * `until` (ms epoch) starts: a {@link messagePage} `before` cursor whose
-   * page starts at the newest message created at or before `until`. The
-   * value is undefined when no message is newer than that one, so the walk
-   * starts at the session's first page as any other does, and null when the
-   * session has no message created at or before `until`. The position comes
-   * from creation times, which rise with the row order, so a message whose
-   * creation time is out of order by more than a few rows may fall on the
-   * other side of it. v1 cannot seek and answers `unsupported`.
+   * page starts at the highest-ordered message created at or before
+   * `until`, so no such message is above it even where creation times are
+   * out of row order. The value is undefined when the walk starts at the
+   * session's first page as any other does: no message is above that one,
+   * or finding it would take more reading than the source allows. It is
+   * null when the session has no message created at or before `until`. v1
+   * cannot seek and answers `unsupported`.
    */
   seekPage?(o: { sessionID: string; until: number }): Promise<Lookup<string | null | undefined>>;
+  /**
+   * Where a newest-first walk through the window `(after, before)` (ms
+   * epoch, both exclusive, `before` optional) may stop: the lowest
+   * {@link HistoryMessage} `info.seq` of a message created inside it. A walk
+   * that has read a message with that seq or a lower one has read every
+   * message inside the window below where it started, whatever order their
+   * creation times are in. Null when no message was created inside the
+   * window; undefined when finding it would take more reading than the
+   * source allows, so the walk cannot stop at the lower bound. Only a host
+   * whose messages carry `seq` has it; v1 answers `unsupported`.
+   */
+  seqFloor?(o: {
+    sessionID: string;
+    after: number;
+    before?: number;
+  }): Promise<Lookup<number | null | undefined>>;
   /**
    * One message. `partOrdinal` continues a message a read cut short (its
    * `partial.nextOrdinal`): the result holds the part rows from that ordinal
@@ -383,11 +399,12 @@ export function createUnavailableSource(
     getSession: async () => ({ ok: false, reason: "error", error }),
     listChildren: async () => ({ ok: false, error }),
     messagePage: reject,
-    // A v2 source pages oldest first and seeks too, so its reads report the
-    // outage rather than a missing capability.
+    // A v2 source pages oldest first, seeks and finds floors too, so its
+    // reads report the outage rather than a missing capability.
     ...(kind === "v2-sqlite" && {
       messagePageAscending: reject,
       seekPage: async () => ({ ok: false as const, reason: "error" as const, error }),
+      seqFloor: async () => ({ ok: false as const, reason: "error" as const, error }),
     }),
     getMessage: async () => ({ ok: false, reason: "error", error }),
   };

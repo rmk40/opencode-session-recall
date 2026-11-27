@@ -1,4 +1,4 @@
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -25,7 +25,46 @@ import { fakeV2Host, type FakeV2Host } from "./v2-host.js";
  * the window. Their later history is long enough that a walk from each
  * session's newest message would stop on the anchor or the session budget
  * before reaching it.
+ *
+ * The runtime opens opencode.db through `openOpencodeDb`, which is wrapped
+ * here so that the history reader and the sync both read through the LIMIT
+ * spy. A violation would surface only as a load error inside the runtime, so
+ * the spy's throws are recorded and checked after each test.
  */
+
+const limits = vi.hoisted(() => ({ historyReads: 0, violations: [] as string[] }));
+
+vi.mock("../src/history/v2.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../src/history/v2.js")>();
+  const { limitSpy } = await import("./v2-db.js");
+  return {
+    ...actual,
+    openOpencodeDb: async (path: string) => {
+      const opened = await actual.openOpencodeDb(path);
+      if (!opened.ok) return opened;
+      const spy = limitSpy(opened.db);
+      const checked = <T>(sql: string, run: () => T): T => {
+        if (/\bsession_(message|part)\b/.test(sql)) limits.historyReads++;
+        try {
+          return run();
+        } catch (error) {
+          limits.violations.push(error instanceof Error ? error.message : String(error));
+          throw error;
+        }
+      };
+      return {
+        ...opened,
+        db: {
+          get: (sql: string, params?: unknown[]) =>
+            checked(sql, () => spy.get(sql, params as Parameters<typeof spy.get>[1])),
+          all: (sql: string, params?: unknown[]) =>
+            checked(sql, () => spy.all(sql, params as Parameters<typeof spy.all>[1])),
+          close: () => spy.close(),
+        },
+      };
+    },
+  };
+});
 
 const HOUR = 3_600_000;
 /** The orchestrator's start. */
@@ -169,8 +208,17 @@ afterAll(() => v2db.cleanup());
 
 beforeEach(() => {
   resetRuntimeRegistryForTests();
+  limits.historyReads = 0;
+  limits.violations.length = 0;
   dir = mkdtempSync(join(tmpdir(), "recall-window-"));
 });
+
+/** The runtime read opencode.db's history tables, and only through
+ *  statements the LIMIT spy accepts. */
+function expectBoundedReads(): void {
+  expect(limits.historyReads).toBeGreaterThan(0);
+  expect(limits.violations).toEqual([]);
+}
 
 afterEach(async () => {
   await Promise.all(cleanups.splice(0).map((cleanup) => cleanup()));
@@ -227,6 +275,7 @@ describe("time-bounded searches over subagents that ran past the window", () => 
       });
       expect(out.ok).toBe(true);
       expect(out.results.map((r) => r.sessionID)).toContain("ses_paths");
+      expectBoundedReads();
     },
     TEST_TIMEOUT_MS,
   );
@@ -243,6 +292,7 @@ describe("time-bounded searches over subagents that ran past the window", () => 
       const stops = out.coverage.sessionStops?.sessions ?? [];
       const viewer = stops.find((s) => s.sessionID === "ses_viewer");
       expect(viewer?.fetched).toBe(2);
+      expectBoundedReads();
     },
     TEST_TIMEOUT_MS,
   );
@@ -254,6 +304,7 @@ describe("time-bounded searches over subagents that ran past the window", () => 
       const out = await recall(h, { query: "ownsNone", deep: true, project: true, ...bounds });
       expect(out.ok).toBe(true);
       expect(out.results.map((r) => r.sessionID)).toContain("ses_owns");
+      expectBoundedReads();
     },
     TEST_TIMEOUT_MS,
   );

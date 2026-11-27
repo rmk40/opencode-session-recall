@@ -492,12 +492,22 @@ const NO_CURSOR_SEQ = Number.MAX_SAFE_INTEGER;
 /** Page plans retried when a whole planned range turns ineligible between the
  *  size read and the body read. */
 const PAGE_ATTEMPTS = 3;
-/** Rows a seek reads by creation time, newest first, to take the highest seq
- *  among them: a row whose creation time is out of order (opencode moves an
- *  assistant's `time_created` to the start of a retried step) stays on the
- *  right side of the seek unless more rows than this were created between
- *  its two times. */
+/**
+ * Rows a seek or a floor first reads down the `(session_id, time_created,
+ * id)` index. Creation times rise with seq only mostly (opencode moves an
+ * assistant's `time_created` to the start of a retried step), so these rows
+ * give only a bound on the answer, which range reads over seq then make
+ * exact.
+ */
 const SEEK_ROWS = 16;
+/** Seqs one range read covers: seq is unique within a session, so a range
+ *  read examines at most this many rows. */
+const SCAN_RANGE = 2_000;
+/** Rows one floor read returns down the creation-time index. */
+const SCAN_PAGE = 1_000;
+/** Rows one seek or floor examines in all before it gives up (the walk then
+ *  starts at the newest page, or cannot stop at the lower bound). */
+const SCAN_ROWS_MAX = 40_000;
 
 /** Which way a page walks a session's rows by `seq`. */
 type PageOrder = {
@@ -674,6 +684,29 @@ function asNumber(value: SqlValue | undefined): number | null {
   if (typeof value === "number") return value;
   if (typeof value === "bigint") return Number(value);
   return null;
+}
+
+/** The highest or lowest `seq` among `rows`; undefined when there is none. */
+function extremeSeq(rows: Row[], pick: (a: number, b: number) => number): number | undefined {
+  let out: number | undefined;
+  for (const row of rows) {
+    const seq = asNumber(row.seq);
+    if (seq !== null) out = out === undefined ? seq : pick(out, seq);
+  }
+  return out;
+}
+
+/** The error a seek or a floor answers for a bound that is not a number. */
+function timeError(
+  what: string,
+  value: unknown,
+): { ok: false; reason: "error"; error: string } | undefined {
+  if (typeof value === "number" && !Number.isNaN(value)) return undefined;
+  return {
+    ok: false,
+    reason: "error",
+    error: `${what} time must be a number, got ${String(value)}`,
+  };
 }
 
 function toSessionRecord(row: Row): SessionRecord {
@@ -2039,24 +2072,21 @@ export function createV2HistorySource(db: ReadOnlyDb, opts: V2SourceOptions = {}
     },
 
     /**
-     * Two point reads. The first walks the `(session_id, time_created, id)`
-     * index down from `until` and takes the highest seq among its first
-     * {@link SEEK_ROWS} rows (fork copies left out, as pages leave them out);
-     * the second asks the `(session_id, seq)` index whether any row lies past
-     * that seq. Neither reads a row's data.
+     * The highest seq of a row created at or before `until` (fork copies left
+     * out, as pages leave them out), read without any row's data. The newest
+     * rows by creation time give a lower bound on it; then range reads walk
+     * seq down from the session's newest row to that bound, each over at most
+     * {@link SCAN_RANGE} seqs, and the first row at or before `until` they
+     * meet is the answer. Past {@link SCAN_ROWS_MAX} seqs the walk starts at
+     * the newest page instead.
      */
     async seekPage(o): Promise<Lookup<string | null | undefined>> {
-      if (typeof o.until !== "number" || Number.isNaN(o.until)) {
-        return {
-          ok: false,
-          reason: "error",
-          error: `seek time must be a number, got ${String(o.until)}`,
-        };
-      }
+      const invalid = timeError("seek", o.until);
+      if (invalid) return invalid;
       const fork = forkBinds(o.sessionID);
       if (!fork) return sessionNotFound(o.sessionID);
       await pause();
-      const rows = read("seek", () =>
+      const near = read("seek", () =>
         db.all(
           `SELECT seq FROM session_message
            WHERE session_id = ? AND time_created <= ? AND ${FORK_FILTER}
@@ -2064,24 +2094,121 @@ export function createV2HistorySource(db: ReadOnlyDb, opts: V2SourceOptions = {}
           [o.sessionID, o.until, ...fork, SEEK_ROWS],
         ),
       );
-      let newest: number | undefined;
-      for (const row of rows) {
-        const seq = asNumber(row.seq);
-        if (seq !== null && (newest === undefined || seq > newest)) newest = seq;
-      }
-      if (newest === undefined) return { ok: true, value: null };
-      // The cursor reads rows below its seq, so it names the row past `newest`.
-      if (!Number.isSafeInteger(newest + 1) || newest + 1 < 0)
-        return { ok: true, value: undefined };
+      let start = extremeSeq(near, Math.max);
+      if (start === undefined) return { ok: true, value: null };
       await pause();
-      const later = read("seek end", () =>
-        db.get(
-          `SELECT seq FROM session_message WHERE session_id = ? AND seq > ?
-           ORDER BY seq ASC LIMIT ?`,
-          [o.sessionID, newest, 1],
-        ),
-      );
-      return { ok: true, value: later ? encodeV2Cursor(newest + 1) : undefined };
+      const top =
+        asNumber(
+          read("seek top", () =>
+            db.get(
+              `SELECT seq FROM session_message WHERE session_id = ? ORDER BY seq DESC LIMIT ?`,
+              [o.sessionID, 1],
+            ),
+          )?.seq,
+        ) ?? start;
+      for (let hi = top; hi > start; ) {
+        if (top - hi >= SCAN_ROWS_MAX) return { ok: true, value: undefined };
+        const lo = Math.max(start, hi - SCAN_RANGE);
+        await pause();
+        const hit = read("seek range", () =>
+          db.get(
+            `SELECT seq FROM session_message
+             WHERE session_id = ? AND seq > ? AND seq <= ? AND time_created <= ? AND ${FORK_FILTER}
+             ORDER BY seq DESC LIMIT ?`,
+            [o.sessionID, lo, hi, o.until, ...fork, 1],
+          ),
+        );
+        const seq = asNumber(hit?.seq);
+        if (seq !== null) {
+          start = seq;
+          break;
+        }
+        hi = lo;
+      }
+      // The cursor reads rows below its seq, so it names the row past `start`.
+      if (start >= top || !Number.isSafeInteger(start + 1) || start + 1 < 0) {
+        return { ok: true, value: undefined };
+      }
+      return { ok: true, value: encodeV2Cursor(start + 1) };
+    },
+
+    /**
+     * The lowest seq of a row created inside the window (fork copies left
+     * out), read without any row's data. One read pages the window's rows up
+     * the creation-time index, {@link SCAN_PAGE} at a time, keeping the lowest
+     * seq: once they are all read, that seq is exact. In turn, range reads
+     * walk seq up from the session's oldest row to the lowest seq found so
+     * far, each over at most {@link SCAN_RANGE} seqs: the first row inside the
+     * window they meet is exact as well. Whichever finishes first answers, so
+     * the cost follows the smaller of the window and the history before it.
+     * Past {@link SCAN_ROWS_MAX} rows it answers undefined.
+     */
+    async seqFloor(o): Promise<Lookup<number | null | undefined>> {
+      const invalid =
+        timeError("floor", o.after) ??
+        (o.before === undefined ? undefined : timeError("floor", o.before));
+      if (invalid) return invalid;
+      const fork = forkBinds(o.sessionID);
+      if (!fork) return sessionNotFound(o.sessionID);
+      const upper = o.before === undefined ? "" : "AND time_created < ?";
+      const upperBind = o.before === undefined ? [] : [o.before];
+      let examined = 0;
+      let last: { time: number; id: string } | undefined;
+      let floor: number | undefined;
+      /** The next page of the window's rows by creation time; true once
+       *  every row of the window was read. */
+      const pageUp = async (): Promise<boolean> => {
+        await pause();
+        const after = last
+          ? { clause: "(time_created, id) > (?, ?)", binds: [last.time, last.id] }
+          : { clause: "time_created > ?", binds: [o.after] };
+        const rows = read("floor", () =>
+          db.all(
+            `SELECT seq, time_created, id FROM session_message
+             WHERE session_id = ? AND ${after.clause} ${upper} AND ${FORK_FILTER}
+             ORDER BY time_created ASC, id ASC LIMIT ?`,
+            [o.sessionID, ...after.binds, ...upperBind, ...fork, SCAN_PAGE],
+          ),
+        );
+        examined += rows.length;
+        const lowest = extremeSeq(rows, Math.min);
+        if (lowest !== undefined) floor = floor === undefined ? lowest : Math.min(floor, lowest);
+        const end = rows[rows.length - 1];
+        if (end) last = { time: asNumber(end.time_created) ?? 0, id: asString(end.id) ?? "" };
+        return rows.length < SCAN_PAGE;
+      };
+      if (await pageUp()) return { ok: true, value: floor ?? null };
+      await pause();
+      let lo =
+        asNumber(
+          read("floor bottom", () =>
+            db.get(
+              `SELECT seq FROM session_message WHERE session_id = ? ORDER BY seq ASC LIMIT ?`,
+              [o.sessionID, 1],
+            ),
+          )?.seq,
+        ) ?? floor!;
+      for (;;) {
+        if (lo >= floor!) return { ok: true, value: floor! };
+        const hi = Math.min(floor!, lo + SCAN_RANGE);
+        await pause();
+        const hit = read("floor range", () =>
+          db.get(
+            `SELECT seq FROM session_message
+             WHERE session_id = ? AND seq >= ? AND seq < ? AND time_created > ? ${upper} AND ${FORK_FILTER}
+             ORDER BY seq ASC LIMIT ?`,
+            [o.sessionID, lo, hi, o.after, ...upperBind, ...fork, 1],
+          ),
+        );
+        const seq = asNumber(hit?.seq);
+        if (seq !== null) return { ok: true, value: seq };
+        examined += hi - lo;
+        lo = hi;
+        if (lo >= floor!) return { ok: true, value: floor! };
+        if (examined >= SCAN_ROWS_MAX) return { ok: true, value: undefined };
+        if (await pageUp()) return { ok: true, value: floor! };
+        if (examined >= SCAN_ROWS_MAX) return { ok: true, value: undefined };
+      }
     },
 
     async getMessage(sessionID, messageID, o = {}): Promise<Lookup<HistoryMessage>> {

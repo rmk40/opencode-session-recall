@@ -121,6 +121,9 @@ function titleTime(target: DrillTarget, card: Card | undefined, window?: TimeWin
   const updated = card?.timeUpdated ?? target.timeUpdated;
   const before = window?.before;
   if (before === undefined || updated < before) return updated;
+  // Without a card the session's start is unknown, so its title is not
+  // dated into a window it may never have been alive in: it keeps the
+  // target's update time, which the window's filter then leaves out.
   const created = card?.timeCreated ?? updated;
   return created < before ? before - 1 : updated;
 }

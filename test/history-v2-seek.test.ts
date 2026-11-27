@@ -84,11 +84,12 @@ describe("v2 seekPage", () => {
     // A message created exactly at the bound starts the walk.
     expect(await firstPage(source, "ses_a", 7_000)).toEqual(["ses_a-7", "ses_a-6", "ses_a-5"]);
 
-    // Two bounded statements per seek, neither reading a row's data.
+    // Three bounded statements for five later rows: the creation-time index,
+    // the newest row and one range over seqs 6 to 10. None reads row data.
     spy.statements.length = 0;
     await source.seekPage!({ sessionID: "ses_a", until: 5_500 });
     const reads = spy.statements.filter((sql) => /\bsession_message\b/.test(sql));
-    expect(reads).toHaveLength(2);
+    expect(reads).toHaveLength(3);
     for (const sql of reads) expect(sql).not.toMatch(/\bdata\b/);
   });
 
@@ -184,7 +185,8 @@ describe("v2 seekPage", () => {
         yields++;
       },
     });
-    // Later rows, the newest row, and nothing at or before the bound.
+    // Later rows (whose range read is a third statement), the newest row,
+    // and nothing at or before the bound.
     const counts: Array<{ yields: number; reads: number }> = [];
     for (const until of [2_500, 4_000, 500]) {
       yields = 0;
@@ -194,7 +196,7 @@ describe("v2 seekPage", () => {
       counts.push({ yields, reads });
     }
     expect(counts).toEqual([
-      { yields: 2, reads: 2 },
+      { yields: 3, reads: 3 },
       { yields: 2, reads: 2 },
       { yields: 1, reads: 1 },
     ]);
@@ -210,10 +212,155 @@ describe("v2 seekPage", () => {
   });
 });
 
+describe("v2 seekPage over creation times out of row order", () => {
+  it("starts above a row the creation-time index ranks below sixteen later-created rows", async () => {
+    // Seqs 1 to 16 were created at 2001 to 2016 and seq 17 at 1500; the
+    // sixteen rows newest by creation time at or before 3000 are seqs 1 to
+    // 16, so only the range read finds seq 17.
+    const t = await fresh();
+    session(t, "ses_a");
+    t.db.exec("BEGIN");
+    for (let seq = 1; seq <= 16; seq++) row(t, "ses_a", seq, 2_000 + seq);
+    row(t, "ses_a", 17, 1_500);
+    for (let seq = 18; seq <= 20; seq++) row(t, "ses_a", seq, 9_000 + seq);
+    t.db.exec("COMMIT");
+    const { source } = await open(t);
+    expect(await firstPage(source, "ses_a", 3_000)).toEqual(["ses_a-17", "ses_a-16", "ses_a-15"]);
+  });
+
+  it("walks a long run of later rows a range at a time, without reading row data", async () => {
+    const t = await fresh();
+    session(t, "ses_a");
+    t.db.exec("BEGIN");
+    row(t, "ses_a", 1, 1_000);
+    for (let seq = 2; seq <= 4_501; seq++) row(t, "ses_a", seq, 10_000 + seq);
+    t.db.exec("COMMIT");
+    const { source, spy } = await open(t);
+    spy.statements.length = 0;
+    await source.seekPage!({ sessionID: "ses_a", until: 5_000 });
+    const reads = spy.statements.filter((sql) => /\bsession_message\b/.test(sql));
+    // The creation-time index, the newest row and three ranges of up to
+    // 2,000 seqs.
+    expect(reads).toHaveLength(5);
+    for (const sql of reads) expect(sql).not.toMatch(/\bdata\b/);
+    expect(await firstPage(source, "ses_a", 5_000)).toEqual(["ses_a-1"]);
+  });
+});
+
+describe("v2 seqFloor", () => {
+  async function floorOf(
+    t: V2TestDb,
+    sessionID: string,
+    after: number,
+    before?: number,
+  ): Promise<{ value: number | null | undefined; reads: string[] }> {
+    const { source, spy } = await open(t);
+    spy.statements.length = 0;
+    const found = await source.seqFloor!({
+      sessionID,
+      after,
+      ...(before !== undefined && { before }),
+    });
+    if (!found.ok) throw new Error(found.error ?? found.reason);
+    return {
+      value: found.value,
+      reads: spy.statements.filter((sql) => /\bsession_message\b/.test(sql)),
+    };
+  }
+
+  it("answers the lowest seq created inside the window, a row out of creation order included", async () => {
+    // Seq 4 was created at 4800 and seq 5, written before a retry moved it,
+    // at 4200: past a lower bound of 4500, seq 4 is the floor.
+    const t = await fresh();
+    session(t, "ses_a");
+    for (const [seq, created] of [
+      [1, 1_000],
+      [2, 2_000],
+      [3, 3_000],
+      [4, 4_800],
+      [5, 4_200],
+      [6, 5_000],
+    ] as const) {
+      row(t, "ses_a", seq, created);
+    }
+    expect((await floorOf(t, "ses_a", 4_500)).value).toBe(4);
+    // An upper bound leaves out rows at or after it.
+    expect((await floorOf(t, "ses_a", 2_500, 3_000)).value).toBeNull();
+    expect((await floorOf(t, "ses_a", 2_500, 3_001)).value).toBe(3);
+  });
+
+  it("answers null when nothing was created inside the window", async () => {
+    const t = await fresh();
+    session(t, "ses_a");
+    row(t, "ses_a", 1, 1_000);
+    expect((await floorOf(t, "ses_a", 1_000)).value).toBeNull();
+  });
+
+  it("finds a small window over a long history in one read of the window's rows", async () => {
+    const t = await fresh();
+    session(t, "ses_a");
+    t.db.exec("BEGIN");
+    for (let seq = 1; seq <= 4_000; seq++) row(t, "ses_a", seq, seq * 10);
+    t.db.exec("COMMIT");
+    const { value, reads } = await floorOf(t, "ses_a", 39_950);
+    expect(value).toBe(3_996);
+    expect(reads).toHaveLength(1);
+    for (const sql of reads) expect(sql).not.toMatch(/\bdata\b/);
+  });
+
+  it("finds a large window over a short history by its range reads up from the oldest row", async () => {
+    const t = await fresh();
+    session(t, "ses_a");
+    t.db.exec("BEGIN");
+    for (let seq = 1; seq <= 4_000; seq++) row(t, "ses_a", seq, seq * 10);
+    t.db.exec("COMMIT");
+    const { value, reads } = await floorOf(t, "ses_a", 25);
+    expect(value).toBe(3);
+    // A page of the window's rows, the oldest row and one range read.
+    expect(reads).toHaveLength(3);
+    for (const sql of reads) expect(sql).not.toMatch(/\bdata\b/);
+  });
+
+  it("leaves out a fork's copies of its parent's rows", async () => {
+    const t = await fresh();
+    session(t, "ses_parent");
+    for (let seq = 1; seq <= 3; seq++) row(t, "ses_parent", seq, seq * 1_000);
+    writeFork(t.db, {
+      parentID: "ses_parent",
+      forkID: "ses_fork",
+      created: 10_000,
+      style: "parts",
+    });
+    row(t, "ses_fork", 4, 11_000);
+    expect((await floorOf(t, "ses_fork", 500)).value).toBe(4);
+  });
+
+  it("answers not-found for a session the database does not hold, and an error for a bound that is not a number", async () => {
+    const t = await fresh();
+    session(t, "ses_a");
+    const { source } = await open(t);
+    expect(await source.seqFloor!({ sessionID: "ses_gone", after: 1 })).toMatchObject({
+      ok: false,
+      reason: "not-found",
+    });
+    expect(
+      await source.seqFloor!({ sessionID: "ses_a", after: 1, before: Number.NaN }),
+    ).toMatchObject({ ok: false, reason: "error" });
+  });
+});
+
 describe("v1 seekPage", () => {
   it("answers unsupported", async () => {
     const { source } = makeFakeHarness();
     expect(await source.seekPage!({ sessionID: "ses_a", until: 1_000 })).toMatchObject({
+      ok: false,
+      reason: "unsupported",
+    });
+  });
+
+  it("answers unsupported for a floor", async () => {
+    const { source } = makeFakeHarness();
+    expect(await source.seqFloor!({ sessionID: "ses_a", after: 1_000 })).toMatchObject({
       ok: false,
       reason: "unsupported",
     });
