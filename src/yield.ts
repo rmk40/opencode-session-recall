@@ -4,10 +4,10 @@
  * On the v2 host this plugin runs inside opencode's shared service, so reads,
  * builds and passes yield regularly to let other work run. They yield on a
  * time budget, not before every step: a `setTimeout(0)` turn costs about
- * 1.25 ms (timers are clamped to 1 ms), which is several times what one read
- * statement costs, so yielding before each statement spent most of a read
- * waiting. A yield itself goes through `setImmediate` where the runtime has
- * it, which lets due timers and ready I/O run for a few microseconds.
+ * 1.25 ms (timers are clamped to 1 ms), several times what one read statement
+ * costs, so a yield per statement would leave a read waiting most of its
+ * time. A yield itself goes through `setImmediate` where the runtime has it,
+ * which lets due timers and ready I/O run for a few microseconds.
  * `MessageChannel` is no substitute: Node and Bun deliver a port's messages
  * back to back without returning to the event loop, so a chain of them keeps
  * timers from ever firing.
@@ -15,6 +15,10 @@
 
 /** How long work runs before it yields, in milliseconds. */
 export const SLICE_MS = 8;
+/** How long a slicer's callers wait on one pending yield before a new
+ *  caller starts another, in milliseconds. A yield resolves within a turn of
+ *  the event loop, so only a yield whose callback was lost waits this long. */
+const STALE_YIELD_MS = 100;
 
 type ImmediateHost = { setImmediate?: (callback: () => void) => unknown };
 
@@ -43,18 +47,54 @@ export type TimeSlicerOptions = {
  * yielded. Work awaits it wherever it may stop: within the budget it resolves
  * at once (one microtask), past it it awaits `yieldNow` and starts the next
  * slice. A slice runs over the budget by at most the work between two calls.
- * Every caller of one slicer shares its slice, so concurrent work through it
- * yields together.
+ *
+ * Every caller of one slicer shares its slice. Callers past the budget wait
+ * in line on one pending yield, which starts the next slice once it
+ * resolves. Only the first of them to resume takes that slice; the others
+ * wait for the yield that starts the one after, and so on, so however many
+ * callers wait, a turn of the event loop holds about one slice of their
+ * work. (Resumed waiters run before any of them does its work, so a waiter
+ * cannot tell from the clock alone whether another has the slice.) A budget
+ * of zero or less yields at every call.
  */
 export function timeSlicer(opts: TimeSlicerOptions = {}): () => Promise<void> {
   const budget = opts.budgetMs ?? SLICE_MS;
   const now = opts.now ?? (() => performance.now());
   const yieldNow = opts.yieldNow ?? macrotask;
+  if (!(budget > 0)) return () => yieldNow();
+  type Turn = { done: Promise<void>; since: number; taken: boolean };
   let sliceStart = now();
+  let turn: Turn | undefined;
+  const startTurn = (): Turn => {
+    const next: Turn = { done: Promise.resolve(), since: now(), taken: false };
+    // A yield that fails still ends the wait; it only let other work run.
+    const end = (): void => {
+      if (turn !== next) return;
+      turn = undefined;
+      sliceStart = now();
+    };
+    next.done = yieldNow().then(end, end);
+    return next;
+  };
   return async () => {
+    // A clock that went backwards (a test's fake clock swapped back for the
+    // real one) restarts the slice rather than holding off every yield.
+    if (now() < sliceStart) sliceStart = now();
     if (now() - sliceStart < budget) return;
-    await yieldNow();
-    sliceStart = now();
+    for (;;) {
+      // A yield whose callback was dropped (a test that swapped the timer
+      // functions out from under it) must not hold every later caller, so a
+      // pending yield older than STALE_YIELD_MS, or from a clock that has
+      // since gone backwards, is replaced.
+      const age = turn ? now() - turn.since : 0;
+      if (!turn || age > STALE_YIELD_MS || age < 0) turn = startTurn();
+      const mine = turn;
+      await mine.done;
+      if (!mine.taken) {
+        mine.taken = true;
+        return;
+      }
+    }
   };
 }
 

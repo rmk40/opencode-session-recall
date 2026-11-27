@@ -137,6 +137,56 @@ describe("timeSlicer", () => {
     await step("b");
     expect(yields).toEqual(["b", "b"]);
   });
+
+  it("lets one of several callers past the budget run per yield, the rest waiting in line", async () => {
+    // Each worker, once resumed, does a whole slice of work. A yield resolves
+    // only when the test releases it, as a turn of the event loop would.
+    let now = 0;
+    const turns: Array<() => void> = [];
+    const slicer = timeSlicer({
+      budgetMs: 8,
+      now: () => now,
+      yieldNow: () => new Promise<void>((resolve) => turns.push(resolve)),
+    });
+    const ran: string[] = [];
+    const worker = async (name: string): Promise<void> => {
+      await slicer();
+      ran.push(name);
+      now += 8;
+    };
+    const settle = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0));
+    now = 8;
+    const workers = [worker("a"), worker("b"), worker("c")];
+    await settle();
+    expect(turns).toHaveLength(1);
+    for (const expected of [["a"], ["a", "b"], ["a", "b", "c"]]) {
+      turns.shift()!();
+      await settle();
+      expect(ran).toEqual(expected);
+    }
+    expect(turns).toEqual([]);
+    await Promise.all(workers);
+  });
+
+  it("lets a later caller start a new yield when the pending one never resolves", async () => {
+    let now = 0;
+    let calls = 0;
+    const slicer = timeSlicer({
+      budgetMs: 8,
+      now: () => now,
+      yieldNow: () => {
+        calls++;
+        // The first yield's callback is lost; later ones resolve.
+        return calls === 1 ? new Promise<void>(() => {}) : Promise.resolve();
+      },
+    });
+    now = 8;
+    void slicer();
+    await Promise.resolve();
+    now = 200;
+    await slicer();
+    expect(calls).toBe(2);
+  });
 });
 
 describe("yieldOnBudget", () => {
