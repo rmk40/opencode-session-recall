@@ -3309,3 +3309,119 @@ describe("family rollups read a page at a time", () => {
     db.close();
   });
 });
+
+describe("session writes from concurrent workers", () => {
+  /**
+   * A store that, after each session write, schedules a timer like a stall
+   * probe's tick, and counts a write made before the previous write's timer
+   * has run: two writes in one slice of the loop.
+   */
+  function pacedStore(store: Store) {
+    const counts = { writes: 0, backToBack: 0, appends: 0 };
+    let tickPending = false;
+    const writes = new Set(["replaceSessionParts", "appendSessionParts", "replaceSessionTail"]);
+    const wrapped = new Proxy(store, {
+      get(target, prop, receiver) {
+        const value: unknown = Reflect.get(target, prop, receiver);
+        if (typeof value !== "function" || !writes.has(String(prop))) return value;
+        const method = value as (...args: unknown[]) => unknown;
+        return (...args: unknown[]) => {
+          if (tickPending) counts.backToBack++;
+          counts.writes++;
+          if (prop === "appendSessionParts") counts.appends++;
+          try {
+            return method.apply(target, args);
+          } finally {
+            tickPending = true;
+            setTimeout(() => (tickPending = false), 0);
+          }
+        };
+      },
+    });
+    return { store: wrapped, counts };
+  }
+
+  const macrotask = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0));
+
+  /** Eight sessions of one message each. */
+  function graph(): Graph {
+    const sessions = Array.from({ length: 8 }, (_, i) =>
+      session(`s${i}`, `Session ${i}`, PROJECT_DIR, 9_000 - i),
+    );
+    const messagesBySession: Record<string, MessageBundle[]> = {};
+    for (const s of sessions) {
+      messagesBySession[s.id] = [
+        bundle(userMessage(`m-${s.id}`, s.id, 100), [
+          textPart(`p-${s.id}`, s.id, `m-${s.id}`, `work in ${s.id}`),
+        ]),
+      ];
+    }
+    return { sessions, messagesBySession };
+  }
+
+  async function setup(g: Graph, appendThresholdParts?: number, distillConcurrency = 2) {
+    const { source } = makeDistillFake(g);
+    const { db, store } = await freshStore();
+    const paced = pacedStore(store);
+    const distiller = createDistiller({
+      source,
+      store: paced.store,
+      gate: makeSpyGate().gate,
+      limits: { ...TEST_LIMITS, distillConcurrency, distillDelayMs: 0 },
+      instanceId: "paced",
+      idleDebounceMs: 1,
+      yieldBetween: macrotask,
+      log: () => {},
+      ...(appendThresholdParts !== undefined && { appendThresholdParts }),
+    });
+    return { db, store, paced, distiller };
+  }
+
+  it.each([2, 4])(
+    "never commits two cold-pass writes of %i workers in one slice of the loop",
+    async (workers) => {
+      const g = graph();
+      const { sessions } = g;
+      const { db, store, paced, distiller } = await setup(g, undefined, workers);
+      distiller.start();
+      await waitFor(() => distiller.status().coldPass === "done");
+      expect(paced.counts.writes).toBe(sessions.length);
+      expect(paced.counts.backToBack).toBe(0);
+      // Every session is indexed as before.
+      for (const s of sessions) expect(store.getCard(s.id)?.distillState).toBe("full");
+      await distiller.stop();
+      db.close();
+    },
+  );
+
+  it.each([
+    ["full reads", undefined, 0],
+    ["appends", 0, 8],
+  ])(
+    "never commits two re-distill writes in one slice of the loop, for %s",
+    async (_, threshold, appends) => {
+      const g = graph();
+      const { db, store, paced, distiller } = await setup(g, threshold);
+      distiller.start();
+      await waitFor(() => distiller.status().coldPass === "done");
+      const coldWrites = paced.counts.writes;
+      for (const s of g.sessions) {
+        s.time.updated += 1_000;
+        g.messagesBySession[s.id]!.push(
+          bundle(userMessage(`m2-${s.id}`, s.id, 200), [
+            textPart(`p2-${s.id}`, s.id, `m2-${s.id}`, `more ${s.id}`),
+          ]),
+        );
+      }
+      for (const s of g.sessions) feed(distiller, idleEvent(s.id));
+      await waitFor(() =>
+        g.sessions.every((s) => store.getCard(s.id)?.distilledThrough === `m2-${s.id}`),
+      );
+      expect(paced.counts.writes - coldWrites).toBe(g.sessions.length);
+      expect(paced.counts.appends).toBe(appends);
+      expect(paced.counts.backToBack).toBe(0);
+      await distiller.stop();
+      db.close();
+    },
+  );
+});

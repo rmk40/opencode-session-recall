@@ -1498,6 +1498,12 @@ export function createDistiller(options: DistillerOptions): Distiller {
   const rollupAgain = new Set<string>();
   /** Recomputes no caller waits for; stop() waits for them. */
   const rollupDetached = new Set<Promise<void>>();
+  /** With `yieldBetween`: the yield that follows the latest session write,
+   *  until it has run. Every session write (cold pass, repair sweep,
+   *  re-distill) waits for it first, so the writes of concurrent workers whose
+   *  yields end in the same turn of the loop never run back to back in one
+   *  slice. */
+  let writeYield: Promise<void> | undefined;
   /** One set per running {@link recomputeAllRootRollups}: the roots written
    *  by a recompute that started after the pass began. That recompute read
    *  the family no earlier than the pass, so the pass leaves its rollup. */
@@ -2125,6 +2131,16 @@ export function createDistiller(options: DistillerOptions): Distiller {
     logMsg(`session ${sessionId} ${kept ? "kept its card" : "is repair-pending"}: ${loss}`);
   }
 
+  /** Start the yield the next session write waits for ({@link writeYield}). */
+  function yieldAfterWrite(): void {
+    if (!pause) return;
+    const clear = (): void => {
+      if (writeYield === settled) writeYield = undefined;
+    };
+    const settled: Promise<void> = pause().then(clear, clear);
+    writeYield = settled;
+  }
+
   /**
    * Store a full derivation with its checkpoint, its settled base (when the
    * checkpoint is unsettled), the generation and, with a
@@ -2170,6 +2186,7 @@ export function createDistiller(options: DistillerOptions): Distiller {
       card,
       rangeHashes ? { rangeHashes, replaceRangeHashes: true } : undefined,
     );
+    yieldAfterWrite();
     // An accepted replace clears the repair reason, so the mark follows it.
     if (loss && !result.refused) markLoss(session.id, loss, false);
     noteSettled(session.id, checkpoint, moved);
@@ -2344,6 +2361,7 @@ export function createDistiller(options: DistillerOptions): Distiller {
       ...(boundary !== undefined && { settledThrough: boundary }),
     });
     if (pause) await pause();
+    while (writeYield) await writeYield;
     // Authoritative re-check (live lease row, not the cached flag): a process
     // suspended past the TTL can lose the lease to a rival before its heartbeat
     // callback ever runs; the resumed fetch must not replace the new holder's
@@ -2527,6 +2545,10 @@ export function createDistiller(options: DistillerOptions): Distiller {
       rangeHashes = [...kept, ...(rangeHashes ?? [])];
       replaceRangeHashes = true;
     }
+    if (writeYield) {
+      while (writeYield) await writeYield;
+      if (stopped || !ownsLease()) return { changed: false };
+    }
     const rootId = resolveRootId(session.id, parentChainOf(session));
     const boundary = { checkpointMessageId: checkpoint, firstNewMessageId: chrono[0]!.info.id };
     /** Rows of the messages past the tail's boundary: the rest of the
@@ -2566,6 +2588,7 @@ export function createDistiller(options: DistillerOptions): Distiller {
         ),
       rangeHashes ? { rangeHashes, replaceRangeHashes } : undefined,
     );
+    yieldAfterWrite();
     noteSettled(session.id, tail, moved);
     return { changed: result.changed };
   }
@@ -2789,6 +2812,7 @@ export function createDistiller(options: DistillerOptions): Distiller {
             allRows.length - tailRows,
           ),
     );
+    while (writeYield) await writeYield;
     if (stopped || !ownsLease()) return { changed: false };
     const result = store.replaceSessionTail(
       session.id,
@@ -2796,6 +2820,7 @@ export function createDistiller(options: DistillerOptions): Distiller {
       card,
       rangeHashes ? { rangeHashes, replaceRangeHashes } : undefined,
     );
+    yieldAfterWrite();
     // Another write changed the card since its rows were read.
     if (result.refused === "base-changed") return distillFull(session);
     noteSettled(session.id, checkpoint, moved);
@@ -3026,6 +3051,7 @@ export function createDistiller(options: DistillerOptions): Distiller {
           // past the TTL loses the lease before the heartbeat callback flips
           // the cached flag — and skip it, counting the session as not
           // distilled.
+          while (writeYield) await writeYield;
           if (stopped || !ownsLease()) return;
           if (writeFull(session, derived, read, checkpoint, moved, digest).kept === undefined) {
             distilled++;
