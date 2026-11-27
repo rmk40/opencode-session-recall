@@ -11,12 +11,24 @@
  * runs to completion and is never interrupted.
  * A background waiter that stays blocked past a threshold reports once via
  * `onBackgroundPause`, making a steady query stream visible rather than silent.
+ *
+ * With a {@link ForegroundSignal} (`foreground`) the gate also takes part in
+ * the foreground count threads share. Each query counts in it from entry
+ * until it settles, and a background call that finds it non-zero (another
+ * thread's search, or a tool read that does not pass through this gate)
+ * waits until it reads zero or {@link FOREGROUND_WAIT_MS} pass before it
+ * queues for a permit. That wait is bounded, unlike the wait for this gate's
+ * own queries, so a count raised elsewhere slows background work but never
+ * stops it.
  */
+
+import { FOREGROUND_WAIT_MS, waitForQuiet, type ForegroundSignal } from "./foreground.js";
 
 export type FetchGate = {
   runQuery<T>(fn: () => Promise<T>): Promise<T>;
   runBackground<T>(fn: () => Promise<T>): Promise<T>;
-  /** Queries currently running or queued (the count background waits to reach 0). */
+  /** Queries currently running or queued (the count background waits to reach
+   *  0), together with the foreground work the shared signal counts elsewhere. */
   activeQueries(): number;
 };
 
@@ -25,6 +37,9 @@ export type FetchGateOptions = {
   onBackgroundPause?: (waitedMs: number) => void;
   /** Wait before a blocked background waiter logs a pause. Configurable for tests. */
   pauseThresholdMs?: number;
+  /** The foreground count shared between threads, which this gate's queries
+   *  count in and its background calls give way to. */
+  foreground?: ForegroundSignal;
 };
 
 const DEFAULT_PAUSE_THRESHOLD_MS = 5_000;
@@ -115,20 +130,29 @@ export function createFetchGate(opts: FetchGateOptions): FetchGate {
     });
   }
 
+  async function runCounted<T>(fn: () => Promise<T>): Promise<T> {
+    queriesInSystem++;
+    await acquireQuery();
+    try {
+      return await fn();
+    } finally {
+      permits++;
+      queriesInSystem--;
+      schedule();
+    }
+  }
+
+  const foreground = opts.foreground;
+
   return {
-    async runQuery<T>(fn: () => Promise<T>): Promise<T> {
-      queriesInSystem++;
-      await acquireQuery();
-      try {
-        return await fn();
-      } finally {
-        permits++;
-        queriesInSystem--;
-        schedule();
-      }
+    runQuery<T>(fn: () => Promise<T>): Promise<T> {
+      return foreground ? foreground.run(() => runCounted(fn)) : runCounted(fn);
     },
 
     async runBackground<T>(fn: () => Promise<T>): Promise<T> {
+      if (foreground?.active()) {
+        await waitForQuiet(foreground, { maxMs: FOREGROUND_WAIT_MS, now: Date.now });
+      }
       await acquireBackground();
       try {
         return await fn();
@@ -139,7 +163,9 @@ export function createFetchGate(opts: FetchGateOptions): FetchGate {
     },
 
     activeQueries(): number {
-      return queriesInSystem;
+      // This gate's own queries count in the signal too, so the larger of the
+      // two is every query this gate and the signal know of.
+      return foreground ? Math.max(queriesInSystem, foreground.count()) : queriesInSystem;
     },
   };
 }

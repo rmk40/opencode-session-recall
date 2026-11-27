@@ -13,6 +13,8 @@
  * timers from ever firing.
  */
 
+import { waitForQuiet, type ForegroundSignal } from "./foreground.js";
+
 /** How long work runs before it yields, in milliseconds. */
 export const SLICE_MS = 8;
 /** While foreground callers wait, background callers take one turn in this
@@ -46,6 +48,10 @@ export type TimeSlicerOptions = {
   /** While foreground callers wait, background callers take one turn in
    *  this many (default {@link BACKGROUND_EVERY}). */
   backgroundEvery?: number;
+  /** Foreground work counted outside this slicer, such as another thread's
+   *  searches, which its background yields give way to (see
+   *  {@link PrioritySlicer.yieldTo}). */
+  foreground?: ForegroundSignal;
 };
 
 /** The two yield points of one slicer, which share its slice. */
@@ -54,6 +60,14 @@ export type PrioritySlicer = {
   foreground: () => Promise<void>;
   /** For upkeep no caller waits on, such as the distiller's passes. */
   background: () => Promise<void>;
+  /**
+   * Set the foreground work counted outside the slicer, or none. A
+   * background yield that has to yield (its slice has run) first waits while
+   * the signal is non-zero, for at most `FOREGROUND_WAIT_MS`
+   * (`src/foreground.ts`), then yields as it would without one. A background
+   * call within its slice, and every foreground yield, never waits on it.
+   */
+  yieldTo: (signal: ForegroundSignal | undefined) => void;
 };
 
 /**
@@ -73,14 +87,33 @@ export type PrioritySlicer = {
  * callers waiting through `backgroundEvery - 1` foreground turns in a row
  * take the next one. (Resumed waiters run before any of them does its work,
  * so a waiter cannot tell from the clock alone whether another has the
- * slice.) A budget of zero or less yields at every call.
+ * slice.) A budget of zero or less yields at every call. Foreground work
+ * counted outside the slicer, such as another thread's searches, holds back
+ * only background yields, each for a bounded time ({@link PrioritySlicer.yieldTo}).
  */
 export function prioritySlicer(opts: TimeSlicerOptions = {}): PrioritySlicer {
   const budget = opts.budgetMs ?? SLICE_MS;
   const now = opts.now ?? (() => performance.now());
   const yieldNow = opts.yieldNow ?? macrotask;
   const every = Math.max(1, Math.floor(opts.backgroundEvery ?? BACKGROUND_EVERY));
-  if (!(budget > 0)) return { foreground: () => yieldNow(), background: () => yieldNow() };
+  let outside = opts.foreground;
+  const yieldTo = (signal: ForegroundSignal | undefined): void => {
+    outside = signal;
+  };
+  /** A background yield's wait for the foreground counted outside; settles
+   *  at once (no await) while the signal is absent or reads zero. */
+  const quiet = (): Promise<void> | undefined =>
+    outside?.active() ? waitForQuiet(outside, { now }) : undefined;
+  if (!(budget > 0)) {
+    return {
+      foreground: () => yieldNow(),
+      background: () => {
+        const waiting = quiet();
+        return waiting ? waiting.then(() => yieldNow()) : yieldNow();
+      },
+      yieldTo,
+    };
+  }
   type Class = "foreground" | "background";
   type Turn = {
     done: Promise<void>;
@@ -125,6 +158,10 @@ export function prioritySlicer(opts: TimeSlicerOptions = {}): PrioritySlicer {
     // real one) restarts the slice rather than holding off every yield.
     if (now() < sliceStart) sliceStart = now();
     if (now() - sliceStart < budget) return;
+    // Upkeep gives way to foreground work counted outside the slicer, once
+    // per yield and for a bounded time, then takes its turn as usual.
+    const waiting = kind === "background" ? quiet() : undefined;
+    if (waiting) await waiting;
     for (;;) {
       // A yield whose callback was dropped (a test that swapped the timer
       // functions out from under it) must not hold every later caller, so a
@@ -141,7 +178,7 @@ export function prioritySlicer(opts: TimeSlicerOptions = {}): PrioritySlicer {
       }
     }
   };
-  return { foreground: yieldPoint("foreground"), background: yieldPoint("background") };
+  return { foreground: yieldPoint("foreground"), background: yieldPoint("background"), yieldTo };
 }
 
 /** A slicer's foreground yield point alone (see {@link prioritySlicer}). */
@@ -166,6 +203,16 @@ export const yieldOnBudget: () => Promise<void> = shared.foreground;
  * one in {@link BACKGROUND_EVERY} turns.
  */
 export const yieldInBackground: () => Promise<void> = shared.background;
+
+/**
+ * Make {@link yieldInBackground} give way to `signal`, foreground work that
+ * another thread counts (see {@link PrioritySlicer.yieldTo}), or to nothing
+ * outside this thread when undefined. The setting belongs to the thread that
+ * makes it, since each thread loads its own copy of this module.
+ */
+export function yieldBackgroundTo(signal: ForegroundSignal | undefined): void {
+  shared.yieldTo(signal);
+}
 
 /**
  * Synchronous work written as a generator that stops at each bare `yield`,
