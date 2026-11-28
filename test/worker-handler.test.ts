@@ -619,6 +619,27 @@ describe("the first lease acquire", () => {
     expect(await leaseRow()).toBeUndefined();
   });
 
+  it("posts a status at once when a later acquire takes the lease, whatever its clock's rate limit", async () => {
+    await seedLease("rival");
+    // The handler's clock never moves: only a status posted at once passes
+    // its rate limit after the first.
+    const { worker, side } = await startSide(
+      workerHarness({ now: () => 1_000_000, leaseRetryMs: 20 }),
+    );
+    worker.postMessage(initMessage({ holderId: "main/w2", limits: { coldPass: true } }));
+    const first = await nextOf(side, "status");
+    expect(first.status.distill.leaseHeld).toBe(false);
+
+    const db = await openSqlite(storePath);
+    if (!db) throw new Error("no sqlite");
+    dbs.push(db);
+    db.run("UPDATE meta SET value=? WHERE key='distill_lease'", [
+      JSON.stringify({ holder: "", heartbeat: 0, ttl: LEASE_TTL_MS, build: "", gen: 0 }),
+    ]);
+    const held = await nextOf(side, "status", (m) => m.status.distill.leaseHeld);
+    expect(held.status.holderId).toBe("main/w2");
+  });
+
   it("never takes the predecessor's lease over on a later acquire", async () => {
     const db = await openSqlite(storePath);
     if (!db) throw new Error("no sqlite");

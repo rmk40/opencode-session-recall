@@ -77,6 +77,9 @@ export type WorkerHandlerOptions = {
    *  (default {@link STORE_LOCK_RETRY_FIRST_MS}, doubling up to
    *  {@link STORE_LOCK_RETRY_MAX_MS}). */
   lockRetryMs?: { first: number; max: number };
+  /** The distiller's wait before a non-holder tries the lease again
+   *  (default its own). */
+  leaseRetryMs?: number;
 };
 
 export type WorkerHandler = {
@@ -380,6 +383,11 @@ export function runWorkerHandler(port: WorkerPort, options: WorkerHandlerOptions
       gen: EMBED_REPRESENTATION,
       projectorGen: V2_PROJECTOR_GEN,
       ...(message.takeOver !== undefined && { takeOverLease: message.takeOver }),
+      ...(options.leaseRetryMs !== undefined && { leaseRetryMs: options.leaseRetryMs }),
+      // Main learns at once that this generation holds the lease, whatever
+      // the status rate limit, so a failure right after still names it as
+      // the holder the next generation takes over from.
+      onLeaseAcquired: () => postStatus(true),
       discover: () => discoverSessions(distillSource, yieldInBackground),
       log,
       sync: createV2Sync(sourceDb, {

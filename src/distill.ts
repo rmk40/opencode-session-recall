@@ -639,6 +639,8 @@ export type DistillerOptions = {
    * never take it over.
    */
   takeOverLease?: string;
+  /** Called each time an acquire takes the lease, right after it does. */
+  onLeaseAcquired?: () => void;
   /**
    * The host's history projector generation, stamped on every card this
    * distiller writes in full ({@link Card.projectorGen}). Only a host that
@@ -4675,6 +4677,11 @@ export function createDistiller(options: DistillerOptions): Distiller {
       repairGenAdopted = false;
       holdCheckpoints(true);
       logMsg(`lease acquired (build ${build}, gen ${gen})`);
+      try {
+        options.onLeaseAcquired?.();
+      } catch (error) {
+        logMsg(`lease acquired callback failed: ${errmsg(error)}`);
+      }
       scheduleHeartbeat();
       schedulePoll();
       // Re-distills queued when the lease was lost resume now, not only when

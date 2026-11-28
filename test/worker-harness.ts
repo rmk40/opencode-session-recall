@@ -119,6 +119,8 @@ export function workerHarness(
     now?: () => number;
     /** The handlers' waits for a store lock (`WorkerHandlerOptions.lockRetryMs`). */
     lockRetryMs?: { first: number; max: number };
+    /** The handlers' lease retry (`WorkerHandlerOptions.leaseRetryMs`). */
+    leaseRetryMs?: number;
   } = {},
 ): WorkerHarness {
   const sides: HandlerSide[] = [];
@@ -181,6 +183,7 @@ export function workerHarness(
       generation,
       ...(opts.now && { now: opts.now }),
       ...(opts.lockRetryMs && { lockRetryMs: opts.lockRetryMs }),
+      ...(opts.leaseRetryMs !== undefined && { leaseRetryMs: opts.leaseRetryMs }),
       openStoreDb: async (path) => {
         const db = await openBase(path);
         return db ? faultyDb(db, state) : db;

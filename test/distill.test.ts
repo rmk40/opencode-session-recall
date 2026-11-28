@@ -2223,6 +2223,30 @@ describe("readRepairState", () => {
 // ── Lease ────────────────────────────────────────────────────────────────────
 
 describe("lease", () => {
+  it("calls onLeaseAcquired each time an acquire takes the lease, a retry's included", async () => {
+    const { source } = makeDistillFake({ sessions: [], messagesBySession: {} });
+    const { db, store } = await freshStore();
+    expect(store.acquireLease("other", 30_000, "otherbuild", 4)).toBe(true);
+    let acquired = 0;
+    const distiller = createDistiller({
+      source,
+      store,
+      gate: makeSpyGate().gate,
+      limits: { ...TEST_LIMITS, coldPass: false },
+      instanceId: "B",
+      leaseRetryMs: 20,
+      onLeaseAcquired: () => acquired++,
+      log: () => {},
+    });
+    distiller.start();
+    expect(acquired).toBe(0);
+    expect(store.releaseLease("other")).toBe(true);
+    await waitFor(() => distiller.status().leaseHeld);
+    expect(acquired).toBe(1);
+    await distiller.stop();
+    db.close();
+  });
+
   it("a non-holder writes nothing on start or events", async () => {
     const graph: Graph = {
       sessions: [session("s1", "Alpha", PROJECT_DIR, 3000)],

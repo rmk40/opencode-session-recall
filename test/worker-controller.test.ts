@@ -400,6 +400,26 @@ describe("the controller with scripted workers", () => {
       });
     });
 
+    it("names a generation whose lease status arrived only after main's reader failed to open", async () => {
+      const { scripted } = scriptedController({
+        restartDelaysMs: [0, 0],
+        onStoreOpen: async () => ({ ok: false, reason: "no-wal" }),
+      });
+      await flush();
+      await ready(scripted.worker(1));
+      // The store result fails the generation before its status is heard.
+      scripted.worker(1).emit({ type: "store", id: scripted.worker(1).last("init")?.id, ok: true });
+      await flush();
+      scripted.worker(1).emit({ type: "status", status: status() });
+      scripted.worker(1).exit();
+      await flush();
+      await ready(scripted.worker(2));
+      expect(scripted.worker(2).last("init")).toMatchObject({
+        holderId: "inst/w2",
+        takeOver: "inst/w1",
+      });
+    });
+
     it("keeps the holder to take over when a failed generation never took the lease", async () => {
       const { controller, scripted, record } = scriptedController({
         restartDelaysMs: [0, 0],

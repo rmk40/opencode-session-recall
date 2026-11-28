@@ -167,6 +167,9 @@ type Generation = {
   markExited: () => void;
   stopped?: () => void;
   status?: WorkerStatus;
+  /** A status of this generation said it held the lease, one that arrived
+   *  after it failed included. */
+  tookLease: boolean;
   /** The `events` batches posted to this generation that it has not
    *  acknowledged yet, by batch id in the order they were posted, with their
    *  signals (at most {@link MAX_UNACKED_BATCHES} of {@link EVENT_BATCH}). */
@@ -305,7 +308,6 @@ export function createWorkerController(options: WorkerControllerOptions): Worker
     log(`worker generation ${gen.number} failed (${failures} of ${maxFailures}): ${reason}`);
     // Its last status is frozen, often still holding the lease: until a new
     // generation reports, the distiller reports as restarting and idle.
-    const heldLease = gen.status?.distill.leaseHeld === true;
     gen.status = undefined;
     mode = { kind: "worker", detail: `restarting (${reason})` };
     gen.worker?.terminate();
@@ -315,7 +317,7 @@ export function createWorkerController(options: WorkerControllerOptions): Worker
     // A takeover compares one holder id with the row's. A generation that
     // never took the lease cannot be in the row, so the holder that may still
     // be there stays the one to take over.
-    if (heldLease || leaseNames(gen.holderId)) predecessor = gen.holderId;
+    if (gen.tookLease || leaseNames(gen.holderId)) predecessor = gen.holderId;
     if (stopping || mode.kind !== "worker") return;
     // The batches it never acknowledged may not have reached its distiller,
     // or only in part: they go back ahead of the signals posted since, for
@@ -392,8 +394,15 @@ export function createWorkerController(options: WorkerControllerOptions): Worker
   }
 
   function onMessage(gen: Generation, raw: unknown): void {
-    if (gen !== current || gen.failed) return;
+    if (gen !== current) return;
     if (!isWorkerMessage(raw) || raw.generation !== gen.number) return;
+    if (gen.failed) {
+      // A failed generation is heard only on whether it took the lease: a
+      // status it posted before it failed can arrive after, and decides
+      // whose lease the next one may take over.
+      if (raw.type === "status" && raw.status?.distill?.leaseHeld === true) gen.tookLease = true;
+      return;
+    }
     switch (raw.type) {
       case "ready": {
         if (gen.readyTimer !== undefined) clearTimeout(gen.readyTimer);
@@ -438,6 +447,7 @@ export function createWorkerController(options: WorkerControllerOptions): Worker
       }
       case "status":
         gen.status = raw.status;
+        if (raw.status?.distill?.leaseHeld === true) gen.tookLease = true;
         options.onStatus?.(raw.status);
         return;
       case "ack":
@@ -491,6 +501,7 @@ export function createWorkerController(options: WorkerControllerOptions): Worker
       failed: false,
       stopRequested: false,
       exited: false,
+      tookLease: false,
       unacked: new Map(),
       exit: new Promise<void>((resolve) => (markExited = resolve)),
       markExited: () => {

@@ -458,18 +458,18 @@ a reply (`init`, `vectors`, `stop`) carries an `id` and an absolute `deadline`.
 Its reply names the `id` and says `committed`, `refused` or `failed`, with a
 reason.
 
-| Direction     | Message                            | Contents                                                                                                                                                                                                                    |
-| ------------- | ---------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| main → worker | `init`                             | store and source paths, holder id, the predecessor's holder id (`takeOver`), limits, sync timings, `BUILD_ID`, the build tag, the representation and projector generations, the foreground signal's buffer                  |
-| main → worker | `events`                           | a batch id and distiller signals, coalesced per session, up to 256 a message                                                                                                                                                |
-| main → worker | `vectors`                          | model, representation and rows, each whole-buffer embedding transferred                                                                                                                                                     |
-| main → worker | `stop`                             | the deadline                                                                                                                                                                                                                |
-| worker → main | `ready`                            | the worker's `BUILD_ID`, once the module has loaded                                                                                                                                                                         |
-| worker → main | `store`                            | the fence result: `ok` with an optional `warning`, or a refusal reason                                                                                                                                                      |
-| worker → main | `status`                           | `DistillStatus` (lease included), indexing, repair progress, `discoveryTruncated`, the holder id, the worker's history drift and the longest synchronous store call since the last status; on change, at most once a second |
-| worker → main | `waiting`                          | the store's open found its write lock held by another connection past the 5 s busy timeout: the reason, the attempt and the wait before it opens again (1 s, doubling to 30 s)                                              |
-| worker → main | `ack`                              | the batch id of an `events` message whose signals the worker handed to its distiller                                                                                                                                        |
-| worker → main | `log`, `fatal`, `reply`, `stopped` | a log line, an unrecoverable error (`store` or `crash`), a request's outcome, the end of a stop                                                                                                                             |
+| Direction     | Message                            | Contents                                                                                                                                                                                                                                                                    |
+| ------------- | ---------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| main → worker | `init`                             | store and source paths, holder id, the predecessor's holder id (`takeOver`), limits, sync timings, `BUILD_ID`, the build tag, the representation and projector generations, the foreground signal's buffer                                                                  |
+| main → worker | `events`                           | a batch id and distiller signals, coalesced per session, up to 256 a message                                                                                                                                                                                                |
+| main → worker | `vectors`                          | model, representation and rows, each whole-buffer embedding transferred                                                                                                                                                                                                     |
+| main → worker | `stop`                             | the deadline                                                                                                                                                                                                                                                                |
+| worker → main | `ready`                            | the worker's `BUILD_ID`, once the module has loaded                                                                                                                                                                                                                         |
+| worker → main | `store`                            | the fence result: `ok` with an optional `warning`, or a refusal reason                                                                                                                                                                                                      |
+| worker → main | `status`                           | `DistillStatus` (lease included), indexing, repair progress, `discoveryTruncated`, the holder id, the worker's history drift and the longest synchronous store call since the last status; on change, at most once a second, and at once when the distiller takes the lease |
+| worker → main | `waiting`                          | the store's open found its write lock held by another connection past the 5 s busy timeout: the reason, the attempt and the wait before it opens again (1 s, doubling to 30 s)                                                                                              |
+| worker → main | `ack`                              | the batch id of an `events` message whose signals the worker handed to its distiller                                                                                                                                                                                        |
+| worker → main | `log`, `fatal`, `reply`, `stopped` | a log line, an unrecoverable error (`store` or `crash`), a request's outcome, the end of a stop                                                                                                                                                                             |
 
 No `opencode.db` row, history page, card or row set crosses. The bounds:
 
@@ -552,7 +552,11 @@ No `opencode.db` row, history page, card or row set crosses. The bounds:
   named once its thread had ended, so its first acquire may take that one lease
   over. The takeover compares one id with the row's, and a generation that never
   took the lease cannot be in the row, so such a generation leaves the id as it
-  was.
+  was. The worker posts a status at once whenever its distiller takes the lease
+  (`onLeaseAcquired`), outside the status rate limit, and main counts a status
+  saying it holds the lease even when it arrives after the generation failed.
+  So a generation whose reader failed to open, leaving main no row to read,
+  still counts as having held the lease.
 - **Watchdog:** every 5 s main reads the lease row through its reader. When the row
   names the running generation, its heartbeat is older than the row's TTL and no
   stop is pending, the generation fails. The row alone decides, so a worker that
