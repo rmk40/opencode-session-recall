@@ -89,9 +89,11 @@ export type WorkerControllerOptions = {
   watchdogEveryMs?: number;
   /** Failed generations before the distiller runs on main (default 3). */
   maxFailures?: number;
-  /** The first generation starts only once this settles: the end of an
-   *  earlier runtime's worker thread on the same store. */
-  startAfter?: Promise<void>;
+  /** The first generation starts only once `ended` settles: the end of an
+   *  earlier runtime's worker thread on the same store. A retire, a stop or
+   *  a terminate cancels the wait, so nothing of this controller stays
+   *  waiting on a thread that may never end. */
+  startAfter?: { ended: Promise<unknown>; cancel(): void };
 };
 
 /** Where the distiller runs, as `coverage.history.distiller` reports it. */
@@ -471,7 +473,7 @@ export function createWorkerController(options: WorkerControllerOptions): Worker
       // a thread that may still hold it.
       mode = { kind: "worker", detail: "waiting (an earlier worker on this store has not ended)" };
       log("waiting for an earlier worker thread on this store to end before starting one");
-      await options.startAfter;
+      await options.startAfter.ended;
       if (stopping || mode.kind !== "worker") return;
       mode = { kind: "worker" };
     }
@@ -582,6 +584,7 @@ export function createWorkerController(options: WorkerControllerOptions): Worker
     },
     retire() {
       stopping = true;
+      options.startAfter?.cancel();
       if (restartTimer !== undefined) clearTimeout(restartTimer);
       restartTimer = undefined;
       markSettled();
@@ -589,6 +592,7 @@ export function createWorkerController(options: WorkerControllerOptions): Worker
     stop(deadlineMs) {
       stopPromise ??= (async () => {
         stopping = true;
+        options.startAfter?.cancel();
         quiesced = true;
         outbox.drain();
         stopWatchdog();
@@ -610,6 +614,7 @@ export function createWorkerController(options: WorkerControllerOptions): Worker
     },
     async terminate(waitMs) {
       stopping = true;
+      options.startAfter?.cancel();
       stopWatchdog();
       if (restartTimer !== undefined) clearTimeout(restartTimer);
       restartTimer = undefined;

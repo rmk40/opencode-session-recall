@@ -77,8 +77,8 @@ import { defaultWorkerStarter } from "../worker/start.js";
 import type { V2Event } from "./opencode-v2-types.js";
 import {
   createIdDedupe,
+  awaitWorkerExit,
   noteWorkerExit,
-  pendingWorkerExit,
   type ResolvedIdentity,
   type RuntimeFactory,
 } from "./runtime.js";
@@ -1032,7 +1032,7 @@ async function createV2Runtime(
     // An earlier runtime's worker on this store whose thread has not ended
     // yet: this one starts its own only after that, and its tools read the
     // store's cards meanwhile when a reader opens.
-    const earlierWorker = pendingWorkerExit(storePath);
+    const earlierWorker = awaitWorkerExit(storePath);
     workerStore = storePath;
     controller = createWorkerController({
       ...(earlierWorker && { startAfter: earlierWorker }),
@@ -1184,10 +1184,12 @@ async function createV2Runtime(
       if (disposePromise) return disposePromise;
       disposed = true;
       // No worker generation starts from here on, a pending restart included,
-      // so the current one's thread is the last: a later runtime on this
-      // store starts its worker only once that thread has ended.
+      // and a wait on an earlier runtime's thread ends: the current
+      // generation's thread is the last, and a later runtime on this store
+      // starts its worker only once that thread has ended. A runtime that
+      // started none records nothing, and the earlier thread's record stays.
       controller?.retire();
-      if (controller && workerStore !== undefined) {
+      if (controller && workerStore !== undefined && controller.generation() > 0) {
         noteWorkerExit(workerStore, controller.exited());
       }
       if (driftTimer !== undefined) clearInterval(driftTimer);

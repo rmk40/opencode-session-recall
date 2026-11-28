@@ -829,10 +829,31 @@ describe("the controller with scripted workers", () => {
       expect(ended.settled).toBe(true);
     });
 
+    /** A wait on an earlier worker's exit, which the test ends or counts
+     *  the cancels of. */
+    function earlierWorker(): {
+      startAfter: { ended: Promise<boolean>; cancel(): void };
+      end(): void;
+      cancels: number;
+    } {
+      let finish!: (ended: boolean) => void;
+      const wait = {
+        startAfter: {
+          ended: new Promise<boolean>((resolve) => (finish = resolve)),
+          cancel: () => {
+            wait.cancels++;
+            finish(false);
+          },
+        },
+        end: () => finish(true),
+        cancels: 0,
+      };
+      return wait;
+    }
+
     it("starts its first generation only once an earlier worker on the store has ended", async () => {
-      let ended!: () => void;
-      const startAfter = new Promise<void>((resolve) => (ended = resolve));
-      const { controller, scripted } = scriptedController({ startAfter });
+      const earlier = earlierWorker();
+      const { controller, scripted } = scriptedController({ startAfter: earlier.startAfter });
       await advance(60_000);
       expect(scripted.workers).toHaveLength(0);
       expect(controller.mode()).toEqual({
@@ -840,22 +861,40 @@ describe("the controller with scripted workers", () => {
         detail: "waiting (an earlier worker on this store has not ended)",
       });
       await controller.exited();
-      ended();
+      earlier.end();
       await flush();
       expect(scripted.workers).toHaveLength(1);
       expect(controller.mode()).toEqual({ kind: "worker" });
+      expect(earlier.cancels).toBe(0);
     });
 
     it("starts no generation after a stop during the wait for an earlier worker", async () => {
-      let ended!: () => void;
-      const startAfter = new Promise<void>((resolve) => (ended = resolve));
-      const { controller, scripted } = scriptedController({ startAfter });
+      const earlier = earlierWorker();
+      const { controller, scripted } = scriptedController({ startAfter: earlier.startAfter });
       await flush();
       expect(await controller.stop(1_000)).toBe(false);
-      ended();
+      earlier.end();
       await advance(60_000);
       expect(scripted.workers).toHaveLength(0);
     });
+
+    it.each(["retire", "stop", "terminate"] as const)(
+      "cancels its wait for an earlier worker on %s, starting nothing when that worker ends",
+      async (how) => {
+        const earlier = earlierWorker();
+        const { controller, scripted } = scriptedController({ startAfter: earlier.startAfter });
+        await flush();
+        if (how === "retire") controller.retire();
+        else if (how === "stop") void controller.stop(1_000);
+        else void controller.terminate(1_000);
+        await flush();
+        expect(earlier.cancels).toBeGreaterThan(0);
+        earlier.end();
+        await advance(60_000);
+        expect(scripted.workers).toHaveLength(0);
+        expect(controller.generation()).toBe(0);
+      },
+    );
 
     it("settles exited at the current generation's exit, with no bound", async () => {
       const { controller, scripted } = scriptedController();

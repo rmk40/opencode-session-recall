@@ -25,7 +25,7 @@ import type { WorkerStarter } from "../src/worker/start.js";
 import entry from "../src/opencode-session-recall.js";
 import { instanceOf } from "../src/host/v2.js";
 import { REGISTRY_KEY } from "../src/host/registry.js";
-import { resetRuntimeRegistryForTests } from "../src/host/runtime.js";
+import { resetRuntimeRegistryForTests, workerExitStateForTests } from "../src/host/runtime.js";
 import type { V2Cleanup } from "../src/host/opencode-v2-types.js";
 import { fakeV2Host, type FakeV2Host } from "./v2-host.js";
 import { TEST_LIMITS, makeContext, toolResultText } from "./helpers.js";
@@ -1126,6 +1126,35 @@ describe("dispose", () => {
     await waitFor(() => next.distiller.status().leaseHeld, "the second worker's lease");
     expect(next.deps.distiller?.()).toBe("worker");
   }, 40_000);
+
+  it("leaves one record and no wait behind for each reload while an earlier thread does not end", async () => {
+    const first = workerHarness();
+    const exits = exitsHeld(first);
+    const { runtime: a } = await create({ worker: { start: exits.start } });
+    await waitFor(() => a.distiller.status().leaseHeld, "A's lease");
+    runtimes.splice(runtimes.indexOf(a), 1);
+    const disposingA = a.dispose();
+    await waitFor(() => first.side(1)?.ended === true, "the end asked of A's thread");
+    const record = workerExitStateForTests(storePath).exit;
+    expect(record).toBeDefined();
+
+    for (let reload = 0; reload < 3; reload++) {
+      const harness = workerHarness();
+      const { runtime } = await create({ worker: { start: harness.start } });
+      // Its one wait on A's thread, which its retire ends.
+      expect(workerExitStateForTests(storePath).exit).toBe(record);
+      expect(workerExitStateForTests(storePath).waiters).toBe(1);
+      await dispose(runtime);
+      expect(harness.sides).toHaveLength(0);
+      // It started no thread, so it recorded nothing: the record is A's.
+      expect(workerExitStateForTests(storePath).exit).toBe(record);
+      expect(workerExitStateForTests(storePath).waiters).toBe(0);
+    }
+
+    exits.release();
+    await disposingA;
+    await waitFor(() => workerExitStateForTests(storePath).exit === undefined, "the record's end");
+  }, 60_000);
 
   it("keeps a running thread's record through a reload whose runtime retired before starting a worker", async () => {
     const first = workerHarness();

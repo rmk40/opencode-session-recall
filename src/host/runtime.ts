@@ -120,12 +120,17 @@ type RuntimeRegistry = {
   /** Cross-build: real store path → the dispose of the runtime retiring on
    *  it. Every build reads and writes only this map. */
   retiring: Map<string, Promise<void>>;
-  /** Cross-build: real store path → the confirmed end of the last distiller
-   *  worker thread a retiring runtime ran on it ({@link noteWorkerExit}).
+  /** Cross-build: real store path → the confirmed end of the distiller
+   *  worker threads retiring runtimes ran on it ({@link noteWorkerExit}).
    *  Absent in a registry an older build made, until first used. */
-  workerExits?: Map<string, Promise<void>>;
+  workerExits?: Map<string, WorkerExitRecord>;
   builds: Map<string, BuildState>;
 };
+
+/** What the registry holds for a store whose worker threads have not all
+ *  ended: their combined exit, and the waits for it ({@link awaitWorkerExit}),
+ *  each one call the exit makes. */
+type WorkerExitRecord = { exit: Promise<void>; waiters: Set<() => void> };
 
 function runtimeRegistry(): RuntimeRegistry {
   const reg = registry();
@@ -138,10 +143,19 @@ function runtimeRegistry(): RuntimeRegistry {
   return created;
 }
 
-function workerExits(): Map<string, Promise<void>> {
+function workerExits(): Map<string, WorkerExitRecord> {
   const reg = runtimeRegistry();
   if (!(reg.workerExits instanceof Map)) reg.workerExits = new Map();
   return reg.workerExits;
+}
+
+/** The record for `store`, if it holds one of this shape: the map is shared
+ *  across builds, so anything else is taken as no record. */
+function exitRecord(store: string): WorkerExitRecord | undefined {
+  const value: unknown = workerExits().get(store);
+  if (typeof value !== "object" || value === null) return undefined;
+  const { exit, waiters } = value as Partial<WorkerExitRecord>;
+  return isThenable(exit) && waiters instanceof Set ? (value as WorkerExitRecord) : undefined;
 }
 
 /**
@@ -150,35 +164,60 @@ function workerExits(): Map<string, Promise<void>> {
  * thread asked to end can still be inside a statement that holds the store's
  * write lock and later commits, and the runtime's own dispose stops waiting
  * for it after a bound: a later runtime on the same store starts its own
- * worker only once this settles ({@link pendingWorkerExit}).
+ * worker only once this settles ({@link awaitWorkerExit}). Only a runtime
+ * that started a thread records one.
  *
  * An exit already recorded for the store is kept: the record settles only
- * once both have. A runtime that waited on an earlier thread and retired
- * before starting one of its own records an exit that settles at once,
- * while the earlier thread may still run.
+ * once both have, and its waits carry over to the combined record.
  */
 export function noteWorkerExit(store: string, exit: Promise<void>): void {
   const exits = workerExits();
-  const earlier = pendingWorkerExit(store);
-  const recorded = earlier ? Promise.all([earlier, exit]).then(() => undefined) : exit;
-  exits.set(store, recorded);
-  const forget = (): void => {
-    if (exits.get(store) === recorded) exits.delete(store);
+  const earlier = exitRecord(store);
+  const record: WorkerExitRecord = {
+    exit: earlier ? Promise.all([earlier.exit, exit]).then(() => undefined) : exit,
+    waiters: earlier?.waiters ?? new Set(),
   };
-  void recorded.then(forget, forget);
+  exits.set(store, record);
+  const settle = (): void => {
+    // A record that replaced this one holds its waits and settles them.
+    if (exits.get(store) !== record) return;
+    exits.delete(store);
+    const waiters = [...record.waiters];
+    record.waiters.clear();
+    for (const wake of waiters) wake();
+  };
+  void record.exit.then(settle, settle);
 }
 
-/** The exit {@link noteWorkerExit} recorded for `store` that has not settled
- *  yet, if any. */
-export function pendingWorkerExit(store: string): Promise<void> | undefined {
-  // Shared across builds, so only a thenable is taken.
-  const exit: unknown = workerExits().get(store);
-  return isThenable(exit)
-    ? Promise.resolve(exit).then(
-        () => undefined,
-        () => undefined,
-      )
-    : undefined;
+/** A wait for the exit recorded on a store: `ended` resolves true at that
+ *  exit, and false at once on `cancel()`, which leaves nothing of the wait
+ *  in the registry. */
+export type WorkerExitWait = { ended: Promise<boolean>; cancel(): void };
+
+/** A wait for the exit {@link noteWorkerExit} recorded for `store` that has
+ *  not settled yet; undefined when there is none. */
+export function awaitWorkerExit(store: string): WorkerExitWait | undefined {
+  const record = exitRecord(store);
+  if (!record) return undefined;
+  let finish!: (ended: boolean) => void;
+  const ended = new Promise<boolean>((resolve) => (finish = resolve));
+  const wake = (): void => finish(true);
+  record.waiters.add(wake);
+  return {
+    ended,
+    cancel() {
+      if (record.waiters.delete(wake)) finish(false);
+    },
+  };
+}
+
+/** Test-only: what the registry holds for `store`'s worker exits. */
+export function workerExitStateForTests(store: string): {
+  exit: Promise<void> | undefined;
+  waiters: number;
+} {
+  const record = exitRecord(store);
+  return { exit: record?.exit, waiters: record?.waiters.size ?? 0 };
 }
 
 function buildState(buildId: string): BuildState {

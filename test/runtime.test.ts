@@ -4,13 +4,14 @@ import {
   createIdDedupe,
   DETACH_WAIT_MS,
   differingKeys,
+  awaitWorkerExit,
   noteWorkerExit,
-  pendingWorkerExit,
   resetRuntimeRegistryForTests,
   RETIRE_WAIT_MS,
   type ResolvedIdentity,
   type RuntimeFactory,
   type RuntimeKey,
+  workerExitStateForTests,
 } from "../src/host/runtime.js";
 import { registry } from "../src/host/registry.js";
 
@@ -346,34 +347,51 @@ describe("worker thread exits on a store", () => {
   it("keeps an exit still pending when a later runtime records one that settled at once", async () => {
     let endA!: () => void;
     noteWorkerExit("/cache/store.db", new Promise<void>((resolve) => (endA = resolve)));
-    // A runtime that waited on that thread and retired without a thread.
     noteWorkerExit("/cache/store.db", Promise.resolve());
     await vi.advanceTimersByTimeAsync(0);
-    const pending = pendingWorkerExit("/cache/store.db");
-    expect(pending).toBeDefined();
-    const state = settledOf(pending);
+    const wait = awaitWorkerExit("/cache/store.db");
+    expect(wait).toBeDefined();
+    const state = settledOf(wait?.ended);
     await vi.advanceTimersByTimeAsync(60_000);
     expect(state.settled).toBe(false);
     endA();
     await vi.advanceTimersByTimeAsync(0);
     expect(state.settled).toBe(true);
-    expect(pendingWorkerExit("/cache/store.db")).toBeUndefined();
+    expect(await wait?.ended).toBe(true);
+    expect(awaitWorkerExit("/cache/store.db")).toBeUndefined();
   });
 
   it("settles a store's record only once every exit recorded on it has", async () => {
     let endA!: () => void;
     let endB!: () => void;
     noteWorkerExit("/cache/store.db", new Promise<void>((resolve) => (endA = resolve)));
+    const early = awaitWorkerExit("/cache/store.db");
     noteWorkerExit("/cache/store.db", new Promise<void>((resolve) => (endB = resolve)));
-    const state = settledOf(pendingWorkerExit("/cache/store.db"));
-    endB();
-    await vi.advanceTimersByTimeAsync(0);
-    expect(state.settled).toBe(false);
+    const late = awaitWorkerExit("/cache/store.db");
+    const states = [settledOf(early?.ended), settledOf(late?.ended)];
     endA();
     await vi.advanceTimersByTimeAsync(0);
-    expect(state.settled).toBe(true);
+    // A wait taken before the second record carries over to it.
+    expect(states.map((s) => s.settled)).toEqual([false, false]);
+    endB();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(states.map((s) => s.settled)).toEqual([true, true]);
     // Another store's record is its own.
-    expect(pendingWorkerExit("/cache/other.db")).toBeUndefined();
+    expect(awaitWorkerExit("/cache/other.db")).toBeUndefined();
+  });
+
+  it("drops a cancelled wait from the record at once, ending it unfulfilled", async () => {
+    noteWorkerExit("/cache/store.db", new Promise<void>(() => {}));
+    const first = awaitWorkerExit("/cache/store.db");
+    const second = awaitWorkerExit("/cache/store.db");
+    expect(workerExitStateForTests("/cache/store.db").waiters).toBe(2);
+    first?.cancel();
+    expect(await first?.ended).toBe(false);
+    expect(workerExitStateForTests("/cache/store.db").waiters).toBe(1);
+    second?.cancel();
+    second?.cancel();
+    expect(workerExitStateForTests("/cache/store.db").waiters).toBe(0);
+    expect(workerExitStateForTests("/cache/store.db").exit).toBeDefined();
   });
 });
 

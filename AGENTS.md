@@ -611,16 +611,19 @@ No `opencode.db` row, history page, card or row set crosses. The bounds:
   thread has ended, and a reload's new runtime on the same store waits for it (at
   most `RETIRE_WAIT_MS`, 3 s). The worker writes nothing after `stopped`: its
   store handle refuses every call from then on.
-- **The next runtime's worker:** dispose also records, per real store path in the
-  registry (`noteWorkerExit`, shared across builds), a promise of the last
-  thread's confirmed exit, with no time bound. A record already there is kept
-  and the two settle together, so a runtime that waited on a thread and retired
-  before starting its own cannot let a third start beside that thread. A later
-  runtime on the same store
-  starts its first generation only once that promise settles (`startAfter`),
-  reporting `"worker: waiting (an earlier worker on this store has not ended)"`.
-  Meanwhile it opens its reader at once when it can and otherwise serves the
-  degraded tier. If the old thread never ends, no new worker starts in this
+- **The next runtime's worker:** a runtime that started a worker thread records
+  at dispose, per real store path in the registry (`noteWorkerExit`, shared
+  across builds), a promise of its last thread's confirmed exit, with no time
+  bound. A record already there is kept and the two settle together; a runtime
+  that started no thread records nothing, so the earlier thread's record stays
+  as it is. A later runtime on the same store starts its first generation only
+  once that record settles, through a wait it takes on it (`awaitWorkerExit`,
+  the controller's `startAfter`), reporting
+  `"worker: waiting (an earlier worker on this store has not ended)"`. A retire,
+  stop or terminate of its controller cancels that wait, which drops it from the
+  record, so reloads behind a thread that never ends leave one record and no
+  waits behind. Meanwhile it opens its reader at once when it can and otherwise
+  serves the degraded tier. If the old thread never ends, no new worker starts in this
   process, and that is safe. A statement the old thread is still inside holds
   the write lock, so it commits or fails before any other connection can write
   or take the lease over, and a terminated thread runs no JavaScript after it.
