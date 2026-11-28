@@ -54,6 +54,14 @@ import {
 
 /** What `sqliteThreadSafety` reports: the real library's answer by default. */
 const threadSafety = vi.hoisted(() => ({ value: "real" as number | undefined | "real" }));
+/** Writable opens of `path`: each one sets `entered`, waits for `hold` and,
+ *  with `fail`, returns no connection. */
+const storeOpens = vi.hoisted(() => ({
+  path: undefined as string | undefined,
+  hold: undefined as Promise<void> | undefined,
+  entered: false,
+  fail: false,
+}));
 
 vi.mock("../src/sqlite.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../src/sqlite.js")>();
@@ -61,6 +69,14 @@ vi.mock("../src/sqlite.js", async (importOriginal) => {
     ...actual,
     sqliteThreadSafety: async () =>
       threadSafety.value === "real" ? actual.sqliteThreadSafety() : threadSafety.value,
+    openSqlite: async (path: string) => {
+      if (storeOpens.path !== undefined && path === storeOpens.path) {
+        storeOpens.entered = true;
+        if (storeOpens.hold) await storeOpens.hold;
+        if (storeOpens.fail) return null;
+      }
+      return actual.openSqlite(path);
+    },
   };
 });
 
@@ -89,6 +105,7 @@ const held: SqliteDb[] = [];
 beforeEach(async () => {
   threadSafety.value = "real";
   discovery.hold = undefined;
+  Object.assign(storeOpens, { path: undefined, hold: undefined, entered: false, fail: false });
   dir = realpathSync(mkdtempSync(join(tmpdir(), "recall-v2-worker-")));
   storePath = join(dir, "store.db");
   v2 = await makeV2PartsDb();
@@ -148,6 +165,7 @@ async function create(
     options?: Partial<V2RuntimeOptions>;
     worker?: V2RuntimeInputs["worker"];
     wrapReader?: V2RuntimeInputs["wrapReader"];
+    sync?: V2RuntimeInputs["sync"];
   } = {},
 ): Promise<{ runtime: V2Runtime; logs: string[] }> {
   const logs: string[] = [];
@@ -158,6 +176,7 @@ async function create(
     idleDebounceMs: 5,
     ...(o.worker !== undefined && { worker: o.worker }),
     ...(o.wrapReader && { wrapReader: o.wrapReader }),
+    ...(o.sync && { sync: o.sync }),
   });
   const runtime = await factory.create(await factory.resolve());
   runtimes.push(runtime);
@@ -610,6 +629,103 @@ describe("after the worker fails", () => {
     expect(out.coverage?.history?.distiller).toBe("inline: the worker exited unexpectedly");
     expect(out.results.some((r) => r.sessionID === "ses_a")).toBe(true);
   }, 30_000);
+
+  it("hands the distiller on this thread every signal queued before it and during its store's open", async () => {
+    insertSession(v2.db, {
+      id: "ses_b",
+      project_id: "prj",
+      directory: "/w",
+      title: "Gannet pipeline",
+      time_created: 1_000,
+      time_updated: 1_300,
+    });
+    insertMessage(v2.db, {
+      id: "msg_b",
+      session_id: "ses_b",
+      type: "user",
+      seq: 1,
+      time_created: 1_100,
+      data: { text: "a gannet question", time: { created: 1_100 } },
+    });
+    const harness = workerHarness();
+    const { runtime } = await create({
+      worker: { start: harness.start, maxFailures: 1 },
+      // No poll in the test's span: only the signals can change the cards.
+      sync: { pollIntervalMs: 600_000 },
+    });
+    await waitFor(() => runtime.distiller.status().coldPass === "done", "the worker's cold pass");
+    await waitFor(() => runtime.store?.getCard("ses_b") !== undefined, "the card of ses_b");
+    // The cold pass on this thread waits, so it reconciles nothing meanwhile.
+    let releaseDiscovery!: () => void;
+    discovery.hold = new Promise<void>((resolve) => (releaseDiscovery = resolve));
+    let releaseOpen!: () => void;
+    storeOpens.hold = new Promise<void>((resolve) => (releaseOpen = resolve));
+    storeOpens.path = storePath;
+
+    harness.side(1)?.crash();
+    // Queued in the controller while the failed generation's thread ends.
+    runtime.onEvent({
+      id: "evt_delete",
+      type: "session.deleted",
+      data: { sessionID: "ses_b" },
+    } as never);
+    await waitFor(() => storeOpens.entered, "the store's open on this thread");
+    // Arrives while the store opens on this thread.
+    runtime.onEvent({
+      id: "evt_rename",
+      type: "session.renamed",
+      data: { sessionID: "ses_a", title: "Osprey pipeline" },
+    } as never);
+    releaseOpen();
+    await waitFor(() => writable(runtime.store), "the writable store");
+    await waitFor(() => runtime.distiller.status().leaseHeld, "the lease on this thread");
+    expect(runtime.store?.getCard("ses_b")).toBeUndefined();
+    expect(runtime.store?.getCard("ses_a")?.title).toBe("Osprey pipeline");
+    releaseDiscovery();
+  }, 30_000);
+
+  it("reports indexing stopped when the store does not open on this thread, keeping the reader's cards", async () => {
+    const harness = workerHarness();
+    const { runtime, logs } = await create({ worker: { start: harness.start, maxFailures: 1 } });
+    await waitFor(() => runtime.store?.getCard("ses_a") !== undefined, "the card");
+    const reader = runtime.store;
+    storeOpens.path = storePath;
+    storeOpens.fail = true;
+
+    harness.side(1)?.crash();
+    const reason = "the store did not open on the main thread either (SQLite is unavailable)";
+    await waitFor(() => runtime.deps.distiller?.() === `stopped: ${reason}`, "the stop");
+    expect(logs).toContain(
+      "the distiller could not run on the main thread either (SQLite is unavailable); serving the cards already stored",
+    );
+    expect(runtime.store).toBe(reader);
+    const out = await recall(runtime, "zephyrine");
+    expect(out.coverage?.history?.distiller).toBe(`stopped: ${reason}`);
+    expect(out.results.some((r) => r.sessionID === "ses_a")).toBe(true);
+    expect(
+      out.warnings?.some((w) => w.startsWith(`New sessions are not being indexed: ${reason}.`)),
+    ).toBe(true);
+  }, 30_000);
+
+  it("closes the reader only once the tool calls reading through it have settled", async () => {
+    const harness = workerHarness();
+    const recorder = readerStatements();
+    const { runtime } = await create({
+      worker: { start: harness.start, maxFailures: 1 },
+      wrapReader: recorder.wrap,
+    });
+    await waitFor(() => runtime.distiller.status().leaseHeld, "the worker's lease");
+    let release!: () => void;
+    void runtime.track(new Promise<void>((resolve) => (release = resolve)));
+
+    harness.side(1)?.crash();
+    await waitFor(() => writable(runtime.store), "the writable store");
+    // Past the bound a caller waits.
+    await sleep(3_000);
+    expect(recorder.closes).toBe(0);
+    release();
+    await waitFor(() => recorder.closes === 1, "the reader's close");
+  }, 30_000);
 });
 
 describe("when indexing stops", () => {
@@ -743,6 +859,23 @@ describe("dispose", () => {
     expect(await leaseHolder()).toBe("");
     await sleep(300);
     expect(afterStopped).toEqual([]);
+  }, 30_000);
+
+  it("returns within its bound and closes the reader once a tool call that outlived it settles", async () => {
+    const recorder = readerStatements();
+    const { runtime, logs } = await create({
+      worker: { start: workerHarness().start },
+      wrapReader: recorder.wrap,
+    });
+    await waitFor(() => runtime.distiller.status().leaseHeld, "the worker's lease");
+    let release!: () => void;
+    void runtime.track(new Promise<void>((resolve) => (release = resolve)));
+
+    await dispose(runtime);
+    expect(logs.some((line) => line.includes("outlived the 2500ms bound"))).toBe(true);
+    expect(recorder.closes).toBe(0);
+    release();
+    await waitFor(() => recorder.closes === 1, "the reader's close");
   }, 30_000);
 
   it("leaves no worker, interval or pending timer behind across a reload", async () => {

@@ -70,7 +70,7 @@ import {
   type WorkerControllerOptions,
   type WorkerInit,
 } from "../worker/controller.js";
-import type { WorkerSyncOptions } from "../worker/protocol.js";
+import { createEventOutbox, type EventOutbox, type WorkerSyncOptions } from "../worker/protocol.js";
 import { defaultWorkerStarter } from "../worker/start.js";
 import type { V2Event } from "./opencode-v2-types.js";
 import { createIdDedupe, type ResolvedIdentity, type RuntimeFactory } from "./runtime.js";
@@ -623,6 +623,11 @@ async function createV2Runtime(
     instanceId,
   });
   let controller: WorkerController | undefined;
+  /** Signals that arrive while the distiller moves to this thread, until the
+   *  distiller there exists. */
+  let handoff: EventOutbox | undefined;
+  /** Why the distiller stopped after its move to this thread failed. */
+  let inlineStopped: string | undefined;
 
   const makeInline = (target: Store, takeOver?: string): Distiller =>
     createDistiller({
@@ -663,6 +668,7 @@ async function createV2Runtime(
     },
     quiesce() {
       controller?.quiesce();
+      handoff = undefined;
       inline.quiesce();
     },
     ownsLease() {
@@ -674,6 +680,7 @@ async function createV2Runtime(
     },
     onEvent(signal) {
       if (controller && inWorker()) controller.post(signal);
+      else if (handoff) handoff.add(signal);
       else inline.onEvent(signal);
     },
     status() {
@@ -776,10 +783,10 @@ async function createV2Runtime(
     );
   };
 
-  const stopReader = (): void => {
-    const open = reader;
-    reader = null;
-    if (open) closeQuietly({ close: open.close });
+  /** Close `open` once every tool call running now has settled: those may
+   *  still read through it, and a closed handle would fail them mid-read. */
+  const closeAfterUsers = (open: { close: () => void }): void => {
+    void Promise.allSettled([...operations]).then(() => closeQuietly({ close: open.close }));
   };
 
   // ── Derived store ──
@@ -852,6 +859,7 @@ async function createV2Runtime(
     rebuildDeps();
     const fixHint = `Indexing resumes after OpenCode restarts; if it does not, quit every OpenCode process and delete ${storePath} (it rebuilds), or set a separate storePath.`;
     distillerMode = () => {
+      if (inlineStopped !== undefined) return `stopped: ${inlineStopped}`;
       const mode = controller?.mode();
       if (!mode) return undefined;
       if (mode.kind === "worker") return mode.detail ? `worker: ${mode.detail}` : "worker";
@@ -859,14 +867,17 @@ async function createV2Runtime(
     };
     distillerWarning = () => {
       const mode = controller?.mode();
-      return mode?.kind === "stopped"
-        ? `New sessions are not being indexed: ${mode.reason}. ${fixHint}`
+      const reason = inlineStopped ?? (mode?.kind === "stopped" ? mode.reason : undefined);
+      return reason !== undefined
+        ? `New sessions are not being indexed: ${reason}. ${fixHint}`
         : undefined;
     };
 
     /** The distiller moves to this thread over a writable store, once the
-     *  last worker's thread has ended. */
+     *  last worker's thread has ended. Until it exists, signals wait in
+     *  {@link handoff}. */
     const goInline = (reason: string, lastHolder: string | undefined): void => {
+      handoff = createEventOutbox();
       void (async () => {
         if (disposed) return;
         const db = await openSqlite(storePath);
@@ -877,10 +888,18 @@ async function createV2Runtime(
         const opened = db ? openStore(db, { host: STORE_HOST, source: sourcePath }) : undefined;
         if (!db || !opened || !opened.ok) {
           closeQuietly(db);
+          handoff = undefined;
           const why = opened && !opened.ok ? opened.reason : "SQLite is unavailable";
           log(
             `the distiller could not run on the main thread either (${why}); serving the cards already stored`,
           );
+          inlineStopped = `the store did not open on the main thread either (${why})`;
+          // The reader's cards keep serving; without one, the degraded tier
+          // serves what discovery finds, no longer as starting.
+          if (!reader) {
+            startLite(true);
+            installCards(liteSource);
+          }
           return;
         }
         if (opened.warning !== undefined) log(opened.warning);
@@ -890,15 +909,15 @@ async function createV2Runtime(
         store = opened.store;
         installCards(storeCardSource(opened.store, inlineVectorWriter(opened.store)));
         inline = makeInline(opened.store, lastHolder);
-        for (const signal of controller?.drainEvents() ?? []) inline.onEvent(signal);
+        // The lease first: a deletion or a metadata patch is applied only by
+        // the lease holder, and dropped otherwise, as by any distiller that
+        // does not hold it (whose holder's polls and cold pass catch it).
         if (limits.coldPass) inline.start();
+        const queued = [...(controller?.drainEvents() ?? []), ...(handoff?.drain() ?? [])];
+        handoff = undefined;
+        for (const signal of queued) inline.onEvent(signal);
         log(`the distiller runs on the main thread (${reason})`);
-        // The reader closes once the tool calls reading through it are done.
-        if (previousReader) {
-          void settleWithin(Promise.allSettled([...operations]), SHUTDOWN_TIMEOUT_MS).then(() =>
-            closeQuietly({ close: previousReader.close }),
-          );
-        }
+        if (previousReader) closeAfterUsers(previousReader);
       })();
     };
 
@@ -1077,7 +1096,10 @@ async function createV2Runtime(
       mapper.dispose();
       distiller.quiesce();
       disposePromise = (async () => {
-        const closeRest = (): void => {
+        const closeAll = (): void => {
+          const open = reader;
+          reader = null;
+          if (open) closeQuietly({ close: open.close });
           closeQuietly(writableDb);
           writableDb = null;
           closeQuietly(opencodeDb);
@@ -1093,21 +1115,20 @@ async function createV2Runtime(
             await settleWithin(inline.stop(), SHUTDOWN_TIMEOUT_MS);
           }
           const ops = await settleWithin(Promise.allSettled([...operations]), SHUTDOWN_TIMEOUT_MS);
-          // The reader closes before the worker's thread is ended, whatever
-          // is still running.
-          stopReader();
+          // Every handle a tool call may still read through, the reader
+          // included, closes only once those calls have settled; dispose
+          // itself waits no longer than its bound.
           if (ops.timedOut) {
             log(
               `dispose: ${operations.size} operation(s) outlived the ${SHUTDOWN_TIMEOUT_MS}ms bound; deferring the SQLite close until they settle`,
             );
-            void Promise.allSettled([...operations]).then(closeRest);
+            void Promise.allSettled([...operations]).then(closeAll);
           } else {
-            closeRest();
+            closeAll();
           }
         } catch (error) {
           log(`dispose failed: ${errmsg(error)}`);
-          stopReader();
-          closeRest();
+          void Promise.allSettled([...operations]).then(closeAll);
         }
         // The runtime stays retiring until the worker's thread has ended, so
         // a runtime replacing it on the same store waits for that.

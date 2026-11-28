@@ -543,11 +543,17 @@ No `opencode.db` row, history page, card or row set crosses. The bounds:
   took the lease and stalled before its first status is caught too.
 - **After three failures** main takes over once the last thread has exited: it opens
   the store with `openStore` on this thread, runs `createDistiller` here (taking
-  over the lease of the holder a replacement's `init` would name), installs a card
-  runtime with `inlineVectorWriter`,
-  hands the queued signals to the new distiller and closes its reader once the tool
-  calls reading through it have finished. `coverage.history.distiller` reports
-  `"inline: <reason>"`.
+  over the lease of the holder a replacement's `init` would name) and installs a
+  card runtime with `inlineVectorWriter`. From the controller's switch to inline
+  until that distiller exists, signals wait in a handoff outbox. The distiller
+  acquires the lease first, then gets the controller's queued signals and the
+  handoff's, in that order: deletions and metadata patches are applied only by the
+  lease holder. Main closes its reader once every tool call running at the switch
+  has settled, however long that takes. `coverage.history.distiller` reports
+  `"inline: <reason>"`. When the store does not open on main either, it reports
+  `"stopped: the store did not open on the main thread either (<why>)"`, `recall`
+  warns that new sessions are not being indexed, and the reader's cards keep
+  serving (cards-lite without a reader).
 - **Store refusals:** a `store` refusal or a `fatal` of kind `store` (a damaged
   file, `isCorruptError`) is never retried and never run inline. Main keeps the
   reader if it had one and otherwise serves cards-lite.
@@ -560,8 +566,9 @@ No `opencode.db` row, history page, card or row set crosses. The bounds:
   (`flushVectorWrites`), then dispose the card runtime; send `stop` (the worker
   quiesces and stops its distiller, which releases the lease, runs a passive
   checkpoint, closes both connections and posts `stopped`); wait for tool calls,
-  bounded; close the reader (always, even when a bound ran out); close
-  `opencode.db`; then `terminate()` and wait at most 10 s for the exit. The runtime's
+  bounded; close the reader and `opencode.db`, at once when the calls settled
+  within the bound and once they settle otherwise; then `terminate()` and wait at
+  most 10 s for the exit. The runtime's
   dispose resolves only then, so it stays in the registry's retiring map until the
   thread has ended, and a reload's new runtime on the same store waits for it (at
   most `RETIRE_WAIT_MS`, 3 s). The worker writes
