@@ -386,11 +386,17 @@ first try (see the worker section below). `wrapReader` wraps its handle for test
   `SQLITE_BUSY_RECOVERY` while another process rebuilds the WAL index after a crash,
   and an exclusive-mode connection elsewhere. The open itself retries through
   `retryOnBusy`, five attempts with waits of 1, 2, 4 and 8 ms spent in `macrotask`
-  turns, then refuses as `busy`. Async callers use the same helper: `recall` wraps
-  its `cards.ready()` waits and its slim-index lookup in it. Sync callers get the
-  error, except the card runtime's counter read on v2 (`cardReadsOf` in
-  `src/host/v2-runtime.ts`), which returns the counters it last read, so a busy
-  refresh reads as "nothing changed" and the next one tries again.
+  turns, then refuses as `busy`. Async callers use the same helper, one step at a
+  time: `recall` wraps its `cards.ready()` waits, its slim-index lookup, the card
+  reads that follow that lookup, its live `write_rev` and uncarded-id reads and
+  its excluded-session counts in it, and `recall_sessions` its read of every card.
+  Sync callers get the error, with two exceptions on v2. The card runtime's
+  counter read (`cardReadsOf` in `src/host/v2-runtime.ts`) returns the counters it
+  last read, so a busy refresh reads as "nothing changed". A synchronous accessor
+  of the card runtime (`list`, `get`, `rank` and the rest) whose in-place apply or
+  load finds a lock keeps serving the map and index it has and reads again only
+  after 250 ms (`BUSY_SERVE_MS`). Before the first load there is nothing to serve,
+  so the error reaches the caller.
 - **Locks:** a read during a writer's open transaction does not wait and sees the
   state before that transaction.
 - **Close:** closing never checkpoints and never deletes the WAL. Measured on both

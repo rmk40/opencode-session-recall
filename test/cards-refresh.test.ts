@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { openSqlite, type SqliteDb } from "../src/sqlite.js";
+import { openSqlite, SqliteBusyError, type SqliteDb } from "../src/sqlite.js";
 import {
   CARDS_DELETED_KEY,
   CARDS_REV_KEY,
@@ -411,6 +411,88 @@ describe("card map refresh from a store", () => {
     await loading;
     expect(runtime.get(cardId(0))?.title).toBe("Renamed");
     expect(reads.fullLoads).toBe(2);
+  });
+});
+
+describe("a store locked under a synchronous refresh", () => {
+  /** A store-backed source whose card reads find a lock while `busy` is set,
+   *  as on a reader connection that never waits on one. */
+  function lockable(store: Store): { source: CardSource; lock: { busy: boolean; hits: number } } {
+    const base = storeCardSource(store, inlineVectorWriter(store));
+    const inner = base.store!;
+    const lock = { busy: false, hits: 0 };
+    const guard = <T>(read: () => T): T => {
+      if (lock.busy) {
+        lock.hits++;
+        throw new SqliteBusyError("SQLITE_BUSY", new Error("database is locked"));
+      }
+      return read();
+    };
+    return {
+      lock,
+      source: {
+        ...base,
+        store: {
+          ...inner,
+          cardsSince: (rev, limit, opts) => guard(() => inner.cardsSince(rev, limit, opts)),
+          cardsPage: (after, limit, opts) => guard(() => inner.cardsPage(after, limit, opts)),
+        },
+      },
+    };
+  }
+
+  it("keeps serving the loaded map, reading again only after a short pause", async () => {
+    const store = await freshStore();
+    put(store, "s1");
+    const { source, lock } = lockable(store);
+    let clock = 1_000_000;
+    const runtime = createCardsRuntime({ source, now: () => clock, refreshIntervalMs: 0 });
+    expect(ids(runtime.list({}))).toEqual(["s1"]);
+
+    put(store, "s2", { title: "Second" });
+    lock.busy = true;
+    expect(ids(runtime.list({}))).toEqual(["s1"]);
+    expect(runtime.get("s2")).toBeUndefined();
+    expect(runtime.exclusionFamily("s1")).toEqual(new Set(["s1"]));
+    expect(lock.hits).toBe(1);
+
+    lock.busy = false;
+    clock += 249;
+    expect(runtime.get("s2")).toBeUndefined();
+    clock += 1;
+    expect(runtime.get("s2")?.title).toBe("Second");
+  });
+
+  it("serves the index it has from rank() while the store is locked", async () => {
+    const store = await freshStore();
+    put(store, "s1", { title: "Heron pipeline" });
+    const { source, lock } = lockable(store);
+    let clock = 1_000_000;
+    const runtime = createCardsRuntime({ source, now: () => clock, refreshIntervalMs: 0 });
+    await runtime.ready({ index: true });
+    put(store, "s2", { title: "Heron again" });
+    lock.busy = true;
+    const hits = runtime.rank(parseQuery("heron"), {});
+    expect(hits.map((hit) => hit.sessionId)).toEqual(["s1"]);
+    lock.busy = false;
+    clock += 250;
+    expect(
+      runtime
+        .rank(parseQuery("heron"), {})
+        .map((hit) => hit.sessionId)
+        .sort(),
+    ).toEqual(["s1", "s2"]);
+  });
+
+  it("gives the lock to the caller while nothing has loaded yet", async () => {
+    const store = await freshStore();
+    put(store, "s1");
+    const { source, lock } = lockable(store);
+    const runtime = createCardsRuntime({ source, refreshIntervalMs: 0 });
+    lock.busy = true;
+    expect(() => runtime.list({})).toThrow(SqliteBusyError);
+    lock.busy = false;
+    expect(ids(runtime.list({}))).toEqual(["s1"]);
   });
 });
 

@@ -18,6 +18,7 @@ import { cosineSimilarity } from "./semantic/similarity.js";
 import type { CandidateEmbedder } from "./corpus.js";
 import type { DirectoryRelevance } from "./types.js";
 import { SLICE_MS, yieldOnBudget } from "./yield.js";
+import { SqliteBusyError } from "./sqlite.js";
 
 /**
  * Tier-1 card runtime.
@@ -61,6 +62,9 @@ import { SLICE_MS, yieldOnBudget } from "./yield.js";
 const MAX_FAMILY_DEPTH = 16;
 /** The store is checked for changes no more often than this. */
 const REFRESH_INTERVAL_MS = 5_000;
+/** After a synchronous refresh found the store locked, the synchronous
+ *  accessors serve what they hold for this long before they read again. */
+const BUSY_SERVE_MS = 250;
 /** Cards per keyset page of a full load and per `cardsSince` page. A page is
  *  read in one synchronous step, so it stays small enough to read (vectors
  *  included) in a few milliseconds; the load yields between pages once a
@@ -1111,6 +1115,34 @@ export function createCardsRuntime(deps: CardsRuntimeDeps): CardsRuntime {
     }
   }
 
+  /** Until when the synchronous accessors read nothing, after a refresh of
+   *  theirs found the store locked. */
+  let busyUntil = -Infinity;
+
+  /**
+   * Run a synchronous accessor's `refresh`. A reader that never waits on a
+   * lock throws {@link SqliteBusyError} where another connection holds one.
+   * Once what the accessor serves has loaded (`loaded`), it keeps serving
+   * that as it is, and the next synchronous refresh comes after
+   * {@link BUSY_SERVE_MS}; before, the error reaches the caller. An async
+   * caller retries through `ready()`. A load installs only once it read
+   * everything and an apply moves its counters only at its end, so a refresh
+   * cut short loses nothing, and `lastCheck` is cleared so it is due again
+   * once the pause ends.
+   */
+  function serving(refresh: () => void, loaded: () => boolean): void {
+    if (loaded() && now() < busyUntil) return;
+    try {
+      refresh();
+    } catch (error) {
+      if (!(error instanceof SqliteBusyError) || !loaded()) throw error;
+      busyUntil = now() + BUSY_SERVE_MS;
+      lastCheck = -Infinity;
+    }
+  }
+  const mapLoaded = (): boolean => metaInstalledAt > 0;
+  const indexLoaded = (): boolean => metaInstalledAt > 0 && indexInstalledAt > 0;
+
   /** {@link syncMeta}'s plan as a build to await, or undefined when fresh. */
   function metaSteps(): Generator<void, void> | undefined {
     const plan = metaPlan();
@@ -1774,7 +1806,7 @@ export function createCardsRuntime(deps: CardsRuntimeDeps): CardsRuntime {
     },
 
     rank(query, filters, stats): CardHit[] {
-      syncIndex();
+      serving(syncIndex, indexLoaded);
       const cards = cardById.values();
       const excluded = exclusionOf(filters);
       // The excluded cards that matched are counted against the same filters
@@ -1888,7 +1920,7 @@ export function createCardsRuntime(deps: CardsRuntimeDeps): CardsRuntime {
     },
 
     list(filters): Card[] {
-      syncMeta();
+      serving(syncMeta, mapLoaded);
       const excluded = exclusionOf(filters);
       return [...cardById.values()]
         .filter((card) => passesFilters(card, filters, excluded))
@@ -1896,24 +1928,24 @@ export function createCardsRuntime(deps: CardsRuntimeDeps): CardsRuntime {
     },
 
     get(sessionId): Card | undefined {
-      syncMeta();
+      serving(syncMeta, mapLoaded);
       const card = cardById.get(sessionId);
       // A worker card is never a valid drill/deep target (see passesFilters).
       return card && !isSummarizerTitle(card.title) ? card : undefined;
     },
 
     exclusionFamily(currentSessionId): Set<string> {
-      syncMeta();
+      serving(syncMeta, mapLoaded);
       return exclusionFamilyFromCards(cardById.values(), currentSessionId);
     },
 
     familyOf(rootId): Card[] {
-      syncMeta();
+      serving(syncMeta, mapLoaded);
       return [...cardById.values()].filter((card) => card.rootId === rootId).sort(byRecency);
     },
 
     coverage(): CardsCoverage {
-      syncMeta();
+      serving(syncMeta, mapLoaded);
       if (coverageCache) return { ...coverageCache };
       let full = 0;
       let recency = 0;
@@ -1934,7 +1966,7 @@ export function createCardsRuntime(deps: CardsRuntimeDeps): CardsRuntime {
 
     semanticStatus(): SemanticStatus | undefined {
       if (!embedder || semanticWeight <= 0) return undefined;
-      syncMeta();
+      serving(syncMeta, mapLoaded);
       return {
         ready: embedder.ready,
         ...(semanticModelId != null && { model: semanticModelId }),

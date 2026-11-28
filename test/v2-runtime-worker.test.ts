@@ -11,6 +11,7 @@ import {
   type V2RuntimeOptions,
 } from "../src/host/v2-runtime.js";
 import { search } from "../src/search.js";
+import { sessions } from "../src/sessions.js";
 import { openSqlite, SqliteBusyError, type ReadOnlyDb, type SqliteDb } from "../src/sqlite.js";
 import {
   openStore,
@@ -500,6 +501,77 @@ describe("main's store connection", () => {
     await recall(runtime, "ses_a heron pipeline");
     expect(recorder.statements.length).toBeGreaterThan(0);
     expect(recorder.nonReads()).toEqual([]);
+  }, 30_000);
+});
+
+describe("store reads on the tools' path", () => {
+  /** A reader wrapper whose next `locks` card reads matching `pattern` find
+   *  a lock, as on a connection that never waits on one. */
+  function lockedCardReads(pattern: RegExp): {
+    wrap: (db: ReadOnlyDb) => ReadOnlyDb;
+    locks: number;
+    hits: number;
+  } {
+    const state = {
+      locks: 0,
+      hits: 0,
+      wrap: (db: ReadOnlyDb): ReadOnlyDb => {
+        const guard = (sql: string): void => {
+          if (state.locks > 0 && pattern.test(sql)) {
+            state.locks--;
+            state.hits++;
+            throw new SqliteBusyError("SQLITE_BUSY", new Error("database is locked"));
+          }
+        };
+        return {
+          get: (sql, params) => {
+            guard(sql);
+            return db.get(sql, params);
+          },
+          all: (sql, params) => {
+            guard(sql);
+            return db.all(sql, params);
+          },
+          close: () => db.close(),
+        };
+      },
+    };
+    return state;
+  }
+
+  it("runs a search's own card read again after a lock instead of failing the search", async () => {
+    const lock = lockedCardReads(/FROM card WHERE session_id=\?/);
+    const { runtime } = await create({
+      worker: { start: workerHarness().start },
+      wrapReader: lock.wrap,
+    });
+    await waitFor(() => runtime.store?.getCard("ses_a") !== undefined, "the card");
+    lock.locks = 2;
+    const out = await recall(runtime, "zephyrine");
+    expect(lock.hits).toBeGreaterThan(0);
+    expect(out.results.some((r) => r.sessionID === "ses_a")).toBe(true);
+  }, 30_000);
+
+  it("runs the sessions listing's card read again after a lock instead of failing it", async () => {
+    const lock = lockedCardReads(/FROM card ORDER BY time_updated DESC/);
+    const { runtime } = await create({
+      worker: { start: workerHarness().start },
+      wrapReader: lock.wrap,
+    });
+    await waitFor(() => runtime.store?.getCard("ses_a") !== undefined, "the card");
+    lock.locks = 2;
+    const tool = sessions(
+      runtime.sourceFor("prj"),
+      true,
+      runtime.options.limits,
+      runtime.enrichment,
+    );
+    const text = toolResultText(
+      await tool.execute({ scope: "global" } as never, makeContext().ctx),
+    );
+    expect(lock.hits).toBe(2);
+    expect(text).toContain("ses_a");
+    expect(text).not.toMatch(/"error"/);
   }, 30_000);
 });
 

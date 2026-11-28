@@ -3412,7 +3412,8 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
          *  `time.updated` alone still drops cached pages at once, even before
          *  the snapshot reloads. Undefined without a store, a card or a
          *  stamped write. */
-        const liveWriteRev = (id: string): number | undefined => store?.cardWriteRev(id);
+        const liveWriteRev = (id: string): Promise<number | undefined> =>
+          retryOnBusy(() => store?.cardWriteRev(id));
 
         /** The explicitly named ids to treat as UNCARDED. Uncarded-ness is
          *  decided from the SAME facade snapshot the carded filter reads
@@ -3421,8 +3422,10 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
          *  drilled (honestly, with a warning), never silently dropped — that
          *  would reopen the original bug in its exact target scenario. This
          *  also keeps the carded and uncarded lists structurally disjoint. */
-        const uncardedShortlist = (ids: string[]): string[] =>
-          ids.filter((id) => id !== excludeSessionID && cards.get(id) == null && !workerCard(id));
+        const uncardedShortlist = (ids: string[]): Promise<string[]> =>
+          retryOnBusy(() =>
+            ids.filter((id) => id !== excludeSessionID && cards.get(id) == null && !workerCard(id)),
+          );
 
         /** The named sessions (`sessions:` and a deep cursor's targets) the
          *  exclusion arguments remove, carded or not. Naming a session asks
@@ -3552,7 +3555,7 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
                     directory: meta.directory,
                     timeUpdated: meta.updated,
                     parentID: meta.parentID,
-                    writeRev: liveWriteRev(id),
+                    writeRev: await liveWriteRev(id),
                   },
                   verified: true,
                 });
@@ -3567,7 +3570,7 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
                     title: "",
                     directory: "",
                     timeUpdated: 0,
-                    writeRev: liveWriteRev(id),
+                    writeRev: await liveWriteRev(id),
                   },
                   verified: false,
                 });
@@ -3628,7 +3631,7 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
               directory: sDir,
               timeUpdated: sUpdated,
               parentID: sParent,
-              writeRev: liveWriteRev(singleTarget),
+              writeRev: await liveWriteRev(singleTarget),
             },
           ];
           deepSet = new Set([singleTarget]);
@@ -3679,7 +3682,7 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
             // the card map, so two reads straddling the probe could disagree
             // (present→absent would drop an id with no warning).
             const cardedIds = new Set(kept.filter((id) => cards.get(id) != null));
-            const explicitOnly = uncardedShortlist(kept.filter((id) => !cardedIds.has(id)));
+            const explicitOnly = await uncardedShortlist(kept.filter((id) => !cardedIds.has(id)));
             const { resolved } = await resolveUncarded(explicitOnly, explicitOnly.length);
             const resolvedById = new Map(resolved.map((r) => [r.target.sessionId, r] as const));
             drillTargets = [];
@@ -3714,7 +3717,7 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
             // time bounds; a failed probe falls back to a bounds-bypassed
             // sweep. Carded-but-filtered ids are NOT resurrected here (they
             // have metadata and were filtered).
-            const uncarded = uncardedShortlist(named);
+            const uncarded = await uncardedShortlist(named);
             if (uncarded.length > 0) {
               // Deep has no session-count cap; the shortlist schema max is the
               // bound on this probe fan-out.
@@ -3776,7 +3779,7 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
             .map((card) => registerTarget(card, relevanceOf(card)));
           // Probe lazily: only as many uncarded ids as the cap leaves room for
           // are resolved; the unprobed remainder is reported, not fetched.
-          const uncarded = uncardedShortlist(named);
+          const uncarded = await uncardedShortlist(named);
           const remaining = Math.max(0, cap - cardedTargets.length);
           const { resolved: uncardedTaken, unprobed } =
             uncarded.length > 0
@@ -3974,10 +3977,17 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
               else ftsBySession.set(row.sessionId, [row]);
             }
             const ftsExcluded = excludedIds();
-            for (const id of ftsBySession.keys()) {
-              if (eligibleIdSet.has(id)) continue;
-              if (id === excludeSessionID) continue;
-              const card = store.getCard(id);
+            // The cards of the hits the ranked lane missed, read as one step
+            // that a lock on the store runs again.
+            const ftsCards = await retryOnBusy(() => {
+              const found = new Map<string, Card | undefined>();
+              for (const id of ftsBySession?.keys() ?? []) {
+                if (eligibleIdSet.has(id) || id === excludeSessionID) continue;
+                found.set(id, lookup.getCard(id));
+              }
+              return found;
+            });
+            for (const [id, card] of ftsCards) {
               if (!card) continue;
               // A direct store read bypasses the card runtime's filter, so a stray
               // worker card (crash leftover) must be rejected here too.
@@ -4199,10 +4209,12 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
             // Count the sessions the exclusion removed from ranking (the
             // current session, or its whole family with excludeFamily) so
             // coverage reports the skip.
-            let excludedKnown = 0;
-            for (const id of excluded) {
-              if (!store || store.getCard(id)) excludedKnown++;
-            }
+            const live = store;
+            const excludedKnown = await retryOnBusy(() => {
+              let known = 0;
+              for (const id of excluded) if (!live || live.getCard(id)) known++;
+              return known;
+            });
             if (excludedKnown > 0) {
               pushUnique(normalized.limitedBy, "excludedSession");
               skippedByReason.excludedSession =
@@ -4219,8 +4231,11 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
 
         if (ctx.abort.aborted) return fail("aborted");
 
+        const live = store;
         const currentSessionExcluded = Boolean(
-          excludeCurrent && currentSessionID && (store ? store.getCard(currentSessionID) : true),
+          excludeCurrent &&
+          currentSessionID &&
+          (live ? await retryOnBusy(() => live.getCard(currentSessionID)) : true),
         );
         drillTargets = drillTargets.filter((t) => t.sessionId !== excludeSessionID);
         // An unreadable history source (v2: opencode.db unavailable) cannot be

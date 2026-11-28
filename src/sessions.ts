@@ -11,7 +11,7 @@ import {
   type IndexingStatus,
   indexingWarning,
 } from "./types.js";
-import type { Card } from "./store.js";
+import { retryOnBusy, type Card } from "./store.js";
 import { isSummarizerTitle } from "./extract.js";
 import { unavailableHistoryError, type HistorySource } from "./history/source.js";
 import type { HistorySession } from "./history/model.js";
@@ -319,7 +319,10 @@ export function sessions(
       let cardById: Map<string, Card> | undefined;
       let childCountByRoot: Map<string, number> | undefined;
       if (enrichment) {
-        allCards = enrichment.cards();
+        // A store reader that never waits on a lock finds one now and then:
+        // the read runs again after a short wait.
+        const enriched = enrichment;
+        allCards = await retryOnBusy(() => enriched.cards());
         cardById = new Map(allCards.map((card) => [card.sessionId, card]));
         childCountByRoot = new Map();
         for (const card of allCards) {
