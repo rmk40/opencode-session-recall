@@ -346,10 +346,15 @@ describe("the controller with scripted workers", () => {
       expect(scripted.workers).toHaveLength(3);
     });
 
-    it("names the failed generation's holder in its replacement's init", async () => {
-      const { controller, scripted } = scriptedController({ restartDelaysMs: [0, 0] });
+    it("names the failed generation's holder in its replacement's init once it reported the lease or the row names it", async () => {
+      const lease: { row?: string } = {};
+      const { controller, scripted } = scriptedController({
+        restartDelaysMs: [0, 0],
+        readLease: () => (lease.row === undefined ? undefined : leaseOf(lease.row, 0)()),
+      });
       await flush();
       await run(scripted.worker(1));
+      scripted.worker(1).emit({ type: "status", status: status() });
       scripted.worker(1).emit({ type: "fatal", kind: "crash", reason: "crashed" });
       scripted.worker(1).exit();
       await flush();
@@ -360,6 +365,10 @@ describe("the controller with scripted workers", () => {
         takeOver: "inst/w1",
       });
 
+      // Generation 2 took the lease over and failed before any status.
+      scripted.worker(2).emit({ type: "store", id: scripted.worker(2).last("init")?.id, ok: true });
+      await flush();
+      lease.row = "inst/w2";
       scripted.worker(2).exit();
       await flush();
       await ready(scripted.worker(3));
@@ -367,6 +376,36 @@ describe("the controller with scripted workers", () => {
         holderId: "inst/w3",
         takeOver: "inst/w2",
       });
+    });
+
+    it("keeps the holder to take over when a failed generation never took the lease", async () => {
+      const { controller, scripted, record } = scriptedController({
+        restartDelaysMs: [0, 0],
+        readLease: leaseOf("inst/w1", 0),
+      });
+      await flush();
+      await run(scripted.worker(1));
+      scripted.worker(1).emit({ type: "status", status: status() });
+      scripted.worker(1).exit();
+      await flush();
+      // Generation 2 reported no lease, and the row still names generation 1.
+      await ready(scripted.worker(2));
+      scripted.worker(2).emit({ type: "store", id: scripted.worker(2).last("init")?.id, ok: true });
+      await flush();
+      scripted
+        .worker(2)
+        .emit({ type: "status", status: status({ leaseHeld: false, holderId: "inst/w2" }) });
+      scripted.worker(2).exit();
+      await flush();
+      await ready(scripted.worker(3));
+      expect(scripted.worker(3).last("init")).toMatchObject({
+        holderId: "inst/w3",
+        takeOver: "inst/w1",
+      });
+      scripted.worker(3).exit();
+      await flush();
+      expect(controller.mode().kind).toBe("inline");
+      expect(record.inline.map((entry) => entry.lastHolder)).toEqual(["inst/w1"]);
     });
 
     it("runs the distiller inline after the third failure, once the last thread has exited", async () => {
@@ -392,7 +431,8 @@ describe("the controller with scripted workers", () => {
       scripted.worker(3).exit();
       await flush();
       expect(controller.mode()).toEqual({ kind: "inline", reason: "crash 3" });
-      expect(record.inline).toEqual([{ reason: "crash 3", lastHolder: "inst/w3" }]);
+      // No generation took the lease: there is none to take over.
+      expect(record.inline).toEqual([{ reason: "crash 3", lastHolder: undefined }]);
       expect(settled.settled).toBe(true);
       expect(controller.post({ type: "turn-ended", sessionID: "s" })).toBe(false);
       await advance(60_000);
@@ -410,7 +450,7 @@ describe("the controller with scripted workers", () => {
       expect(record.inline).toEqual([
         {
           reason: "the worker did not start: the worker module did not load",
-          lastHolder: "inst/w1",
+          lastHolder: undefined,
         },
       ]);
     });
@@ -1080,7 +1120,8 @@ describe("the controller over the inline harness", () => {
     expect(record.inline).toEqual([
       {
         reason: "the worker did not start: the worker module did not load",
-        lastHolder: "harness/w3",
+        // No thread ran, so none took the lease.
+        lastHolder: undefined,
       },
     ]);
     expect(harness.sides).toHaveLength(0);

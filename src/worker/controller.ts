@@ -28,8 +28,9 @@ import type { WorkerLike, WorkerStarter } from "./start.js";
  * predecessor's thread has ended (its exit event), since a thread that was
  * asked to end may still be inside a statement that can commit. The holder id
  * of generation `n` is `<instanceId>/w<n>`, and each replacement's `init`
- * names its predecessor's holder id, so its first lease acquire may take that
- * one lease over without waiting out the TTL.
+ * names the holder id of the last failed generation that reported holding
+ * the lease or that the lease row named, so its first lease acquire may take
+ * that one lease over without waiting out the TTL.
  *
  * A generation fails when it reports no `ready` within 10 s of starting or no
  * `store` within 10 s of `init`, when its thread reports an error or ends
@@ -65,7 +66,8 @@ export type WorkerControllerOptions = {
   /**
    * Every allowed generation failed and the last one's thread has ended:
    * main runs the distiller itself from here on, and may take over
-   * `lastHolder`'s lease.
+   * `lastHolder`'s lease: the last generation that reported holding the
+   * lease or that the lease row named, if any did.
    */
   onInline(reason: string, lastHolder: string | undefined): void;
   /** A status message of the current generation arrived. */
@@ -220,6 +222,16 @@ export function createWorkerController(options: WorkerControllerOptions): Worker
     gen.storeTimer = undefined;
   };
 
+  /** Whether the lease row main's reader sees names `holderId`; false while
+   *  there is no reader or the read fails. */
+  const leaseNames = (holderId: string): boolean => {
+    try {
+      return options.readLease()?.holder === holderId;
+    } catch {
+      return false;
+    }
+  };
+
   const stopWatchdog = (): void => {
     if (watchdog !== undefined) clearInterval(watchdog);
     watchdog = undefined;
@@ -281,12 +293,17 @@ export function createWorkerController(options: WorkerControllerOptions): Worker
     // Its thread may still be inside a statement that can commit: nothing
     // replaces it before the thread has ended.
     await gen.exit;
-    predecessor = gen.holderId;
+    // A takeover compares one holder id with the row's. A generation that
+    // never took the lease cannot be in the row, so the holder that may still
+    // be there stays the one to take over.
+    if (gen.status?.distill.leaseHeld === true || leaseNames(gen.holderId)) {
+      predecessor = gen.holderId;
+    }
     if (stopping || mode.kind !== "worker") return;
     if (failures >= maxFailures) {
       mode = { kind: "inline", reason };
       log(`the distiller runs on the main thread from now on: ${reason}`);
-      options.onInline(reason, gen.holderId);
+      options.onInline(reason, predecessor);
       markSettled();
       return;
     }
