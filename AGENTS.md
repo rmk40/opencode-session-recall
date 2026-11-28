@@ -559,7 +559,10 @@ No `opencode.db` row, history page, card or row set crosses. The bounds:
   nothing after `stopped`: its store handle refuses every call from then on.
 - **Coverage:** `coverage.history.distiller` is `"worker"` while the distiller runs
   in a worker (from the first start on), `"inline: <reason>"` or
-  `"stopped: <reason>"`. v1 reports `"inline"`, alone in `coverage.history`.
+  `"stopped: <reason>"`. From a generation's failure until its replacement reports
+  its store it is `"worker: restarting (<reason>)"`, and the failed generation's
+  last status is dropped, so the distill status, indexing and repair progress read
+  idle rather than frozen. v1 reports `"inline"`, alone in `coverage.history`.
 
 ### What each thread owns
 

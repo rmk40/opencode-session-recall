@@ -289,6 +289,11 @@ export function createWorkerController(options: WorkerControllerOptions): Worker
     stopWatchdog();
     failPending(gen, `the worker failed: ${reason}`);
     log(`worker generation ${gen.number} failed (${failures} of ${maxFailures}): ${reason}`);
+    // Its last status is frozen, often still holding the lease: until a new
+    // generation reports, the distiller reports as restarting and idle.
+    const heldLease = gen.status?.distill.leaseHeld === true;
+    gen.status = undefined;
+    mode = { kind: "worker", detail: `restarting (${reason})` };
     gen.worker?.terminate();
     // Its thread may still be inside a statement that can commit: nothing
     // replaces it before the thread has ended.
@@ -296,9 +301,7 @@ export function createWorkerController(options: WorkerControllerOptions): Worker
     // A takeover compares one holder id with the row's. A generation that
     // never took the lease cannot be in the row, so the holder that may still
     // be there stays the one to take over.
-    if (gen.status?.distill.leaseHeld === true || leaseNames(gen.holderId)) {
-      predecessor = gen.holderId;
-    }
+    if (heldLease || leaseNames(gen.holderId)) predecessor = gen.holderId;
     if (stopping || mode.kind !== "worker") return;
     if (failures >= maxFailures) {
       mode = { kind: "inline", reason };

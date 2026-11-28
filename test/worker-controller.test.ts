@@ -346,6 +346,28 @@ describe("the controller with scripted workers", () => {
       expect(scripted.workers).toHaveLength(3);
     });
 
+    it("reports a failed generation as restarting with no status until its replacement's store opens", async () => {
+      const { controller, scripted } = scriptedController({ restartDelaysMs: [1_000, 1_000] });
+      await flush();
+      await run(scripted.worker(1));
+      scripted.worker(1).emit({ type: "status", status: status() });
+      expect(controller.status()?.distill.leaseHeld).toBe(true);
+      scripted.worker(1).emit({ type: "fatal", kind: "crash", reason: "disk stalled" });
+      await flush();
+      expect(controller.mode()).toEqual({ kind: "worker", detail: "restarting (disk stalled)" });
+      expect(controller.status()).toBeUndefined();
+      // A late status of the failed generation changes nothing.
+      scripted.worker(1).emit({ type: "status", status: status() });
+      expect(controller.status()).toBeUndefined();
+      scripted.worker(1).exit();
+      await advance(1_000);
+      await ready(scripted.worker(2));
+      expect(controller.mode()).toEqual({ kind: "worker", detail: "restarting (disk stalled)" });
+      scripted.worker(2).emit({ type: "store", id: scripted.worker(2).last("init")?.id, ok: true });
+      await flush();
+      expect(controller.mode()).toEqual({ kind: "worker" });
+    });
+
     it("names the failed generation's holder in its replacement's init once it reported the lease or the row names it", async () => {
       const lease: { row?: string } = {};
       const { controller, scripted } = scriptedController({
@@ -424,7 +446,7 @@ describe("the controller with scripted workers", () => {
         }
       }
       expect(scripted.worker(3).terminations).toBe(1);
-      expect(controller.mode()).toEqual({ kind: "worker" });
+      expect(controller.mode()).toEqual({ kind: "worker", detail: "restarting (crash 3)" });
       expect(record.inline).toEqual([]);
       expect(settled.settled).toBe(false);
 
