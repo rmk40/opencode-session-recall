@@ -480,6 +480,9 @@ export function createWorkerController(options: WorkerControllerOptions): Worker
       }
     });
     if (stopping) {
+      // Asked to end while it started: its exit is no failure, and
+      // terminate() waits for it.
+      gen.stopRequested = true;
       worker.terminate();
       return;
     }
@@ -576,9 +579,11 @@ export function createWorkerController(options: WorkerControllerOptions): Worker
       const gen = current;
       if (!gen) return;
       failPending(gen, "the worker ended");
-      if (!gen.worker || gen.exited) return;
+      if (gen.exited) return;
       gen.stopRequested = true;
-      gen.worker.terminate();
+      // A worker whose start is still pending is ended by launch once it
+      // exists (it sees `stopping`); its exit settles `gen.exit` either way.
+      gen.worker?.terminate();
       await settleWithin(gen.exit, waitMs);
     },
   };

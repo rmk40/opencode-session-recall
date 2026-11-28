@@ -818,6 +818,33 @@ describe("the controller with scripted workers", () => {
       await flush();
       expect(ended.settled).toBe(true);
     });
+
+    it("ends a worker whose start was pending at the stop, counting no failure, and terminate waits for its exit", async () => {
+      const scripted = scriptedWorkers();
+      let release!: () => void;
+      const gate = new Promise<void>((resolve) => (release = resolve));
+      const { controller, record } = scriptedController({
+        start: async (generation) => {
+          await gate;
+          return scripted.start(generation);
+        },
+      });
+      await flush();
+      expect(await controller.stop(1_000)).toBe(false);
+      const ended = tracked(controller.terminate(10_000));
+      await flush();
+      expect(ended.settled).toBe(false);
+      release();
+      await flush();
+      expect(scripted.worker(1).terminations).toBeGreaterThan(0);
+      expect(ended.settled).toBe(false);
+      scripted.worker(1).exit();
+      await flush();
+      expect(ended.settled).toBe(true);
+      expect(failures(record)).toEqual([]);
+      await advance(60_000);
+      expect(scripted.workers).toHaveLength(1);
+    });
   });
 
   describe("generations", () => {
