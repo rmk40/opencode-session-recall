@@ -530,10 +530,26 @@ describe("the controller with scripted workers", () => {
       ]);
     });
 
+    it.each([
+      ["before its first status", undefined],
+      ["whose last status says it holds no lease", status({ leaseHeld: false })],
+    ])(
+      "fails a generation %s when the lease row names it with a stale heartbeat",
+      async (_label, last) => {
+        const { scripted, record } = await watched(last);
+        lease = leaseOf("inst/w1", 60_000);
+        await advance(5_000);
+        expect(scripted.worker(1).terminations).toBe(1);
+        expect(failures(record)).toEqual([
+          "worker generation 1 failed (1 of 3): its lease heartbeat is older than 30000 ms",
+        ]);
+      },
+    );
+
     const calm: Array<[string, WorkerStatus | undefined, () => LeaseInfo | undefined]> = [
-      ["no status yet", undefined, leaseOf("inst/w1", 60_000)],
-      ["a last status without the lease", status({ leaseHeld: false }), leaseOf("inst/w1", 60_000)],
+      ["no status yet and a fresh heartbeat", undefined, leaseOf("inst/w1", 1_000)],
       ["a lease row naming another holder", status(), leaseOf("other/w1", 60_000)],
+      ["no status yet and a row naming another holder", undefined, leaseOf("other/w1", 60_000)],
       ["a heartbeat exactly at the TTL", status(), leaseOf("inst/w1", 30_000)],
       ["a longer TTL on the row", status(), leaseOf("inst/w1", 30_001, 60_000)],
       ["no lease row", status(), () => undefined],

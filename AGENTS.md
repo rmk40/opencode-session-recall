@@ -527,9 +527,10 @@ No `opencode.db` row, history page, card or row set crosses. The bounds:
   while a statement still runs, and that statement can still commit). The next
   generation starts 1 s later, then 5 s later, and its `init` names the
   predecessor's holder id, so its first acquire may take that one lease over.
-- **Watchdog:** every 5 s, when the generation reported holding the lease, the lease
-  row main's reader sees names it, its heartbeat is older than the row's TTL and no
-  stop is pending, the generation fails.
+- **Watchdog:** every 5 s main reads the lease row through its reader. When the row
+  names the running generation, its heartbeat is older than the row's TTL and no
+  stop is pending, the generation fails. The row alone decides, so a worker that
+  took the lease and stalled before its first status is caught too.
 - **After three failures** main takes over once the last thread has exited: it opens
   the store with `openStore` on this thread, runs `createDistiller` here (taking the
   last worker's lease over), installs a card runtime with `inlineVectorWriter`,

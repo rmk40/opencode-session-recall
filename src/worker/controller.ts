@@ -302,7 +302,8 @@ export function createWorkerController(options: WorkerControllerOptions): Worker
     stopWatchdog();
     watchdog = setInterval(() => {
       if (gen !== current || !gen.running || gen.stopRequested || stopping) return;
-      if (gen.status?.distill.leaseHeld !== true) return;
+      // The row, not the generation's last status, says who holds the lease:
+      // a worker can take it and stall before it reports a status.
       let lease: LeaseInfo | undefined;
       try {
         lease = options.readLease();
