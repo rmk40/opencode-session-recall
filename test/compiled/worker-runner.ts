@@ -67,7 +67,7 @@ export type CompiledWorker = {
     sourcePath: string;
     limits?: Partial<Limits>;
     holderId?: string;
-    takeOver?: string;
+    takeOver?: string[];
     foreground?: ForegroundSignal;
     sync?: InitMessage["sync"];
     timeoutMs?: number;

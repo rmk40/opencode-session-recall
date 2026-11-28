@@ -295,15 +295,16 @@ coordinated by a single `distill_lease` row in `meta` (holder, heartbeat, 30s TT
 plus the writer's build/gen for diagnosis); only the lease holder writes, stale
 leases are taken over on expiry, and per-session writes are transactional so readers
 never see half a session. `acquireLease(..., { takeOver })` may also take a lease
-that has not expired from the one holder it names, a predecessor the caller knows
-has stopped. The row is compared with that holder in the same conditional write as
-the acquire, so a lease another holder took meanwhile is never taken. Without
-`takeOver`, as every older build calls it, the acquire takes only an expired lease
-or its own. A distiller passes it on
-its first acquire only (`DistillerOptions.takeOverLease`). On v2 the lease holder
-is the distiller worker, whose holder id is `<instanceId>/w<generation>`; a
-replacement generation takes over its own predecessor's id that way, and to other
-processes each generation is one more contender (see the worker section below).
+that has not expired from a holder it names, predecessors the caller knows have
+stopped: one id or a set of at most `MAX_TAKEOVER_HOLDERS` (4), the last ones
+named (`takeOverHolders`). The row is compared with that set in the same
+conditional write as the acquire, so a lease any other holder took meanwhile is
+never taken. Without `takeOver`, as every older build calls it, the acquire takes
+only an expired lease or its own. A distiller passes it on its first acquire only
+(`DistillerOptions.takeOverLease`). On v2 the lease holder is the distiller
+worker, whose holder id is `<instanceId>/w<generation>`; a replacement generation
+takes over its own predecessors' ids that way, and to other processes each
+generation is one more contender (see the worker section below).
 Two revision counters
 drive lazy reader reloads and they are NOT interchangeable. `cards_rev` covers
 lexical card writes and the tier-1
@@ -462,7 +463,7 @@ reason.
 
 | Direction     | Message                            | Contents                                                                                                                                                                                                                                                                    |
 | ------------- | ---------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| main → worker | `init`                             | store and source paths, holder id, the predecessor's holder id (`takeOver`), limits, sync timings, `BUILD_ID`, the build tag, the representation and projector generations, the foreground signal's buffer                                                                  |
+| main → worker | `init`                             | store and source paths, holder id, the ended earlier generations' holder ids (`takeOver`, at most 4), limits, sync timings, `BUILD_ID`, the build tag, the representation and projector generations, the foreground signal's buffer                                         |
 | main → worker | `events`                           | a batch id and distiller signals, coalesced per session, up to 256 a message                                                                                                                                                                                                |
 | main → worker | `vectors`                          | model, representation and rows, each whole-buffer embedding transferred                                                                                                                                                                                                     |
 | main → worker | `stop`                             | the deadline                                                                                                                                                                                                                                                                |
@@ -550,23 +551,23 @@ No `opencode.db` row, history page, card or row set crosses. The bounds:
   `fatal` of kind `crash`, a reader refusal after `ok` and a watchdog trip each fail
   the generation. Main asks it to end and waits for its exit (`terminate()` returns
   while a statement still runs, and that statement can still commit). The next
-  generation starts 1 s later, then 5 s later. Its `init` names the holder id of
-  the last failed generation that reported holding the lease or that the lease row
-  named once its thread had ended, so its first acquire may take that one lease
-  over. The takeover compares one id with the row's, and a generation that never
-  took the lease cannot be in the row, so such a generation leaves the id as it
-  was. The worker posts a status at once whenever its distiller takes the lease
-  (`onLeaseAcquired`), outside the status rate limit, and main counts a status
-  saying it holds the lease even when it arrives after the generation failed.
-  So a generation whose reader failed to open, leaving main no row to read,
-  still counts as having held the lease.
+  generation starts 1 s later, then 5 s later. Its `init` names the holder ids of
+  this runtime's earlier generations whose threads have ended, the most recent
+  four (`takeOver`), so its first acquire may take a lease that names one of them
+  over. A generation can take the lease in its last moments without main hearing
+  of it, its acquire committing while main ends it, and once its thread has ended
+  nothing of it can hold the lease, so every ended generation is named whether or
+  not it reported the lease. A live lease of any other holder is never taken. The
+  worker also posts a status at once whenever its distiller takes the lease
+  (`onLeaseAcquired`), outside the status rate limit.
 - **Watchdog:** every 5 s main reads the lease row through its reader. When the row
   names the running generation, its heartbeat is older than the row's TTL and no
   stop is pending, the generation fails. The row alone decides, so a worker that
   took the lease and stalled before its first status is caught too.
 - **After three failures** main takes over once the last thread has exited: it opens
   the store with `openStore` on this thread, runs `createDistiller` here (taking
-  over the lease of the holder a replacement's `init` would name) and installs a
+  over a lease naming one of the holders a replacement's `init` would name) and
+  installs a
   card runtime with `inlineVectorWriter`. From the controller's switch to inline
   until that distiller exists, signals wait in a handoff outbox. The distiller
   acquires the lease first, then gets the controller's queued signals and the

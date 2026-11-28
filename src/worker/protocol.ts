@@ -96,9 +96,10 @@ export type InitMessage = Envelope & {
   sourcePath: string;
   /** The lease holder id this generation distills as. */
   holderId: string;
-  /** The predecessor generation's holder id, whose lease the first acquire
-   *  may take over. */
-  takeOver?: string;
+  /** The holder ids of this runtime's earlier generations whose threads
+   *  have ended, the most recent last (at most four): the first acquire may
+   *  take over a lease that names one of them. */
+  takeOver?: string[];
   limits: Limits;
   sync?: WorkerSyncOptions;
   idleDebounceMs?: number;

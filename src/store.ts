@@ -137,6 +137,26 @@ const EXPIRED_SENTINEL = JSON.stringify({
   ttl: 0,
 });
 
+/** The most holders one lease acquire may take a live lease over from. */
+export const MAX_TAKEOVER_HOLDERS = 4;
+
+/**
+ * The holder ids a lease acquire's `takeOver` names: its non-empty strings,
+ * once each, the last {@link MAX_TAKEOVER_HOLDERS} of them. The empty holder
+ * is the released sentinel's, which the expiry clause already covers.
+ */
+export function takeOverHolders(takeOver: unknown): string[] {
+  const named = typeof takeOver === "string" ? [takeOver] : Array.isArray(takeOver) ? takeOver : [];
+  const ids: string[] = [];
+  for (const id of named) {
+    if (typeof id !== "string" || id === "") continue;
+    const at = ids.indexOf(id);
+    if (at >= 0) ids.splice(at, 1);
+    ids.push(id);
+  }
+  return ids.slice(-MAX_TAKEOVER_HOLDERS);
+}
+
 /** Connection-only PRAGMA, safe before the fence: it changes nothing on disk. */
 const PRE_FENCE_PRAGMAS = "PRAGMA busy_timeout=5000;";
 /** Applied only once the fence accepts the store. `journal_mode=WAL` is
@@ -1027,18 +1047,19 @@ export type Store = {
    * wins); the extra fields are pure observability so a mixed-version store can be
    * diagnosed with one {@link Store.leaseStatus} read instead of a process hunt.
    *
-   * `opts.takeOver` names one more holder whose lease this call may take
-   * although its heartbeat has not expired: a predecessor the caller knows
-   * has stopped. The lease row must name exactly that holder, compared in
-   * the same conditional write, so a lease another holder took meanwhile is
-   * never taken. An empty or non-string `takeOver` is ignored.
+   * `opts.takeOver` names more holders whose lease this call may take
+   * although its heartbeat has not expired: predecessors the caller knows
+   * have stopped, at most {@link MAX_TAKEOVER_HOLDERS} (the last ones
+   * named). The lease row must name exactly one of them, compared in the
+   * same conditional write, so a lease any other holder took meanwhile is
+   * never taken. Empty and non-string ids are ignored.
    */
   acquireLease(
     holder: string,
     ttlMs: number,
     build: string,
     gen: number,
-    opts?: { takeOver?: string },
+    opts?: { takeOver?: string | readonly string[] },
   ): boolean;
   heartbeatLease(holder: string): boolean;
   releaseLease(holder: string): boolean;
@@ -3359,42 +3380,33 @@ class SqliteStore implements Store {
    * Acquire or take over the distill lease as a single conditional write,
    * verified via the changes count — never an application-level
    * read-check-write. Succeeds when the row is absent, already held by this
-   * holder, held by `opts.takeOver` (a non-empty string), or expired
-   * (heartbeat older than `ttlMs` ago).
+   * holder, held by one of `opts.takeOver` (see {@link takeOverHolders}), or
+   * expired (heartbeat older than `ttlMs` ago).
    */
   acquireLease(
     holder: string,
     ttlMs: number,
     build: string,
     gen: number,
-    opts?: { takeOver?: string },
+    opts?: { takeOver?: string | readonly string[] },
   ): boolean {
     const now = this.now();
     const cutoff = now - ttlMs;
     // `build`/`gen` ride the value for diagnosis only. A heartbeat updates
     // only `$.heartbeat` (json_set), so they survive renewals.
     const value = JSON.stringify({ holder, heartbeat: now, ttl: ttlMs, build, gen });
-    // The empty holder is the released sentinel's, which the expiry clause
-    // already covers, so an empty `takeOver` names no holder.
-    const takeOver =
-      typeof opts?.takeOver === "string" && opts.takeOver !== "" ? opts.takeOver : undefined;
+    const holders = [holder, ...takeOverHolders(opts?.takeOver).filter((id) => id !== holder)];
     return this.db.tx(() => {
       this.db.run("INSERT OR IGNORE INTO meta(key, value) VALUES(?, ?)", [
         LEASE_KEY,
         EXPIRED_SENTINEL,
       ]);
-      // The predecessor is compared in the same conditional write, so a
-      // lease another holder took after the predecessor is never taken.
-      const res =
-        takeOver === undefined
-          ? this.db.run(
-              `UPDATE meta SET value=? WHERE key=? AND (json_extract(value,'$.holder')=? OR json_extract(value,'$.heartbeat') < ?)`,
-              [value, LEASE_KEY, holder, cutoff],
-            )
-          : this.db.run(
-              `UPDATE meta SET value=? WHERE key=? AND (json_extract(value,'$.holder') IN (?, ?) OR json_extract(value,'$.heartbeat') < ?)`,
-              [value, LEASE_KEY, holder, takeOver, cutoff],
-            );
+      // The predecessors are compared in the same conditional write, so a
+      // lease another holder took after them is never taken.
+      const res = this.db.run(
+        `UPDATE meta SET value=? WHERE key=? AND (json_extract(value,'$.holder') IN (${holders.map(() => "?").join(", ")}) OR json_extract(value,'$.heartbeat') < ?)`,
+        [value, LEASE_KEY, ...holders, cutoff],
+      );
       return res.changes > 0;
     });
   }

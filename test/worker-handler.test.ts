@@ -146,7 +146,7 @@ function initMessage(
     generation?: number;
     limits?: Partial<typeof TEST_LIMITS>;
     holderId?: string;
-    takeOver?: string;
+    takeOver?: string[];
     sourcePath?: string;
     foreground?: ForegroundSignal;
     idleDebounceMs?: number;
@@ -593,7 +593,7 @@ describe("the first lease acquire", () => {
     await seedLease("main/w1");
     const { worker, side } = await startSide();
     worker.postMessage(
-      initMessage({ holderId: "main/w2", takeOver: "main/w1", limits: { coldPass: true } }),
+      initMessage({ holderId: "main/w2", takeOver: ["main/w1"], limits: { coldPass: true } }),
     );
     await nextOf(side, "store");
     const status = await nextOf(side, "status");

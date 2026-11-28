@@ -1,7 +1,7 @@
 import { BUILD_ID } from "../build-id.js";
 import type { CardVectorWriteResult, CardVectorWriter } from "../cards.js";
 import { LEASE_TTL_MS, type DistillSignal } from "../distill.js";
-import type { LeaseInfo } from "../store.js";
+import { takeOverHolders, type LeaseInfo } from "../store.js";
 import { errmsg, settleWithin } from "../types.js";
 import {
   createEventOutbox,
@@ -28,9 +28,11 @@ import type { WorkerLike, WorkerStarter } from "./start.js";
  * predecessor's thread has ended (its exit event), since a thread that was
  * asked to end may still be inside a statement that can commit. The holder id
  * of generation `n` is `<instanceId>/w<n>`, and each replacement's `init`
- * names the holder id of the last failed generation that reported holding
- * the lease or that the lease row named, so its first lease acquire may take
- * that one lease over without waiting out the TTL.
+ * names the holder ids of the earlier generations whose threads have ended
+ * (the most recent four), so its first lease acquire may take a lease that
+ * names one of them over without waiting out the TTL. A generation can take
+ * the lease in its last moments without main hearing of it, and once its
+ * thread has ended nothing of it can still hold the lease.
  *
  * A generation fails when it reports no `ready` within 10 s of starting or no
  * `store` within 10 s of `init`, when its thread reports an error or ends
@@ -65,11 +67,11 @@ export type WorkerControllerOptions = {
   onStopped(reason: string): void;
   /**
    * Every allowed generation failed and the last one's thread has ended:
-   * main runs the distiller itself from here on, and may take over
-   * `lastHolder`'s lease: the last generation that reported holding the
-   * lease or that the lease row named, if any did.
+   * main runs the distiller itself from here on, and may take over a lease
+   * that names one of `takeOver`, the holder ids of the generations whose
+   * threads have ended, the most recent last (at most four).
    */
-  onInline(reason: string, lastHolder: string | undefined): void;
+  onInline(reason: string, takeOver: readonly string[]): void;
   /** A status message of the current generation arrived. */
   onStatus?(status: WorkerStatus): void;
   /** The current generation waits for a store whose write lock another
@@ -167,9 +169,6 @@ type Generation = {
   markExited: () => void;
   stopped?: () => void;
   status?: WorkerStatus;
-  /** A status of this generation said it held the lease, one that arrived
-   *  after it failed included. */
-  tookLease: boolean;
   /** The `events` batches posted to this generation that it has not
    *  acknowledged yet, by batch id in the order they were posted, with their
    *  signals (at most {@link MAX_UNACKED_BATCHES} of {@link EVENT_BATCH}). */
@@ -195,7 +194,9 @@ export function createWorkerController(options: WorkerControllerOptions): Worker
   let current: Generation | undefined;
   let count = 0;
   let failures = 0;
-  let predecessor: string | undefined;
+  /** The holder ids of the generations whose threads have ended, the most
+   *  recent last, as many as a takeover names ({@link takeOverHolders}). */
+  let ended: string[] = [];
   let stopping = false;
   let quiesced = false;
   let nextId = 1;
@@ -237,16 +238,6 @@ export function createWorkerController(options: WorkerControllerOptions): Worker
     if (gen.storeTimer !== undefined) clearTimeout(gen.storeTimer);
     gen.readyTimer = undefined;
     gen.storeTimer = undefined;
-  };
-
-  /** Whether the lease row main's reader sees names `holderId`; false while
-   *  there is no reader or the read fails. */
-  const leaseNames = (holderId: string): boolean => {
-    try {
-      return options.readLease()?.holder === holderId;
-    } catch {
-      return false;
-    }
   };
 
   const stopWatchdog = (): void => {
@@ -314,10 +305,10 @@ export function createWorkerController(options: WorkerControllerOptions): Worker
     // Its thread may still be inside a statement that can commit: nothing
     // replaces it before the thread has ended.
     await gen.exit;
-    // A takeover compares one holder id with the row's. A generation that
-    // never took the lease cannot be in the row, so the holder that may still
-    // be there stays the one to take over.
-    if (gen.tookLease || leaseNames(gen.holderId)) predecessor = gen.holderId;
+    // Its thread has ended, so a lease naming it is dead, whether or not main
+    // heard that it took it (an acquire can commit while the thread is
+    // ended). Its holder id joins the ones a takeover may name.
+    ended = takeOverHolders([...ended, gen.holderId]);
     if (stopping || mode.kind !== "worker") return;
     // The batches it never acknowledged may not have reached its distiller,
     // or only in part: they go back ahead of the signals posted since, for
@@ -331,7 +322,7 @@ export function createWorkerController(options: WorkerControllerOptions): Worker
     if (failures >= maxFailures) {
       mode = { kind: "inline", reason };
       log(`the distiller runs on the main thread from now on: ${reason}`);
-      options.onInline(reason, predecessor);
+      options.onInline(reason, [...ended]);
       markSettled();
       return;
     }
@@ -394,15 +385,8 @@ export function createWorkerController(options: WorkerControllerOptions): Worker
   }
 
   function onMessage(gen: Generation, raw: unknown): void {
-    if (gen !== current) return;
+    if (gen !== current || gen.failed) return;
     if (!isWorkerMessage(raw) || raw.generation !== gen.number) return;
-    if (gen.failed) {
-      // A failed generation is heard only on whether it took the lease: a
-      // status it posted before it failed can arrive after, and decides
-      // whose lease the next one may take over.
-      if (raw.type === "status" && raw.status?.distill?.leaseHeld === true) gen.tookLease = true;
-      return;
-    }
     switch (raw.type) {
       case "ready": {
         if (gen.readyTimer !== undefined) clearTimeout(gen.readyTimer);
@@ -417,7 +401,7 @@ export function createWorkerController(options: WorkerControllerOptions): Worker
           id: nextId++,
           deadline: now() + storeTimeout,
           holderId: gen.holderId,
-          ...(predecessor !== undefined && { takeOver: predecessor }),
+          ...(ended.length > 0 && { takeOver: [...ended] }),
           ...options.init,
         });
         gen.storeTimer = setTimeout(
@@ -447,7 +431,6 @@ export function createWorkerController(options: WorkerControllerOptions): Worker
       }
       case "status":
         gen.status = raw.status;
-        if (raw.status?.distill?.leaseHeld === true) gen.tookLease = true;
         options.onStatus?.(raw.status);
         return;
       case "ack":
@@ -501,7 +484,6 @@ export function createWorkerController(options: WorkerControllerOptions): Worker
       failed: false,
       stopRequested: false,
       exited: false,
-      tookLease: false,
       unacked: new Map(),
       exit: new Promise<void>((resolve) => (markExited = resolve)),
       markExited: () => {

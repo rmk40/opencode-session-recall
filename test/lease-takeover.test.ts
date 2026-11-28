@@ -3,7 +3,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openSqlite, type SqliteDb } from "../src/sqlite.js";
-import type { Store } from "../src/store.js";
+import { MAX_TAKEOVER_HOLDERS, takeOverHolders, type Store } from "../src/store.js";
 import { openV1Store } from "./helpers.js";
 
 /**
@@ -74,6 +74,40 @@ describe("distill lease takeover", () => {
     expect(one.store.leaseStatus()?.holder).toBe("B");
     one.db.close();
     two.db.close();
+  });
+
+  it("takes a live lease from any holder of the set it names", async () => {
+    let clock = 1_000_000;
+    const { db, store } = await connect(freshPath(), () => clock);
+    expect(store.acquireLease("w2", TTL, "build", 4)).toBe(true);
+    clock += 1_000;
+    expect(store.acquireLease("w4", TTL, "build", 4, { takeOver: ["w1", "w2", "w3"] })).toBe(true);
+    expect(store.leaseStatus()?.holder).toBe("w4");
+    db.close();
+  });
+
+  it("never takes a live lease from a holder outside the set it names", async () => {
+    let clock = 1_000_000;
+    const { db, store } = await connect(freshPath(), () => clock);
+    expect(store.acquireLease("other", TTL, "build", 4)).toBe(true);
+    clock += 1_000;
+    expect(store.acquireLease("w4", TTL, "build", 4, { takeOver: ["w1", "w2", "w3"] })).toBe(false);
+    expect(store.leaseStatus()?.holder).toBe("other");
+    db.close();
+  });
+
+  it("names at most the last four holders of a longer set, and ignores empty ids", async () => {
+    let clock = 1_000_000;
+    const { db, store } = await connect(freshPath(), () => clock);
+    expect(store.acquireLease("w1", TTL, "build", 4)).toBe(true);
+    clock += 1_000;
+    // w1 is the fifth from the end: past the bound.
+    const named = ["w1", "w2", "", "w3", "w4", "w5"];
+    expect(store.acquireLease("w6", TTL, "build", 4, { takeOver: named })).toBe(false);
+    expect(takeOverHolders(named)).toEqual(["w2", "w3", "w4", "w5"]);
+    expect(takeOverHolders(["a", "b", "a"])).toEqual(["b", "a"]);
+    expect(MAX_TAKEOVER_HOLDERS).toBe(4);
+    db.close();
   });
 
   it("still takes an expired lease and renews its own, whatever holder it names", async () => {

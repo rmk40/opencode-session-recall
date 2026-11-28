@@ -639,7 +639,7 @@ async function createV2Runtime(
   /** The real store path the worker distills into, when one runs. */
   let workerStore: string | undefined;
 
-  const makeInline = (target: Store, takeOver?: string): Distiller =>
+  const makeInline = (target: Store, takeOver?: readonly string[]): Distiller =>
     createDistiller({
       source: distillSource,
       store: target,
@@ -944,7 +944,7 @@ async function createV2Runtime(
     /** The distiller moves to this thread over a writable store, once the
      *  last worker's thread has ended. Until it exists, signals wait in
      *  {@link handoff}. */
-    const goInline = (reason: string, lastHolder: string | undefined): void => {
+    const goInline = (reason: string, takeOver: readonly string[]): void => {
       handoff = createEventOutbox();
       let previousReader: typeof reader = null;
       void (async () => {
@@ -968,7 +968,7 @@ async function createV2Runtime(
           reader = null;
           store = opened.store;
           installCards(storeCardSource(opened.store, inlineVectorWriter(opened.store)));
-          const next = makeInline(opened.store, lastHolder);
+          const next = makeInline(opened.store, takeOver);
           inline = next;
           try {
             // The lease first: a deletion or a metadata patch is applied only

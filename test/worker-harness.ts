@@ -287,7 +287,7 @@ export function workerInit(o: {
 export type ControllerRecord = {
   storeOpens: Array<string | undefined>;
   stopped: string[];
-  inline: Array<{ reason: string; lastHolder: string | undefined }>;
+  inline: Array<{ reason: string; takeOver: readonly string[] }>;
   logs: string[];
 };
 
@@ -312,7 +312,7 @@ export function harnessController(
       return { ok: true };
     },
     onStopped: (reason) => record.stopped.push(reason),
-    onInline: (reason, lastHolder) => record.inline.push({ reason, lastHolder }),
+    onInline: (reason, takeOver) => record.inline.push({ reason, takeOver }),
     readLease: (): LeaseInfo | undefined => undefined,
     restartDelaysMs: [0, 0],
     ...overrides,

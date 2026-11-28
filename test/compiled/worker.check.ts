@@ -245,7 +245,7 @@ describe("a worker blocked in SQLite", () => {
       sourcePath,
       limits: { coldPass: true },
       holderId: "compiled/w2",
-      takeOver: "compiled/w1",
+      takeOver: ["compiled/w1"],
     });
     expect(reopened.ok).toBe(true);
     // The dead thread's transaction holds no lock: the open does not wait
@@ -279,7 +279,7 @@ describe("many generations", () => {
         sourcePath,
         limits: { coldPass: true },
         holderId,
-        ...(predecessor !== undefined && { takeOver: predecessor }),
+        ...(predecessor !== undefined && { takeOver: [predecessor] }),
       });
       expect(store.ok).toBe(true);
       const status = await worker.next("status");

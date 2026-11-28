@@ -28,6 +28,7 @@ import {
   DEFAULT_AUTOCHECKPOINT_PAGES,
   REPAIR_REV_KEY,
   REPAIR_STATE_PAGE,
+  takeOverHolders,
 } from "./store.js";
 import type { FetchGate } from "./fetch-gate.js";
 import { isSelfToolPart, toolNameMatches, isSummarizerTitle } from "./extract.js";
@@ -633,12 +634,12 @@ export type DistillerOptions = {
    *  ({@link import("./embedding-text.js").EMBED_REPRESENTATION}). Defaults to 0. */
   gen?: number;
   /**
-   * A holder id whose lease this distiller's first acquire may take over
+   * Holder ids whose lease this distiller's first acquire may take over
    * although its heartbeat has not expired ({@link Store.acquireLease}'s
-   * `takeOver`): a predecessor the caller knows has stopped. Later acquires
-   * never take it over.
+   * `takeOver`, at most its last four): predecessors the caller knows have
+   * stopped. Later acquires never take them over.
    */
-  takeOverLease?: string;
+  takeOverLease?: string | readonly string[];
   /** Called each time an acquire takes the lease, right after it does. */
   onLeaseAcquired?: () => void;
   /**
@@ -1593,12 +1594,10 @@ export function createDistiller(options: DistillerOptions): Distiller {
   const build = options.build ?? "unknown";
   const gen = options.gen ?? 0;
   const projectorGen = options.projectorGen;
-  /** The predecessor whose lease the first acquire may take over; cleared
+  /** The predecessors whose lease the first acquire may take over; cleared
    *  once that acquire has run, whatever it found. */
-  let takeOverLease =
-    typeof options.takeOverLease === "string" && options.takeOverLease !== ""
-      ? options.takeOverLease
-      : undefined;
+  let takeOverLease: string[] | undefined = takeOverHolders(options.takeOverLease);
+  if (takeOverLease.length === 0) takeOverLease = undefined;
   const caps = {
     ftsRowsPerSession: limits.ftsRowsPerSession,
     inventoryTokens: limits.inventoryTokens,

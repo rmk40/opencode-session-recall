@@ -36,7 +36,7 @@ import {
 type Recorded = {
   storeOpens: Array<string | undefined>;
   stopped: string[];
-  inline: Array<{ reason: string; lastHolder: string | undefined }>;
+  inline: Array<{ reason: string; takeOver: readonly string[] }>;
   logs: string[];
   statuses: WorkerStatus[];
 };
@@ -65,7 +65,7 @@ function scriptedController(
       return { ok: true };
     },
     onStopped: (reason) => record.stopped.push(reason),
-    onInline: (reason, lastHolder) => record.inline.push({ reason, lastHolder }),
+    onInline: (reason, takeOver) => record.inline.push({ reason, takeOver }),
     onStatus: (status) => record.statuses.push(status),
     readLease: () => undefined,
     ...overrides,
@@ -368,86 +368,52 @@ describe("the controller with scripted workers", () => {
       expect(controller.mode()).toEqual({ kind: "worker" });
     });
 
-    it("names the failed generation's holder in its replacement's init once it reported the lease or the row names it", async () => {
-      const lease: { row?: string } = {};
+    it("names every earlier generation whose thread has ended in its replacement's init, the most recent four", async () => {
       const { controller, scripted } = scriptedController({
-        restartDelaysMs: [0, 0],
-        readLease: () => (lease.row === undefined ? undefined : leaseOf(lease.row, 0)()),
+        restartDelaysMs: [0],
+        maxFailures: 6,
       });
       await flush();
-      await run(scripted.worker(1));
-      scripted.worker(1).emit({ type: "status", status: status() });
-      scripted.worker(1).emit({ type: "fatal", kind: "crash", reason: "crashed" });
-      scripted.worker(1).exit();
-      await flush();
-      expect(controller.holderId()).toBe("inst/w2");
-      await ready(scripted.worker(2));
-      expect(scripted.worker(2).last("init")).toMatchObject({
-        holderId: "inst/w2",
-        takeOver: "inst/w1",
-      });
-
-      // Generation 2 took the lease over and failed before any status.
-      scripted.worker(2).emit({ type: "store", id: scripted.worker(2).last("init")?.id, ok: true });
-      await flush();
-      lease.row = "inst/w2";
-      scripted.worker(2).exit();
-      await flush();
-      await ready(scripted.worker(3));
-      expect(scripted.worker(3).last("init")).toMatchObject({
-        holderId: "inst/w3",
-        takeOver: "inst/w2",
-      });
+      const takeOvers: unknown[] = [];
+      for (const generation of [1, 2, 3, 4, 5, 6]) {
+        await ready(scripted.worker(generation));
+        takeOvers.push(scripted.worker(generation).last("init")?.takeOver);
+        if (generation === 6) break;
+        scripted.worker(generation).exit();
+        await flush();
+      }
+      expect(controller.holderId()).toBe("inst/w6");
+      expect(takeOvers).toEqual([
+        undefined,
+        ["inst/w1"],
+        ["inst/w1", "inst/w2"],
+        ["inst/w1", "inst/w2", "inst/w3"],
+        ["inst/w1", "inst/w2", "inst/w3", "inst/w4"],
+        ["inst/w2", "inst/w3", "inst/w4", "inst/w5"],
+      ]);
     });
 
-    it("names a generation whose lease status arrived only after main's reader failed to open", async () => {
+    it("names a generation main never heard take the lease once its thread has ended", async () => {
+      // Its reader does not open, so main reads no lease row, and the
+      // generation fails before any status of it arrives.
       const { scripted } = scriptedController({
         restartDelaysMs: [0, 0],
         onStoreOpen: async () => ({ ok: false, reason: "no-wal" }),
       });
       await flush();
       await ready(scripted.worker(1));
-      // The store result fails the generation before its status is heard.
       scripted.worker(1).emit({ type: "store", id: scripted.worker(1).last("init")?.id, ok: true });
       await flush();
-      scripted.worker(1).emit({ type: "status", status: status() });
+      // Asked to end, its thread has not: no replacement and no takeover yet.
+      await advance(60_000);
+      expect(scripted.workers).toHaveLength(1);
       scripted.worker(1).exit();
       await flush();
       await ready(scripted.worker(2));
       expect(scripted.worker(2).last("init")).toMatchObject({
         holderId: "inst/w2",
-        takeOver: "inst/w1",
+        takeOver: ["inst/w1"],
       });
-    });
-
-    it("keeps the holder to take over when a failed generation never took the lease", async () => {
-      const { controller, scripted, record } = scriptedController({
-        restartDelaysMs: [0, 0],
-        readLease: leaseOf("inst/w1", 0),
-      });
-      await flush();
-      await run(scripted.worker(1));
-      scripted.worker(1).emit({ type: "status", status: status() });
-      scripted.worker(1).exit();
-      await flush();
-      // Generation 2 reported no lease, and the row still names generation 1.
-      await ready(scripted.worker(2));
-      scripted.worker(2).emit({ type: "store", id: scripted.worker(2).last("init")?.id, ok: true });
-      await flush();
-      scripted
-        .worker(2)
-        .emit({ type: "status", status: status({ leaseHeld: false, holderId: "inst/w2" }) });
-      scripted.worker(2).exit();
-      await flush();
-      await ready(scripted.worker(3));
-      expect(scripted.worker(3).last("init")).toMatchObject({
-        holderId: "inst/w3",
-        takeOver: "inst/w1",
-      });
-      scripted.worker(3).exit();
-      await flush();
-      expect(controller.mode().kind).toBe("inline");
-      expect(record.inline.map((entry) => entry.lastHolder)).toEqual(["inst/w1"]);
     });
 
     it("runs the distiller inline after the third failure, once the last thread has exited", async () => {
@@ -473,8 +439,10 @@ describe("the controller with scripted workers", () => {
       scripted.worker(3).exit();
       await flush();
       expect(controller.mode()).toEqual({ kind: "inline", reason: "crash 3" });
-      // No generation took the lease: there is none to take over.
-      expect(record.inline).toEqual([{ reason: "crash 3", lastHolder: undefined }]);
+      // Every generation's thread has ended: any of them may be in the row.
+      expect(record.inline).toEqual([
+        { reason: "crash 3", takeOver: ["inst/w1", "inst/w2", "inst/w3"] },
+      ]);
       expect(settled.settled).toBe(true);
       expect(controller.post({ type: "turn-ended", sessionID: "s" })).toBe(false);
       await advance(60_000);
@@ -492,7 +460,7 @@ describe("the controller with scripted workers", () => {
       expect(record.inline).toEqual([
         {
           reason: "the worker did not start: the worker module did not load",
-          lastHolder: undefined,
+          takeOver: ["inst/w1"],
         },
       ]);
     });
@@ -1312,7 +1280,7 @@ describe("the controller over the inline harness", () => {
     expect(harness.side(2)?.received[0]).toMatchObject({
       type: "init",
       holderId: "harness/w2",
-      takeOver: "harness/w1",
+      takeOver: ["harness/w1"],
     });
     expect(await leaseHolder()).toBe("harness/w2");
   });
@@ -1327,8 +1295,8 @@ describe("the controller over the inline harness", () => {
     expect(record.inline).toEqual([
       {
         reason: "the worker did not start: the worker module did not load",
-        // No thread ran, so none took the lease.
-        lastHolder: undefined,
+        // No thread ran: each start that failed counts as ended.
+        takeOver: ["harness/w1", "harness/w2", "harness/w3"],
       },
     ]);
     expect(harness.sides).toHaveLength(0);
