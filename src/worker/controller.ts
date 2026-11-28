@@ -58,7 +58,8 @@ export type WorkerControllerOptions = {
    * already open. A refusal there is a failure of this generation.
    */
   onStoreOpen(warning: string | undefined): Promise<{ ok: true } | { ok: false; reason: string }>;
-  /** Indexing stopped for good (a store refusal or a damaged store). */
+  /** Indexing stopped for good: the store refused (`reason` is the refusal,
+   *  such as `source-mismatch`) or is damaged. */
   onStopped(reason: string): void;
   /**
    * Every allowed generation failed and the last one's thread has ended:
@@ -115,7 +116,7 @@ export type WorkerController = {
    * Stop: no generation starts after this. The running worker is asked to
    * stop its distiller, release its lease and close its connections; resolves
    * true once it reported `stopped`, false at the deadline or when no worker
-   * was running.
+   * was running. Later calls return the first call's promise.
    */
   stop(deadlineMs: number): Promise<boolean>;
   /** End the worker's thread and wait at most `waitMs` for its exit. */
@@ -175,6 +176,7 @@ export function createWorkerController(options: WorkerControllerOptions): Worker
   let restartTimer: ReturnType<typeof setTimeout> | undefined;
   let watchdog: ReturnType<typeof setInterval> | undefined;
   let flushScheduled = false;
+  let stopPromise: Promise<boolean> | undefined;
   let revisions: { cardsRev: number; vectorsRev: number } | undefined;
   const outbox = createEventOutbox();
   const pending = new Map<number, Pending>();
@@ -237,7 +239,6 @@ export function createWorkerController(options: WorkerControllerOptions): Worker
   function stopIndexing(gen: Generation | undefined, reason: string): void {
     if (mode.kind !== "worker") return;
     mode = { kind: "stopped", reason };
-    log(`indexing stopped: ${reason}`);
     stopWatchdog();
     if (gen) {
       clearGenerationTimers(gen);
@@ -303,7 +304,7 @@ export function createWorkerController(options: WorkerControllerOptions): Worker
     if (gen.storeTimer !== undefined) clearTimeout(gen.storeTimer);
     gen.storeTimer = undefined;
     if (!message.ok) {
-      stopIndexing(gen, `the store was refused (${message.reason})`);
+      stopIndexing(gen, message.reason);
       return;
     }
     if (message.warning !== undefined) log(`store: ${message.warning}`);
@@ -493,24 +494,27 @@ export function createWorkerController(options: WorkerControllerOptions): Worker
       quiesced = true;
       outbox.drain();
     },
-    async stop(deadlineMs) {
-      stopping = true;
-      quiesced = true;
-      outbox.drain();
-      stopWatchdog();
-      if (restartTimer !== undefined) clearTimeout(restartTimer);
-      restartTimer = undefined;
-      markSettled();
-      const gen = current;
-      if (!gen?.worker || gen.exited || gen.failed) return false;
-      clearGenerationTimers(gen);
-      gen.stopRequested = true;
-      const stopped = new Promise<void>((resolve) => (gen.stopped = resolve));
-      const sent = send(gen, { type: "stop", id: nextId++, deadline: now() + deadlineMs });
-      if (!sent) return false;
-      const result = await settleWithin(stopped, deadlineMs);
-      failPending(gen, "the worker stopped");
-      return !result.timedOut && !gen.exited;
+    stop(deadlineMs) {
+      stopPromise ??= (async () => {
+        stopping = true;
+        quiesced = true;
+        outbox.drain();
+        stopWatchdog();
+        if (restartTimer !== undefined) clearTimeout(restartTimer);
+        restartTimer = undefined;
+        markSettled();
+        const gen = current;
+        if (!gen?.worker || gen.exited || gen.failed) return false;
+        clearGenerationTimers(gen);
+        gen.stopRequested = true;
+        const stopped = new Promise<void>((resolve) => (gen.stopped = resolve));
+        const sent = send(gen, { type: "stop", id: nextId++, deadline: now() + deadlineMs });
+        if (!sent) return false;
+        const result = await settleWithin(stopped, deadlineMs);
+        failPending(gen, "the worker stopped");
+        return !result.timedOut && !gen.exited;
+      })();
+      return stopPromise;
     },
     async terminate(waitMs) {
       stopping = true;

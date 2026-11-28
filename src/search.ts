@@ -155,6 +155,9 @@ export type SearchDeps = {
    *  (see {@link HistoryCoverage.distiller}); absent, or undefined, when the
    *  host runs none. */
   distiller?: () => string | undefined;
+  /** A warning while the host's distiller has stopped indexing new
+   *  sessions, saying why and how to fix it. */
+  distillerWarning?: () => string | undefined;
   /** Why the cards are metadata-only when the store is not simply missing,
    *  such as the index still starting: reported as `coverage.cards.reason`
    *  and as the degraded-cards warning in place of the default one. */
@@ -4278,6 +4281,8 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
             "Session discovery stopped at its limit, so older sessions may not be indexed and their history is not searched.",
           );
         }
+        const stoppedIndexing = deps.distillerWarning?.();
+        if (stoppedIndexing) normalized.warnings.push(stoppedIndexing);
         if (cardsCoverage.degraded) {
           // Mode-gated wording: configured ephemeral operation is not damage.
           // The driver-missing degraded path keeps its wording byte-identical

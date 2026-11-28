@@ -334,11 +334,15 @@ async function wire(
     );
     return failed;
   };
-  let live: { runtime: V2Runtime; tools: ToolSet } | undefined;
+  let live: { runtime: V2Runtime; revision: number; tools: ToolSet } | undefined;
+  // Rebuilt when the runtime's store or cards change (its store opened after
+  // the runtime was created, or the distiller moved to this thread).
   const liveTools = (runtime: V2Runtime): ToolSet => {
-    if (live?.runtime !== runtime) {
+    const revision = runtime.revision();
+    if (live?.runtime !== runtime || live.revision !== revision) {
       live = {
         runtime,
+        revision,
         tools: buildToolSet({
           source: runtime.sourceFor(ctx.location.project.id),
           gate: runtime.gate,
@@ -371,8 +375,12 @@ async function wire(
       // coerce defensively (ctx.tool.list() callers bypass validation).
       const args = (input ?? {}) as Parameters<ToolSet[ToolName]["execute"]>[0];
       const standIn = attachment.failed() ? failedTools() : starting;
+      // Counted in the foreground signal while it runs, so the worker's
+      // background work gives way to it.
       const result = runtime
-        ? await runtime.track(liveTools(runtime)[name].execute(args, toolContext))
+        ? await runtime.foreground.run(() =>
+            runtime.track(liveTools(runtime)[name].execute(args, toolContext)),
+          )
         : await standIn[name].execute(args, toolContext);
       // The backstop: whatever a tool returns or rejects with (through
       // `errorContent`), OpenCode never receives a result it would cut (see

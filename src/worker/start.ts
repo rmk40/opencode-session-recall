@@ -1,4 +1,3 @@
-import { BUILD_ID } from "../build-id.js";
 import { loadWorkerThreads } from "../node-import.js";
 import { portOf, runWorkerHandler, type WorkerHandlerOptions } from "./handler.js";
 import { WORKER_ENTRY, type MainMessage } from "./protocol.js";
@@ -101,11 +100,17 @@ export function inlineStarter(opts: Omit<WorkerHandlerOptions, "generation"> = {
   };
 }
 
+/** Whether this module runs from its TypeScript source (the tests), where no
+ *  compiled worker lies beside it. */
+function unbundled(): boolean {
+  return /\.[cm]?ts$/.test(new URL(import.meta.url).pathname);
+}
+
 /**
  * The starter a runtime uses unless told otherwise: a thread over the
- * compiled worker in a built plugin, and the inline handler in unbundled
- * code (tests, `tsc` output), which has no compiled worker beside it.
+ * compiled worker in a built plugin, and the inline handler when this module
+ * runs from its TypeScript source, which has no compiled worker beside it.
  */
 export function defaultWorkerStarter(): WorkerStarter {
-  return BUILD_ID === "dev" ? inlineStarter() : threadStarter();
+  return unbundled() ? inlineStarter() : threadStarter();
 }

@@ -1,10 +1,19 @@
 import { createFetchGate, type FetchGate } from "../fetch-gate.js";
-import { openSqlite, type ReadOnlyDb, type SqliteDb } from "../sqlite.js";
 import {
+  openSqlite,
+  sqliteThreadSafety,
+  SqliteBusyError,
+  type ReadOnlyDb,
+  type SqliteDb,
+} from "../sqlite.js";
+import {
+  openReadStore,
   openStore,
   peekStoreIdentity,
   defaultStorePath,
   pluginBuild,
+  type CardCounters,
+  type ReadStore,
   type Store,
   type StoreHost,
   type Card,
@@ -16,13 +25,20 @@ import {
   inlineVectorWriter,
   storeCardSource,
   type CardSource,
+  type CardSourceStore,
   type CardsRuntime,
 } from "../cards.js";
 import { createLiteRefresh, type LiteRefreshController } from "../lite-refresh.js";
 import { createDrill, type Drill } from "../drill.js";
-import { createDistiller, type Distiller, type RepairStatus } from "../distill.js";
+import {
+  createDistiller,
+  type Distiller,
+  type DistillStatus,
+  type RepairStatus,
+} from "../distill.js";
 import type { HistorySession } from "../history/model.js";
 import {
+  addReadCounts,
   createHistoryDriftState,
   createUnavailableSource,
   type HistoryDrift,
@@ -46,6 +62,16 @@ import type { ResolvedOptions } from "../options.js";
 import { errmsg, settleWithin, type Limits } from "../types.js";
 import { yieldInBackground, yieldOnBudget } from "../yield.js";
 import { loadFs, loadPath } from "../node-import.js";
+import { BUILD_ID } from "../build-id.js";
+import { createForegroundSignal, type ForegroundSignal } from "../foreground.js";
+import {
+  createWorkerController,
+  type WorkerController,
+  type WorkerControllerOptions,
+  type WorkerInit,
+} from "../worker/controller.js";
+import type { WorkerSyncOptions } from "../worker/protocol.js";
+import { defaultWorkerStarter } from "../worker/start.js";
 import type { V2Event } from "./opencode-v2-types.js";
 import { createIdDedupe, type ResolvedIdentity, type RuntimeFactory } from "./runtime.js";
 
@@ -55,10 +81,18 @@ import { createIdDedupe, type ResolvedIdentity, type RuntimeFactory } from "./ru
  * the registry's deferred init (never on `setup`'s admission path), shared by
  * every attached instance, and disposed by the last one to detach.
  *
- * The runtime reads opencode's own `opencode.db` read-only. The distiller uses
- * a global facade over it (the v2 store is one per process and discovers every
- * project); each instance gets a facade bound to its own opencode project id
- * through {@link V2Runtime.sourceFor}.
+ * The runtime reads opencode's own `opencode.db` read-only. Each instance gets
+ * a facade over it bound to its own opencode project id through
+ * {@link V2Runtime.sourceFor}.
+ *
+ * With a store path and a canonical `opencode.db` that opens, the distiller
+ * runs in a worker thread (`src/worker/`): the worker holds the only writable
+ * store connection, the lease, the checkpoints and its own `opencode.db`
+ * handle, and this thread keeps the tools, the event mapping, the card
+ * runtime and every search, over a store connection that only reads
+ * (`openReadStore`). After three failed worker generations, or with a SQLite
+ * library that is not thread-safe, the distiller runs on this thread as it
+ * did without a worker, over a writable store opened here.
  */
 
 const STORE_HOST: StoreHost = "opencode-v2";
@@ -66,9 +100,20 @@ const STORE_HOST: StoreHost = "opencode-v2";
 export const V2_PLUGIN_BUILD = pluginBuild(STORE_HOST, V2_PROJECTOR_GEN);
 /** Per-phase bound on dispose's awaited waits (as on v1). */
 const SHUTDOWN_TIMEOUT_MS = 2_500;
+/** How long dispose waits for the worker's thread to end after `terminate`. */
+const WORKER_EXIT_WAIT_MS = 10_000;
+/** How long the runtime's creation waits for the worker's store result. A
+ *  runtime created without it serves the degraded card tier, saying the
+ *  index is starting, and takes the store's cards once it is open. */
+export const STORE_READY_WAIT_MS = 3_000;
+/** The reason the degraded card tier gives while the worker is starting. */
+export const INDEX_STARTING_REASON = "the index is starting";
 /** How often the runtime compares the history drift with what it last
  *  logged. */
 const DRIFT_LOG_EVERY_MS = 5 * 60_000;
+/** Unknown part type names a merged drift snapshot keeps, as each drift
+ *  state does. */
+const UNKNOWN_TYPE_NAMES_CAP = 16;
 
 export { discoverSessions };
 
@@ -81,7 +126,10 @@ export type V2RuntimeOptions = Pick<
 export type V2Runtime = {
   readonly options: V2RuntimeOptions;
   readonly gate: FetchGate;
-  readonly store: Store | null;
+  /** The store the tools read: main's reader while the distiller runs in a
+   *  worker, a writable store when it runs on this thread, null without one.
+   *  It can change after creation (see {@link revision}). */
+  readonly store: ReadStore | null;
   readonly cards: CardsRuntime;
   readonly drill: Drill;
   readonly distiller: Distiller;
@@ -90,6 +138,12 @@ export type V2Runtime = {
   readonly enrichment: SessionEnrichment | undefined;
   /** Set when `opencode.db` cannot be read. */
   readonly unavailable: string | undefined;
+  /** Counts the changes of {@link store}, {@link cards}, {@link deps} and
+   *  {@link enrichment}: tools built over an older value are rebuilt. */
+  revision(): number;
+  /** The count of tool calls running, which the worker's background work
+   *  gives way to. */
+  readonly foreground: ForegroundSignal;
   /** The history facade scoped to one opencode project. */
   sourceFor(projectID: string): HistorySource;
   /** The drill's facade: no project, global listings only. The distiller
@@ -100,8 +154,8 @@ export type V2Runtime = {
   /**
    * How `opencode.db` differs from what this build reads (capabilities,
    * migration, unknown tables, and what reads could not project), summed
-   * over every facade's reads: the same state each facade's `history()`
-   * returns. Undefined when `opencode.db` is unavailable.
+   * over every facade's reads, the worker's included: the same state each
+   * facade's `history()` returns. Undefined when `opencode.db` is unavailable.
    */
   history(): HistoryDrift | undefined;
   /** The repair sweep's and the range check's progress, as the lease holder
@@ -114,6 +168,19 @@ export type V2Runtime = {
   dispose(): Promise<void>;
 };
 
+/** The worker settings a test may replace. */
+export type V2WorkerInputs = Partial<
+  Pick<
+    WorkerControllerOptions,
+    | "start"
+    | "restartDelaysMs"
+    | "readyTimeoutMs"
+    | "storeTimeoutMs"
+    | "watchdogEveryMs"
+    | "maxFailures"
+  >
+>;
+
 export type V2RuntimeInputs = {
   options: V2RuntimeOptions;
   /** `ctx.app.channel` of the attaching instance (process-wide). */
@@ -123,6 +190,12 @@ export type V2RuntimeInputs = {
   sync?: V2SyncOptions;
   /** Test affordance: the distiller's idle debounce. */
   idleDebounceMs?: number;
+  /** Test affordance: how worker generations start and time out, or `false`
+   *  to run the distiller on this thread. */
+  worker?: V2WorkerInputs | false;
+  /** Test affordance: wraps main's store reader handle (see
+   *  `ReadStoreOptions.wrapReader`). */
+  wrapReader?: (db: ReadOnlyDb) => ReadOnlyDb;
 };
 
 /** The runtime-shaping values an attaching instance compares. */
@@ -189,22 +262,69 @@ async function fileExists(path: string): Promise<boolean> {
   }
 }
 
+/** A store the card-only fallback found: read-only, or writable when no
+ *  connection had it open in WAL mode. */
+type CardOnlyStore =
+  | { kind: "reader"; store: ReadStore; close: () => void; stamped: string }
+  | { kind: "writable"; db: SqliteDb; store: Store; stamped: string };
+
 /**
  * The card-only fallback for a source path that cannot be canonicalized:
  * open an EXISTING store, but only when its stamped `source_db` names the
- * same file (both compared as real directory plus name). The store is opened
- * with the stamped string as its source identity, so the exact-string fence
+ * same file (both compared as real directory plus name). It is opened with
+ * the stamped string as its source identity, so the exact-string fence
  * matches and nothing is stamped; the caller must not distill into it.
- * Null (and nothing created or written) in every other case, with
- * `refused` set when a matching store was refused by openStore.
+ *
+ * It opens a reader first ({@link openReadStore}), which takes no lock. Only
+ * when the store has no WAL files beside it (`no-wal`), so no connection
+ * anywhere holds it open, is it opened with a writable connection, for
+ * existing layouts only: a store needing a migration or a rebuild is refused
+ * untouched, since its cards cannot be rebuilt while the source is
+ * unavailable. Null (and nothing created or written) when no store matches,
+ * with `refused` set when a matching store was refused.
  */
-async function openStampedStore(
+async function openCardOnlyStore(
   storePath: string,
   located: string,
-): Promise<{ db: SqliteDb; store: Store; stamped: string } | { refused: string } | null> {
+  wrapReader: ((db: ReadOnlyDb) => ReadOnlyDb) | undefined,
+): Promise<CardOnlyStore | { refused: string } | null> {
   if (storePath === ":memory:") return null;
   const logical = await logicalFilePath(located, null);
   if (logical === null || !(await fileExists(storePath))) return null;
+  const opened = await openReadStore(
+    storePath,
+    { host: STORE_HOST, source: located },
+    {
+      acceptSource: async (stamped) => (await logicalFilePath(stamped, stamped)) === logical,
+      ...(wrapReader && { wrapReader }),
+    },
+  );
+  if (opened.ok) {
+    return {
+      kind: "reader",
+      store: opened.store,
+      close: opened.close,
+      stamped: opened.source ?? located,
+    };
+  }
+  switch (opened.reason) {
+    case "no-wal":
+      return openStampedStore(storePath, logical);
+    case "host-mismatch":
+    case "source-mismatch":
+    case "missing":
+      return null;
+    default:
+      return { refused: opened.reason };
+  }
+}
+
+/** {@link openCardOnlyStore}'s writable open, for a store no connection
+ *  holds open. */
+async function openStampedStore(
+  storePath: string,
+  logical: string,
+): Promise<CardOnlyStore | { refused: string } | null> {
   const db = await openSqlite(storePath);
   if (!db) return null;
   const stamped = peekStoreIdentity(db);
@@ -213,15 +333,12 @@ async function openStampedStore(
     stamped.source !== undefined &&
     (await logicalFilePath(stamped.source, stamped.source)) === logical
   ) {
-    // Existing layout only: a store needing a migration or a rebuild is
-    // refused untouched, never rebuilt, since its cards cannot be rebuilt
-    // while the source is unavailable.
     const opened = openStore(
       db,
       { host: STORE_HOST, source: stamped.source },
       { existingOnly: true },
     );
-    if (opened.ok) return { db, store: opened.store, stamped: stamped.source };
+    if (opened.ok) return { kind: "writable", db, store: opened.store, stamped: stamped.source };
     closeQuietly(db);
     return { refused: opened.reason };
   }
@@ -256,6 +373,70 @@ function readDriftLine(drift: HistoryDrift): string {
     found.push(`unknown part types ${drift.unknownPartTypeNames.join(", ")}`);
   }
   return found.join(", ");
+}
+
+/** This thread's drift with the worker's reads added in: reads and counts
+ *  summed, unknown part types joined. The database's own fields (schema,
+ *  migration, tables) are this thread's, read from the same file. */
+function mergeDrift(main: HistoryDrift, worker: HistoryDrift | undefined): HistoryDrift {
+  if (!worker) return main;
+  const counts = { ...main.counts };
+  addReadCounts(counts, worker.counts);
+  const names = [...new Set([...main.unknownPartTypeNames, ...worker.unknownPartTypeNames])]
+    .sort()
+    .slice(0, UNKNOWN_TYPE_NAMES_CAP);
+  return { ...main, reads: main.reads + worker.reads, counts, unknownPartTypeNames: names };
+}
+
+/** The numeric fields of the sync test options, which can cross a thread. */
+function workerSyncOptions(sync: V2SyncOptions | undefined): WorkerSyncOptions | undefined {
+  if (!sync) return undefined;
+  const out: Record<string, number> = {};
+  for (const [key, value] of Object.entries(sync)) {
+    if (typeof value === "number" && Number.isFinite(value)) out[key] = value;
+  }
+  return out as WorkerSyncOptions;
+}
+
+/**
+ * The store reads a card source makes over main's reader. A reader never
+ * waits on a lock, so a refresh's counter read that finds one reads as
+ * "nothing changed" (the counters it last returned) and the next refresh
+ * tries again; every other read throws {@link SqliteBusyError} to its caller.
+ */
+function cardReadsOf(reader: ReadStore): CardSourceStore {
+  let last: CardCounters | undefined;
+  return {
+    allCards: (opts) => reader.allCards(opts),
+    getMeta: (key) => reader.getMeta(key),
+    cardCounters: () => {
+      try {
+        last = reader.cardCounters();
+        return last;
+      } catch (error) {
+        if (error instanceof SqliteBusyError && last) return last;
+        throw error;
+      }
+    },
+    cardsSince: (rev, limit, opts) => reader.cardsSince(rev, limit, opts),
+    cardSessionIds: () => reader.cardSessionIds(),
+    cardsPage: (after, limit, opts) => reader.cardsPage(after, limit, opts),
+    cardVectorsPage: (after, limit) => reader.cardVectorsPage(after, limit),
+  };
+}
+
+/** What a distiller reports before it has said anything. */
+function idleStatus(): DistillStatus {
+  return {
+    leaseHeld: false,
+    coldPass: "idle",
+    distilledCount: 0,
+    knownCount: 0,
+    examinedCount: 0,
+    quarantinedCount: 0,
+    skippedCount: 0,
+    failingCount: 0,
+  };
 }
 
 /** Close a handle, swallowing errors (a failed close must not reject dispose). */
@@ -333,10 +514,14 @@ async function createV2Runtime(
   if (unavailable !== undefined) log(`opencode history unavailable: ${unavailable}`);
 
   // One schema and one drift state for every facade over the handle, and
-  // the sync, so all of them report the same database the same way.
-  const drift: HistoryDriftState | undefined = schema
-    ? createHistoryDriftState(v2DriftBase(schema))
-    : undefined;
+  // the sync, so all of them report the same database the same way. A
+  // worker's reads arrive with its status and are added in.
+  let workerDrift: HistoryDrift | undefined;
+  const ownDrift = schema ? createHistoryDriftState(v2DriftBase(schema)) : undefined;
+  const drift: HistoryDriftState | undefined = ownDrift && {
+    record: (counts, names) => ownDrift.record(counts, names),
+    snapshot: () => mergeDrift(ownDrift.snapshot(), workerDrift),
+  };
   if (schema) logSchemaDrift(schema, log);
 
   const facades = new Map<string, HistorySource>();
@@ -344,8 +529,9 @@ async function createV2Runtime(
     opencodeDb && schema && drift
       ? createV2HistorySource(opencodeDb, { schema, drift })
       : createUnavailableSource("v2-sqlite", unavailable ?? "unknown");
-  // The distiller reads through a global facade of its own whose reads yield
-  // in the background, so a search reading or building meanwhile goes first.
+  // A distiller on this thread reads through a global facade of its own
+  // whose reads yield in the background, so a search reading or building
+  // meanwhile goes first.
   const distillSource: HistorySource =
     opencodeDb && schema && drift
       ? createV2HistorySource(opencodeDb, { schema, drift, yieldBetween: yieldInBackground })
@@ -377,51 +563,6 @@ async function createV2Runtime(
     log("summaries are not available on opencode v2 yet; the option is ignored");
   }
 
-  // ── Derived store ──
-  // Stamped with the real source path, so a store built from another
-  // opencode.db refuses (`source-mismatch`) instead of being reconciled
-  // against the wrong history. No source path, or one that could not be
-  // canonicalized, means no store: the file is not even opened, so nothing
-  // is stamped with a spelling a later run would refuse. (So an unresolvable
-  // source, `:memory:` or an empty override, loses the card tier as well;
-  // see createUnavailableSource.) One exception keeps the card tier when
-  // opencode.db is missing or unreadable: an existing store stamped for the
-  // same file is opened for cards only, never stamped or distilled into.
-  let store: Store | null = null;
-  let db: SqliteDb | null = null;
-  /** The store was opened read-for-cards through the stamped source. */
-  let cardsOnly = false;
-  if (identity.store !== null && identity.source !== null && identity.sourceCanonical !== true) {
-    const fallback = await openStampedStore(identity.store, identity.source);
-    if (fallback && "store" in fallback) {
-      ({ db, store } = fallback);
-      cardsOnly = true;
-      log(
-        `opencode database path ${identity.source} could not be canonicalized; serving cards from the store stamped for ${fallback.stamped}, without distilling`,
-      );
-    } else {
-      const refused = fallback?.refused
-        ? ` (the store stamped for it was refused: ${fallback.refused})`
-        : "";
-      log(
-        `opencode database path ${identity.source} could not be canonicalized${refused}; running degraded without a store`,
-      );
-    }
-  } else if (identity.store !== null && identity.source !== null) {
-    db = await openSqlite(identity.store);
-    if (db) {
-      const opened = openStore(db, { host: STORE_HOST, source: identity.source });
-      if (opened.ok) store = opened.store;
-      else {
-        log(`store refused (${opened.reason}): ${identity.store}; running degraded`);
-        closeQuietly(db);
-        db = null;
-      }
-    }
-  } else if (identity.store !== null) {
-    log("no opencode database to pair the store with; running degraded");
-  }
-
   let disposed = false;
   let disposePromise: Promise<void> | undefined;
   const operations = new Set<Promise<unknown>>();
@@ -434,30 +575,391 @@ async function createV2Runtime(
     return operation;
   };
 
-  const gate = createFetchGate({ concurrency: limits.concurrency });
+  // Every tool call counts in it, and so does each of the gate's queries; a
+  // worker's background work gives way while it is non-zero.
+  const foreground = createForegroundSignal();
+  const gate = createFetchGate({ concurrency: limits.concurrency, foreground });
 
   const discover = (): Promise<HistorySession[]> => discoverSessions(globalSource, yieldOnBudget);
+  const drill = createDrill({ source: globalSource, gate, limits });
 
+  const instanceId =
+    globalThis.crypto?.randomUUID?.() ??
+    `recall-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+
+  // ── Store, cards and the distiller: what the tools read changes when the
+  // worker's store opens later, or when the distiller moves to this thread.
+  /** The store the tools read. */
+  let store: ReadStore | null = null;
+  /** A writable store this thread opened (inline distilling, or the
+   *  card-only fallback when no connection held the store open). */
+  let writableDb: SqliteDb | null = null;
+  /** Main's reader, while the distiller runs in a worker or the card-only
+   *  fallback reads. */
+  let reader: { store: ReadStore; close: () => void } | null = null;
   let liteCards: Card[] = [];
-  const cardSource: CardSource = store
-    ? storeCardSource(store, inlineVectorWriter(store))
-    : { getCards: () => liteCards, revision: () => undefined, degraded: true };
-
-  const cards = createCardsRuntime({
-    source: cardSource,
-    embedder: semantic?.embedder,
-    semanticWeight: semantic?.weight,
-    semanticModel: options.semantic?.model,
-    semanticReady,
-    pluginVersion: V2_PLUGIN_BUILD,
-    log,
+  const liteSource: CardSource = {
+    getCards: () => liteCards,
+    revision: () => undefined,
+    degraded: true,
+  };
+  let degradedReason: string | undefined;
+  let revision = 0;
+  let distillerMode: () => string | undefined = () => undefined;
+  let distillerWarning: () => string | undefined = () => undefined;
+  /** The distiller on this thread: inert unless it distills here. */
+  let inline: Distiller = createDistiller({
+    source: distillSource,
+    store: null,
+    gate,
+    limits,
+    instanceId,
   });
+  let controller: WorkerController | undefined;
+
+  const makeInline = (target: Store, takeOver?: string): Distiller =>
+    createDistiller({
+      source: distillSource,
+      store: target,
+      gate,
+      limits,
+      instanceId,
+      build: V2_PLUGIN_BUILD,
+      gen: EMBED_REPRESENTATION,
+      // Cards built under an older projection are rebuilt by the repair
+      // sweep, and range checks catch part-only changes.
+      projectorGen: V2_PROJECTOR_GEN,
+      ...(takeOver !== undefined && { takeOverLease: takeOver }),
+      discover: () => discoverSessions(distillSource, yieldInBackground),
+      log,
+      // The poll, checkpoints and deletion reconcile keep the store fresh with
+      // no events at all; the yields keep long passes off the shared loop and
+      // behind a search's work.
+      ...(opencodeDb && {
+        sync: createV2Sync(opencodeDb, {
+          yieldBetween: yieldInBackground,
+          ...inputs.sync,
+          ...(schema && { schema }),
+        }),
+      }),
+      yieldBetween: yieldInBackground,
+      ...(inputs.idleDebounceMs !== undefined && { idleDebounceMs: inputs.idleDebounceMs }),
+    });
+
+  const inWorker = (): boolean => controller !== undefined && controller.mode().kind === "worker";
+
+  // The facade every caller holds: the worker's view from its status while
+  // it runs there, the distiller on this thread otherwise.
+  const distiller: Distiller = {
+    start() {
+      if (!inWorker()) inline.start();
+    },
+    quiesce() {
+      controller?.quiesce();
+      inline.quiesce();
+    },
+    ownsLease() {
+      return inWorker() ? controller?.status()?.distill.leaseHeld === true : inline.ownsLease();
+    },
+    async stop() {
+      if (controller && inWorker()) await controller.stop(SHUTDOWN_TIMEOUT_MS);
+      else await inline.stop();
+    },
+    onEvent(signal) {
+      if (controller && inWorker()) controller.post(signal);
+      else inline.onEvent(signal);
+    },
+    status() {
+      return inWorker() ? (controller?.status()?.distill ?? idleStatus()) : inline.status();
+    },
+    indexing() {
+      return inWorker() ? controller?.status()?.indexing : inline.indexing();
+    },
+    repair() {
+      return inWorker() ? controller?.status()?.repair : inline.repair();
+    },
+    discoveryTruncated() {
+      return inWorker()
+        ? controller?.status()?.discoveryTruncated === true
+        : inline.discoveryTruncated();
+    },
+  };
+
+  const makeCards = (source: CardSource): CardsRuntime =>
+    createCardsRuntime({
+      source,
+      embedder: semantic?.embedder,
+      semanticWeight: semantic?.weight,
+      semanticModel: options.semantic?.model,
+      semanticReady,
+      pluginVersion: V2_PLUGIN_BUILD,
+      log,
+    });
 
   let liteRefresh: LiteRefreshController | undefined;
-  if (!store && opencodeDb) {
+  let cards: CardsRuntime = makeCards(liteSource);
+  let deps: SearchDeps;
+  let enrichment: SessionEnrichment | undefined;
+
+  const rebuildDeps = (): void => {
+    const liteRefreshHook = liteRefresh;
+    deps = {
+      gate,
+      store,
+      cards,
+      drill,
+      semantic,
+      ...(options.ephemeral && { mode: "ephemeral" as const }),
+      ...(liteRefreshHook && { maybeRefresh: () => liteRefreshHook.maybeRefresh() }),
+      indexing: () => distiller.indexing(),
+      history: () => drift?.snapshot(),
+      repair: () => distiller.repair(),
+      distiller: () => distillerMode(),
+      distillerWarning: () => distillerWarning(),
+      ...(degradedReason !== undefined && { cardsDegradedReason: degradedReason }),
+    };
+    const enriched = store;
+    enrichment = enriched
+      ? { cards: () => enriched.allCards(), indexing: () => distiller.indexing() }
+      : undefined;
+  };
+  rebuildDeps();
+
+  /** Serve the tools from `source` from now on, with `reason` for degraded
+   *  cards. */
+  const installCards = (source: CardSource, reason?: string): void => {
+    const previous = cards;
+    cards = makeCards(source);
+    degradedReason = reason;
+    rebuildDeps();
+    revision++;
+    previous.dispose();
+  };
+
+  let liteStarted = false;
+  /** Fill the degraded card tier from one discovery of `opencode.db`. With
+   *  `upkeep`, the discovery yields in the background, since no tool call
+   *  waits on it. */
+  const startLite = (upkeep = false): void => {
+    if (liteStarted || !opencodeDb || options.ephemeral) return;
+    liteStarted = true;
     const toLite = (list: HistorySession[]): Card[] =>
       cardsLiteFromSessions(list as Parameters<typeof cardsLiteFromSessions>[0]);
+    void track(
+      (upkeep ? discoverSessions(distillSource, yieldInBackground) : discover())
+        .then((list) => {
+          if (!disposed) {
+            liteCards = toLite(list);
+            cards.invalidate();
+          }
+        })
+        .catch(() => {
+          // Best-effort; cards-lite stays empty.
+        }),
+    );
+  };
+
+  const stopReader = (): void => {
+    const open = reader;
+    reader = null;
+    if (open) closeQuietly({ close: open.close });
+  };
+
+  // ── Derived store ──
+  // Stamped with the real source path, so a store built from another
+  // opencode.db refuses (`source-mismatch`) instead of being reconciled
+  // against the wrong history. No source path, or one that could not be
+  // canonicalized, means no store: the file is not even opened, so nothing
+  // is stamped with a spelling a later run would refuse. (So an unresolvable
+  // source, `:memory:` or an empty override, loses the card tier as well;
+  // see createUnavailableSource.) One exception keeps the card tier when
+  // opencode.db is missing or unreadable: an existing store stamped for the
+  // same file is opened for cards only, never stamped or distilled into.
+  const threadSafety =
+    identity.store !== null && identity.source !== null && identity.sourceCanonical === true
+      ? await sqliteThreadSafety()
+      : undefined;
+  if (identity.store !== null && identity.source !== null && identity.sourceCanonical !== true) {
+    const fallback = await openCardOnlyStore(identity.store, identity.source, inputs.wrapReader);
+    if (fallback && "kind" in fallback) {
+      if (fallback.kind === "reader") {
+        reader = { store: fallback.store, close: fallback.close };
+        store = fallback.store;
+        installCards(storeCardSource(cardReadsOf(fallback.store), undefined));
+      } else {
+        writableDb = fallback.db;
+        store = fallback.store;
+        installCards(storeCardSource(fallback.store, inlineVectorWriter(fallback.store)));
+      }
+      log(
+        `opencode database path ${identity.source} could not be canonicalized; serving cards from the store stamped for ${fallback.stamped}, without distilling`,
+      );
+    } else {
+      const refused = fallback?.refused
+        ? ` (the store stamped for it was refused: ${fallback.refused})`
+        : "";
+      log(
+        `opencode database path ${identity.source} could not be canonicalized${refused}; running degraded without a store`,
+      );
+    }
+  } else if (
+    identity.store !== null &&
+    identity.source !== null &&
+    opencodeDb &&
+    inputs.worker !== false &&
+    threadSafety !== 0
+  ) {
+    const storePath = identity.store;
+    const sourcePath = identity.source;
+    const workerInputs = inputs.worker ?? {};
+    const init: WorkerInit = {
+      buildId: BUILD_ID,
+      build: V2_PLUGIN_BUILD,
+      representation: EMBED_REPRESENTATION,
+      projectorGen: V2_PROJECTOR_GEN,
+      storePath,
+      sourcePath,
+      limits,
+      ...(inputs.sync && { sync: workerSyncOptions(inputs.sync) }),
+      ...(inputs.idleDebounceMs !== undefined && { idleDebounceMs: inputs.idleDebounceMs }),
+      foreground: foreground.buffer,
+    };
+    degradedReason = INDEX_STARTING_REASON;
+    rebuildDeps();
+    const fixHint = `Indexing resumes after OpenCode restarts; if it does not, quit every OpenCode process and delete ${storePath} (it rebuilds), or set a separate storePath.`;
+    distillerMode = () => {
+      const mode = controller?.mode();
+      if (!mode) return undefined;
+      return mode.kind === "worker" ? "worker" : `${mode.kind}: ${mode.reason}`;
+    };
+    distillerWarning = () => {
+      const mode = controller?.mode();
+      return mode?.kind === "stopped"
+        ? `New sessions are not being indexed: ${mode.reason}. ${fixHint}`
+        : undefined;
+    };
+
+    /** The distiller moves to this thread over a writable store, once the
+     *  last worker's thread has ended. */
+    const goInline = (reason: string, lastHolder: string | undefined): void => {
+      void (async () => {
+        if (disposed) return;
+        const db = await openSqlite(storePath);
+        if (disposed) {
+          closeQuietly(db);
+          return;
+        }
+        const opened = db ? openStore(db, { host: STORE_HOST, source: sourcePath }) : undefined;
+        if (!db || !opened || !opened.ok) {
+          closeQuietly(db);
+          const why = opened && !opened.ok ? opened.reason : "SQLite is unavailable";
+          log(
+            `the distiller could not run on the main thread either (${why}); serving the cards already stored`,
+          );
+          return;
+        }
+        if (opened.warning !== undefined) log(opened.warning);
+        writableDb = db;
+        const previousReader = reader;
+        reader = null;
+        store = opened.store;
+        installCards(storeCardSource(opened.store, inlineVectorWriter(opened.store)));
+        inline = makeInline(opened.store, lastHolder);
+        for (const signal of controller?.drainEvents() ?? []) inline.onEvent(signal);
+        if (limits.coldPass) inline.start();
+        log(`the distiller runs on the main thread (${reason})`);
+        // The reader closes once the tool calls reading through it are done.
+        if (previousReader) {
+          void settleWithin(Promise.allSettled([...operations]), SHUTDOWN_TIMEOUT_MS).then(() =>
+            closeQuietly({ close: previousReader.close }),
+          );
+        }
+      })();
+    };
+
+    controller = createWorkerController({
+      start: workerInputs.start ?? defaultWorkerStarter(),
+      instanceId,
+      init,
+      log,
+      async onStoreOpen() {
+        if (reader) return { ok: true };
+        if (disposed) return { ok: false, reason: "the runtime is disposed" };
+        const opened = await openReadStore(
+          storePath,
+          { host: STORE_HOST, source: sourcePath },
+          { ...(inputs.wrapReader && { wrapReader: inputs.wrapReader }) },
+        );
+        if (!opened.ok) {
+          const reason = `${opened.reason}${opened.detail ? `: ${opened.detail}` : ""}`;
+          log(`store reader refused (${reason}): ${storePath}`);
+          return { ok: false, reason };
+        }
+        if (disposed) {
+          opened.close();
+          return { ok: false, reason: "the runtime is disposed" };
+        }
+        reader = { store: opened.store, close: opened.close };
+        store = opened.store;
+        const writer = controller?.writeVectors;
+        installCards(storeCardSource(cardReadsOf(opened.store), writer));
+        return { ok: true };
+      },
+      onStopped(reason) {
+        log(`store refused (${reason}): ${storePath}; running degraded`);
+        if (!reader) {
+          startLite(true);
+          installCards(liteSource);
+        }
+      },
+      onInline: goInline,
+      onStatus(status) {
+        workerDrift = status.drift;
+      },
+      readLease: () => reader?.store.leaseStatus(),
+      ...(workerInputs.restartDelaysMs && { restartDelaysMs: workerInputs.restartDelaysMs }),
+      ...(workerInputs.readyTimeoutMs !== undefined && {
+        readyTimeoutMs: workerInputs.readyTimeoutMs,
+      }),
+      ...(workerInputs.storeTimeoutMs !== undefined && {
+        storeTimeoutMs: workerInputs.storeTimeoutMs,
+      }),
+      ...(workerInputs.watchdogEveryMs !== undefined && {
+        watchdogEveryMs: workerInputs.watchdogEveryMs,
+      }),
+      ...(workerInputs.maxFailures !== undefined && { maxFailures: workerInputs.maxFailures }),
+    });
+    const settled = await settleWithin(controller.settled(), STORE_READY_WAIT_MS);
+    // Still starting: serve what discovery finds until the store opens.
+    if (settled.timedOut && !reader && controller.mode().kind === "worker") startLite(true);
+  } else if (identity.store !== null && identity.source !== null) {
+    const db = await openSqlite(identity.store);
+    if (db) {
+      const opened = openStore(db, { host: STORE_HOST, source: identity.source });
+      if (opened.ok) {
+        writableDb = db;
+        store = opened.store;
+        installCards(storeCardSource(opened.store, inlineVectorWriter(opened.store)));
+        // No history, no distilling: the distiller does not start.
+        if (opencodeDb) {
+          inline = makeInline(opened.store);
+          const reason =
+            threadSafety === 0 ? "sqlite is not thread-safe" : "the worker is turned off";
+          distillerMode = () => `inline: ${reason}`;
+        }
+      } else {
+        log(`store refused (${opened.reason}): ${identity.store}; running degraded`);
+        closeQuietly(db);
+      }
+    }
+  } else if (identity.store !== null) {
+    log("no opencode database to pair the store with; running degraded");
+  }
+
+  if (!store && !controller && opencodeDb) {
     if (options.ephemeral) {
+      const toLite = (list: HistorySession[]): Card[] =>
+        cardsLiteFromSessions(list as Parameters<typeof cardsLiteFromSessions>[0]);
       liteRefresh = createLiteRefresh({
         list: async () => toLite(await discover()),
         assign: (next) => {
@@ -468,57 +970,13 @@ async function createV2Runtime(
         track,
         disposed: () => disposed,
       });
+      rebuildDeps();
       void liteRefresh.initialRefresh();
     } else {
-      void track(
-        discover()
-          .then((list) => {
-            if (!disposed) {
-              liteCards = toLite(list);
-              cards.invalidate();
-            }
-          })
-          .catch(() => {
-            // Best-effort; cards-lite stays empty.
-          }),
-      );
+      startLite();
     }
   }
 
-  const drill = createDrill({ source: globalSource, gate, limits });
-
-  const instanceId =
-    globalThis.crypto?.randomUUID?.() ??
-    `recall-${Date.now()}-${Math.random().toString(36).slice(2)}`;
-
-  const distiller = createDistiller({
-    source: distillSource,
-    // No history, no distilling: the distiller does not start. Nor for a
-    // store opened for cards only: its source path is not canonical.
-    store: opencodeDb && !cardsOnly ? store : null,
-    gate,
-    limits,
-    instanceId,
-    build: V2_PLUGIN_BUILD,
-    gen: EMBED_REPRESENTATION,
-    // Cards built under an older projection are rebuilt by the repair
-    // sweep, and range checks catch part-only changes.
-    projectorGen: V2_PROJECTOR_GEN,
-    discover: () => discoverSessions(distillSource, yieldInBackground),
-    log,
-    // The poll, checkpoints and deletion reconcile keep the store fresh with
-    // no events at all; the yields keep long passes off the shared loop and
-    // behind a search's work.
-    ...(opencodeDb && {
-      sync: createV2Sync(opencodeDb, {
-        yieldBetween: yieldInBackground,
-        ...inputs.sync,
-        ...(schema && { schema }),
-      }),
-    }),
-    yieldBetween: yieldInBackground,
-    ...(inputs.idleDebounceMs !== undefined && { idleDebounceMs: inputs.idleDebounceMs }),
-  });
   // What reads could not project, logged when it changes (debug log only).
   let driftLogged = "";
   const logDrift = (): void => {
@@ -535,23 +993,6 @@ async function createV2Runtime(
   if (limits.coldPass) distiller.start();
   const mapper = createV2EventMapper({ emit: (signal) => distiller.onEvent(signal) });
 
-  const liteRefreshHook = liteRefresh;
-  const deps: SearchDeps = {
-    gate,
-    store,
-    cards,
-    drill,
-    semantic,
-    ...(options.ephemeral && { mode: "ephemeral" as const }),
-    ...(liteRefreshHook && { maybeRefresh: () => liteRefreshHook.maybeRefresh() }),
-    indexing: () => distiller.indexing(),
-    history: () => drift?.snapshot(),
-    repair: () => distiller.repair(),
-  };
-  const enrichment: SessionEnrichment | undefined = store
-    ? { cards: () => store.allCards(), indexing: () => distiller.indexing() }
-    : undefined;
-
   const freshEvent = createIdDedupe();
 
   const parentOf = async (sessionID: string): Promise<string | null | undefined> => {
@@ -564,13 +1005,23 @@ async function createV2Runtime(
   return {
     options,
     gate,
-    store,
-    cards,
+    get store() {
+      return store;
+    },
+    get cards() {
+      return cards;
+    },
     drill,
     distiller,
-    deps,
-    enrichment,
+    get deps() {
+      return deps;
+    },
+    get enrichment() {
+      return enrichment;
+    },
     unavailable,
+    revision: () => revision,
+    foreground,
     sourceFor,
     globalSource,
     parentOf,
@@ -588,29 +1039,42 @@ async function createV2Runtime(
       if (driftTimer !== undefined) clearInterval(driftTimer);
       mapper.dispose();
       distiller.quiesce();
-      cards.dispose();
       disposePromise = (async () => {
-        const closeAll = (): void => {
-          closeQuietly(db);
-          db = null;
+        const closeRest = (): void => {
+          closeQuietly(writableDb);
+          writableDb = null;
           closeQuietly(opencodeDb);
           opencodeDb = null;
         };
         try {
-          await settleWithin(distiller.stop(), SHUTDOWN_TIMEOUT_MS);
+          // Vector writes waiting to be sent to the worker, or to run here.
+          await cards.flushVectorWrites(SHUTDOWN_TIMEOUT_MS);
+          cards.dispose();
+          if (controller && inWorker()) {
+            await controller.stop(SHUTDOWN_TIMEOUT_MS);
+          } else {
+            await settleWithin(inline.stop(), SHUTDOWN_TIMEOUT_MS);
+          }
           const ops = await settleWithin(Promise.allSettled([...operations]), SHUTDOWN_TIMEOUT_MS);
+          // The reader closes before the worker's thread is ended, whatever
+          // is still running.
+          stopReader();
           if (ops.timedOut) {
             log(
               `dispose: ${operations.size} operation(s) outlived the ${SHUTDOWN_TIMEOUT_MS}ms bound; deferring the SQLite close until they settle`,
             );
-            void Promise.allSettled([...operations]).then(closeAll);
+            void Promise.allSettled([...operations]).then(closeRest);
           } else {
-            closeAll();
+            closeRest();
           }
         } catch (error) {
           log(`dispose failed: ${errmsg(error)}`);
-          closeAll();
+          stopReader();
+          closeRest();
         }
+        // The runtime stays retiring until the worker's thread has ended, so
+        // a runtime replacing it on the same store waits for that.
+        await controller?.terminate(WORKER_EXIT_WAIT_MS);
       })();
       return disposePromise;
     },
