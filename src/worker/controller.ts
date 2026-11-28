@@ -168,8 +168,9 @@ type Generation = {
   stopped?: () => void;
   status?: WorkerStatus;
   /** The `events` batches posted to this generation that it has not
-   *  acknowledged yet. */
-  unacked: Set<number>;
+   *  acknowledged yet, by batch id in the order they were posted, with their
+   *  signals (at most {@link MAX_UNACKED_BATCHES} of {@link EVENT_BATCH}). */
+  unacked: Map<number, DistillSignal[]>;
 };
 
 function unref(timer: ReturnType<typeof setTimeout> | ReturnType<typeof setInterval>): void {
@@ -275,7 +276,7 @@ export function createWorkerController(options: WorkerControllerOptions): Worker
         for (const signal of signals) outbox.add(signal);
         return;
       }
-      gen.unacked.add(batch);
+      gen.unacked.set(batch, signals);
     }
   }
 
@@ -316,6 +317,15 @@ export function createWorkerController(options: WorkerControllerOptions): Worker
     // be there stays the one to take over.
     if (heldLease || leaseNames(gen.holderId)) predecessor = gen.holderId;
     if (stopping || mode.kind !== "worker") return;
+    // The batches it never acknowledged may not have reached its distiller,
+    // or only in part: they go back ahead of the signals posted since, for
+    // the next generation or the distiller on this thread. One it had partly
+    // dispatched is safe to dispatch again: a deletion of a deleted session
+    // removes nothing, a patch writes the values it wrote, and a re-check, a
+    // removal or a patchless meta reads the session from opencode.db again.
+    const unacked = [...gen.unacked.values()].flat();
+    gen.unacked.clear();
+    if (unacked.length > 0) outbox.requeue(unacked);
     if (failures >= maxFailures) {
       mode = { kind: "inline", reason };
       log(`the distiller runs on the main thread from now on: ${reason}`);
@@ -481,7 +491,7 @@ export function createWorkerController(options: WorkerControllerOptions): Worker
       failed: false,
       stopRequested: false,
       exited: false,
-      unacked: new Set(),
+      unacked: new Map(),
       exit: new Promise<void>((resolve) => (markExited = resolve)),
       markExited: () => {
         gen.exited = true;

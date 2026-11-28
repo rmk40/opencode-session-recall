@@ -892,6 +892,37 @@ describe("events", () => {
     // Each batch is acknowledged once it was handled, a malformed one too.
     expect(sentOf(side, "ack").map((ack) => ack.batch)).toEqual([1, 2]);
   }, 15_000);
+
+  it("acknowledges no batch whose dispatch threw, and reports the crash", async () => {
+    // Every deletion of a card fails, as a write the disk refuses does.
+    const harness = workerHarness({
+      openStoreDb: async (path) => {
+        const db = await openSqlite(path);
+        if (!db) return null;
+        return {
+          ...db,
+          run: (sql, params) => {
+            if (/^DELETE FROM card\b/.test(sql.trim())) throw new Error("disk I/O error");
+            return db.run(sql, params);
+          },
+        };
+      },
+    });
+    const { worker, side } = await startSide(harness);
+    worker.postMessage(initMessage({ limits: { coldPass: true }, idleDebounceMs: 5 }));
+    const status = await nextOf(side, "status");
+    expect(status.status.distill.leaseHeld).toBe(true);
+    worker.postMessage({
+      v: PROTOCOL_VERSION,
+      generation: 1,
+      type: "events",
+      batch: 7,
+      signals: [{ type: "deleted", sessionID: "ses_a" }],
+    } as MainMessage);
+    const fatal = await nextOf(side, "fatal");
+    expect(fatal.kind).toBe("crash");
+    expect(sentOf(side, "ack")).toEqual([]);
+  }, 15_000);
 });
 
 describe("stop", () => {

@@ -169,6 +169,30 @@ describe("the event outbox", () => {
       expect(outbox.drain()).toEqual([]);
     });
 
+    it("requeues older signals ahead of the pending ones, the pending winning where they share a session", () => {
+      const outbox = createEventOutbox();
+      outbox.add(meta("s2", { title: "newer" }));
+      outbox.add(turnEnded("s3"));
+      outbox.requeue([
+        deleted("s1"),
+        meta("s2", { title: "older", directory: "/d" }),
+        removal("s2"),
+      ]);
+      expect(outbox.drain()).toEqual([
+        deleted("s1"),
+        meta("s2", { title: "newer", directory: "/d" }),
+        removal("s2"),
+        turnEnded("s3"),
+      ]);
+    });
+
+    it("keeps a requeued deletion over newer signals for the same session", () => {
+      const outbox = createEventOutbox();
+      outbox.add(turnEnded("s1"));
+      outbox.requeue([deleted("s1")]);
+      expect(outbox.drain()).toEqual([deleted("s1")]);
+    });
+
     it("drains with a limit only whole sessions that fit, the first one always", () => {
       const outbox = createEventOutbox();
       outbox.add(meta("s1", { title: "t" }));

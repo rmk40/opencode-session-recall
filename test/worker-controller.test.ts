@@ -1053,6 +1053,65 @@ describe("the controller with scripted workers", () => {
       ]);
     });
 
+    it("gives the batches an exited generation never acknowledged to its replacement, ahead of newer signals", async () => {
+      const { controller, scripted } = scriptedController({ restartDelaysMs: [0, 0] });
+      await flush();
+      await run(scripted.worker(1));
+      controller.post({ type: "deleted", sessionID: "s1" });
+      controller.post({ type: "meta", sessionID: "s2", patch: { title: "a" } });
+      await flush();
+      controller.post({ type: "meta", sessionID: "s2", patch: { title: "b" } });
+      controller.post({ type: "turn-ended", sessionID: "s3" });
+      await flush();
+      expect(batchesOf(scripted.worker(1))).toHaveLength(2);
+      // Queued behind the two batches waiting on their ack.
+      controller.post({ type: "meta", sessionID: "s2", patch: { directory: "/d" } });
+      await flush();
+
+      scripted.worker(1).exit();
+      await flush();
+      await run(scripted.worker(2));
+      expect(batchesOf(scripted.worker(2)).flatMap((b) => b.signals)).toEqual([
+        { type: "deleted", sessionID: "s1" },
+        { type: "meta", sessionID: "s2", patch: { title: "b", directory: "/d" } },
+        { type: "turn-ended", sessionID: "s3" },
+      ]);
+    });
+
+    it("gives no acknowledged batch to the replacement", async () => {
+      const { controller, scripted } = scriptedController({ restartDelaysMs: [0, 0] });
+      await flush();
+      await run(scripted.worker(1));
+      controller.post({ type: "deleted", sessionID: "s1" });
+      await flush();
+      controller.post({ type: "deleted", sessionID: "s2" });
+      await flush();
+      const [first] = batchesOf(scripted.worker(1));
+      scripted.worker(1).emit({ type: "ack", batch: first?.batch });
+      scripted.worker(1).exit();
+      await flush();
+      await run(scripted.worker(2));
+      expect(batchesOf(scripted.worker(2)).flatMap((b) => b.signals)).toEqual([
+        { type: "deleted", sessionID: "s2" },
+      ]);
+    });
+
+    it("gives the unacknowledged batches of the last generation to the distiller taking over", async () => {
+      const { controller, scripted, record } = scriptedController({ maxFailures: 1 });
+      await flush();
+      await run(scripted.worker(1));
+      controller.post({ type: "deleted", sessionID: "s1" });
+      await flush();
+      controller.post({ type: "turn-ended", sessionID: "s2" });
+      scripted.worker(1).exit();
+      await flush();
+      expect(record.inline).toHaveLength(1);
+      expect(controller.drainEvents()).toEqual([
+        { type: "deleted", sessionID: "s1" },
+        { type: "turn-ended", sessionID: "s2" },
+      ]);
+    });
+
     it("puts a batch whose send failed back in the outbox", async () => {
       const { controller, scripted, record } = scriptedController();
       await flush();

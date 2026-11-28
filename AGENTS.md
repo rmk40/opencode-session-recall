@@ -489,7 +489,15 @@ No `opencode.db` row, history page, card or row set crosses. The bounds:
   (`MAX_UNACKED_BATCHES`). A worker that SQLite holds up reads no message, so
   everything posted meanwhile keeps coalescing in the bounded outbox rather than
   queuing on the port. Each batch takes whole sessions out of the outbox, and a
-  batch whose send fails goes back into it.
+  batch whose send fails goes back into it. Main keeps the signals of every
+  batch waiting on its ack. The worker acks a batch only once every signal of
+  it reached its distiller, so a dispatch that throws leaves it unacked. Once a
+  failed generation's thread has ended, its unacked batches go back into the
+  outbox ahead of the signals posted since (`requeue`, the later signals
+  winning for a session both name), for the next generation or the distiller on
+  main. Dispatching one again is safe: a deletion of a deleted session removes
+  nothing, a patch writes the values it wrote, and a re-check, a removal or a
+  patchless `meta` reads the session from `opencode.db` again.
 - **Vector writes:** at most 8 wait for a reply. A ninth, or any write while no
   generation runs, settles `failed` at once. A write with no reply within 10 s
   settles `failed`. Vector writes are never gated by the foreground signal, and the

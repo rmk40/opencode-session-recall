@@ -313,6 +313,10 @@ export type EventOutbox = {
    *  With `limit`, only the sessions whose signals fit in `limit` together,
    *  the first one always, which leave the outbox whole. */
   drain(limit?: number): DistillSignal[];
+  /** Put `older` back ahead of every signal pending: the pending ones are
+   *  added again after them, so for a session they share, the pending
+   *  signals win as later arrivals do. The bounds apply as to any add. */
+  requeue(older: readonly DistillSignal[]): void;
   size(): number;
   /** Signals dropped at the bound since the outbox was made. */
   dropped(): number;
@@ -336,7 +340,7 @@ export function createEventOutbox(bounds: { sessions?: number; bytes?: number } 
     return false;
   };
 
-  return {
+  const outbox: EventOutbox = {
     add(signal) {
       const id = signal.sessionID;
       let entry = pending.get(id);
@@ -417,7 +421,16 @@ export function createEventOutbox(bounds: { sessions?: number; bytes?: number } 
       }
       return out;
     },
+    requeue(older) {
+      // A pending session's drained signals coalesce again to the same
+      // entry, so adding them after `older` merges exactly as their own
+      // arrival after `older` would have.
+      const newer = outbox.drain();
+      for (const signal of older) outbox.add(signal);
+      for (const signal of newer) outbox.add(signal);
+    },
     size: () => pending.size,
     dropped: () => dropped,
   };
+  return outbox;
 }
