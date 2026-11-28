@@ -14,7 +14,7 @@ import {
   type WorkerInit,
 } from "../src/worker/controller.js";
 import { runWorkerHandler, type WorkerHandler, type WorkerPort } from "../src/worker/handler.js";
-import type { MainMessage, WorkerMessage } from "../src/worker/protocol.js";
+import { PROTOCOL_VERSION, type MainMessage, type WorkerMessage } from "../src/worker/protocol.js";
 import type { WorkerLike, WorkerStarter } from "../src/worker/start.js";
 import { TEST_LIMITS } from "./helpers.js";
 
@@ -46,6 +46,8 @@ export type HandlerSide = {
   received: MainMessage[];
   /** Every message the handler posted, delivered or not, in order. */
   sent: WorkerMessage[];
+  /** When each message of {@link sent} was posted (`Date.now()`). */
+  sentAt: number[];
   /** End the handler now, as a crashed thread: nothing more is delivered
    *  either way, the store connection closes without releasing the lease,
    *  and main's exit listeners run on a later turn. */
@@ -111,7 +113,11 @@ function faultyDb(db: SqliteDb, state: { fault?: WorkerFault; crash(): void }): 
 /** The inline harness: each generation's handler runs here, over a
  *  `MessageChannel`, with crash points and delayed replies. */
 export function workerHarness(
-  opts: { openStoreDb?: (path: string) => Promise<SqliteDb | null> } = {},
+  opts: {
+    openStoreDb?: (path: string) => Promise<SqliteDb | null>;
+    /** The handlers' clock (`WorkerHandlerOptions.now`). */
+    now?: () => number;
+  } = {},
 ): WorkerHarness {
   const sides: HandlerSide[] = [];
   let allFault: WorkerFault | undefined;
@@ -133,6 +139,7 @@ export function workerHarness(
     let delayTypes: Set<string> | undefined;
     const received: MainMessage[] = [];
     const sent: WorkerMessage[] = [];
+    const sentAt: number[] = [];
     const state: { fault?: WorkerFault; crash(): void } = {
       fault: allFault && { ...allFault },
       crash: () => end(),
@@ -141,6 +148,7 @@ export function workerHarness(
     const handlerPort: WorkerPort = {
       postMessage(message, transfer) {
         sent.push(message);
+        sentAt.push(Date.now());
         if (ended) return;
         const deliver = (): void => {
           if (!ended) port2.postMessage(message, transfer ?? []);
@@ -169,6 +177,7 @@ export function workerHarness(
 
     const handler = runWorkerHandler(handlerPort, {
       generation,
+      ...(opts.now && { now: opts.now }),
       openStoreDb: async (path) => {
         const db = await openBase(path);
         return db ? faultyDb(db, state) : db;
@@ -190,6 +199,7 @@ export function workerHarness(
       handler,
       received,
       sent,
+      sentAt,
       crash: end,
       arm(fault) {
         state.fault = { ...fault };
@@ -312,14 +322,19 @@ export function readerStatements(): {
   /** The recorded statements that are not reads: anything but a `SELECT`,
    *  a `WITH` query or a `PRAGMA` that sets nothing. */
   nonReads(): string[];
+  /** How many times a wrapped handle was closed. */
+  readonly closes: number;
+  /** Called each time a wrapped handle is closed, before it closes. */
+  onClose?: () => void;
 } {
   const statements: string[] = [];
+  let closes = 0;
   const isRead = (sql: string): boolean => {
     const text = sql.trim();
     if (/^(SELECT|WITH)\b/i.test(text)) return !/\b(INSERT|UPDATE|DELETE|REPLACE)\b/i.test(text);
     return /^PRAGMA\s+[\w.]+(\([^)]*\))?\s*;?$/i.test(text) && !text.includes("=");
   };
-  return {
+  const recorder: ReturnType<typeof readerStatements> = {
     statements,
     wrap: (db) => ({
       get: (sql, params) => {
@@ -330,8 +345,116 @@ export function readerStatements(): {
         statements.push(sql);
         return db.all(sql, params);
       },
-      close: () => db.close(),
+      close: () => {
+        closes++;
+        recorder.onClose?.();
+        db.close();
+      },
     }),
     nonReads: () => statements.filter((sql) => !isRead(sql)),
+    get closes() {
+      return closes;
+    },
+  };
+  return recorder;
+}
+
+/** One worker a {@link scriptedWorkers} starter started: the test plays the
+ *  worker's side by hand. */
+export type ScriptedWorker = {
+  generation: number;
+  /** Every message main sent, in order, with the transfer list it gave. */
+  received: Array<{ message: MainMessage; transfer: ArrayBuffer[] | undefined }>;
+  /** Deliver `message` to main as this worker's, with this generation and
+   *  protocol version unless `message` sets its own. */
+  emit(message: Record<string, unknown>): void;
+  /** Deliver a raw value to main, as is. */
+  emitRaw(value: unknown): void;
+  /** Report an `error` event. */
+  error(error: unknown): void;
+  /** Report the thread's exit. */
+  exit(): void;
+  /** How many times main asked the worker to end. */
+  readonly terminations: number;
+  /** The last message main sent of `type`, if any. */
+  last<T extends MainMessage["type"]>(type: T): Extract<MainMessage, { type: T }> | undefined;
+};
+
+/**
+ * A starter whose workers do nothing on their own: no `ready`, no exit after
+ * `terminate()`. Each starts as the test scripts it, so the controller's
+ * timeouts, restarts and exits can be driven one at a time (with fake timers).
+ */
+export function scriptedWorkers(): {
+  start: WorkerStarter;
+  readonly workers: ScriptedWorker[];
+  worker(generation: number): ScriptedWorker;
+  /** Make the next `n` starts reject. */
+  failStarts(n: number): void;
+} {
+  const workers: ScriptedWorker[] = [];
+  let failing = 0;
+  const start: WorkerStarter = async (generation) => {
+    if (failing > 0) {
+      failing--;
+      throw new Error("the worker module did not load");
+    }
+    const messageListeners: Array<(message: unknown) => void> = [];
+    const errorListeners: Array<(error: unknown) => void> = [];
+    const exitListeners: Array<() => void> = [];
+    let terminations = 0;
+    const scripted: ScriptedWorker = {
+      generation,
+      received: [],
+      emit: (message) => {
+        const full = { v: PROTOCOL_VERSION, generation, ...message };
+        for (const listener of messageListeners) listener(full);
+      },
+      emitRaw: (value) => {
+        for (const listener of messageListeners) listener(value);
+      },
+      error: (error) => {
+        for (const listener of errorListeners) listener(error);
+      },
+      exit: () => {
+        for (const listener of exitListeners) listener();
+      },
+      get terminations() {
+        return terminations;
+      },
+      last: (type) =>
+        [...scripted.received].reverse().find((entry) => entry.message.type === type)
+          ?.message as never,
+    };
+    workers.push(scripted);
+    return {
+      postMessage: (message, transfer) => {
+        scripted.received.push({ message, transfer });
+      },
+      onMessage: (listener) => {
+        messageListeners.push(listener);
+      },
+      onError: (listener) => {
+        errorListeners.push(listener);
+      },
+      onExit: (listener) => {
+        exitListeners.push(listener);
+      },
+      terminate: () => {
+        terminations++;
+      },
+    };
+  };
+  return {
+    start,
+    workers,
+    worker: (generation) => {
+      const found = workers.find((w) => w.generation === generation);
+      if (!found) throw new Error(`no worker of generation ${generation} started`);
+      return found;
+    },
+    failStarts: (n) => {
+      failing = n;
+    },
   };
 }

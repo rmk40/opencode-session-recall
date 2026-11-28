@@ -31,9 +31,14 @@ export const DIST_WORKER = join(ROOT, "dist", "distill-worker.js");
 export const STALL_WORKER = join(ROOT, "test-dist", "stall-worker.js");
 
 /** What the stall entry reads from `workerData.stall`: it holds the thread
- *  for `ms` inside the `afterTx`-th write transaction it opens (counting
- *  from 1, the fence's), before that transaction's COMMIT. */
-export type StallRequest = { ms: number; afterTx?: number };
+ *  inside the `afterTx`-th write transaction it opens (counting from 1, the
+ *  fence's), before that transaction's COMMIT: for `ms`, or with `rows` for
+ *  one real SQLite statement counting that many rows. It sets `flag` to 1
+ *  just before. */
+export type StallRequest = { afterTx?: number; flag?: SharedArrayBuffer } & (
+  | { ms: number; rows?: undefined }
+  | { rows: number; ms?: undefined }
+);
 
 type Body<T> = T extends unknown ? Omit<T, "v" | "generation"> : never;
 
