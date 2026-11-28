@@ -1,5 +1,6 @@
 node_modules/
 dist/
+test-dist/
 *.tsbuildinfo
 RELEASE_NOTES.md
 session-ses_*.md
