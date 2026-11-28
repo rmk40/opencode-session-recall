@@ -64,6 +64,22 @@ vi.mock("../src/sqlite.js", async (importOriginal) => {
   };
 });
 
+/** A discovery hold: the next session discovery waits for it, once. */
+const discovery = vi.hoisted(() => ({ hold: undefined as Promise<void> | undefined }));
+
+vi.mock("../src/history/v2-discovery.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../src/history/v2-discovery.js")>();
+  return {
+    ...actual,
+    discoverSessions: async (...args: Parameters<typeof actual.discoverSessions>) => {
+      const hold = discovery.hold;
+      discovery.hold = undefined;
+      if (hold) await hold;
+      return actual.discoverSessions(...args);
+    },
+  };
+});
+
 let dir: string;
 let v2: V2TestDb;
 let storePath: string;
@@ -72,6 +88,7 @@ const held: SqliteDb[] = [];
 
 beforeEach(async () => {
   threadSafety.value = "real";
+  discovery.hold = undefined;
   dir = realpathSync(mkdtempSync(join(tmpdir(), "recall-v2-worker-")));
   storePath = join(dir, "store.db");
   v2 = await makeV2PartsDb();
@@ -428,6 +445,26 @@ describe("while the worker starts", () => {
     expect(open.coverage?.cards?.degraded).toBe(false);
     expect(open.coverage?.cards).not.toHaveProperty("reason");
     expect(open.results.some((r) => r.sessionID === "ses_a")).toBe(true);
+  }, 40_000);
+
+  it("drops a degraded-tier discovery that ends after the store's card runtime was installed", async () => {
+    let release!: () => void;
+    discovery.hold = new Promise<void>((resolve) => (release = resolve));
+    const harness = workerHarness();
+    const { runtime } = await create({
+      // No cold pass, so the degraded tier's discovery is the only one.
+      options: { limits: { ...TEST_LIMITS, coldPass: false } },
+      worker: { start: startingWith(harness, (side) => side.delay(3_000, ["store"])) },
+    });
+    expect(runtime.store).toBeNull();
+    // The discovery started at the 2.5 s mark is held until the store opened.
+    await waitFor(() => runtime.store !== null, "the store");
+    const installed = runtime.cards;
+    const invalidate = vi.spyOn(installed, "invalidate");
+    release();
+    await sleep(300);
+    expect(invalidate).not.toHaveBeenCalled();
+    expect(runtime.cards).toBe(installed);
   }, 40_000);
 });
 

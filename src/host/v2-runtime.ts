@@ -704,6 +704,8 @@ async function createV2Runtime(
     });
 
   let liteRefresh: LiteRefreshController | undefined;
+  /** The source the tools' card runtime reads. */
+  let cardsSource: CardSource = liteSource;
   let cards: CardsRuntime = makeCards(liteSource);
   let deps: SearchDeps;
   let enrichment: SessionEnrichment | undefined;
@@ -736,6 +738,7 @@ async function createV2Runtime(
    *  cards. */
   const installCards = (source: CardSource, reason?: string): void => {
     const previous = cards;
+    cardsSource = source;
     cards = makeCards(source);
     degradedReason = reason;
     rebuildDeps();
@@ -755,10 +758,17 @@ async function createV2Runtime(
     void track(
       (upkeep ? discoverSessions(distillSource, yieldInBackground) : discover())
         .then((list) => {
-          if (!disposed) {
-            liteCards = toLite(list);
-            cards.invalidate();
+          if (disposed) return;
+          // Only the degraded tier reads these cards. A store-backed card
+          // runtime installed since then has nothing to gain from them, and
+          // an invalidate would force its full reload; a later return to
+          // the degraded tier discovers again.
+          if (cardsSource !== liteSource) {
+            liteStarted = false;
+            return;
           }
+          liteCards = toLite(list);
+          cards.invalidate();
         })
         .catch(() => {
           // Best-effort; cards-lite stays empty.

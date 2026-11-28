@@ -522,7 +522,9 @@ No `opencode.db` row, history page, card or row set crosses. The bounds:
   the degraded tier rather than the "still starting" error. Until the result
   arrives, `recall` serves the degraded card tier with `coverage.cards.reason`
   "the index is starting", filled by one background discovery started at the
-  2.5 s mark. Once the reader opens, the runtime installs a store-backed card
+  2.5 s mark. A discovery that ends after the store's card runtime was installed
+  is dropped, since invalidating that runtime would force its full reload. Once
+  the reader opens, the runtime installs a store-backed card
   runtime and bumps `runtime.revision()`, and `src/host/v2.ts` rebuilds its tools
   over the new deps.
 - **Failures:** a missed deadline, an `error` event, an exit main did not ask for, a
