@@ -209,8 +209,9 @@ describe("the event outbox", () => {
     });
 
     it("frees the bytes of the sessions a limited drain took", () => {
-      // Each re-check costs its id's length plus 32 bytes: three fit in 100.
-      const outbox = createEventOutbox({ bytes: 100 });
+      // A re-check costs 2 bytes per code unit of its id plus 32: three
+      // one-letter ids fit in 110.
+      const outbox = createEventOutbox({ bytes: 110 });
       outbox.add(turnEnded("a"));
       outbox.add(turnEnded("b"));
       outbox.add(turnEnded("c"));
@@ -250,8 +251,9 @@ describe("the event outbox", () => {
     });
 
     it("evicts at the byte bound as at the session bound", () => {
-      // Each re-check costs its id's length plus 32 bytes: three fit in 100.
-      const outbox = createEventOutbox({ bytes: 100 });
+      // A re-check costs 2 bytes per code unit of its id plus 32: three
+      // one-letter ids fit in 110.
+      const outbox = createEventOutbox({ bytes: 110 });
       outbox.add(turnEnded("a"));
       outbox.add(turnEnded("b"));
       outbox.add(turnEnded("c"));
@@ -262,10 +264,12 @@ describe("the event outbox", () => {
     });
 
     it("counts a new session's patch toward the byte bound", () => {
-      const outbox = createEventOutbox({ bytes: 100 });
+      // "a" costs 34, its patch 52 (2 bytes a code unit, 16 a field and 16
+      // for the patch): "a" and "b" fit in 130.
+      const outbox = createEventOutbox({ bytes: 130 });
       outbox.add(meta("a", { title: "x".repeat(10) }));
       outbox.add(turnEnded("b"));
-      // The patch made "a" cost more than a re-check: "c" no longer fits
+      // The patch makes "a" cost more than a re-check: "c" does not fit
       // beside both, and "a" holds a patch, so "b" goes.
       outbox.add(turnEnded("c"));
       expect(outbox.dropped()).toBe(1);
@@ -293,8 +297,9 @@ describe("the event outbox", () => {
     });
 
     it("evicts no session that holds a patchless metadata change", () => {
-      // Each entry costs its id's length plus 32 bytes: three fit in 100.
-      const outbox = createEventOutbox({ bytes: 100 });
+      // An entry costs 2 bytes per code unit of its id plus 32: three
+      // one-letter ids fit in 110.
+      const outbox = createEventOutbox({ bytes: 110 });
       outbox.add(meta("a"));
       outbox.add(turnEnded("b"));
       outbox.add(turnEnded("c"));
@@ -304,13 +309,29 @@ describe("the event outbox", () => {
     });
 
     it("frees the bytes of a patch a deletion replaced", () => {
+      // "a" with its patch costs 106; without it, three entries fit in 120.
       const outbox = createEventOutbox({ bytes: 120 });
-      outbox.add(meta("a", { title: "x".repeat(40) }));
+      outbox.add(meta("a", { title: "x".repeat(20) }));
       outbox.add(deleted("a"));
       outbox.add(turnEnded("b"));
       outbox.add(turnEnded("c"));
       expect(outbox.dropped()).toBe(0);
       expect(outbox.drain().map((s) => s.sessionID)).toEqual(["a", "b", "c"]);
+    });
+
+    it("charges 2 bytes per UTF-16 code unit, so a 600,000-character CJK title over 1 MiB becomes a patchless meta", () => {
+      const outbox = createEventOutbox();
+      outbox.add(meta("s1", { title: "漢".repeat(600_000) }));
+      outbox.add(turnEnded("s2"));
+      expect(outbox.dropped()).toBe(0);
+      expect(outbox.drain()).toEqual([meta("s1"), turnEnded("s2")]);
+    });
+
+    it("charges the session id the same way: a new session whose id passes the bound is dropped", () => {
+      const outbox = createEventOutbox({ bytes: 100 });
+      outbox.add(turnEnded("漢".repeat(40)));
+      expect(outbox.dropped()).toBe(1);
+      expect(outbox.size()).toBe(0);
     });
 
     it("holds at most OUTBOX_SESSIONS sessions by default", () => {

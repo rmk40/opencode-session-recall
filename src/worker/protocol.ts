@@ -272,13 +272,32 @@ type Pending = {
   bytes: number;
 };
 
+/** The bytes charged for one field over its text: the key, the value's
+ *  header and the slot that holds it. */
+const FIELD_OVERHEAD_BYTES = 16;
+/** The bytes charged for one session's entry over its id's text. */
+const ENTRY_OVERHEAD_BYTES = 32;
+
+/** A conservative size for `text`: 2 bytes per UTF-16 code unit, the most a
+ *  JavaScript string takes per code unit in memory and in the structured
+ *  clone that posts it, plus the field's overhead. */
+function textBytes(text: string | undefined): number {
+  return text === undefined ? 0 : 2 * text.length + FIELD_OVERHEAD_BYTES;
+}
+
+/** What a session's entry costs before any patch. */
+function entryBytes(sessionID: string): number {
+  return 2 * sessionID.length + ENTRY_OVERHEAD_BYTES;
+}
+
 function patchBytes(patch: SessionMetaPatch | undefined): number {
   if (!patch) return 0;
   return (
-    (patch.title?.length ?? 0) +
-    (patch.directory?.length ?? 0) +
-    (patch.projectId?.length ?? 0) +
-    16
+    textBytes(patch.title) +
+    textBytes(patch.directory) +
+    textBytes(patch.projectId) +
+    (patch.timeArchived !== undefined ? FIELD_OVERHEAD_BYTES : 0) +
+    FIELD_OVERHEAD_BYTES
   );
 }
 
@@ -345,7 +364,7 @@ export function createEventOutbox(bounds: { sessions?: number; bytes?: number } 
       const id = signal.sessionID;
       let entry = pending.get(id);
       if (!entry) {
-        const base = id.length + 32;
+        const base = entryBytes(id);
         // Room for the patch too while evicting allows, unless it could never
         // fit; the session alone must fit, and its patch becomes a re-read
         // when it does not.

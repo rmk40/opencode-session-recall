@@ -477,7 +477,9 @@ No `opencode.db` row, history page, card or row set crosses. The bounds:
   worker is not running and between flushes. A deletion stays a deletion and drops
   the session's other signals, patches merge field by field (later values win),
   patchless metadata changes become one patchless `meta` and turn ends one
-  re-check. At 4,096 sessions or 1 MiB a new session evicts the oldest one holding
+  re-check. Bytes are charged conservatively: 2 per UTF-16 code unit of a session
+  id and of every patch field, plus a fixed overhead per entry and per field.
+  At 4,096 sessions or 1 MiB a new session evicts the oldest one holding
   only a re-check or a removal (the poll finds it again). When every entry holds a
   deletion or a metadata change, the new signal is dropped and counted (the
   session scan and the deletion reconcile catch it). A patch that would pass the
