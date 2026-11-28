@@ -930,13 +930,16 @@ describe("vectors behind a card's content", () => {
     const store = await freshStore();
     for (let i = 0; i < 300; i++) put(store, cardId(i), { inventory: `card${i} ${SUBST}` });
     const embed = vi.fn(() => Float32Array.from([1, 0]));
-    // Another runtime stores every card's vector first.
-    await createCardsRuntime({
+    // Another runtime stores every card's vector first. Its writes run after
+    // ready() resolves, so wait for them before this runtime reads.
+    const first = createCardsRuntime({
       source: storeCardSource(store, inlineVectorWriter(store)),
       embedder: { ready: true, embed },
       semanticWeight: 0.5,
       semanticModel: MODEL,
-    }).ready({ index: true });
+    });
+    await first.ready({ index: true });
+    expect(await first.flushVectorWrites()).toBe(true);
     expect(embed).toHaveBeenCalledTimes(300);
     embed.mockClear();
 
