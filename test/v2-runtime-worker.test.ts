@@ -766,6 +766,55 @@ describe("after the worker fails", () => {
     releaseDiscovery();
   }, 30_000);
 
+  it("ends the handover of queued signals at the first that finds the write lock held, waiting on it once", async () => {
+    const harness = workerHarness();
+    const { runtime, logs } = await create({
+      worker: { start: harness.start, maxFailures: 1 },
+      sync: { pollIntervalMs: 600_000 },
+    });
+    await waitFor(() => runtime.distiller.status().leaseHeld, "the worker's lease");
+    // On this thread's connection a session's deletion waits out a busy
+    // timeout on a lock another connection holds, then fails.
+    const BUSY_MS = 200;
+    const sleeper = new Int32Array(new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT));
+    let waits = 0;
+    storeOpens.wrap = (db) => ({
+      ...db,
+      run: (sql, params) => {
+        if (sql.trim() === "DELETE FROM part_text WHERE session_id=?") {
+          waits++;
+          Atomics.wait(sleeper, 0, 0, BUSY_MS);
+          throw Object.assign(new Error("database is locked"), {
+            code: "ERR_SQLITE_ERROR",
+            errcode: 5,
+          });
+        }
+        return db.run(sql, params);
+      },
+    });
+    let releaseOpen!: () => void;
+    storeOpens.hold = new Promise<void>((resolve) => (releaseOpen = resolve));
+    storeOpens.path = storePath;
+
+    harness.side(1)?.crash();
+    await waitFor(() => storeOpens.entered, "the store's open on this thread");
+    for (let i = 0; i < 20; i++) {
+      runtime.onEvent({
+        id: `evt_gone_${i}`,
+        type: "session.deleted",
+        data: { sessionID: `ses_gone_${i}` },
+      } as never);
+    }
+    const started = Date.now();
+    releaseOpen();
+    const ended = (line: string): boolean => line.includes("left to the polls");
+    await waitFor(() => logs.some(ended), "the end of the handover");
+    expect(waits).toBe(1);
+    expect(Date.now() - started).toBeLessThan(BUSY_MS * 10);
+    expect(logs.find(ended)).toContain("; 19 left to the polls and the deletion reconcile");
+    expect(runtime.deps.distiller?.()).toBe("inline: the worker exited unexpectedly");
+  }, 30_000);
+
   it("reports indexing stopped when the store does not open on this thread, keeping the reader's cards", async () => {
     const harness = workerHarness();
     const { runtime, logs } = await create({ worker: { start: harness.start, maxFailures: 1 } });

@@ -1,5 +1,6 @@
 import { createFetchGate, type FetchGate } from "../fetch-gate.js";
 import {
+  isBusyError,
   openSqlite,
   sqliteThreadSafety,
   SqliteBusyError,
@@ -32,6 +33,7 @@ import { createLiteRefresh, type LiteRefreshController } from "../lite-refresh.j
 import { createDrill, type Drill } from "../drill.js";
 import {
   createDistiller,
+  type DistillSignal,
   type Distiller,
   type DistillStatus,
   type RepairStatus,
@@ -897,6 +899,48 @@ async function createV2Runtime(
       }
     };
 
+    /**
+     * Hand `queued`, then what {@link handoff} gathers meanwhile, to `target`
+     * in order, in slices through the background yield point its distiller
+     * yields through, so searches and dispose run between them. Signals that
+     * arrive during the replay keep waiting in `handoff` until it is empty,
+     * and go straight to `target` from then on. A deletion or a metadata
+     * patch writes on this thread's connection, which waits for the store's
+     * write lock up to its busy timeout: the first signal that finds the lock
+     * held ends the replay, so the wait is paid once, and the rest is left to
+     * the polls and the deletion reconcile, which recover what it carried. A
+     * signal that fails otherwise is logged and skipped.
+     */
+    const replayQueued = async (target: Distiller, queued: DistillSignal[]): Promise<void> => {
+      let pending = [...queued, ...(handoff?.drain() ?? [])];
+      let failed = 0;
+      try {
+        for (; pending.length > 0; pending = handoff?.drain() ?? []) {
+          for (let i = 0; i < pending.length; i++) {
+            await yieldInBackground();
+            if (disposed) return;
+            try {
+              target.onEvent(pending[i]!);
+            } catch (error) {
+              if (isBusyError(error)) {
+                const left = pending.length - i - 1 + (handoff?.size() ?? 0);
+                log(
+                  `the store's write lock was held while queued signals were handed to the distiller on the main thread (${errmsg(error)}); ${left} left to the polls and the deletion reconcile`,
+                );
+                return;
+              }
+              if (failed++ === 0) {
+                log(`a queued signal failed on the main thread: ${errmsg(error)}`);
+              }
+            }
+          }
+        }
+      } finally {
+        handoff = undefined;
+        if (failed > 1) log(`${failed} queued signals failed on the main thread`);
+      }
+    };
+
     /** The distiller moves to this thread over a writable store, once the
      *  last worker's thread has ended. Until it exists, signals wait in
      *  {@link handoff}. */
@@ -940,20 +984,7 @@ async function createV2Runtime(
             stopOnMain(`the distiller did not start on the main thread (${why})`, why);
             return;
           }
-          const queued = [...(controller?.drainEvents() ?? []), ...(handoff?.drain() ?? [])];
-          handoff = undefined;
-          let failed = 0;
-          for (const signal of queued) {
-            try {
-              next.onEvent(signal);
-            } catch (error) {
-              // The distiller runs on: its polls and its deletion reconcile
-              // find what a signal it could not apply carried.
-              if (failed++ === 0)
-                log(`a queued signal failed on the main thread: ${errmsg(error)}`);
-            }
-          }
-          if (failed > 1) log(`${failed} queued signals failed on the main thread`);
+          await replayQueued(next, controller?.drainEvents() ?? []);
           log(`the distiller runs on the main thread (${reason})`);
         } catch (error) {
           const why = errmsg(error);

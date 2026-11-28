@@ -581,11 +581,16 @@ No `opencode.db` row, history page, card or row set crosses. The bounds:
   stopped and reported as
   `"stopped: the distiller did not start on the main thread (<why>)"`, and the
   opened store's cards keep serving. A lease another process holds is no
-  failure: the distiller waits on its lease loop as every non-holder does. A
-  queued signal that throws as it is handed over is logged and skipped, since
-  the polls and the deletion reconcile find what it carried. Whatever happens,
-  the handoff outbox is cleared and the old reader closes once its users have
-  settled.
+  failure: the distiller waits on its lease loop as every non-holder does. The
+  queued signals are handed over in order, in slices through the background
+  yield point the distiller yields through, and signals arriving meanwhile wait
+  in the handoff outbox until it is empty. A deletion or a metadata patch
+  writes on main's connection, which waits up to its busy timeout on a write
+  lock, so the first signal that finds the lock held ends the handover: the
+  wait is paid once, one line logs how many signals were left, and the polls
+  and the deletion reconcile recover them. A signal that fails otherwise is
+  logged and skipped. Whatever happens, the handoff outbox is cleared and the
+  old reader closes once its users have settled.
 - **Store refusals:** a `store` refusal or a `fatal` of kind `store` (a damaged
   file, `isCorruptError`) is never retried and never run inline. Main keeps the
   reader if it had one and otherwise serves cards-lite.
