@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { openSqlite } from "../src/sqlite.js";
+import { openSqlite, SqliteBusyError } from "../src/sqlite.js";
 import type { Card, Store } from "../src/store.js";
 import {
   createCardsRuntime,
@@ -427,6 +427,52 @@ describe("acknowledgements of card vector writes", () => {
       expect(h.reads.vectors > 0).toBe(!advances);
     },
   );
+
+  it("counts a restamp check whose store read throws as a failed write, drops that batch and runs again only for new work", async () => {
+    // A store with no card, stamped for another model: the pass computes no
+    // row, so its one write is due only to restamp, and whether it still is
+    // takes a read of the stamp, which a connection that never waits on a
+    // lock can fail.
+    let reads = 0;
+    /** The first read that fails: the restamp check's, after the index
+     *  build's own read of the stamp. */
+    let failFrom = Number.POSITIVE_INFINITY;
+    const writer = fakeVectorWriter();
+    const logs: string[] = [];
+    const runtime = createCardsRuntime({
+      source: {
+        getCards: () => [],
+        revision: () => "1",
+        vectorsRevision: () => "0",
+        semanticModel: () => {
+          reads++;
+          // Bounded, so a runtime that kept retrying would still finish.
+          if (reads >= failFrom && reads < 10_000) {
+            throw new SqliteBusyError("SQLITE_BUSY", new Error("database is locked"));
+          }
+          return "another-model:1";
+        },
+        writeEmbeddings: writer.write,
+      },
+      embedder: { ready: true, embed: vectorOf },
+      semanticWeight: 0.5,
+      semanticModel: MODEL,
+      log: (line) => logs.push(line),
+    });
+    await runtime.ready();
+    const before = reads;
+    failFrom = before + 2;
+    runtime.rank(parseQuery("reticulate"), {});
+    await turns(8);
+    expect(await runtime.flushVectorWrites(1_000)).toBe(true);
+    expect(reads - before).toBe(2);
+    expect(writer.calls).toHaveLength(0);
+    expect(logs).toHaveLength(1);
+    expect(logs[0]).toContain("1 of 1 write(s) failed");
+    expect(logs[0]).toContain("database is locked");
+    await turns(8);
+    expect(reads - before).toBe(2);
+  });
 
   it("logs one line for a pass whose writes failed or were refused, and none for one that committed", async () => {
     const committed = await harness(3);

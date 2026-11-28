@@ -1285,9 +1285,14 @@ export function createCardsRuntime(deps: CardsRuntimeDeps): CardsRuntime {
    * {@link VECTOR_WRITE_CHUNK}, yielding before every write but the first.
    * A batch that must restamp issues one write even when no row of it is
    * left, unless the store's stamp is this model's by then. Never rejects: a
-   * write that throws counts as failed. A refused or failed write moves
-   * nothing and leaves the vectors in memory as they are, and a later pass
-   * may write them again. Stops issuing once the runtime is disposed.
+   * write that throws counts as failed, and so does a restamp check whose
+   * read of the stamp throws (a busy read on a connection that never waits
+   * on a lock), which ends its batch. Anything else that throws ends the
+   * batch it was in. A batch is taken off the queue however it ended, so a
+   * failure never makes the next run start over with it. A refused or failed
+   * write moves nothing and leaves the vectors in memory as they are, and a
+   * later pass may write them again. Stops issuing once the runtime is
+   * disposed.
    */
   async function runVectorWrites(): Promise<void> {
     const write = source.writeEmbeddings;
@@ -1301,30 +1306,48 @@ export function createCardsRuntime(deps: CardsRuntimeDeps): CardsRuntime {
       let failed = 0;
       let refused = 0;
       let firstProblem: string | undefined;
-      for (;;) {
-        const restampDue = issued === 0 && batch.restamp;
-        if (batch.next >= batch.rows.length && !restampDue) break;
-        if (!first) {
-          await yieldBetween();
+      try {
+        for (;;) {
+          const restampDue = issued === 0 && batch.restamp;
+          if (batch.next >= batch.rows.length && !restampDue) break;
+          if (!first) {
+            await yieldBetween();
+            if (disposed) return;
+          }
+          first = false;
+          const chunk = takeChunk(batch);
+          // Every row left was superseded or outdated: the write is still due
+          // only to restamp a store that still carries another stamp.
+          if (chunk.length === 0) {
+            if (!restampDue) break;
+            let stale: boolean;
+            try {
+              stale = source.semanticModel?.() !== model;
+            } catch (error) {
+              issued++;
+              failed++;
+              firstProblem ??= errorText(error);
+              break;
+            }
+            if (!stale) break;
+          }
+          issued++;
+          const result = await issueVectorWrite(write, model, chunk);
+          if (result.status === "failed") {
+            failed++;
+            firstProblem ??= result.error;
+          } else if (result.status === "refused") {
+            refused++;
+            firstProblem ??= result.reason;
+          }
           if (disposed) return;
         }
-        first = false;
-        const chunk = takeChunk(batch);
-        // Every row left was superseded or outdated: the write is still due
-        // only to restamp a store that still carries another stamp.
-        if (chunk.length === 0 && !(restampDue && source.semanticModel?.() !== model)) break;
+      } catch (error) {
         issued++;
-        const result = await issueVectorWrite(write, model, chunk);
-        if (result.status === "failed") {
-          failed++;
-          firstProblem ??= result.error;
-        } else if (result.status === "refused") {
-          refused++;
-          firstProblem ??= result.reason;
-        }
-        if (disposed) return;
+        failed++;
+        firstProblem ??= errorText(error);
       }
-      writeQueue.shift();
+      if (writeQueue[0] === batch) writeQueue.shift();
       if ((failed > 0 || refused > 0) && log) {
         log(
           `card vectors not persisted: ${failed} of ${issued} write(s) failed and ${refused} were refused (${firstProblem ?? "no detail"}); the vectors stay in memory`,
