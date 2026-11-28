@@ -12,9 +12,11 @@ in a thread of their own, so a slow disk under that work no longer holds up
 the sessions OpenCode serves. Searches still run on the main thread, and
 indexing gives way to them while they run. `coverage.history.distiller` says
 where indexing runs: `"worker"`, or `"inline: <reason>"` when it fell back to
-the main thread. When the store cannot be used, it says `"stopped: <reason>"`
-and searches warn that new sessions are not being indexed. opencode v1 is
-unchanged and reports `"inline"`.
+the main thread. While the thread waits for a store another process has
+locked, or restarts after a failure, it says `"worker: waiting (<reason>)"` or
+`"worker: restarting (<reason>)"`. When the store cannot be used, it says
+`"stopped: <reason>"` and searches warn that new sessions are not being
+indexed. opencode v1 is unchanged and reports `"inline"`.
 
 ## 3.1.0
 

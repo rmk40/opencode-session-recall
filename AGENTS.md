@@ -298,7 +298,8 @@ never see half a session. `acquireLease(..., { takeOver })` may also take a leas
 that has not expired from the one holder it names, a predecessor the caller knows
 has stopped. The row is compared with that holder in the same conditional write as
 the acquire, so a lease another holder took meanwhile is never taken. Without
-`takeOver` (every older build) the acquire is unchanged. A distiller passes it on
+`takeOver`, as every older build calls it, the acquire takes only an expired lease
+or its own. A distiller passes it on
 its first acquire only (`DistillerOptions.takeOverLease`). On v2 the lease holder
 is the distiller worker, whose holder id is `<instanceId>/w<generation>`; a
 replacement generation takes over its own predecessor's id that way, and to other
@@ -435,11 +436,12 @@ in-process SDK transport, which cannot leave the thread.
 - **Main** keeps the tools, the event mapping, the card runtime and every search,
   drill and browse read, over its own `opencode.db` handle and a reader
   (`openReadStore`) it opens only after the worker reported its store open.
-- **Unchanged:** v1, ephemeral mode, and a store with no readable `opencode.db`. The
-  card-only fallback (a source path that cannot be canonicalized) starts no worker.
-  It tries `openReadStore` with `acceptSource` first and, only on `no-wal` (no
-  connection anywhere holds the store open), falls back to the writable
-  `openStore(..., { existingOnly: true })`. It refuses as before otherwise.
+- **No worker:** v1, ephemeral mode, and a store with no readable `opencode.db`
+  start no worker. Neither does the card-only fallback (a source path that cannot
+  be canonicalized). It tries `openReadStore` with `acceptSource` first and, only
+  on `no-wal` (no connection anywhere holds the store open), falls back to the
+  writable `openStore(..., { existingOnly: true })`. Any other refusal is logged
+  and serves no store.
 - **Inline on main:** a SQLite library compiled with `THREADSAFE=0`
   (`sqliteThreadSafety`, read from a throwaway in-memory connection) runs the
   distiller inline, reported as `"inline: sqlite is not thread-safe"`.
@@ -504,11 +506,12 @@ No `opencode.db` row, history page, card or row set crosses. The bounds:
   generation runs, settles `failed` at once. A write with no reply within 10 s
   settles `failed`. Vector writes are never gated by the foreground signal, and the
   worker serves them as they arrive, between its slices, whether or not it holds the
-  lease. That is how every process wrote its card vectors before the worker existed:
-  the store's own guards decide (representation generations only move up, a model
-  switch clears every vector first, a write never downgrades one), so a process
-  without the lease still persists vectors for everyone. Gating them on the lease
-  would change what processes sharing a store see of each other's vectors.
+  lease. Every process may persist card vectors whether or not it holds the lease,
+  so a process without it still persists vectors for everyone. The store enforces
+  what may land: representation generations only move up, a model switch clears
+  every vector before it changes the stamp, and a write never downgrades a vector.
+  Two processes configured with different semantic models contend through the
+  model stamp, each clearing and rewriting the vectors under its own.
 - **Worker logs:** at most 200 lines a second, each cut to 2,000 characters. The
   rest are counted and reported with the next line posted.
 - **Status** is latest-only and rate-limited as above. Main learns of the worker's
@@ -888,7 +891,7 @@ await path. A build, a vector reload or an in-place update installs its index an
 vectors, then queues the rows it computed. A write queue of its own issues them in
 chunks of 200 (`VECTOR_WRITE_CHUNK`), one write in flight at a time, with a yield
 between writes. The first write of an idle queue is issued on the caller's turn,
-so with the inline writer a pass of up to 200 rows commits where it did before.
+so with the inline writer a pass of up to 200 rows commits on the caller's turn.
 **No `rank()`, `ready()` or search awaits a vector write**, so a search that waits
 on index work never also waits on whatever thread commits the write.
 
@@ -917,8 +920,8 @@ on index work never also waits on whatever thread commits the write.
   during it. Then it keeps the larger of the sample and the cached revision, since
   that write's vectors are in memory. A source without store reads does the same at
   a full load. A store that was reset can therefore move the cached revision down.
-- **The model-stamp guard (`stampedRead`) is unchanged**, because it depends only
-  on store state at the moment of a read. Every write, the runtime's own included,
+- **The model-stamp guard (`stampedRead`) holds whichever thread writes**,
+  because it depends only on store state at the moment of a read. Every write, the runtime's own included,
   bumps `vectors_rev` in its transaction, whenever its acknowledgement arrives.
 - **Shutdown:** `dispose()` drops every queued write. The write in flight settles
   on its own. `flushVectorWrites(deadlineMs)` resolves `true` once nothing is
@@ -1005,7 +1008,8 @@ it hands `signal.buffer` to wraps it with `foregroundSignalFrom`.
 - **The fetch gate's `foreground` option:** each `runQuery` counts in the signal
   from entry until it settles. A `runBackground` call that finds the signal
   non-zero waits until it reads zero or `FOREGROUND_WAIT_MS` (250 ms) pass, then
-  queues for a permit as before. `activeQueries()` reports the larger of the gate's
+  queues for a permit as every background call does. `activeQueries()` reports the
+  larger of the gate's
   own queries and the signal's count, so the range check keeps standing aside for
   another thread's searches.
 - **The slicer:** `prioritySlicer({ foreground })`, `slicer.yieldTo(signal)` and
