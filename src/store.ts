@@ -2056,6 +2056,10 @@ export type ReadStoreOptions = {
   /** How the open retries reads that find a lock (default
    *  {@link BUSY_READ_ATTEMPTS} attempts). */
   busyRetry?: BusyRetryOptions;
+  /** Wraps the connection's read handle once it is open and verified, before
+   *  the fence reads through it: every statement the open and the returned
+   *  store run goes through the wrapper. For tests that record them. */
+  wrapReader?: (db: ReadOnlyDb) => ReadOnlyDb;
 };
 
 export type OpenReadStoreResult =
@@ -2152,7 +2156,7 @@ async function openReadStoreOnce(
     if (opened.busy !== undefined) throw new SqliteBusyError(opened.busy, opened.reason);
     return { ok: false, reason: "error", detail: opened.reason };
   }
-  const db = opened.db;
+  const db = opts.wrapReader ? opts.wrapReader(opened.db) : opened.db;
   try {
     const fence = await readFence(db, identity, opts.acceptSource);
     if ("refusal" in fence) {

@@ -3327,7 +3327,7 @@ describe("recall history coverage", () => {
 
     expect(out.coverage?.sessionStops?.sessions.some((s) => s.fetched > 0)).toBe(true);
     expect(out.coverage?.history?.unknownPartTypeNames).toEqual(["hologram"]);
-    expect(out.coverage?.history?.counts.unknownPartTypes).toBeGreaterThan(0);
+    expect(out.coverage?.history?.counts?.unknownPartTypes).toBeGreaterThan(0);
     expect(out.warnings?.filter((w) => DRIFT.test(w))).toEqual([
       expect.stringContaining("of unknown types (hologram)"),
     ]);

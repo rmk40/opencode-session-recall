@@ -243,6 +243,17 @@ export type HistoryCoverage = {
   counts: HistoryReadCounts;
   repair?: HistoryRepairCoverage;
   reconcile?: HistoryReconcileCoverage;
+  /** Where the distiller runs: `"worker"` (a thread of its own),
+   *  `"inline: <reason>"` (on the thread that serves the tools, and why) or
+   *  `"stopped: <reason>"` (nothing is being indexed, and why). Absent when
+   *  the host runs no distiller. */
+  distiller?: string;
+};
+
+/** `coverage.history` on a host that reads no history database (opencode
+ *  v1): only where its distiller runs, which is always `"inline"`. */
+export type DistillerHistoryCoverage = { distiller: string } & {
+  [K in Exclude<keyof HistoryCoverage, "distiller">]?: undefined;
 };
 
 export type SearchCoverage = {
@@ -313,6 +324,9 @@ export type SearchCoverage = {
     full: number;
     storeRecency: number;
     degraded: boolean;
+    /** Present with `degraded` when the host gave a reason other than the
+     *  store being unavailable, such as the index still starting. */
+    reason?: string;
     /** Present when ranking left out cards whose latest content the search
      *  index had yet to take (its update was still running when the search
      *  stopped waiting): how many would otherwise have competed. */
@@ -348,8 +362,9 @@ export type SearchCoverage = {
    *  (no drill, no deep sweep) for `reason`. */
   source?: { kind: "v1-http" | "v2-sqlite"; available: false; reason: string };
   /** Present on opencode v2 while `opencode.db` can be read: how it differs
-   *  from what this build reads and how far card repair has got. */
-  history?: HistoryCoverage;
+   *  from what this build reads, how far card repair has got and where the
+   *  distiller runs. On opencode v1 it holds only where the distiller runs. */
+  history?: HistoryCoverage | DistillerHistoryCoverage;
   /** Present only for a deep sweep: how much of the scoped session set the sweep
    *  actually covered. `sessionsCovered` were fully swept, `sessionsPartial`
    *  stopped mid-session on a budget, `sessionsRemaining` were never reached,

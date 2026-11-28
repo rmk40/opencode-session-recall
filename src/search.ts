@@ -20,6 +20,7 @@ import {
   type ResultSource,
   type ResultWhy,
   type IndexingStatus,
+  type DistillerHistoryCoverage,
   type HistoryCoverage,
   type HistoryRepairCoverage,
   type ToolNamesCoverage,
@@ -69,7 +70,7 @@ import {
   type DrilledPool,
   type TimeWindow,
 } from "./drill.js";
-import { buildMatch, type ReadStore, type FtsHit, type Card } from "./store.js";
+import { buildMatch, retryOnBusy, type ReadStore, type FtsHit, type Card } from "./store.js";
 import type { FetchGate } from "./fetch-gate.js";
 import { fetchMessageWindow, type FetchRunner } from "./fetch-window.js";
 import type { HistoryMessage } from "./history/model.js";
@@ -150,6 +151,14 @@ export type SearchDeps = {
    *  one bounded listing; v2 discovery pages without a cap and leaves it
    *  unset). */
   discoveryTruncated?: () => boolean;
+  /** Where the host's distiller runs, reported as `coverage.history.distiller`
+   *  (see {@link HistoryCoverage.distiller}); absent, or undefined, when the
+   *  host runs none. */
+  distiller?: () => string | undefined;
+  /** Why the cards are metadata-only when the store is not simply missing,
+   *  such as the index still starting: reported as `coverage.cards.reason`
+   *  and as the degraded-cards warning in place of the default one. */
+  cardsDegradedReason?: string;
 };
 
 /** Wall-clock budget for the synchronous literal/regex scan loops (ms). Bounds
@@ -2384,14 +2393,15 @@ export function toolNamesCoverage(
 
 // ── History drift and card repair ────────────────────────────────────
 
-/** `coverage.history` from the drift state and the repair progress;
- *  undefined when the host reports no drift state (v1, or `opencode.db`
- *  unreadable). */
+/** `coverage.history` from the drift state, the repair progress and where
+ *  the distiller runs; only the last when the host reports no drift state
+ *  (v1, or `opencode.db` unreadable), and undefined with neither. */
 function historyCoverage(
   drift: HistoryDrift | undefined,
   repair: RepairStatus | undefined,
-): HistoryCoverage | undefined {
-  if (!drift) return undefined;
+  distiller: string | undefined,
+): HistoryCoverage | DistillerHistoryCoverage | undefined {
+  if (!drift) return distiller === undefined ? undefined : { distiller };
   const sweep = repair?.sweep;
   const reconcile = repair?.reconcile;
   return {
@@ -2424,6 +2434,7 @@ function historyCoverage(
         lastCheckAt: reconcile.at,
       },
     }),
+    ...(distiller !== undefined && { distiller }),
   };
 }
 
@@ -3250,8 +3261,10 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
 
         // Every branch reads the card map; only tier-1 ranking below waits for
         // the search index, so a search scoped to one session or a named list
-        // never builds or updates it.
-        await cards.ready();
+        // never builds or updates it. A store connection that only reads
+        // never waits on a lock, so a load that found one is run again
+        // after a short wait.
+        await retryOnBusy(() => cards.ready());
 
         /** The current session's family (itself, its parent, siblings and
          *  subagents) from the card map, read once and only when needed. */
@@ -3801,7 +3814,7 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
           // to them here, since `rank` never sees it. The same pass counts the
           // cards it left out because the index had yet to take them.
           const rankStats: RankStats = { rootOnlySkipped: [] };
-          await cards.ready({ index: true });
+          await retryOnBusy(() => cards.ready({ index: true }));
           let cardHits: CardHit[] = cards.rank(queryMeta, cardFilters, rankStats);
           cardsPending = rankStats.pending ?? 0;
 
@@ -3946,9 +3959,9 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
           /** The lookup's rows in its order, kept for the family's preference. */
           let ftsRows: FtsHit[] = [];
           if (store) {
-            const rows = await store.ftsSearchPausing(
-              { strong: strongAnchors, weak: queryMeta.tokens },
-              pause,
+            const lookup = store;
+            const rows = await retryOnBusy(() =>
+              lookup.ftsSearchPausing({ strong: strongAnchors, weak: queryMeta.tokens }, pause),
             );
             ftsRows = rows;
             ftsBySession = new Map<string, FtsHit[]>();
@@ -4273,7 +4286,9 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
           normalized.warnings.push(
             mode
               ? "Ephemeral mode (configured): session cards are metadata-quality; content matches come from live drill, not a persistent index."
-              : "Cards are metadata-only (card store unavailable); content search is degraded.",
+              : deps.cardsDegradedReason !== undefined
+                ? `Cards are metadata-only (${deps.cardsDegradedReason}); content search is degraded.`
+                : "Cards are metadata-only (card store unavailable); content search is degraded.",
           );
         } else if (indexing) {
           // A running cold pass: the card counts alone read as complete while
@@ -4385,6 +4400,8 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
               full: cardsCoverage.fullCards,
               storeRecency: cardsCoverage.storeRecency,
               degraded: cardsCoverage.degraded,
+              ...(cardsCoverage.degraded &&
+                deps.cardsDegradedReason !== undefined && { reason: deps.cardsDegradedReason }),
               ...(cardsPending > 0 && { pending: cardsPending }),
               ...(indexing && { indexing }),
             },
@@ -4583,13 +4600,15 @@ Modes: literal exact substring; smart ranked BM25; fuzzy looser; regex pattern (
           const expanded = await includeExpansion(out, final, warnings, effectiveMatchMode);
           // Read after every history read this query makes (the drill and the
           // expansions), so what they could not project is reported now.
-          const history = historyCoverage(deps.history?.(), deps.repair?.());
+          const history = historyCoverage(deps.history?.(), deps.repair?.(), deps.distiller?.());
           if (history) {
             outCtx.coverage.history = history;
-            const historyWarnings = [
-              driftWarning(history),
-              history.repair && repairWarning(history.repair),
-            ].filter((warning): warning is string => Boolean(warning));
+            const historyWarnings =
+              history.capabilities === undefined
+                ? []
+                : [driftWarning(history), history.repair && repairWarning(history.repair)].filter(
+                    (warning): warning is string => Boolean(warning),
+                  );
             warnings.splice(historyWarningsAt, 0, ...historyWarnings);
           }
           if (final.length === 0 && toolName && toolFilter && outCtx.toolCounts) {

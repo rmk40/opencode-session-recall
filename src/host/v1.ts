@@ -318,6 +318,9 @@ export const server: Plugin = async (ctx, options) => {
     ...(liteRefreshHook && { maybeRefresh: () => liteRefreshHook.maybeRefresh() }),
     indexing: () => distiller.indexing(),
     discoveryTruncated: store ? () => distiller.discoveryTruncated() : () => discoveryTruncated,
+    // The v1 history reads go through the host's in-process SDK transport,
+    // which cannot leave this thread, so the distiller always runs here.
+    distiller: () => "inline",
   };
   // recall_sessions serves the card store directly when it exists (digest, top
   // files/tools, family rollups); degraded mode leaves listings bare.

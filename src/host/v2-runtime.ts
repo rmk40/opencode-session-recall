@@ -39,6 +39,7 @@ import { V2_PROJECTOR_GEN } from "../history/v2-project.js";
 import { opencodeDbPath } from "../history/v2-path.js";
 import { createV2Sync, type V2SyncOptions } from "../history/v2-sync.js";
 import { createV2EventMapper } from "../history/v2-events.js";
+import { discoverSessions } from "../history/v2-discovery.js";
 import type { SearchDeps, SemanticSearchConfig } from "../search.js";
 import type { SessionEnrichment } from "../sessions.js";
 import type { ResolvedOptions } from "../options.js";
@@ -65,43 +66,11 @@ const STORE_HOST: StoreHost = "opencode-v2";
 export const V2_PLUGIN_BUILD = pluginBuild(STORE_HOST, V2_PROJECTOR_GEN);
 /** Per-phase bound on dispose's awaited waits (as on v1). */
 const SHUTDOWN_TIMEOUT_MS = 2_500;
-/** Sessions per discovery page. */
-const DISCOVERY_PAGE = 2_000;
 /** How often the runtime compares the history drift with what it last
  *  logged. */
 const DRIFT_LOG_EVERY_MS = 5 * 60_000;
 
-/**
- * Every session the history holds, as the distiller and cards-lite discover
- * them: globally, since one store per process serves every location. The
- * listing pages by the immutable session id, so a session updated during the
- * walk is neither skipped nor listed twice, and it has no overall cap.
- * Archived sessions are included: archiving hides a session from opencode's
- * list but keeps its history, which is still past work to recall, and
- * cards-lite (the store-less mode) then covers the same sessions the store
- * does. `pause` runs between pages.
- */
-export async function discoverSessions(
-  source: HistorySource,
-  pause: () => Promise<void>,
-): Promise<HistorySession[]> {
-  const sessions: HistorySession[] = [];
-  let after: string | undefined;
-  for (;;) {
-    const listing = await source.listSessions({
-      scope: "global",
-      limit: DISCOVERY_PAGE,
-      order: "id",
-      archived: "include",
-      ...(after !== undefined && { after }),
-    });
-    if (!listing.ok) throw new Error(listing.error);
-    sessions.push(...listing.items);
-    if (!listing.truncated || listing.nextCursor === undefined) return sessions;
-    after = listing.nextCursor;
-    await pause();
-  }
-}
+export { discoverSessions };
 
 /** The runtime-shaping options: first writer wins (see `runtime.ts`). */
 export type V2RuntimeOptions = Pick<

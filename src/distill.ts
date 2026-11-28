@@ -82,7 +82,8 @@ const DEFAULT_COLD_PASS_RETRY_MS = 60_000;
 const DEFAULT_META_RETRY_MS = 5_000;
 /** Failed re-reads of a session's metadata before its follow-up is dropped. */
 const MAX_META_RETRIES = 5;
-const LEASE_TTL_MS = 30_000;
+/** How long a distill lease stays valid after its holder's last heartbeat. */
+export const LEASE_TTL_MS = 30_000;
 const HEARTBEAT_MS = 10_000;
 /** Bound process-lifetime state retained for malformed legacy sessions. */
 const MAX_QUARANTINED_SESSIONS = 1_000;
@@ -631,6 +632,13 @@ export type DistillerOptions = {
   /** Representation generation recorded in the distill-lease value
    *  ({@link import("./embedding-text.js").EMBED_REPRESENTATION}). Defaults to 0. */
   gen?: number;
+  /**
+   * A holder id whose lease this distiller's first acquire may take over
+   * although its heartbeat has not expired ({@link Store.acquireLease}'s
+   * `takeOver`): a predecessor the caller knows has stopped. Later acquires
+   * never take it over.
+   */
+  takeOverLease?: string;
   /**
    * The host's history projector generation, stamped on every card this
    * distiller writes in full ({@link Card.projectorGen}). Only a host that
@@ -1583,6 +1591,12 @@ export function createDistiller(options: DistillerOptions): Distiller {
   const build = options.build ?? "unknown";
   const gen = options.gen ?? 0;
   const projectorGen = options.projectorGen;
+  /** The predecessor whose lease the first acquire may take over; cleared
+   *  once that acquire has run, whatever it found. */
+  let takeOverLease =
+    typeof options.takeOverLease === "string" && options.takeOverLease !== ""
+      ? options.takeOverLease
+      : undefined;
   const caps = {
     ftsRowsPerSession: limits.ftsRowsPerSession,
     inventoryTokens: limits.inventoryTokens,
@@ -4646,7 +4660,13 @@ export function createDistiller(options: DistillerOptions): Distiller {
 
   function acquire(): void {
     if (stopped) return;
-    if (store.acquireLease(instanceId, LEASE_TTL_MS, build, gen)) {
+    const takeOver = takeOverLease;
+    takeOverLease = undefined;
+    const acquired =
+      takeOver === undefined
+        ? store.acquireLease(instanceId, LEASE_TTL_MS, build, gen)
+        : store.acquireLease(instanceId, LEASE_TTL_MS, build, gen, { takeOver });
+    if (acquired) {
       leaseHeld = true;
       // Whoever held the lease before may have written repair reasons this
       // process's count does not know of, and stamped another generation.

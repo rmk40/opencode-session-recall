@@ -257,6 +257,60 @@ function typedBusy(error: unknown): unknown {
   return code === undefined ? error : new SqliteBusyError(code, error);
 }
 
+/** SQLite's primary result codes for a database file that is damaged
+ *  (`SQLITE_CORRUPT`) or not a database at all (`SQLITE_NOTADB`). */
+const SQLITE_CORRUPT = 11;
+const SQLITE_NOTADB = 26;
+
+/**
+ * Whether `error`, from either driver, says the database file is damaged or
+ * is not a database: `SQLITE_CORRUPT` (with its extended codes) or
+ * `SQLITE_NOTADB`. Retrying the statement or reopening the file cannot fix
+ * either.
+ */
+export function isCorruptError(error: unknown): boolean {
+  if (typeof error !== "object" || error === null) return false;
+  const { code, errcode } = error as { code?: unknown; errcode?: unknown };
+  if (typeof code === "string" && code.startsWith("SQLITE_")) {
+    return code.startsWith("SQLITE_CORRUPT") || code === "SQLITE_NOTADB";
+  }
+  if (code === "ERR_SQLITE_ERROR" && typeof errcode === "number") {
+    const primary = errcode & 0xff;
+    return primary === SQLITE_CORRUPT || primary === SQLITE_NOTADB;
+  }
+  return false;
+}
+
+/**
+ * The `THREADSAFE` compile option of the SQLite library the driver links, read
+ * from `PRAGMA compile_options` on a throwaway in-memory connection: 0 means
+ * the library must not be used from more than one thread at all, 1 and 2
+ * allow one connection per thread. Undefined when no driver loads or the
+ * option is not listed.
+ */
+export async function sqliteThreadSafety(): Promise<number | undefined> {
+  const db = await openSqlite(":memory:");
+  if (!db) return undefined;
+  try {
+    for (const row of db.all("PRAGMA compile_options")) {
+      const option = row.compile_options;
+      if (typeof option === "string" && option.startsWith("THREADSAFE=")) {
+        const value = Number(option.slice("THREADSAFE=".length));
+        return Number.isInteger(value) ? value : undefined;
+      }
+    }
+    return undefined;
+  } catch {
+    return undefined;
+  } finally {
+    try {
+      db.close();
+    } catch {
+      // A throwaway connection; its close cannot matter.
+    }
+  }
+}
+
 /** How long a read waits on a lock before failing. Short on purpose: a WAL
  *  reader almost never waits, and a stalled read would stall the host. */
 const READ_ONLY_BUSY_TIMEOUT_MS = 500;
