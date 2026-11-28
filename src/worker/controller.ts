@@ -1,0 +1,529 @@
+import { BUILD_ID } from "../build-id.js";
+import type { CardVectorWriteResult, CardVectorWriter } from "../cards.js";
+import { LEASE_TTL_MS, type DistillSignal } from "../distill.js";
+import type { LeaseInfo } from "../store.js";
+import { errmsg, settleWithin } from "../types.js";
+import {
+  createEventOutbox,
+  EVENT_BATCH,
+  isWorkerMessage,
+  MAX_PENDING_REQUESTS,
+  PROTOCOL_VERSION,
+  transferableBuffers,
+  VECTOR_WRITE_DEADLINE_MS,
+  WORKER_READY_TIMEOUT_MS,
+  WORKER_STORE_TIMEOUT_MS,
+  type InitMessage,
+  type MainMessage,
+  type WorkerMessage,
+  type WorkerStatus,
+} from "./protocol.js";
+import type { WorkerLike, WorkerStarter } from "./start.js";
+
+/**
+ * Main's side of the distiller worker: one per v2 runtime.
+ *
+ * It starts generation 1 at once, and each later generation only after its
+ * predecessor's thread has ended (its exit event), since a thread that was
+ * asked to end may still be inside a statement that can commit. The holder id
+ * of generation `n` is `<instanceId>/w<n>`, and each replacement's `init`
+ * names its predecessor's holder id, so its first lease acquire may take that
+ * one lease over without waiting out the TTL.
+ *
+ * A generation fails when it reports no `ready` within 10 s of starting or no
+ * `store` within 10 s of `init`, when its thread reports an error or ends
+ * unexpectedly, when it reports `fatal` of kind `crash` (a build mismatch
+ * included), when main cannot open its reader after the worker reported its
+ * store open, and when the watchdog trips. After a failure the next
+ * generation starts 1 s later, then 5 s later; the third failure hands the
+ * distiller to main ({@link WorkerControllerOptions.onInline}). A store the
+ * worker refuses, or reports damaged (`fatal` of kind `store`), stops
+ * indexing for good: no generation is retried and nothing runs on main.
+ */
+
+/** The fields of `init` the runtime supplies; the controller adds the
+ *  envelope, the request id, the deadline and the holder ids. */
+export type WorkerInit = Omit<
+  InitMessage,
+  "v" | "generation" | "type" | "id" | "deadline" | "holderId" | "takeOver"
+>;
+
+export type WorkerControllerOptions = {
+  start: WorkerStarter;
+  instanceId: string;
+  init: WorkerInit;
+  log: (line: string) => void;
+  /**
+   * The worker reported its store open: open main's reader, or keep the one
+   * already open. A refusal there is a failure of this generation.
+   */
+  onStoreOpen(warning: string | undefined): Promise<{ ok: true } | { ok: false; reason: string }>;
+  /** Indexing stopped for good (a store refusal or a damaged store). */
+  onStopped(reason: string): void;
+  /**
+   * Every allowed generation failed and the last one's thread has ended:
+   * main runs the distiller itself from here on, and may take over
+   * `lastHolder`'s lease.
+   */
+  onInline(reason: string, lastHolder: string | undefined): void;
+  /** A status message of the current generation arrived. */
+  onStatus?(status: WorkerStatus): void;
+  /** The lease row as main's reader sees it, for the watchdog; undefined
+   *  while there is no reader. */
+  readLease(): LeaseInfo | undefined;
+  now?: () => number;
+  /** Waits before the second and the third generation (default 1 s, 5 s). */
+  restartDelaysMs?: readonly number[];
+  readyTimeoutMs?: number;
+  storeTimeoutMs?: number;
+  /** How often the watchdog reads the lease (default 5 s). */
+  watchdogEveryMs?: number;
+  /** Failed generations before the distiller runs on main (default 3). */
+  maxFailures?: number;
+};
+
+/** Where the distiller runs, as `coverage.history.distiller` reports it. */
+export type DistillerMode =
+  | { kind: "worker" }
+  | { kind: "inline"; reason: string }
+  | { kind: "stopped"; reason: string };
+
+export type WorkerController = {
+  /** Resolves once the first generation's store result settled: its reader
+   *  opened, the store was refused, or the distiller went inline. */
+  settled(): Promise<void>;
+  mode(): DistillerMode;
+  /** The current generation's last status, if it sent one. */
+  status(): WorkerStatus | undefined;
+  /** The current generation, 0 before the first. */
+  generation(): number;
+  /** The current generation's holder id. */
+  holderId(): string | undefined;
+  /** The worker's last revision hint. */
+  revisions(): { cardsRev: number; vectorsRev: number } | undefined;
+  /** Queue a distiller signal for the worker (coalesced per session). False
+   *  when the controller takes none: the distiller runs inline, indexing
+   *  stopped, or the controller is stopping. */
+  post(signal: DistillSignal): boolean;
+  /** Every signal still queued, emptied (for a distiller taking over). */
+  drainEvents(): DistillSignal[];
+  /** A vector writer that sends each write to the worker. */
+  readonly writeVectors: CardVectorWriter;
+  /** Take no more signals, and drop the queued ones. */
+  quiesce(): void;
+  /**
+   * Stop: no generation starts after this. The running worker is asked to
+   * stop its distiller, release its lease and close its connections; resolves
+   * true once it reported `stopped`, false at the deadline or when no worker
+   * was running.
+   */
+  stop(deadlineMs: number): Promise<boolean>;
+  /** End the worker's thread and wait at most `waitMs` for its exit. */
+  terminate(waitMs: number): Promise<void>;
+};
+
+const DEFAULT_RESTART_DELAYS_MS = [1_000, 5_000];
+const DEFAULT_WATCHDOG_EVERY_MS = 5_000;
+const DEFAULT_MAX_FAILURES = 3;
+
+type Pending = {
+  generation: number;
+  resolve: (result: CardVectorWriteResult) => void;
+  timer: ReturnType<typeof setTimeout>;
+};
+
+type Generation = {
+  number: number;
+  holderId: string;
+  worker?: WorkerLike;
+  readyTimer?: ReturnType<typeof setTimeout>;
+  storeTimer?: ReturnType<typeof setTimeout>;
+  /** The worker reported its store open and main's reader is open. */
+  running: boolean;
+  failed: boolean;
+  stopRequested: boolean;
+  exited: boolean;
+  exit: Promise<void>;
+  markExited: () => void;
+  stopped?: () => void;
+  status?: WorkerStatus;
+};
+
+function unref(timer: ReturnType<typeof setTimeout> | ReturnType<typeof setInterval>): void {
+  (timer as { unref?: () => void }).unref?.();
+}
+
+type Body<T> = T extends unknown ? Omit<T, "v" | "generation"> : never;
+
+export function createWorkerController(options: WorkerControllerOptions): WorkerController {
+  const now = options.now ?? Date.now;
+  const delays = options.restartDelaysMs ?? DEFAULT_RESTART_DELAYS_MS;
+  const readyTimeout = options.readyTimeoutMs ?? WORKER_READY_TIMEOUT_MS;
+  const storeTimeout = options.storeTimeoutMs ?? WORKER_STORE_TIMEOUT_MS;
+  const watchdogEvery = options.watchdogEveryMs ?? DEFAULT_WATCHDOG_EVERY_MS;
+  const maxFailures = options.maxFailures ?? DEFAULT_MAX_FAILURES;
+  const log = options.log;
+
+  let mode: DistillerMode = { kind: "worker" };
+  let current: Generation | undefined;
+  let count = 0;
+  let failures = 0;
+  let predecessor: string | undefined;
+  let stopping = false;
+  let quiesced = false;
+  let nextId = 1;
+  let restartTimer: ReturnType<typeof setTimeout> | undefined;
+  let watchdog: ReturnType<typeof setInterval> | undefined;
+  let flushScheduled = false;
+  let revisions: { cardsRev: number; vectorsRev: number } | undefined;
+  const outbox = createEventOutbox();
+  const pending = new Map<number, Pending>();
+  let markSettled!: () => void;
+  const firstSettled = new Promise<void>((resolve) => (markSettled = resolve));
+
+  const send = (gen: Generation, message: Body<MainMessage>, transfer?: ArrayBuffer[]): boolean => {
+    if (!gen.worker || gen.exited) return false;
+    try {
+      gen.worker.postMessage(
+        { v: PROTOCOL_VERSION, generation: gen.number, ...message } as MainMessage,
+        transfer,
+      );
+      return true;
+    } catch (error) {
+      log(`worker message failed: ${errmsg(error)}`);
+      return false;
+    }
+  };
+
+  const failPending = (gen: Generation, reason: string): void => {
+    for (const [id, request] of pending) {
+      if (request.generation !== gen.number) continue;
+      pending.delete(id);
+      clearTimeout(request.timer);
+      request.resolve({ status: "failed", error: reason });
+    }
+  };
+
+  const clearGenerationTimers = (gen: Generation): void => {
+    if (gen.readyTimer !== undefined) clearTimeout(gen.readyTimer);
+    if (gen.storeTimer !== undefined) clearTimeout(gen.storeTimer);
+    gen.readyTimer = undefined;
+    gen.storeTimer = undefined;
+  };
+
+  const stopWatchdog = (): void => {
+    if (watchdog !== undefined) clearInterval(watchdog);
+    watchdog = undefined;
+  };
+
+  function flushSoon(): void {
+    if (flushScheduled) return;
+    flushScheduled = true;
+    setTimeout(() => {
+      flushScheduled = false;
+      flush();
+    }, 0);
+  }
+
+  function flush(): void {
+    const gen = current;
+    if (!gen?.running || gen.failed || gen.stopRequested || outbox.size() === 0) return;
+    const signals = outbox.drain();
+    for (let i = 0; i < signals.length; i += EVENT_BATCH) {
+      send(gen, { type: "events", signals: signals.slice(i, i + EVENT_BATCH) });
+    }
+  }
+
+  function stopIndexing(gen: Generation | undefined, reason: string): void {
+    if (mode.kind !== "worker") return;
+    mode = { kind: "stopped", reason };
+    log(`indexing stopped: ${reason}`);
+    stopWatchdog();
+    if (gen) {
+      clearGenerationTimers(gen);
+      failPending(gen, "indexing stopped");
+      gen.worker?.terminate();
+    }
+    outbox.drain();
+    options.onStopped(reason);
+    markSettled();
+  }
+
+  async function fail(gen: Generation, reason: string): Promise<void> {
+    if (gen.failed || gen !== current || mode.kind !== "worker") return;
+    gen.failed = true;
+    gen.running = false;
+    failures++;
+    clearGenerationTimers(gen);
+    stopWatchdog();
+    failPending(gen, `the worker failed: ${reason}`);
+    log(`worker generation ${gen.number} failed (${failures} of ${maxFailures}): ${reason}`);
+    gen.worker?.terminate();
+    // Its thread may still be inside a statement that can commit: nothing
+    // replaces it before the thread has ended.
+    await gen.exit;
+    predecessor = gen.holderId;
+    if (stopping || mode.kind !== "worker") return;
+    if (failures >= maxFailures) {
+      mode = { kind: "inline", reason };
+      log(`the distiller runs on the main thread from now on: ${reason}`);
+      options.onInline(reason, gen.holderId);
+      markSettled();
+      return;
+    }
+    const delay = delays[Math.min(failures - 1, delays.length - 1)] ?? 0;
+    restartTimer = setTimeout(() => {
+      restartTimer = undefined;
+      void launch();
+    }, delay);
+    unref(restartTimer);
+  }
+
+  function startWatchdog(gen: Generation): void {
+    stopWatchdog();
+    watchdog = setInterval(() => {
+      if (gen !== current || !gen.running || gen.stopRequested || stopping) return;
+      if (gen.status?.distill.leaseHeld !== true) return;
+      let lease: LeaseInfo | undefined;
+      try {
+        lease = options.readLease();
+      } catch {
+        return;
+      }
+      if (lease?.holder !== gen.holderId) return;
+      const ttl = lease.ttl > 0 ? lease.ttl : LEASE_TTL_MS;
+      if (now() - lease.heartbeat > ttl) {
+        void fail(gen, `its lease heartbeat is older than ${ttl} ms`);
+      }
+    }, watchdogEvery);
+    unref(watchdog);
+  }
+
+  async function onStore(gen: Generation, message: Extract<WorkerMessage, { type: "store" }>) {
+    if (gen.storeTimer !== undefined) clearTimeout(gen.storeTimer);
+    gen.storeTimer = undefined;
+    if (!message.ok) {
+      stopIndexing(gen, `the store was refused (${message.reason})`);
+      return;
+    }
+    if (message.warning !== undefined) log(`store: ${message.warning}`);
+    let opened: { ok: true } | { ok: false; reason: string };
+    try {
+      opened = await options.onStoreOpen(message.warning);
+    } catch (error) {
+      opened = { ok: false, reason: errmsg(error) };
+    }
+    if (gen !== current || gen.failed || mode.kind !== "worker") return;
+    if (!opened.ok) {
+      void fail(gen, `main could not open its store reader (${opened.reason})`);
+      return;
+    }
+    gen.running = true;
+    startWatchdog(gen);
+    markSettled();
+    flush();
+  }
+
+  function onMessage(gen: Generation, raw: unknown): void {
+    if (gen !== current || gen.failed) return;
+    if (!isWorkerMessage(raw) || raw.generation !== gen.number) return;
+    switch (raw.type) {
+      case "ready": {
+        if (gen.readyTimer !== undefined) clearTimeout(gen.readyTimer);
+        gen.readyTimer = undefined;
+        if (raw.buildId !== BUILD_ID) {
+          void fail(gen, `build mismatch: main has ${BUILD_ID}, the worker ${raw.buildId}`);
+          return;
+        }
+        if (gen.stopRequested) return;
+        send(gen, {
+          type: "init",
+          id: nextId++,
+          deadline: now() + storeTimeout,
+          holderId: gen.holderId,
+          ...(predecessor !== undefined && { takeOver: predecessor }),
+          ...options.init,
+        });
+        gen.storeTimer = setTimeout(
+          () => void fail(gen, `no store result within ${storeTimeout} ms of init`),
+          storeTimeout,
+        );
+        unref(gen.storeTimer);
+        return;
+      }
+      case "store":
+        void onStore(gen, raw);
+        return;
+      case "status":
+        gen.status = raw.status;
+        options.onStatus?.(raw.status);
+        return;
+      case "rev":
+        revisions = { cardsRev: raw.cardsRev, vectorsRev: raw.vectorsRev };
+        return;
+      case "log":
+        if (raw.dropped) log(`worker: ${raw.dropped} log line(s) dropped`);
+        log(raw.line);
+        return;
+      case "fatal":
+        if (raw.kind === "store") stopIndexing(gen, raw.reason);
+        else void fail(gen, raw.reason);
+        return;
+      case "reply": {
+        const request = pending.get(raw.id);
+        if (!request || request.generation !== gen.number) return;
+        pending.delete(raw.id);
+        clearTimeout(request.timer);
+        if (raw.outcome === "committed" && typeof raw.revision === "number") {
+          request.resolve({ status: "committed", revision: raw.revision });
+        } else if (raw.outcome === "refused") {
+          request.resolve({ status: "refused", reason: raw.reason ?? "refused" });
+        } else {
+          request.resolve({ status: "failed", error: raw.reason ?? "the write failed" });
+        }
+        return;
+      }
+      case "stopped":
+        gen.stopped?.();
+        return;
+    }
+  }
+
+  async function launch(): Promise<void> {
+    if (stopping || mode.kind !== "worker") return;
+    const number = ++count;
+    let markExited!: () => void;
+    const gen: Generation = {
+      number,
+      holderId: `${options.instanceId}/w${number}`,
+      running: false,
+      failed: false,
+      stopRequested: false,
+      exited: false,
+      exit: new Promise<void>((resolve) => (markExited = resolve)),
+      markExited: () => {
+        gen.exited = true;
+        markExited();
+      },
+    };
+    current = gen;
+    let worker: WorkerLike;
+    try {
+      worker = await options.start(number);
+    } catch (error) {
+      gen.markExited();
+      void fail(gen, `the worker did not start: ${errmsg(error)}`);
+      return;
+    }
+    gen.worker = worker;
+    worker.onMessage((message) => onMessage(gen, message));
+    worker.onError((error) => void fail(gen, `worker error: ${errmsg(error)}`));
+    worker.onExit(() => {
+      gen.markExited();
+      gen.stopped?.();
+      if (gen === current && !gen.failed && !gen.stopRequested && mode.kind === "worker") {
+        void fail(gen, "the worker exited unexpectedly");
+      }
+    });
+    if (stopping) {
+      worker.terminate();
+      return;
+    }
+    gen.readyTimer = setTimeout(
+      () => void fail(gen, `no ready within ${readyTimeout} ms of starting`),
+      readyTimeout,
+    );
+    unref(gen.readyTimer);
+  }
+
+  const writeVectors: CardVectorWriter = (model, representation, rows) => {
+    const gen = current;
+    if (mode.kind !== "worker" || !gen?.running || gen.failed || gen.stopRequested) {
+      return Promise.resolve({ status: "failed", error: "the store writer is not running" });
+    }
+    if (pending.size >= MAX_PENDING_REQUESTS) {
+      return Promise.resolve({ status: "failed", error: "too many vector writes are waiting" });
+    }
+    const id = nextId++;
+    return new Promise<CardVectorWriteResult>((resolve) => {
+      const timer = setTimeout(() => {
+        pending.delete(id);
+        resolve({ status: "failed", error: "no acknowledgement before the deadline" });
+      }, VECTOR_WRITE_DEADLINE_MS);
+      unref(timer);
+      pending.set(id, { generation: gen.number, resolve, timer });
+      const sent = send(
+        gen,
+        {
+          type: "vectors",
+          id,
+          deadline: now() + VECTOR_WRITE_DEADLINE_MS,
+          model,
+          representation,
+          rows,
+        },
+        transferableBuffers(rows),
+      );
+      if (!sent) {
+        pending.delete(id);
+        clearTimeout(timer);
+        resolve({ status: "failed", error: "the store writer is not running" });
+      }
+    });
+  };
+
+  void launch();
+
+  return {
+    settled: () => firstSettled,
+    mode: () => mode,
+    status: () => current?.status,
+    generation: () => count,
+    holderId: () => current?.holderId,
+    revisions: () => revisions,
+    post(signal) {
+      if (mode.kind !== "worker" || stopping || quiesced) return false;
+      outbox.add(signal);
+      if (current?.running) flushSoon();
+      return true;
+    },
+    drainEvents: () => outbox.drain(),
+    writeVectors,
+    quiesce() {
+      quiesced = true;
+      outbox.drain();
+    },
+    async stop(deadlineMs) {
+      stopping = true;
+      quiesced = true;
+      outbox.drain();
+      stopWatchdog();
+      if (restartTimer !== undefined) clearTimeout(restartTimer);
+      restartTimer = undefined;
+      markSettled();
+      const gen = current;
+      if (!gen?.worker || gen.exited || gen.failed) return false;
+      clearGenerationTimers(gen);
+      gen.stopRequested = true;
+      const stopped = new Promise<void>((resolve) => (gen.stopped = resolve));
+      const sent = send(gen, { type: "stop", id: nextId++, deadline: now() + deadlineMs });
+      if (!sent) return false;
+      const result = await settleWithin(stopped, deadlineMs);
+      failPending(gen, "the worker stopped");
+      return !result.timedOut && !gen.exited;
+    },
+    async terminate(waitMs) {
+      stopping = true;
+      stopWatchdog();
+      if (restartTimer !== undefined) clearTimeout(restartTimer);
+      restartTimer = undefined;
+      const gen = current;
+      if (!gen) return;
+      failPending(gen, "the worker ended");
+      if (!gen.worker || gen.exited) return;
+      gen.stopRequested = true;
+      gen.worker.terminate();
+      await settleWithin(gen.exit, waitMs);
+    },
+  };
+}
