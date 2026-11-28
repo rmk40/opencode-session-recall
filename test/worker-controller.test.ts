@@ -1,0 +1,992 @@
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { mkdtempSync, realpathSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { BUILD_ID } from "../src/build-id.js";
+import type { CardVectorWriteResult } from "../src/cards.js";
+import { LEASE_TTL_MS, type DistillSignal } from "../src/distill.js";
+import { openSqlite } from "../src/sqlite.js";
+import { openStore, VECTORS_REV_KEY, type LeaseInfo } from "../src/store.js";
+import {
+  createWorkerController,
+  type WorkerController,
+  type WorkerControllerOptions,
+} from "../src/worker/controller.js";
+import type { WorkerStatus } from "../src/worker/protocol.js";
+import { insertProject, insertSession, makeV2PartsDb, type V2TestDb } from "./v2-db.js";
+import {
+  harnessController,
+  scriptedWorkers,
+  workerHarness,
+  workerInit,
+  type ScriptedWorker,
+} from "./worker-harness.js";
+
+/**
+ * Main's side of the worker (`createWorkerController`): how it starts each
+ * generation and times it out, what counts as a failure, how it restarts and
+ * when it gives up (inline) or stops for good, its watchdog, its vector
+ * writes and signal posts, and how it stops. Scripted workers under fake
+ * timers drive one event at a time; the inline harness, over a real store,
+ * covers crashes inside and around a commit.
+ */
+
+// ── Scripted workers under fake timers ──────────────────────────────────────
+
+type Recorded = {
+  storeOpens: Array<string | undefined>;
+  stopped: string[];
+  inline: Array<{ reason: string; lastHolder: string | undefined }>;
+  logs: string[];
+  statuses: WorkerStatus[];
+};
+
+const INIT = workerInit({ storePath: "/scratch/store.db", sourcePath: "/scratch/opencode.db" });
+
+function scriptedController(
+  overrides: Partial<WorkerControllerOptions> = {},
+  /** Starts that reject, from generation 1 on. */
+  failStarts = 0,
+): {
+  controller: WorkerController;
+  scripted: ReturnType<typeof scriptedWorkers>;
+  record: Recorded;
+} {
+  const scripted = scriptedWorkers();
+  scripted.failStarts(failStarts);
+  const record: Recorded = { storeOpens: [], stopped: [], inline: [], logs: [], statuses: [] };
+  const controller = createWorkerController({
+    start: scripted.start,
+    instanceId: "inst",
+    init: INIT,
+    log: (line) => record.logs.push(line),
+    onStoreOpen: async (warning) => {
+      record.storeOpens.push(warning);
+      return { ok: true };
+    },
+    onStopped: (reason) => record.stopped.push(reason),
+    onInline: (reason, lastHolder) => record.inline.push({ reason, lastHolder }),
+    onStatus: (status) => record.statuses.push(status),
+    readLease: () => undefined,
+    ...overrides,
+  });
+  return { controller, scripted, record };
+}
+
+/** Run what is due now and the promise chains it starts. */
+async function flush(): Promise<void> {
+  for (let i = 0; i < 5; i++) await vi.advanceTimersByTimeAsync(0);
+}
+async function advance(ms: number): Promise<void> {
+  await vi.advanceTimersByTimeAsync(ms);
+}
+
+/** Settle-state of a promise, without waiting for it. */
+function tracked<T>(promise: Promise<T>): { settled: boolean; value?: T } {
+  const state: { settled: boolean; value?: T } = { settled: false };
+  void promise.then((value) => {
+    state.settled = true;
+    state.value = value;
+  });
+  return state;
+}
+
+async function ready(worker: ScriptedWorker, buildId = BUILD_ID): Promise<void> {
+  worker.emit({ type: "ready", buildId });
+  await flush();
+}
+
+/** Ready, init and a store result that opens: the generation runs. */
+async function run(worker: ScriptedWorker, warning?: string): Promise<void> {
+  await ready(worker);
+  const init = worker.last("init");
+  if (!init) throw new Error("no init was sent");
+  worker.emit({
+    type: "store",
+    id: init.id,
+    ok: true,
+    ...(warning !== undefined && { warning }),
+  });
+  await flush();
+}
+
+function status(over: { leaseHeld?: boolean; holderId?: string } = {}): WorkerStatus {
+  return {
+    holderId: over.holderId ?? "inst/w1",
+    distill: {
+      leaseHeld: over.leaseHeld ?? true,
+      coldPass: "done",
+      distilledCount: 0,
+      knownCount: 0,
+      examinedCount: 0,
+      quarantinedCount: 0,
+      skippedCount: 0,
+      failingCount: 0,
+    },
+    discoveryTruncated: false,
+    longestStoreCallMs: 0,
+  };
+}
+
+/** A lease row whose heartbeat is `age` ms old whenever it is read. */
+function leaseOf(holder: string, age: number, ttl = LEASE_TTL_MS): () => LeaseInfo {
+  return () => ({ holder, build: "b", gen: 1, heartbeat: Date.now() - age, ttl });
+}
+
+const failures = (record: Recorded): string[] =>
+  record.logs.filter((line) => /^worker generation \d+ failed/.test(line));
+
+describe("the controller with scripted workers", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  describe("starting a generation", () => {
+    it("starts generation 1 at creation, as <instanceId>/w1, and sends init only after ready", async () => {
+      const { controller, scripted } = scriptedController();
+      await flush();
+      expect(scripted.workers).toHaveLength(1);
+      expect(controller.generation()).toBe(1);
+      expect(controller.holderId()).toBe("inst/w1");
+      expect(controller.mode()).toEqual({ kind: "worker" });
+      const worker = scripted.worker(1);
+      expect(worker.received).toEqual([]);
+
+      await ready(worker);
+      const init = worker.last("init");
+      expect(init).toMatchObject({ ...INIT, type: "init", generation: 1, holderId: "inst/w1" });
+      expect(init).not.toHaveProperty("takeOver");
+      expect(init?.deadline).toBe(Date.now() + 10_000);
+    });
+
+    it("fails a generation that reports no ready within 10 s of its start", async () => {
+      const { scripted, record } = scriptedController();
+      await flush();
+      await advance(9_999);
+      expect(scripted.worker(1).terminations).toBe(0);
+      await advance(1);
+      expect(scripted.worker(1).terminations).toBe(1);
+      expect(failures(record)).toEqual([
+        "worker generation 1 failed (1 of 3): no ready within 10000 ms of starting",
+      ]);
+    });
+
+    it("fails a generation that reports no store result within 10 s of init", async () => {
+      const { scripted, record } = scriptedController();
+      await flush();
+      await advance(5_000);
+      await ready(scripted.worker(1));
+      await advance(9_999);
+      expect(scripted.worker(1).terminations).toBe(0);
+      await advance(1);
+      expect(scripted.worker(1).terminations).toBe(1);
+      expect(failures(record)).toEqual([
+        "worker generation 1 failed (1 of 3): no store result within 10000 ms of init",
+      ]);
+    });
+
+    it("counts a ready from another build as a failure and sends no init", async () => {
+      const { scripted, record } = scriptedController();
+      await flush();
+      await ready(scripted.worker(1), "another-build");
+      expect(scripted.worker(1).last("init")).toBeUndefined();
+      expect(scripted.worker(1).terminations).toBe(1);
+      expect(failures(record)).toEqual([
+        `worker generation 1 failed (1 of 3): build mismatch: main has ${BUILD_ID}, the worker another-build`,
+      ]);
+    });
+
+    it.each([
+      [
+        "an error event",
+        (w: ScriptedWorker) => w.error(new Error("boom")),
+        "worker error: boom",
+        true,
+      ],
+      [
+        "an exit main did not ask for",
+        (w: ScriptedWorker) => w.exit(),
+        "the worker exited unexpectedly",
+        false,
+      ],
+      [
+        "a fatal crash",
+        (w: ScriptedWorker) => w.emit({ type: "fatal", kind: "crash", reason: "it broke" }),
+        "it broke",
+        true,
+      ],
+    ] as const)("fails a generation on %s", async (_label, act, reason, needsExit) => {
+      const { scripted, record } = scriptedController();
+      await flush();
+      await ready(scripted.worker(1));
+      act(scripted.worker(1));
+      await flush();
+      expect(scripted.worker(1).terminations).toBe(1);
+      expect(failures(record)).toEqual([`worker generation 1 failed (1 of 3): ${reason}`]);
+      if (needsExit) scripted.worker(1).exit();
+      await advance(1_000);
+      expect(scripted.workers).toHaveLength(2);
+    });
+
+    it.each([
+      ["refuses", async () => ({ ok: false as const, reason: "busy: locked" })],
+      [
+        "throws",
+        async (): Promise<{ ok: true }> => {
+          throw new Error("no reader");
+        },
+      ],
+    ])(
+      "fails a generation whose store reader %s after the worker opened the store",
+      async (_label, onStoreOpen) => {
+        const { controller, scripted, record } = scriptedController({ onStoreOpen });
+        await flush();
+        await run(scripted.worker(1));
+        expect(scripted.worker(1).terminations).toBe(1);
+        const [line] = failures(record);
+        expect(line).toMatch(
+          /^worker generation 1 failed \(1 of 3\): main could not open its store reader \((busy: locked|no reader)\)$/,
+        );
+        expect(tracked(controller.settled()).settled).toBe(false);
+      },
+    );
+
+    it("fails a generation whose starter rejects, and starts the next one after the delay", async () => {
+      const { scripted, record } = scriptedController({}, 1);
+      await flush();
+      expect(failures(record)).toEqual([
+        "worker generation 1 failed (1 of 3): the worker did not start: the worker module did not load",
+      ]);
+      expect(scripted.workers).toHaveLength(0);
+      await advance(1_000);
+      expect(scripted.workers).toHaveLength(1);
+      expect(scripted.workers[0]?.generation).toBe(2);
+    });
+
+    it("counts a generation's failure once however many ways it fails", async () => {
+      const { scripted, record } = scriptedController();
+      await flush();
+      await ready(scripted.worker(1));
+      scripted.worker(1).emit({ type: "fatal", kind: "crash", reason: "first" });
+      scripted.worker(1).error(new Error("second"));
+      await advance(20_000);
+      scripted.worker(1).exit();
+      await flush();
+      expect(failures(record)).toEqual(["worker generation 1 failed (1 of 3): first"]);
+    });
+  });
+
+  describe("restarts", () => {
+    it("starts each replacement after its predecessor's exit, 1 s and then 5 s later", async () => {
+      const { scripted } = scriptedController();
+      await flush();
+      await ready(scripted.worker(1));
+      scripted.worker(1).emit({ type: "fatal", kind: "crash", reason: "crashed" });
+      await flush();
+      // Asked to end, the thread has not yet: nothing replaces it.
+      await advance(60_000);
+      expect(scripted.workers).toHaveLength(1);
+      scripted.worker(1).exit();
+      await advance(999);
+      expect(scripted.workers).toHaveLength(1);
+      await advance(1);
+      expect(scripted.workers).toHaveLength(2);
+
+      await ready(scripted.worker(2));
+      scripted.worker(2).emit({ type: "fatal", kind: "crash", reason: "crashed again" });
+      await flush();
+      scripted.worker(2).exit();
+      await advance(4_999);
+      expect(scripted.workers).toHaveLength(2);
+      await advance(1);
+      expect(scripted.workers).toHaveLength(3);
+    });
+
+    it("names the failed generation's holder in its replacement's init", async () => {
+      const { controller, scripted } = scriptedController({ restartDelaysMs: [0, 0] });
+      await flush();
+      await run(scripted.worker(1));
+      scripted.worker(1).emit({ type: "fatal", kind: "crash", reason: "crashed" });
+      scripted.worker(1).exit();
+      await flush();
+      expect(controller.holderId()).toBe("inst/w2");
+      await ready(scripted.worker(2));
+      expect(scripted.worker(2).last("init")).toMatchObject({
+        holderId: "inst/w2",
+        takeOver: "inst/w1",
+      });
+
+      scripted.worker(2).exit();
+      await flush();
+      await ready(scripted.worker(3));
+      expect(scripted.worker(3).last("init")).toMatchObject({
+        holderId: "inst/w3",
+        takeOver: "inst/w2",
+      });
+    });
+
+    it("runs the distiller inline after the third failure, once the last thread has exited", async () => {
+      const { controller, scripted, record } = scriptedController({ restartDelaysMs: [0, 0] });
+      const settled = tracked(controller.settled());
+      await flush();
+      for (const generation of [1, 2, 3]) {
+        await ready(scripted.worker(generation));
+        scripted
+          .worker(generation)
+          .emit({ type: "fatal", kind: "crash", reason: `crash ${generation}` });
+        await flush();
+        if (generation < 3) {
+          scripted.worker(generation).exit();
+          await flush();
+        }
+      }
+      expect(scripted.worker(3).terminations).toBe(1);
+      expect(controller.mode()).toEqual({ kind: "worker" });
+      expect(record.inline).toEqual([]);
+      expect(settled.settled).toBe(false);
+
+      scripted.worker(3).exit();
+      await flush();
+      expect(controller.mode()).toEqual({ kind: "inline", reason: "crash 3" });
+      expect(record.inline).toEqual([{ reason: "crash 3", lastHolder: "inst/w3" }]);
+      expect(settled.settled).toBe(true);
+      expect(controller.post({ type: "turn-ended", sessionID: "s" })).toBe(false);
+      await advance(60_000);
+      expect(scripted.workers).toHaveLength(3);
+    });
+
+    it("goes inline after as many failures as maxFailures says", async () => {
+      const { controller, scripted, record } = scriptedController({ maxFailures: 1 }, 1);
+      await flush();
+      expect(scripted.workers).toEqual([]);
+      expect(controller.mode()).toEqual({
+        kind: "inline",
+        reason: "the worker did not start: the worker module did not load",
+      });
+      expect(record.inline).toEqual([
+        {
+          reason: "the worker did not start: the worker module did not load",
+          lastHolder: "inst/w1",
+        },
+      ]);
+    });
+  });
+
+  describe("store results", () => {
+    it("runs the generation on store ok: the reader opens, settled resolves and queued signals go out", async () => {
+      const { controller, scripted, record } = scriptedController();
+      const settled = tracked(controller.settled());
+      await flush();
+      expect(controller.post({ type: "turn-ended", sessionID: "s1" })).toBe(true);
+      expect(controller.post({ type: "deleted", sessionID: "s2" })).toBe(true);
+      await ready(scripted.worker(1));
+      await flush();
+      expect(scripted.worker(1).last("events")).toBeUndefined();
+
+      await run(scripted.worker(1), "journal_mode stays delete");
+      expect(record.storeOpens).toEqual(["journal_mode stays delete"]);
+      expect(record.logs).toContain("store: journal_mode stays delete");
+      expect(settled.settled).toBe(true);
+      expect(scripted.worker(1).last("events")?.signals).toEqual([
+        { type: "turn-ended", sessionID: "s1" },
+        { type: "deleted", sessionID: "s2" },
+      ]);
+    });
+
+    it("stops indexing for good on a store refusal, with no retry", async () => {
+      const { controller, scripted, record } = scriptedController();
+      const settled = tracked(controller.settled());
+      await flush();
+      controller.post({ type: "turn-ended", sessionID: "s1" });
+      await ready(scripted.worker(1));
+      const init = scripted.worker(1).last("init");
+      scripted
+        .worker(1)
+        .emit({ type: "store", id: init?.id, ok: false, reason: "source-mismatch" });
+      await flush();
+      expect(controller.mode()).toEqual({ kind: "stopped", reason: "source-mismatch" });
+      expect(record.stopped).toEqual(["source-mismatch"]);
+      expect(record.storeOpens).toEqual([]);
+      expect(scripted.worker(1).terminations).toBe(1);
+      expect(settled.settled).toBe(true);
+      expect(controller.drainEvents()).toEqual([]);
+      expect(controller.post({ type: "turn-ended", sessionID: "s1" })).toBe(false);
+
+      scripted.worker(1).exit();
+      await advance(60_000);
+      expect(scripted.workers).toHaveLength(1);
+      expect(failures(record)).toEqual([]);
+    });
+
+    it("stops indexing for good on a fatal store, failing the writes that wait", async () => {
+      const { controller, scripted, record } = scriptedController();
+      await flush();
+      await run(scripted.worker(1));
+      const write = controller.writeVectors("m", 1, []);
+      scripted
+        .worker(1)
+        .emit({ type: "fatal", kind: "store", reason: "the store file is damaged: x" });
+      await flush();
+      expect(await write).toEqual({ status: "failed", error: "indexing stopped" });
+      expect(controller.mode()).toEqual({
+        kind: "stopped",
+        reason: "the store file is damaged: x",
+      });
+      expect(record.stopped).toEqual(["the store file is damaged: x"]);
+      expect(scripted.worker(1).terminations).toBe(1);
+      scripted.worker(1).exit();
+      await advance(60_000);
+      expect(scripted.workers).toHaveLength(1);
+    });
+  });
+
+  describe("the watchdog", () => {
+    /** The lease row the reader sees, computed at each read. */
+    let lease: () => LeaseInfo | undefined;
+    let leaseError: Error | undefined;
+    const readLease = (): LeaseInfo | undefined => {
+      if (leaseError) throw leaseError;
+      return lease();
+    };
+
+    beforeEach(() => {
+      lease = () => undefined;
+      leaseError = undefined;
+    });
+
+    async function watched(last: WorkerStatus | undefined): Promise<{
+      scripted: ReturnType<typeof scriptedWorkers>;
+      record: Recorded;
+    }> {
+      const { scripted, record } = scriptedController({ readLease });
+      await flush();
+      await run(scripted.worker(1));
+      if (last) scripted.worker(1).emit({ type: "status", status: last });
+      return { scripted, record };
+    }
+
+    it("fails a generation whose lease heartbeat is older than the lease's TTL", async () => {
+      const { scripted, record } = await watched(status());
+      lease = leaseOf("inst/w1", 30_001);
+      await advance(4_999);
+      expect(failures(record)).toEqual([]);
+      await advance(1);
+      expect(scripted.worker(1).terminations).toBe(1);
+      expect(failures(record)).toEqual([
+        "worker generation 1 failed (1 of 3): its lease heartbeat is older than 30000 ms",
+      ]);
+    });
+
+    it("uses LEASE_TTL_MS for a lease row without a TTL", async () => {
+      const { record } = await watched(status());
+      lease = leaseOf("inst/w1", LEASE_TTL_MS + 1, 0);
+      await advance(5_000);
+      expect(failures(record)).toEqual([
+        `worker generation 1 failed (1 of 3): its lease heartbeat is older than ${LEASE_TTL_MS} ms`,
+      ]);
+    });
+
+    const calm: Array<[string, WorkerStatus | undefined, () => LeaseInfo | undefined]> = [
+      ["no status yet", undefined, leaseOf("inst/w1", 60_000)],
+      ["a last status without the lease", status({ leaseHeld: false }), leaseOf("inst/w1", 60_000)],
+      ["a lease row naming another holder", status(), leaseOf("other/w1", 60_000)],
+      ["a heartbeat exactly at the TTL", status(), leaseOf("inst/w1", 30_000)],
+      ["a longer TTL on the row", status(), leaseOf("inst/w1", 30_001, 60_000)],
+      ["no lease row", status(), () => undefined],
+    ];
+    it.each(calm)("leaves a generation alone with %s", async (_label, last, row) => {
+      const { scripted, record } = await watched(last);
+      lease = row;
+      await advance(20_000);
+      expect(failures(record)).toEqual([]);
+      expect(scripted.worker(1).terminations).toBe(0);
+    });
+
+    it("ignores a lease read that throws", async () => {
+      const { scripted, record } = await watched(status());
+      leaseError = new Error("SQLITE_BUSY");
+      await advance(20_000);
+      expect(failures(record)).toEqual([]);
+      expect(scripted.worker(1).terminations).toBe(0);
+    });
+
+    it("does not trip once a stop is pending", async () => {
+      const { controller, scripted, record } = scriptedController({ readLease });
+      await flush();
+      await run(scripted.worker(1));
+      scripted.worker(1).emit({ type: "status", status: status() });
+      lease = leaseOf("inst/w1", 60_000);
+      void controller.stop(60_000);
+      await advance(20_000);
+      expect(failures(record)).toEqual([]);
+      expect(scripted.worker(1).terminations).toBe(0);
+    });
+  });
+
+  describe("vector writes", () => {
+    it("fail at once while no generation runs", async () => {
+      const { controller, scripted } = scriptedController();
+      await flush();
+      expect(await controller.writeVectors("m", 1, [])).toEqual({
+        status: "failed",
+        error: "the store writer is not running",
+      });
+      await run(scripted.worker(1));
+      void controller.stop(1_000);
+      expect(await controller.writeVectors("m", 1, [])).toEqual({
+        status: "failed",
+        error: "the store writer is not running",
+      });
+    });
+
+    it.each([
+      [
+        "committed with a revision",
+        { outcome: "committed", revision: 7 },
+        { status: "committed", revision: 7 },
+      ],
+      [
+        "committed without a revision",
+        { outcome: "committed" },
+        { status: "failed", error: "the write failed" },
+      ],
+      ["refused", { outcome: "refused", reason: "older" }, { status: "refused", reason: "older" }],
+      [
+        "failed",
+        { outcome: "failed", reason: "disk I/O" },
+        { status: "failed", error: "disk I/O" },
+      ],
+    ] as const)("settle a reply %s as its outcome", async (_label, reply, expected) => {
+      const { controller, scripted } = scriptedController();
+      await flush();
+      await run(scripted.worker(1));
+      const write = controller.writeVectors("m", 3, []);
+      const sent = scripted.worker(1).last("vectors");
+      expect(sent).toMatchObject({ model: "m", representation: 3, rows: [] });
+      scripted.worker(1).emit({ type: "reply", id: sent?.id, ...reply });
+      expect(await write).toEqual(expected);
+    });
+
+    it("transfer only the embeddings that are whole buffers of their own", async () => {
+      const { controller, scripted } = scriptedController();
+      await flush();
+      await run(scripted.worker(1));
+      const whole = new Uint8Array(8);
+      const view = new Uint8Array(new ArrayBuffer(16), 4, 8);
+      void controller.writeVectors("m", 1, [
+        { sessionId: "a", embedding: whole, expectedSummaryHash: "" },
+        { sessionId: "b", embedding: view, expectedSummaryHash: "" },
+      ]);
+      const entry = scripted.worker(1).received.find((r) => r.message.type === "vectors");
+      expect(entry?.transfer).toHaveLength(1);
+      expect(entry?.transfer?.[0]).toBe(whole.buffer);
+    });
+
+    it("fail a ninth write while eight wait for their replies", async () => {
+      const { controller, scripted } = scriptedController();
+      await flush();
+      await run(scripted.worker(1));
+      const waiting = Array.from({ length: 8 }, () => tracked(controller.writeVectors("m", 1, [])));
+      expect(await controller.writeVectors("m", 1, [])).toEqual({
+        status: "failed",
+        error: "too many vector writes are waiting",
+      });
+      expect(waiting.every((w) => !w.settled)).toBe(true);
+    });
+
+    it("fail a write with no reply within 10 s, and ignore its late reply", async () => {
+      const { controller, scripted } = scriptedController();
+      await flush();
+      await run(scripted.worker(1));
+      const write = tracked(controller.writeVectors("m", 1, []));
+      const sent = scripted.worker(1).last("vectors");
+      expect(sent?.deadline).toBe(Date.now() + 10_000);
+      await advance(9_999);
+      expect(write.settled).toBe(false);
+      await advance(1);
+      expect(write.value).toEqual({
+        status: "failed",
+        error: "no acknowledgement before the deadline",
+      });
+      scripted.worker(1).emit({ type: "reply", id: sent?.id, outcome: "committed", revision: 1 });
+      await flush();
+      expect(write.value).toEqual({
+        status: "failed",
+        error: "no acknowledgement before the deadline",
+      });
+    });
+
+    it("fail the writes that wait when their generation fails", async () => {
+      const { controller, scripted } = scriptedController();
+      await flush();
+      await run(scripted.worker(1));
+      const write = controller.writeVectors("m", 1, []);
+      scripted.worker(1).emit({ type: "fatal", kind: "crash", reason: "crashed" });
+      expect(await write).toEqual({ status: "failed", error: "the worker failed: crashed" });
+    });
+  });
+
+  describe("stop and terminate", () => {
+    it("returns the first stop's promise on every call and resolves true on stopped", async () => {
+      const { controller, scripted } = scriptedController();
+      await flush();
+      await run(scripted.worker(1));
+      const first = controller.stop(1_000);
+      expect(controller.stop(5_000)).toBe(first);
+      await flush();
+      const stops = scripted.worker(1).received.filter((r) => r.message.type === "stop");
+      expect(stops).toHaveLength(1);
+      const stop = stops[0]?.message as { id: number; deadline: number };
+      expect(stop.deadline).toBe(Date.now() + 1_000);
+      expect(controller.post({ type: "turn-ended", sessionID: "s" })).toBe(false);
+      scripted.worker(1).emit({ type: "stopped", id: stop.id });
+      expect(await first).toBe(true);
+    });
+
+    it.each([
+      ["at its deadline", async () => advance(1_000)],
+      [
+        "when the thread exits first",
+        async (w: ScriptedWorker) => {
+          w.exit();
+          await flush();
+        },
+      ],
+    ] as const)("resolves false %s", async (_label, end) => {
+      const { controller, scripted, record } = scriptedController();
+      await flush();
+      await run(scripted.worker(1));
+      const stopped = tracked(controller.stop(1_000));
+      await flush();
+      await end(scripted.worker(1));
+      await flush();
+      expect(stopped).toEqual({ settled: true, value: false });
+      // Asked to stop, its exit is no failure.
+      expect(failures(record)).toEqual([]);
+    });
+
+    it("resolves false with no live generation, cancelling the restart and resolving settled", async () => {
+      const { controller, scripted } = scriptedController();
+      const settled = tracked(controller.settled());
+      await flush();
+      await ready(scripted.worker(1));
+      scripted.worker(1).emit({ type: "fatal", kind: "crash", reason: "crashed" });
+      scripted.worker(1).exit();
+      await flush();
+      expect(await controller.stop(1_000)).toBe(false);
+      await flush();
+      expect(settled.settled).toBe(true);
+      await advance(60_000);
+      expect(scripted.workers).toHaveLength(1);
+    });
+
+    it("sends no init to a generation asked to stop before it was ready", async () => {
+      const { controller, scripted } = scriptedController();
+      await flush();
+      void controller.stop(1_000);
+      await flush();
+      await ready(scripted.worker(1));
+      expect(scripted.worker(1).last("init")).toBeUndefined();
+      expect(scripted.worker(1).last("stop")).toBeDefined();
+      // Nor does the missing ready count against it.
+      await advance(20_000);
+      expect(scripted.worker(1).terminations).toBe(0);
+    });
+
+    it("waits at most its bound for the thread's exit on terminate", async () => {
+      const { controller, scripted } = scriptedController();
+      await flush();
+      await run(scripted.worker(1));
+      const write = controller.writeVectors("m", 1, []);
+      const ended = tracked(controller.terminate(500));
+      await flush();
+      expect(scripted.worker(1).terminations).toBe(1);
+      expect(await write).toEqual({ status: "failed", error: "the worker ended" });
+      await advance(499);
+      expect(ended.settled).toBe(false);
+      await advance(1);
+      expect(ended.settled).toBe(true);
+    });
+
+    it("returns from terminate at the thread's exit", async () => {
+      const { controller, scripted } = scriptedController();
+      await flush();
+      await run(scripted.worker(1));
+      const ended = tracked(controller.terminate(10_000));
+      await flush();
+      scripted.worker(1).exit();
+      await flush();
+      expect(ended.settled).toBe(true);
+    });
+  });
+
+  describe("generations", () => {
+    it("drops replies and status from a generation that is no longer current", async () => {
+      const { controller, scripted, record } = scriptedController({ restartDelaysMs: [0, 0] });
+      await flush();
+      await run(scripted.worker(1));
+      scripted.worker(1).emit({ type: "fatal", kind: "crash", reason: "crashed" });
+      scripted.worker(1).exit();
+      await flush();
+      await run(scripted.worker(2));
+      const write = tracked(controller.writeVectors("m", 1, []));
+      const sent = scripted.worker(2).last("vectors");
+
+      const old = scripted.worker(1);
+      old.emit({ type: "status", status: status({ holderId: "inst/w1" }) });
+      old.emit({ type: "reply", id: sent?.id, outcome: "committed", revision: 9 });
+      old.emit({ type: "rev", cardsRev: 5, vectorsRev: 5 });
+      // The current worker's channel, but another generation's envelope.
+      scripted.worker(2).emit({ type: "status", status: status(), generation: 1 });
+      scripted.worker(2).emitRaw({ type: "status", status: status() });
+      await flush();
+      expect(controller.status()).toBeUndefined();
+      expect(record.statuses).toEqual([]);
+      expect(controller.revisions()).toBeUndefined();
+      expect(write.settled).toBe(false);
+
+      scripted.worker(2).emit({ type: "reply", id: sent?.id, outcome: "committed", revision: 1 });
+      await flush();
+      expect(write.value).toEqual({ status: "committed", revision: 1 });
+    });
+
+    it("keeps the current generation's last status, revision hint and log lines", async () => {
+      const { controller, scripted, record } = scriptedController();
+      await flush();
+      await run(scripted.worker(1));
+      const last = status({ leaseHeld: false });
+      scripted.worker(1).emit({ type: "status", status: status() });
+      scripted.worker(1).emit({ type: "status", status: last });
+      scripted.worker(1).emit({ type: "rev", cardsRev: 4, vectorsRev: 2 });
+      scripted.worker(1).emit({ type: "log", line: "worker says hi", dropped: 3 });
+      expect(controller.status()).toEqual(last);
+      expect(record.statuses).toHaveLength(2);
+      expect(controller.revisions()).toEqual({ cardsRev: 4, vectorsRev: 2 });
+      expect(record.logs.slice(-2)).toEqual(["worker: 3 log line(s) dropped", "worker says hi"]);
+    });
+  });
+
+  describe("posting signals", () => {
+    it("sends queued signals on the next turn, in messages of at most 256", async () => {
+      const { controller, scripted } = scriptedController();
+      await flush();
+      await run(scripted.worker(1));
+      for (let i = 0; i < 600; i++) controller.post({ type: "turn-ended", sessionID: `s${i}` });
+      expect(scripted.worker(1).last("events")).toBeUndefined();
+      await flush();
+      const batches = scripted
+        .worker(1)
+        .received.filter((r) => r.message.type === "events")
+        .map((r) => (r.message as { signals: DistillSignal[] }).signals);
+      expect(batches.map((b) => b.length)).toEqual([256, 256, 88]);
+      expect(batches.flat().map((s) => s.sessionID)).toEqual(
+        Array.from({ length: 600 }, (_, i) => `s${i}`),
+      );
+    });
+
+    it("takes no signal once quiesced, and drops the queued ones", async () => {
+      const { controller } = scriptedController();
+      await flush();
+      expect(controller.post({ type: "turn-ended", sessionID: "s1" })).toBe(true);
+      controller.quiesce();
+      expect(controller.drainEvents()).toEqual([]);
+      expect(controller.post({ type: "turn-ended", sessionID: "s2" })).toBe(false);
+    });
+
+    it("hands the queued signals over through drainEvents", async () => {
+      const { controller } = scriptedController();
+      await flush();
+      controller.post({ type: "turn-ended", sessionID: "s1" });
+      controller.post({ type: "meta", sessionID: "s1", patch: { title: "t" } });
+      expect(controller.drainEvents()).toEqual([
+        { type: "meta", sessionID: "s1", patch: { title: "t" } },
+        { type: "turn-ended", sessionID: "s1" },
+      ]);
+      expect(controller.drainEvents()).toEqual([]);
+    });
+  });
+});
+
+// ── The inline harness over a real store ────────────────────────────────────
+
+describe("the controller over the inline harness", () => {
+  let dir: string;
+  let v2: V2TestDb;
+  let storePath: string;
+  let sourcePath: string;
+  const controllers: WorkerController[] = [];
+
+  beforeEach(async () => {
+    dir = realpathSync(mkdtempSync(join(tmpdir(), "recall-worker-controller-")));
+    v2 = await makeV2PartsDb();
+    insertProject(v2.db, { id: "prj", worktree: "/w" });
+    insertSession(v2.db, {
+      id: "ses_a",
+      project_id: "prj",
+      directory: "/w",
+      time_created: 1_000,
+      time_updated: 1_200,
+    });
+    storePath = join(dir, "store.db");
+    sourcePath = realpathSync(v2.path);
+  });
+
+  afterEach(async () => {
+    for (const controller of controllers.splice(0)) {
+      await controller.stop(2_000);
+      await controller.terminate(2_000);
+    }
+    v2.cleanup();
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
+  async function waitFor(pred: () => boolean, what: string, timeoutMs = 10_000): Promise<void> {
+    const start = Date.now();
+    while (!pred()) {
+      if (Date.now() - start > timeoutMs) throw new Error(`timed out waiting for ${what}`);
+      await sleep(5);
+    }
+  }
+
+  function start(
+    coldPass: boolean,
+    failStarts = 0,
+  ): ReturnType<typeof harnessController> & {
+    harness: ReturnType<typeof workerHarness>;
+  } {
+    const harness = workerHarness();
+    harness.failStarts(failStarts);
+    const made = harnessController(
+      harness,
+      workerInit({ storePath, sourcePath, limits: { coldPass } }),
+    );
+    controllers.push(made.controller);
+    return { ...made, harness };
+  }
+
+  async function meta(key: string): Promise<string | undefined> {
+    const db = await openSqlite(storePath);
+    if (!db) throw new Error("no sqlite");
+    try {
+      const row = db.get("SELECT value FROM meta WHERE key = ?", [key]);
+      return row === undefined ? undefined : String(row.value);
+    } finally {
+      db.close();
+    }
+  }
+
+  const leaseHolder = async (): Promise<string | undefined> => {
+    const raw = await meta("distill_lease");
+    return raw === undefined ? undefined : (JSON.parse(raw) as { holder: string }).holder;
+  };
+
+  async function running(controller: WorkerController, generation: number): Promise<void> {
+    await waitFor(
+      () => controller.generation() === generation && controller.status() !== undefined,
+      `generation ${generation} to run`,
+    );
+  }
+
+  it("fails the write and rolls it back when the worker crashes before its commit", async () => {
+    const { controller, harness } = start(false);
+    await controller.settled();
+    await running(controller, 1);
+    harness.side(1)?.arm({ at: "before-commit" });
+    const result: CardVectorWriteResult = await controller.writeVectors("m", 1, []);
+    expect(result).toEqual({
+      status: "failed",
+      error: "the worker failed: the worker exited unexpectedly",
+    });
+    expect(await meta(VECTORS_REV_KEY)).toBeUndefined();
+
+    await running(controller, 2);
+    // The next generation's first write is the store's first.
+    expect(await controller.writeVectors("m", 1, [])).toEqual({ status: "committed", revision: 1 });
+  });
+
+  it("fails the write whose commit landed when the worker crashes before replying", async () => {
+    const { controller, harness } = start(false);
+    await controller.settled();
+    await running(controller, 1);
+    harness.side(1)?.arm({ at: "after-commit" });
+    expect(await controller.writeVectors("m", 1, [])).toEqual({
+      status: "failed",
+      error: "the worker failed: the worker exited unexpectedly",
+    });
+    expect(await meta(VECTORS_REV_KEY)).toBe("1");
+
+    await running(controller, 2);
+    expect(await controller.writeVectors("m", 1, [])).toEqual({ status: "committed", revision: 2 });
+  });
+
+  it("resolves stop false and leaves the lease held when the worker crashes during shutdown", async () => {
+    const { controller, harness, record } = start(true);
+    await controller.settled();
+    await waitFor(() => controller.status()?.distill.leaseHeld === true, "the lease");
+    harness.side(1)?.arm({ at: "during-shutdown" });
+    expect(await controller.stop(2_000)).toBe(false);
+    expect(await leaseHolder()).toBe("harness/w1");
+    // Asked to stop, the generation is not replaced.
+    await sleep(200);
+    expect(harness.sides).toHaveLength(1);
+    expect(record.logs.filter((l) => /failed/.test(l))).toEqual([]);
+  });
+
+  it("starts a replacement that takes its crashed predecessor's live lease over at once", async () => {
+    const { controller, harness } = start(true);
+    await controller.settled();
+    await waitFor(() => controller.status()?.distill.leaseHeld === true, "the lease");
+    expect(await leaseHolder()).toBe("harness/w1");
+    harness.side(1)?.crash();
+
+    await waitFor(
+      () => controller.generation() === 2 && controller.status()?.distill.leaseHeld === true,
+      "the replacement to hold the lease",
+    );
+    expect(harness.side(2)?.received[0]).toMatchObject({
+      type: "init",
+      holderId: "harness/w2",
+      takeOver: "harness/w1",
+    });
+    expect(await leaseHolder()).toBe("harness/w2");
+  });
+
+  it("goes inline after three starts that fail", async () => {
+    const { controller, harness, record } = start(true, 3);
+    await controller.settled();
+    expect(controller.mode()).toEqual({
+      kind: "inline",
+      reason: "the worker did not start: the worker module did not load",
+    });
+    expect(record.inline).toEqual([
+      {
+        reason: "the worker did not start: the worker module did not load",
+        lastHolder: "harness/w3",
+      },
+    ]);
+    expect(harness.sides).toHaveLength(0);
+  });
+
+  it("stops for good when the worker refuses the store", async () => {
+    const db = await openSqlite(storePath);
+    if (!db) throw new Error("no sqlite");
+    const seeded = openStore(db, { host: "opencode-v2", source: "/elsewhere/opencode.db" });
+    if (!seeded.ok) throw new Error(seeded.reason);
+    db.close();
+
+    const { controller, harness, record } = start(true);
+    await controller.settled();
+    expect(controller.mode()).toEqual({ kind: "stopped", reason: "source-mismatch" });
+    expect(record.stopped).toEqual(["source-mismatch"]);
+    expect(record.storeOpens).toEqual([]);
+    await sleep(200);
+    expect(harness.sides).toHaveLength(1);
+    expect(harness.side(1)?.ended).toBe(true);
+  });
+});
