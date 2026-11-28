@@ -100,8 +100,6 @@ export type WorkerController = {
   generation(): number;
   /** The current generation's holder id. */
   holderId(): string | undefined;
-  /** The worker's last revision hint. */
-  revisions(): { cardsRev: number; vectorsRev: number } | undefined;
   /** Queue a distiller signal for the worker (coalesced per session). False
    *  when the controller takes none: the distiller runs inline, indexing
    *  stopped, or the controller is stopping. */
@@ -177,7 +175,6 @@ export function createWorkerController(options: WorkerControllerOptions): Worker
   let watchdog: ReturnType<typeof setInterval> | undefined;
   let flushScheduled = false;
   let stopPromise: Promise<boolean> | undefined;
-  let revisions: { cardsRev: number; vectorsRev: number } | undefined;
   const outbox = createEventOutbox();
   const pending = new Map<number, Pending>();
   let markSettled!: () => void;
@@ -359,9 +356,6 @@ export function createWorkerController(options: WorkerControllerOptions): Worker
         gen.status = raw.status;
         options.onStatus?.(raw.status);
         return;
-      case "rev":
-        revisions = { cardsRev: raw.cardsRev, vectorsRev: raw.vectorsRev };
-        return;
       case "log":
         if (raw.dropped) log(`worker: ${raw.dropped} log line(s) dropped`);
         log(raw.line);
@@ -481,7 +475,6 @@ export function createWorkerController(options: WorkerControllerOptions): Worker
     status: () => current?.status,
     generation: () => count,
     holderId: () => current?.holderId,
-    revisions: () => revisions,
     post(signal) {
       if (mode.kind !== "worker" || stopping || quiesced) return false;
       outbox.add(signal);

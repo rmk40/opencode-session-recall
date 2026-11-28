@@ -37,8 +37,6 @@ export const MAX_PENDING_REQUESTS = 8;
 export const STATUS_EVERY_MS = 1_000;
 /** How often the worker looks for a status change. */
 export const STATUS_CHECK_MS = 250;
-/** The least time between two revision hints. */
-export const REV_HINT_EVERY_MS = 100;
 /** Log lines the worker posts in one second at most; the rest are counted
  *  and reported as dropped with the next line it posts. */
 export const LOG_LINES_PER_SECOND = 200;
@@ -145,10 +143,6 @@ export type StoreMessage = Envelope &
 
 export type StatusMessage = Envelope & { type: "status"; status: WorkerStatus };
 
-/** A hint that the store's revision counters moved; main's polling of the
- *  counters stays authoritative. */
-export type RevMessage = Envelope & { type: "rev"; cardsRev: number; vectorsRev: number };
-
 export type LogMessage = Envelope & { type: "log"; line: string; dropped?: number };
 
 /** `store`: the store refused or is damaged, which no restart can fix.
@@ -171,23 +165,13 @@ export type WorkerMessage =
   | ReadyMessage
   | StoreMessage
   | StatusMessage
-  | RevMessage
   | LogMessage
   | FatalMessage
   | ReplyMessage
   | StoppedMessage;
 
 const MAIN_TYPES = new Set(["init", "events", "vectors", "stop"]);
-const WORKER_TYPES = new Set([
-  "ready",
-  "store",
-  "status",
-  "rev",
-  "log",
-  "fatal",
-  "reply",
-  "stopped",
-]);
+const WORKER_TYPES = new Set(["ready", "store", "status", "log", "fatal", "reply", "stopped"]);
 
 function enveloped(value: unknown, types: Set<string>): boolean {
   if (typeof value !== "object" || value === null) return false;

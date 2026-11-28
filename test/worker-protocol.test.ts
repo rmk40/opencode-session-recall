@@ -17,16 +17,7 @@ import {
  */
 
 const MAIN_TYPES = ["init", "events", "vectors", "stop"] as const;
-const WORKER_TYPES = [
-  "ready",
-  "store",
-  "status",
-  "rev",
-  "log",
-  "fatal",
-  "reply",
-  "stopped",
-] as const;
+const WORKER_TYPES = ["ready", "store", "status", "log", "fatal", "reply", "stopped"] as const;
 
 describe("message guards", () => {
   it.each(MAIN_TYPES)("accepts a main %s message only as a main message", (type) => {

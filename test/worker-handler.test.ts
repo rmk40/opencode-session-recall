@@ -660,54 +660,6 @@ describe("status", () => {
   }, 20_000);
 });
 
-describe("revision hints", () => {
-  it("posts a hint after card writes at most every 100 ms, only when the counters moved", async () => {
-    await seedStore((store) => store.replaceSessionParts("ses_x", [], makeCard("ses_x")));
-    const { worker, side } = await startSide();
-    worker.postMessage(initMessage());
-    await nextOf(side, "store");
-
-    let last = 0;
-    for (let i = 0; i < 6; i++) {
-      const reply = await request(
-        worker,
-        side,
-        vectorsMessage({ rows: [vectorRow("ses_x")], representation: EMBED_REPRESENTATION + 1 }),
-      );
-      expect(reply.outcome).toBe("committed");
-      last = reply.revision ?? 0;
-    }
-    await waitFor(
-      () => sentOf(side, "rev").some((rev) => rev.vectorsRev === last),
-      "the hint for the last write",
-    );
-
-    // A write the store refuses moves no counter, so no hint follows it.
-    const hints = sentOf(side, "rev").length;
-    const refused = await request(
-      worker,
-      side,
-      vectorsMessage({ rows: [vectorRow("ses_x")], representation: EMBED_REPRESENTATION }),
-    );
-    expect(refused).toMatchObject({
-      outcome: "refused",
-      reason: "a stored vector has a higher representation generation",
-    });
-    await sleep(400);
-    expect(sentOf(side, "rev")).toHaveLength(hints);
-
-    const revs = sentOf(side, "rev");
-    const times = revs.map((rev) => side.sentAt[side.sent.indexOf(rev)] ?? 0);
-    for (let i = 1; i < revs.length; i++) {
-      expect(`${revs[i]!.cardsRev}/${revs[i]!.vectorsRev}`).not.toBe(
-        `${revs[i - 1]!.cardsRev}/${revs[i - 1]!.vectorsRev}`,
-      );
-      expect(times[i]! - times[i - 1]!).toBeGreaterThanOrEqual(90);
-    }
-    expect(revs.at(-1)).toMatchObject({ cardsRev: 1, vectorsRev: last });
-  }, 20_000);
-});
-
 describe("a damaged store file", () => {
   const corrupt = (): Error =>
     Object.assign(new Error("database disk image is malformed"), {

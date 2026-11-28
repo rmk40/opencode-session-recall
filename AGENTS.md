@@ -457,7 +457,6 @@ reason.
 | worker → main | `ready`                            | the worker's `BUILD_ID`, once the module has loaded                                                                                                                                                                         |
 | worker → main | `store`                            | the fence result: `ok` with an optional `warning`, or a refusal reason                                                                                                                                                      |
 | worker → main | `status`                           | `DistillStatus` (lease included), indexing, repair progress, `discoveryTruncated`, the holder id, the worker's history drift and the longest synchronous store call since the last status; on change, at most once a second |
-| worker → main | `rev`                              | `cards_rev` and `vectors_rev` after a card write, at most every 100 ms; a hint only, main's counter polling stays authoritative                                                                                             |
 | worker → main | `log`, `fatal`, `reply`, `stopped` | a log line, an unrecoverable error (`store` or `crash`), a request's outcome, the end of a stop                                                                                                                             |
 
 No `opencode.db` row, history page, card or row set crosses. The bounds:
@@ -473,10 +472,16 @@ No `opencode.db` row, history page, card or row set crosses. The bounds:
 - **Vector writes:** at most 8 wait for a reply. A ninth, or any write while no
   generation runs, settles `failed` at once. A write with no reply within 10 s
   settles `failed`. Vector writes are never gated by the foreground signal, and the
-  worker serves them as they arrive, between its slices.
+  worker serves them as they arrive, between its slices, whether or not it holds the
+  lease. That is how every process wrote its card vectors before the worker existed:
+  the store's own guards decide (representation generations only move up, a model
+  switch clears every vector first, a write never downgrades one), so a process
+  without the lease still persists vectors for everyone. Gating them on the lease
+  would change what processes sharing a store see of each other's vectors.
 - **Worker logs:** at most 200 lines a second, each cut to 2,000 characters. The
   rest are counted and reported with the next line posted.
-- **Status and hints** are latest-only and rate-limited as above.
+- **Status** is latest-only and rate-limited as above. Main learns of the worker's
+  card writes only from its own `cardCounters()` poll.
 
 ### Lifecycle (`src/worker/controller.ts`)
 
@@ -485,15 +490,16 @@ No `opencode.db` row, history page, card or row set crosses. The bounds:
   thread and `store` within 10 s of `init`. The worker refuses an `init` whose
   `BUILD_ID`, build tag, representation or projector generation differs from its
   own (`fatal`, kind `crash`).
-- **The store result:** on `ok` main opens its reader (whose own busy retry applies).
-  A reader refusal then is a start failure, logged. Creation waits for the result
-  at most 2.5 s (`STORE_READY_WAIT_MS`), and a tool call waits for the runtime at
-  most 3 s (`TOOL_READY_WAIT_MS`), so a call during a slow start gets the degraded
-  tier rather than the "still starting" error. Until the result arrives, `recall`
-  serves the degraded card tier with `coverage.cards.reason` "the index is
-  starting", filled by one background discovery started at the 2.5 s mark. Once the reader opens, the runtime
-  installs a store-backed card runtime and bumps `runtime.revision()`, and
-  `src/host/v2.ts` rebuilds its tools over the new deps.
+- **The store result:** on `ok` main opens its reader (whose own busy retry
+  applies). A reader refusal then is a start failure, logged. Creation waits for
+  the result at most 2.5 s (`STORE_READY_WAIT_MS`), and a tool call waits for the
+  runtime at most 3 s (`TOOL_READY_WAIT_MS`), so a call during a slow start gets
+  the degraded tier rather than the "still starting" error. Until the result
+  arrives, `recall` serves the degraded card tier with `coverage.cards.reason`
+  "the index is starting", filled by one background discovery started at the
+  2.5 s mark. Once the reader opens, the runtime installs a store-backed card
+  runtime and bumps `runtime.revision()`, and `src/host/v2.ts` rebuilds its tools
+  over the new deps.
 - **Failures:** a missed deadline, an `error` event, an exit main did not ask for, a
   `fatal` of kind `crash`, a reader refusal after `ok` and a watchdog trip each fail
   the generation. Main asks it to end and waits for its exit (`terminate()` returns
@@ -550,8 +556,8 @@ state exists once per thread.
 - **The embedder** (`src/semantic/embedder.ts`): main only. The worker never embeds.
 - **Logging:** the v2 file sink (`v2Sink` in `src/host/v2.ts`) is main's. The
   worker never writes the debug log; its lines arrive as `log` messages.
-- **Timers:** the distiller's timers and the worker's status and hint timers live
-  in the worker. The status and hint timers are unreferenced, and the thread itself
+- **Timers:** the distiller's timers and the worker's status timer live in the
+  worker. The status timer is unreferenced, and the thread itself
   is unreferenced, so neither keeps the host alive.
 - **Caches** (`normalizedLabels` in `src/candidates.ts`, the part-id counter in
   `src/hooks/part-id.ts`, `sharedStartingCards` in `src/host/v2-tools.ts`): main's
@@ -871,8 +877,8 @@ drill's reads. `yieldInBackground` is for upkeep. The distiller yields through
 it on both hosts. On v2 so do the history facade, the sync and the discovery
 the distiller reads through. Each thread loads its own copy of `src/yield.ts`,
 so the v2 worker's distiller slices against the worker thread's slicer, never the
-main thread's; the foreground signal below is what reaches across. A yield gives its slice to the first
-foreground waiter whenever one waits on it. Background waiters that have
+main thread's; the foreground signal below is what reaches across. A yield gives
+its slice to the first foreground waiter whenever one waits on it. Background waiters that have
 waited through `BACKGROUND_EVERY - 1` (7) foreground turns in a row take the
 next one, so upkeep slows down while a search runs but never stops. Within a
 class the first to wait goes first. A reader yields through the one point it

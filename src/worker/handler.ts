@@ -18,7 +18,6 @@ import {
   LOG_LINE_CHARS,
   LOG_LINES_PER_SECOND,
   PROTOCOL_VERSION,
-  REV_HINT_EVERY_MS,
   STATUS_CHECK_MS,
   STATUS_EVERY_MS,
   type EventsMessage,
@@ -86,38 +85,21 @@ export type WorkerHandler = {
   readonly done: Promise<void>;
 };
 
-/** Store methods that change what readers see, after which a revision hint
- *  may be due. */
-const CARD_WRITES = new Set<string>([
-  "upsertCard",
-  "writeCardEmbeddings",
-  "writeSummary",
-  "deleteSession",
-  "patchCardMeta",
-  "refreshCardMeta",
-  "setFamilyRollup",
-  "replaceSessionParts",
-  "appendSessionParts",
-  "replaceSessionTail",
-]);
-
 /** What the handler knows of its store's calls. */
 type StoreProbe = {
-  /** The longest synchronous call since the last {@link takeLongest}. */
+  /** The longest synchronous call since the last status. */
   longest: number;
   /** Every call from now on throws. */
   severed: boolean;
 };
 
 /**
- * `store` with every method timed, a revision hint scheduled after each card
- * write, a damaged file reported through `onCorrupt`, and every call refused
- * once `probe.severed` is set.
+ * `store` with every method timed, a damaged file reported through
+ * `onCorrupt`, and every call refused once `probe.severed` is set.
  */
 function instrumentStore(
   store: Store,
   probe: StoreProbe,
-  afterWrite: () => void,
   onCorrupt: (error: unknown) => void,
 ): Store {
   const wrapped = new Map<PropertyKey, unknown>();
@@ -139,7 +121,6 @@ function instrumentStore(
         } finally {
           const took = performance.now() - started;
           if (took > probe.longest) probe.longest = took;
-          if (typeof property === "string" && CARD_WRITES.has(property)) afterWrite();
         }
       };
       wrapped.set(property, call);
@@ -204,9 +185,6 @@ export function runWorkerHandler(port: WorkerPort, options: WorkerHandlerOptions
   let holderId = "";
   const probe: StoreProbe = { longest: 0, severed: false };
   let statusTimer: ReturnType<typeof setInterval> | undefined;
-  let revTimer: ReturnType<typeof setTimeout> | undefined;
-  let lastRevAt = -Infinity;
-  let lastRev: string | undefined;
   let lastStatusKey: string | undefined;
   let lastStatusAt = -Infinity;
   let corruptReported = false;
@@ -246,7 +224,7 @@ export function runWorkerHandler(port: WorkerPort, options: WorkerHandlerOptions
     send({ type: "fatal", kind, reason });
   };
 
-  // ── Status and revision hints ──
+  // ── Status ──
   const statusNow = (): WorkerStatus | undefined => {
     if (!distiller || !store) return undefined;
     return {
@@ -278,27 +256,6 @@ export function runWorkerHandler(port: WorkerPort, options: WorkerHandlerOptions
     send({ type: "status", status });
   };
 
-  const postRev = (): void => {
-    revTimer = undefined;
-    if (halted || probe.severed || !store) return;
-    try {
-      const { cardsRev, vectorsRev } = store.cardCounters();
-      const key = `${cardsRev}/${vectorsRev}`;
-      lastRevAt = now();
-      if (key === lastRev) return;
-      lastRev = key;
-      send({ type: "rev", cardsRev, vectorsRev });
-    } catch {
-      // A hint only.
-    }
-  };
-
-  const scheduleRev = (): void => {
-    if (revTimer !== undefined || halted) return;
-    revTimer = setTimeout(postRev, Math.max(0, REV_HINT_EVERY_MS - (now() - lastRevAt)));
-    unref(revTimer);
-  };
-
   const onCorrupt = (error: unknown): void => {
     if (corruptReported) return;
     corruptReported = true;
@@ -310,9 +267,7 @@ export function runWorkerHandler(port: WorkerPort, options: WorkerHandlerOptions
 
   const clearTimers = (): void => {
     if (statusTimer !== undefined) clearInterval(statusTimer);
-    if (revTimer !== undefined) clearTimeout(revTimer);
     statusTimer = undefined;
-    revTimer = undefined;
   };
 
   const closeAll = (): void => {
@@ -361,7 +316,7 @@ export function runWorkerHandler(port: WorkerPort, options: WorkerHandlerOptions
       return;
     }
     storeDb = db;
-    store = instrumentStore(result.store, probe, scheduleRev, onCorrupt);
+    store = instrumentStore(result.store, probe, onCorrupt);
     // SQLite creates the WAL and its index file at a connection's first
     // statement in WAL mode, and openStore switches a new store to WAL as
     // its last step: main's reader refuses a store without them.

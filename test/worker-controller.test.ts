@@ -739,14 +739,12 @@ describe("the controller with scripted workers", () => {
       const old = scripted.worker(1);
       old.emit({ type: "status", status: status({ holderId: "inst/w1" }) });
       old.emit({ type: "reply", id: sent?.id, outcome: "committed", revision: 9 });
-      old.emit({ type: "rev", cardsRev: 5, vectorsRev: 5 });
       // The current worker's channel, but another generation's envelope.
       scripted.worker(2).emit({ type: "status", status: status(), generation: 1 });
       scripted.worker(2).emitRaw({ type: "status", status: status() });
       await flush();
       expect(controller.status()).toBeUndefined();
       expect(record.statuses).toEqual([]);
-      expect(controller.revisions()).toBeUndefined();
       expect(write.settled).toBe(false);
 
       scripted.worker(2).emit({ type: "reply", id: sent?.id, outcome: "committed", revision: 1 });
@@ -754,18 +752,16 @@ describe("the controller with scripted workers", () => {
       expect(write.value).toEqual({ status: "committed", revision: 1 });
     });
 
-    it("keeps the current generation's last status, revision hint and log lines", async () => {
+    it("keeps the current generation's last status and log lines", async () => {
       const { controller, scripted, record } = scriptedController();
       await flush();
       await run(scripted.worker(1));
       const last = status({ leaseHeld: false });
       scripted.worker(1).emit({ type: "status", status: status() });
       scripted.worker(1).emit({ type: "status", status: last });
-      scripted.worker(1).emit({ type: "rev", cardsRev: 4, vectorsRev: 2 });
       scripted.worker(1).emit({ type: "log", line: "worker says hi", dropped: 3 });
       expect(controller.status()).toEqual(last);
       expect(record.statuses).toHaveLength(2);
-      expect(controller.revisions()).toEqual({ cardsRev: 4, vectorsRev: 2 });
       expect(record.logs.slice(-2)).toEqual(["worker: 3 log line(s) dropped", "worker says hi"]);
     });
   });
