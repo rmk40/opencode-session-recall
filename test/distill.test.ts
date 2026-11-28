@@ -2922,6 +2922,13 @@ describe("sync-host poll dispatch", () => {
     const { source } = makeDistillFake({ sessions: [], messagesBySession: {} });
     let polled = false;
     let committed = false;
+    // How many signals had been dispatched at each yield. A yield can be
+    // followed by a second one at the same point when the checkpoint it runs
+    // takes a few milliseconds (a slow disk), so the points count, not the
+    // yields.
+    let dispatched = 0;
+    const yieldPoints: number[] = [];
+    let pointsAtCommit: number[] = [];
     const sync: DistillSync = {
       checkpoint: async () => null,
       compare: async () => "fresh",
@@ -2934,14 +2941,28 @@ describe("sync-host poll dispatch", () => {
               sessionID: `s${i}`,
               patch: { title: `t${i}` },
             }));
+        const first = !polled;
         polled = true;
-        return { signals, commit: () => void (committed = true), failures: [] };
+        return {
+          signals,
+          commit: () => {
+            if (!first) return;
+            committed = true;
+            pointsAtCommit = [...new Set(yieldPoints)];
+          },
+          failures: [],
+        };
       },
       pollIntervalMs: 5,
       reconcileEveryMs: 1e12,
     };
-    let yields = 0;
     const { db, store } = await freshStore();
+    // Each metadata signal is dispatched as one patchCardMeta call.
+    const patchCardMeta = store.patchCardMeta.bind(store);
+    store.patchCardMeta = (...args) => {
+      dispatched++;
+      return patchCardMeta(...args);
+    };
     const distiller = createDistiller({
       source,
       store,
@@ -2950,14 +2971,16 @@ describe("sync-host poll dispatch", () => {
       instanceId: "dispatch-yields",
       sync,
       yieldBetween: async () => {
-        yields++;
+        yieldPoints.push(dispatched);
       },
       log: () => {},
     });
     distiller.start();
     await waitFor(() => committed);
-    // 120 signals: a pause after the 50th and the 100th.
-    expect(yields).toBe(2);
+    // 120 signals: a pause after the 50th and the 100th, and none before the
+    // first or after the last.
+    expect(pointsAtCommit).toEqual([50, 100]);
+    expect(dispatched).toBe(120);
     await distiller.stop();
     db.close();
   });
