@@ -87,6 +87,9 @@ export type WorkerControllerOptions = {
   watchdogEveryMs?: number;
   /** Failed generations before the distiller runs on main (default 3). */
   maxFailures?: number;
+  /** The first generation starts only once this settles: the end of an
+   *  earlier runtime's worker thread on the same store. */
+  startAfter?: Promise<void>;
 };
 
 /** Where the distiller runs, as `coverage.history.distiller` reports it. */
@@ -133,6 +136,10 @@ export type WorkerController = {
   stop(deadlineMs: number): Promise<boolean>;
   /** End the worker's thread and wait at most `waitMs` for its exit. */
   terminate(waitMs: number): Promise<void>;
+  /** Settles once the current generation's thread has ended, with no time
+   *  bound; at once when none runs. After {@link retire} no generation
+   *  follows, so it is the end of the last thread. */
+  exited(): Promise<void>;
 };
 
 const DEFAULT_RESTART_DELAYS_MS = [1_000, 5_000];
@@ -456,6 +463,15 @@ export function createWorkerController(options: WorkerControllerOptions): Worker
 
   async function launch(): Promise<void> {
     if (stopping || mode.kind !== "worker") return;
+    if (count === 0 && options.startAfter) {
+      // A writer started now would contend on the store's write lock behind
+      // a thread that may still hold it.
+      mode = { kind: "worker", detail: "waiting (an earlier worker on this store has not ended)" };
+      log("waiting for an earlier worker thread on this store to end before starting one");
+      await options.startAfter;
+      if (stopping || mode.kind !== "worker") return;
+      mode = { kind: "worker" };
+    }
     const number = ++count;
     let markExited!: () => void;
     const gen: Generation = {
@@ -604,5 +620,6 @@ export function createWorkerController(options: WorkerControllerOptions): Worker
       gen.worker?.terminate();
       await settleWithin(gen.exit, waitMs);
     },
+    exited: () => current?.exit ?? Promise.resolve(),
   };
 }

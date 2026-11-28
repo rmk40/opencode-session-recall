@@ -861,6 +861,47 @@ describe("dispose", () => {
     expect(afterStopped).toEqual([]);
   }, 30_000);
 
+  it("lets the next runtime on the store start its worker only once the last thread has ended", async () => {
+    // A starter whose threads report their exit only when released.
+    const first = workerHarness();
+    const held: Array<() => void> = [];
+    let holding = true;
+    const holdExits: WorkerStarter = async (generation) => {
+      const worker = await first.start(generation);
+      return {
+        ...worker,
+        onExit: (listener) =>
+          worker.onExit(() => {
+            if (holding) held.push(listener);
+            else listener();
+          }),
+      };
+    };
+    const { runtime: old } = await create({ worker: { start: holdExits } });
+    await waitFor(() => old.distiller.status().leaseHeld, "the first worker's lease");
+    runtimes.splice(runtimes.indexOf(old), 1);
+    const disposing = old.dispose();
+    await waitFor(() => first.side(1)?.ended === true, "the first worker's end");
+
+    const second = workerHarness();
+    const { runtime: next, logs } = await create({ worker: { start: second.start } });
+    await sleep(500);
+    expect(second.sides).toHaveLength(0);
+    expect(next.deps.distiller?.()).toBe(
+      "worker: waiting (an earlier worker on this store has not ended)",
+    );
+    expect(logs).toContain(
+      "waiting for an earlier worker thread on this store to end before starting one",
+    );
+
+    holding = false;
+    for (const listener of held.splice(0)) listener();
+    await disposing;
+    await waitFor(() => second.sides.length === 1, "the second worker");
+    await waitFor(() => next.distiller.status().leaseHeld, "the second worker's lease");
+    expect(next.deps.distiller?.()).toBe("worker");
+  }, 40_000);
+
   it("returns within its bound and closes the reader once a tool call that outlived it settles", async () => {
     const recorder = readerStatements();
     const { runtime, logs } = await create({

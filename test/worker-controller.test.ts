@@ -841,6 +841,48 @@ describe("the controller with scripted workers", () => {
       expect(ended.settled).toBe(true);
     });
 
+    it("starts its first generation only once an earlier worker on the store has ended", async () => {
+      let ended!: () => void;
+      const startAfter = new Promise<void>((resolve) => (ended = resolve));
+      const { controller, scripted } = scriptedController({ startAfter });
+      await advance(60_000);
+      expect(scripted.workers).toHaveLength(0);
+      expect(controller.mode()).toEqual({
+        kind: "worker",
+        detail: "waiting (an earlier worker on this store has not ended)",
+      });
+      await controller.exited();
+      ended();
+      await flush();
+      expect(scripted.workers).toHaveLength(1);
+      expect(controller.mode()).toEqual({ kind: "worker" });
+    });
+
+    it("starts no generation after a stop during the wait for an earlier worker", async () => {
+      let ended!: () => void;
+      const startAfter = new Promise<void>((resolve) => (ended = resolve));
+      const { controller, scripted } = scriptedController({ startAfter });
+      await flush();
+      expect(await controller.stop(1_000)).toBe(false);
+      ended();
+      await advance(60_000);
+      expect(scripted.workers).toHaveLength(0);
+    });
+
+    it("settles exited at the current generation's exit, with no bound", async () => {
+      const { controller, scripted } = scriptedController();
+      await flush();
+      await run(scripted.worker(1));
+      const exited = tracked(controller.exited());
+      const terminated = tracked(controller.terminate(1_000));
+      await advance(600_000);
+      expect(terminated.settled).toBe(true);
+      expect(exited.settled).toBe(false);
+      scripted.worker(1).exit();
+      await flush();
+      expect(exited.settled).toBe(true);
+    });
+
     it("starts no generation once retired, a pending restart included", async () => {
       const { controller, scripted, record } = scriptedController();
       await flush();

@@ -73,7 +73,13 @@ import {
 import { createEventOutbox, type EventOutbox, type WorkerSyncOptions } from "../worker/protocol.js";
 import { defaultWorkerStarter } from "../worker/start.js";
 import type { V2Event } from "./opencode-v2-types.js";
-import { createIdDedupe, type ResolvedIdentity, type RuntimeFactory } from "./runtime.js";
+import {
+  createIdDedupe,
+  noteWorkerExit,
+  pendingWorkerExit,
+  type ResolvedIdentity,
+  type RuntimeFactory,
+} from "./runtime.js";
 
 /**
  * The v2 host's process runtime: everything that must exist once per process
@@ -628,6 +634,8 @@ async function createV2Runtime(
   let handoff: EventOutbox | undefined;
   /** Why the distiller stopped after its move to this thread failed. */
   let inlineStopped: string | undefined;
+  /** The real store path the worker distills into, when one runs. */
+  let workerStore: string | undefined;
 
   const makeInline = (target: Store, takeOver?: string): Distiller =>
     createDistiller({
@@ -921,34 +929,47 @@ async function createV2Runtime(
       })();
     };
 
+    /** Open main's reader over the store, if none is open, and serve its
+     *  cards. `quiet` logs no refusal, for an open ahead of the worker's. */
+    const openReader = async (
+      quiet: boolean,
+    ): Promise<{ ok: true } | { ok: false; reason: string }> => {
+      if (reader) return { ok: true };
+      if (disposed) return { ok: false, reason: "the runtime is disposed" };
+      const opened = await openReadStore(
+        storePath,
+        { host: STORE_HOST, source: sourcePath },
+        { ...(inputs.wrapReader && { wrapReader: inputs.wrapReader }) },
+      );
+      if (!opened.ok) {
+        const reason = `${opened.reason}${opened.detail ? `: ${opened.detail}` : ""}`;
+        if (!quiet) log(`store reader refused (${reason}): ${storePath}`);
+        return { ok: false, reason };
+      }
+      if (disposed || reader) {
+        // Disposed meanwhile, or another open got there first.
+        opened.close();
+        return reader ? { ok: true } : { ok: false, reason: "the runtime is disposed" };
+      }
+      reader = { store: opened.store, close: opened.close };
+      store = opened.store;
+      const writer = controller?.writeVectors;
+      installCards(storeCardSource(cardReadsOf(opened.store), writer));
+      return { ok: true };
+    };
+
+    // An earlier runtime's worker on this store whose thread has not ended
+    // yet: this one starts its own only after that, and its tools read the
+    // store's cards meanwhile when a reader opens.
+    const earlierWorker = pendingWorkerExit(storePath);
+    workerStore = storePath;
     controller = createWorkerController({
+      ...(earlierWorker && { startAfter: earlierWorker }),
       start: workerInputs.start ?? defaultWorkerStarter(),
       instanceId,
       init,
       log,
-      async onStoreOpen() {
-        if (reader) return { ok: true };
-        if (disposed) return { ok: false, reason: "the runtime is disposed" };
-        const opened = await openReadStore(
-          storePath,
-          { host: STORE_HOST, source: sourcePath },
-          { ...(inputs.wrapReader && { wrapReader: inputs.wrapReader }) },
-        );
-        if (!opened.ok) {
-          const reason = `${opened.reason}${opened.detail ? `: ${opened.detail}` : ""}`;
-          log(`store reader refused (${reason}): ${storePath}`);
-          return { ok: false, reason };
-        }
-        if (disposed) {
-          opened.close();
-          return { ok: false, reason: "the runtime is disposed" };
-        }
-        reader = { store: opened.store, close: opened.close };
-        store = opened.store;
-        const writer = controller?.writeVectors;
-        installCards(storeCardSource(cardReadsOf(opened.store), writer));
-        return { ok: true };
-      },
+      onStoreOpen: () => openReader(false),
       onStopped(reason) {
         log(`store refused (${reason}): ${storePath}; running degraded`);
         if (!reader) {
@@ -980,6 +1001,7 @@ async function createV2Runtime(
       }),
       ...(workerInputs.maxFailures !== undefined && { maxFailures: workerInputs.maxFailures }),
     });
+    if (earlierWorker) void openReader(true);
     const settled = await settleWithin(controller.settled(), STORE_READY_WAIT_MS);
     // Still starting: serve what discovery finds until the store opens.
     if (settled.timedOut && !reader && controller.mode().kind === "worker") startLite(true);
@@ -1090,8 +1112,13 @@ async function createV2Runtime(
     dispose() {
       if (disposePromise) return disposePromise;
       disposed = true;
-      // No worker generation starts from here on, a pending restart included.
+      // No worker generation starts from here on, a pending restart included,
+      // so the current one's thread is the last: a later runtime on this
+      // store starts its worker only once that thread has ended.
       controller?.retire();
+      if (controller && workerStore !== undefined) {
+        noteWorkerExit(workerStore, controller.exited());
+      }
       if (driftTimer !== undefined) clearInterval(driftTimer);
       mapper.dispose();
       distiller.quiesce();

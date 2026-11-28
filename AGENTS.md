@@ -571,8 +571,20 @@ No `opencode.db` row, history page, card or row set crosses. The bounds:
   most 10 s for the exit. The runtime's
   dispose resolves only then, so it stays in the registry's retiring map until the
   thread has ended, and a reload's new runtime on the same store waits for it (at
-  most `RETIRE_WAIT_MS`, 3 s). The worker writes
-  nothing after `stopped`: its store handle refuses every call from then on.
+  most `RETIRE_WAIT_MS`, 3 s). The worker writes nothing after `stopped`: its
+  store handle refuses every call from then on.
+- **The next runtime's worker:** dispose also records, per real store path in the
+  registry (`noteWorkerExit`, shared across builds), a promise of the last
+  thread's confirmed exit, with no time bound. A later runtime on the same store
+  starts its first generation only once that promise settles (`startAfter`),
+  reporting `"worker: waiting (an earlier worker on this store has not ended)"`.
+  Meanwhile it opens its reader at once when it can and otherwise serves the
+  degraded tier. If the old thread never ends, no new worker starts in this
+  process, and that is safe. A statement the old thread is still inside holds
+  the write lock, so it commits or fails before any other connection can write
+  or take the lease over, and a terminated thread runs no JavaScript after it.
+  Another process's distiller takes the stale lease over after its TTL as
+  usual, and this process indexes again once OpenCode restarts.
 - **Coverage:** `coverage.history.distiller` is `"worker"` while the distiller runs
   in a worker (from the first start on), `"inline: <reason>"` or
   `"stopped: <reason>"`. From a generation's failure until its replacement reports

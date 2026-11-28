@@ -120,6 +120,10 @@ type RuntimeRegistry = {
   /** Cross-build: real store path → the dispose of the runtime retiring on
    *  it. Every build reads and writes only this map. */
   retiring: Map<string, Promise<void>>;
+  /** Cross-build: real store path → the confirmed end of the last distiller
+   *  worker thread a retiring runtime ran on it ({@link noteWorkerExit}).
+   *  Absent in a registry an older build made, until first used. */
+  workerExits?: Map<string, Promise<void>>;
   builds: Map<string, BuildState>;
 };
 
@@ -132,6 +136,42 @@ function runtimeRegistry(): RuntimeRegistry {
   const created: RuntimeRegistry = { retiring: new Map(), builds: new Map() };
   reg.runtimes = created;
   return created;
+}
+
+function workerExits(): Map<string, Promise<void>> {
+  const reg = runtimeRegistry();
+  if (!(reg.workerExits instanceof Map)) reg.workerExits = new Map();
+  return reg.workerExits;
+}
+
+/**
+ * Record `exit`, which settles once a retiring runtime's distiller worker
+ * thread on `store` (a real store path) has ended, with no time bound. A
+ * thread asked to end can still be inside a statement that holds the store's
+ * write lock and later commits, and the runtime's own dispose stops waiting
+ * for it after a bound: a later runtime on the same store starts its own
+ * worker only once this settles ({@link pendingWorkerExit}).
+ */
+export function noteWorkerExit(store: string, exit: Promise<void>): void {
+  const exits = workerExits();
+  exits.set(store, exit);
+  const forget = (): void => {
+    if (exits.get(store) === exit) exits.delete(store);
+  };
+  void exit.then(forget, forget);
+}
+
+/** The exit {@link noteWorkerExit} recorded for `store` that has not settled
+ *  yet, if any. */
+export function pendingWorkerExit(store: string): Promise<void> | undefined {
+  // Shared across builds, so only a thenable is taken.
+  const exit: unknown = workerExits().get(store);
+  return isThenable(exit)
+    ? Promise.resolve(exit).then(
+        () => undefined,
+        () => undefined,
+      )
+    : undefined;
 }
 
 function buildState(buildId: string): BuildState {
