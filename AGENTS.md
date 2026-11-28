@@ -644,6 +644,17 @@ state exists once per thread.
   (`test/stall-worker.ts`, built to `test-dist/`) wraps the production handler with
   a store handle that holds the thread with `Atomics.wait` inside a write
   transaction (`workerData.stall`).
+- **The shipped plugin:** `test/compiled/bundle.check.ts` loads the bundled main
+  entry in a child process, the way a host loads it, through the repository's
+  `server.js` and from the `npm pack` tarball installed into a scratch project's
+  `node_modules` (its dependencies come from npm's cache when it holds them). It
+  runs under Node and, when `bun` is on PATH, under Bun, and logs why it skips
+  Bun otherwise. The child runs `test-dist/bundle-scenario.js`, which drives
+  `setup()` with the fake v2 host over a scratch store and `opencode.db` and
+  passes only when `coverage.history.distiller` is `"worker"` and a session was
+  distilled into the store. So the production thread starter has to find
+  `dist/distill-worker.js` from its chunk and both threads have to agree on
+  `BUILD_ID`.
 - **Packaging:** `npm run check:pack` checks `npm pack --dry-run`.
 
 ## Schema 5 card writes account for their own revisions

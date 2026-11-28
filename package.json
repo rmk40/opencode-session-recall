@@ -29,7 +29,7 @@
     "test:typecheck": "tsc -p tsconfig.test.json --noEmit",
     "typecheck": "tsc --noEmit",
     "compile": "tsup --entry.opencode-session-recall=src/opencode-session-recall.ts --entry.distill-worker=src/distill-worker.ts --format esm --external bun:sqlite --clean && tsc --emitDeclarationOnly --outDir dist",
-    "build:test-worker": "tsup test/stall-worker.ts --format esm --external bun:sqlite --clean -d test-dist",
+    "build:test-worker": "tsup --entry.stall-worker=test/stall-worker.ts --entry.bundle-scenario=test/compiled/bundle-scenario.ts --format esm --external bun:sqlite --clean -d test-dist",
     "test:compiled": "npm run build:test-worker && vitest run -c vitest.compiled.config.ts",
     "check:pack": "node scripts/check-pack.mjs",
     "check": "npm run format:check && npm run lint && npm run test:typecheck && npm run test && npm run typecheck && npm run compile && npm run test:compiled && npm run check:pack",

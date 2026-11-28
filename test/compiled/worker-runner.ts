@@ -29,6 +29,11 @@ export const DIST_WORKER = join(ROOT, "dist", "distill-worker.js");
 /** The stall entry: the published handler with a store handle that stalls
  *  inside a write transaction (see `test/stall-worker.ts`). */
 export const STALL_WORKER = join(ROOT, "test-dist", "stall-worker.js");
+/** The repository's root, where `server.js` and `package.json` live. */
+export const REPO_ROOT = ROOT;
+/** The built scenario that loads the plugin from an entry in a process of
+ *  its own (see `bundle-scenario.ts`). */
+export const BUNDLE_SCENARIO = join(ROOT, "test-dist", "bundle-scenario.js");
 
 /** What the stall entry reads from `workerData.stall`: it holds the thread
  *  inside the `afterTx`-th write transaction it opens (counting from 1, the
