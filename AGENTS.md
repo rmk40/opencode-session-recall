@@ -953,10 +953,10 @@ it on both hosts. On v2 so do the history facade, the sync and the discovery
 the distiller reads through. Each thread loads its own copy of `src/yield.ts`,
 so the v2 worker's distiller slices against the worker thread's slicer, never the
 main thread's; the foreground signal below is what reaches across. A yield gives
-its slice to the first foreground waiter whenever one waits on it. Background waiters that have
-waited through `BACKGROUND_EVERY - 1` (7) foreground turns in a row take the
-next one, so upkeep slows down while a search runs but never stops. Within a
-class the first to wait goes first. A reader yields through the one point it
+its slice to the first foreground waiter whenever one waits on it. Background
+waiters that have waited through `BACKGROUND_EVERY - 1` (7) foreground turns in
+a row take the next one, so upkeep slows down while a search runs but never
+stops. Within a class the first to wait goes first. A reader yields through the one point it
 was built with, which is why the drill and the distiller read `opencode.db`
 through separate facades. **Give new upkeep the background point, and work a
 search awaits the foreground one.** A pending yield older than
