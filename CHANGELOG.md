@@ -4,6 +4,18 @@ All notable changes to this project are documented here. This project follows
 [Conventional Commits](https://www.conventionalcommits.org/) and
 [Semantic Versioning](https://semver.org/).
 
+## Unreleased
+
+On opencode v2, background indexing no longer runs on OpenCode's main thread.
+The indexing pass, every write to the session store and the store's upkeep run
+in a thread of their own, so a slow disk under that work no longer holds up
+the sessions OpenCode serves. Searches still run on the main thread, and
+indexing gives way to them while they run. `coverage.history.distiller` says
+where indexing runs: `"worker"`, or `"inline: <reason>"` when it fell back to
+the main thread. When the store cannot be used, it says `"stopped: <reason>"`
+and searches warn that new sessions are not being indexed. opencode v1 is
+unchanged and reports `"inline"`.
+
 ## 3.1.0
 
 Upgrading needs no migration, since the store stays at schema 5. Restart

@@ -111,7 +111,13 @@ import `bun:*` or `node:*` directly.
   configs: both resolve against the working directory of the background service
   the plugin runs in, not the project the TUI was started from.
 - `files: ["dist"]` in `package.json` means only `dist/` is published to npm;
-  CHANGELOG, AGENTS.md, src, etc. never ship.
+  CHANGELOG, AGENTS.md, src, etc. never ship. `npm run compile` builds two named
+  entries, `dist/opencode-session-recall.js` and `dist/distill-worker.js` (the v2
+  distiller's worker thread), which share tsup's split chunks. The worker is
+  started from `new URL("./distill-worker.js", import.meta.url)`, so it resolves
+  beside whichever `dist/` file the controller's code landed in, in every install
+  layout, the `server.js` shim included. `npm run check:pack` fails when
+  `npm pack` would publish anything outside `dist/` or test-only worker code.
 
 ## Live end-to-end testing with tuistory (when unit tests can't reach it)
 
@@ -292,7 +298,12 @@ never see half a session. `acquireLease(..., { takeOver })` may also take a leas
 that has not expired from the one holder it names, a predecessor the caller knows
 has stopped. The row is compared with that holder in the same conditional write as
 the acquire, so a lease another holder took meanwhile is never taken. Without
-`takeOver` (every older build) the acquire is unchanged. Two revision counters
+`takeOver` (every older build) the acquire is unchanged. A distiller passes it on
+its first acquire only (`DistillerOptions.takeOverLease`). On v2 the lease holder
+is the distiller worker, whose holder id is `<instanceId>/w<generation>`; a
+replacement generation takes over its own predecessor's id that way, and to other
+processes each generation is one more contender (see the worker section below).
+Two revision counters
 drive lazy reader reloads and they are NOT interchangeable. `cards_rev` covers
 lexical card writes and the tier-1
 runtime watches it. The store allocates it inside each write's own transaction (see
@@ -303,7 +314,8 @@ nothing. A lexical write that allocates no revision stays invisible to readers. 
 card runtime applies only the cards stamped since its last refresh (see the card
 runtime section below), so it keeps serving the old card until its next full load.
 
-The lease holder also owns WAL checkpoints. SQLite's automatic checkpoint runs
+The lease holder also owns WAL checkpoints (on v2, the worker thread: main's
+reader never checkpoints). SQLite's automatic checkpoint runs
 inside whichever commit crosses 1,000 WAL pages and copies them all into the
 database there, so one small meta write can carry tens of milliseconds of copying
 on a long-used store. While a process holds the lease its connection sets
@@ -340,7 +352,10 @@ connection that never takes it. It returns a `ReadStore`, the `Store` methods th
 only read (cards, card pages and counters, the slim-index lookup, `getMeta` and
 `leaseStatus`). The search deps and the card hook's deps are typed against it. The
 returned object holds those methods alone, and the connection behind them refuses
-`exec`, `run` and `tx` before SQLite sees them.
+`exec`, `run` and `tx` before SQLite sees them. On v2 it is the main thread's store
+connection while the distiller runs in its worker, and the card-only fallback's
+first try (see the worker section below). `wrapReader` wraps its handle for tests
+(`readerStatements()` in `test/worker-harness.ts` records every statement).
 
 - **Connection:** it is opened through `openSqliteReadOnly`, with SQLite's read-only
   flag, `query_only=1` and `busy_timeout=0`. It never sets `journal_mode` or any
@@ -371,8 +386,11 @@ returned object holds those methods alone, and the connection behind them refuse
   `SQLITE_BUSY_RECOVERY` while another process rebuilds the WAL index after a crash,
   and an exclusive-mode connection elsewhere. The open itself retries through
   `retryOnBusy`, five attempts with waits of 1, 2, 4 and 8 ms spent in `macrotask`
-  turns, then refuses as `busy`. Async callers use the same helper. Sync callers get
-  the error.
+  turns, then refuses as `busy`. Async callers use the same helper: `recall` wraps
+  its `cards.ready()` waits and its slim-index lookup in it. Sync callers get the
+  error, except the card runtime's counter read on v2 (`cardReadsOf` in
+  `src/host/v2-runtime.ts`), which returns the counters it last read, so a busy
+  refresh reads as "nothing changed" and the next one tries again.
 - **Locks:** a read during a writer's open transaction does not wait and sees the
   state before that transaction.
 - **Close:** closing never checkpoints and never deletes the WAL. Measured on both
@@ -391,6 +409,170 @@ child process). Closing any descriptor of a file drops every POSIX lock the proc
 holds on it, the SQLite connections' included. Another process's closing
 connection could then checkpoint and delete the WAL under a reader that is still
 open. `stat` opens no descriptor.
+
+## The v2 distiller runs in a worker thread
+
+On v2, with a store path and a canonical `opencode.db` that opens, the runtime
+(`src/host/v2-runtime.ts`) runs the distiller in a `node:worker_threads` thread, so
+a busy disk under a store commit or an `opencode.db` read cannot block OpenCode's
+main thread. v1 always runs it inline: its history reads go through the host's
+in-process SDK transport, which cannot leave the thread.
+
+- **The worker** (`src/worker/handler.ts`, entry `src/distill-worker.ts`) owns the
+  only writable store connection (`openStore`, the fence and migrations), the
+  lease, the WAL checkpoints, the whole distiller (cold pass, polls, `createV2Sync`,
+  the range check, the repair sweep, rollups, metadata follow-ups) and its own
+  read-only `opencode.db` handle. It runs one read on its connection after
+  `openStore` before it reports the store, because SQLite creates the WAL files only
+  at a connection's first statement in WAL mode and the reader refuses `no-wal`
+  without them.
+- **Main** keeps the tools, the event mapping, the card runtime and every search,
+  drill and browse read, over its own `opencode.db` handle and a reader
+  (`openReadStore`) it opens only after the worker reported its store open.
+- **Unchanged:** v1, ephemeral mode, and a store with no readable `opencode.db`. The
+  card-only fallback (a source path that cannot be canonicalized) starts no worker.
+  It tries `openReadStore` with `acceptSource` first and, only on `no-wal` (no
+  connection anywhere holds the store open), falls back to the writable
+  `openStore(..., { existingOnly: true })`. It refuses as before otherwise.
+- **Inline on main:** a SQLite library compiled with `THREADSAFE=0`
+  (`sqliteThreadSafety`, read from a throwaway in-memory connection) runs the
+  distiller inline, reported as `"inline: sqlite is not thread-safe"`.
+  `V2RuntimeInputs.worker: false` does the same, as `"inline: the worker is turned
+off"`, for tests.
+
+### The protocol (`src/worker/protocol.ts`)
+
+Every message carries `v` (`PROTOCOL_VERSION`) and the worker `generation`. Main
+drops a message of another version or an older generation. A request that expects
+a reply (`init`, `vectors`, `stop`) carries an `id` and an absolute `deadline`.
+Its reply names the `id` and says `committed`, `refused` or `failed`, with a
+reason.
+
+| Direction     | Message                            | Contents                                                                                                                                                                                                                    |
+| ------------- | ---------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| main → worker | `init`                             | store and source paths, holder id, the predecessor's holder id (`takeOver`), limits, sync timings, `BUILD_ID`, the build tag, the representation and projector generations, the foreground signal's buffer                  |
+| main → worker | `events`                           | distiller signals, coalesced per session, up to 256 a message                                                                                                                                                               |
+| main → worker | `vectors`                          | model, representation and rows, each whole-buffer embedding transferred                                                                                                                                                     |
+| main → worker | `stop`                             | the deadline                                                                                                                                                                                                                |
+| worker → main | `ready`                            | the worker's `BUILD_ID`, once the module has loaded                                                                                                                                                                         |
+| worker → main | `store`                            | the fence result: `ok` with an optional `warning`, or a refusal reason                                                                                                                                                      |
+| worker → main | `status`                           | `DistillStatus` (lease included), indexing, repair progress, `discoveryTruncated`, the holder id, the worker's history drift and the longest synchronous store call since the last status; on change, at most once a second |
+| worker → main | `rev`                              | `cards_rev` and `vectors_rev` after a card write, at most every 100 ms; a hint only, main's counter polling stays authoritative                                                                                             |
+| worker → main | `log`, `fatal`, `reply`, `stopped` | a log line, an unrecoverable error (`store` or `crash`), a request's outcome, the end of a stop                                                                                                                             |
+
+No `opencode.db` row, history page, card or row set crosses. The bounds:
+
+- **Main's event outbox** (`createEventOutbox`) coalesces per session while the
+  worker is not running and between flushes. A deletion stays a deletion and drops
+  the session's other signals, patches merge field by field (later values win),
+  and a turn end or a patchless metadata change becomes one re-check. At 4,096
+  sessions or 1 MiB a new session evicts the oldest one holding only a re-check or
+  a removal (the poll finds it again). When every entry holds a deletion or a
+  patch, the new signal is dropped and counted (the session scan and the deletion
+  reconcile catch it).
+- **Vector writes:** at most 8 wait for a reply. A ninth, or any write while no
+  generation runs, settles `failed` at once. A write with no reply within 10 s
+  settles `failed`. Vector writes are never gated by the foreground signal, and the
+  worker serves them as they arrive, between its slices.
+- **Worker logs:** at most 200 lines a second, each cut to 2,000 characters. The
+  rest are counted and reported with the next line posted.
+- **Status and hints** are latest-only and rate-limited as above.
+
+### Lifecycle (`src/worker/controller.ts`)
+
+- **Start:** one controller per runtime, generations counted from 1, holder id
+  `<instanceId>/w<generation>`. `ready` must arrive within 10 s of starting the
+  thread and `store` within 10 s of `init`. The worker refuses an `init` whose
+  `BUILD_ID`, build tag, representation or projector generation differs from its
+  own (`fatal`, kind `crash`).
+- **The store result:** on `ok` main opens its reader (whose own busy retry applies).
+  A reader refusal then is a start failure, logged. Creation waits for the result
+  at most 3 s (`STORE_READY_WAIT_MS`). Until it arrives, `recall` serves the degraded
+  card tier with `coverage.cards.reason` "the index is starting", filled by one
+  background discovery started at the 3 s mark. Once the reader opens, the runtime
+  installs a store-backed card runtime and bumps `runtime.revision()`, and
+  `src/host/v2.ts` rebuilds its tools over the new deps.
+- **Failures:** a missed deadline, an `error` event, an exit main did not ask for, a
+  `fatal` of kind `crash`, a reader refusal after `ok` and a watchdog trip each fail
+  the generation. Main asks it to end and waits for its exit (`terminate()` returns
+  while a statement still runs, and that statement can still commit). The next
+  generation starts 1 s later, then 5 s later, and its `init` names the
+  predecessor's holder id, so its first acquire may take that one lease over.
+- **Watchdog:** every 5 s, when the generation reported holding the lease, the lease
+  row main's reader sees names it, its heartbeat is older than the row's TTL and no
+  stop is pending, the generation fails.
+- **After three failures** main takes over once the last thread has exited: it opens
+  the store with `openStore` on this thread, runs `createDistiller` here (taking the
+  last worker's lease over), installs a card runtime with `inlineVectorWriter`,
+  hands the queued signals to the new distiller and closes its reader once the tool
+  calls reading through it have finished. `coverage.history.distiller` reports
+  `"inline: <reason>"`.
+- **Store refusals:** a `store` refusal or a `fatal` of kind `store` (a damaged
+  file, `isCorruptError`) is never retried and never run inline. Main keeps the
+  reader if it had one and otherwise serves cards-lite.
+  `coverage.history.distiller` reports `"stopped: <reason>"`, and `recall` warns
+  that new sessions are not being indexed and how to fix it.
+- **Dispose:** stop mapping events; flush pending vector writes within the bound
+  (`flushVectorWrites`), then dispose the card runtime; send `stop` (the worker
+  quiesces and stops its distiller, which releases the lease, runs a passive
+  checkpoint, closes both connections and posts `stopped`); wait for tool calls,
+  bounded; close the reader (always, even when a bound ran out); close
+  `opencode.db`; then `terminate()` and wait at most 10 s for the exit. The runtime's
+  dispose resolves only then, so it stays in the registry's retiring map until the
+  thread has ended, and a reload's new runtime on the same store waits for it (at
+  most `RETIRE_WAIT_MS`, 3 s). The worker writes
+  nothing after `stopped`: its store handle refuses every call from then on.
+- **Coverage:** `coverage.history.distiller` is `"worker"` while the distiller runs
+  in a worker (from the first start on), `"inline: <reason>"` or
+  `"stopped: <reason>"`. v1 reports `"inline"`, alone in `coverage.history`.
+
+### What each thread owns
+
+The worker bundle evaluates its own copy of every module it imports, so module
+state exists once per thread.
+
+- **`BUILD_ID`** (`src/build-id.ts`): one tsup run defines it for both entries, so
+  both copies hold one value. `ready` and `init` carry it, and a mismatch is a
+  start failure.
+- **The yield slicer** (`src/yield.ts`): one per thread, slicing that thread's own
+  event loop. The worker's background point gives way to main through the
+  foreground signal (`yieldBackgroundTo`), which it sets at `init` and clears when
+  it stops.
+- **The runtime registry** (`globalThis` through `src/host/registry.ts`): main only.
+  The worker never imports a host module, so it never creates one. In the inline
+  starter the handler shares main's `globalThis` but still never calls
+  `registry()`.
+- **History drift:** each `opencode.db` handle has its own state (`sharedByHandle`
+  in `src/history/v2.ts` is keyed by handle). The worker reports its drift in each
+  status, and main adds it to its own (`mergeDrift`).
+- **The embedder** (`src/semantic/embedder.ts`): main only. The worker never embeds.
+- **Logging:** the v2 file sink (`v2Sink` in `src/host/v2.ts`) is main's. The
+  worker never writes the debug log; its lines arrive as `log` messages.
+- **Timers:** the distiller's timers and the worker's status and hint timers live
+  in the worker. The status and hint timers are unreferenced, and the thread itself
+  is unreferenced, so neither keeps the host alive.
+- **Caches** (`normalizedLabels` in `src/candidates.ts`, the part-id counter in
+  `src/hooks/part-id.ts`, `sharedStartingCards` in `src/host/v2-tools.ts`): main's
+  search, hook and tool code. A copy in the worker, if bundled, is never used.
+- **SQLite:** each thread loads its own driver module over the process's one SQLite
+  library, with one connection per thread, which `THREADSAFE=1` or `2` allows.
+
+### Testing it
+
+- **Unit suites** run the handler on the test's own thread over an in-process
+  `MessageChannel` (same protocol, same structured cloning): a runtime created from
+  the TypeScript sources defaults to `inlineStarter()` (`defaultWorkerStarter` picks
+  it when its module path ends in `.ts`), so every existing v2 suite exercises the
+  protocol. `test/worker-harness.ts` adds `workerHarness()` (crash points before a
+  commit, after a commit and during shutdown, delayed replies, failing starts),
+  `harnessController()`, `workerInit()` and `readerStatements()`.
+- **The compiled worker:** `npm run test:compiled` (part of `npm run check`, after
+  `compile`) runs `test/compiled/*.check.ts` against `dist/distill-worker.js` in a
+  real Node thread through `startCompiledWorker()`. The stall entry
+  (`test/stall-worker.ts`, built to `test-dist/`) wraps the production handler with
+  a store handle that holds the thread with `Atomics.wait` inside a write
+  transaction (`workerData.stall`).
+- **Packaging:** `npm run check:pack` checks `npm pack --dry-run`.
 
 ## Schema 5 card writes account for their own revisions
 
@@ -525,10 +707,14 @@ with `storeCardSource(store, writer)`, which adds the reads an incremental refre
 needs (`cardCounters`, `cardsSince`, `cardSessionIds`, `cardsPage`,
 `cardVectorsPage`). Its store parameter (`CardSourceStore`) is a `Pick` of those
 reads plus `allCards` and `getMeta`, with no write method. Vectors are persisted
-only through `writer`, a `CardVectorWriter`. Both hosts pass
-`inlineVectorWriter(store)`, which runs `writeCardEmbeddings` on the calling thread
-and returns its outcome as a settled promise. Without a writer the runtime keeps the
-vectors it computes in memory and writes none. A source without the reads
+only through `writer`, a `CardVectorWriter`. The v1 host, and the v2 host whenever
+its distiller runs on the main thread, pass `inlineVectorWriter(store)`, which runs
+`writeCardEmbeddings` on the calling thread and returns its outcome as a settled
+promise. While the v2 distiller runs in its worker, the source reads main's reader
+and the writer is the controller's `writeVectors`, which posts each write to the
+worker and settles with its acknowledgement. Without a writer (the card-only
+fallback over a reader) the runtime keeps the vectors it computes in memory and
+writes none. A source without the reads
 (cards-lite, the static sources in tests) reloads every card whenever its revision
 changes.
 
@@ -681,7 +867,9 @@ One slicer has two yield points that share its slice. `yieldOnBudget` is for
 work a caller waits on, such as the card runtime's jobs behind `ready()` and the
 drill's reads. `yieldInBackground` is for upkeep. The distiller yields through
 it on both hosts. On v2 so do the history facade, the sync and the discovery
-the distiller reads through. A yield gives its slice to the first
+the distiller reads through. Each thread loads its own copy of `src/yield.ts`,
+so the v2 worker's distiller slices against the worker thread's slicer, never the
+main thread's; the foreground signal below is what reaches across. A yield gives its slice to the first
 foreground waiter whenever one waits on it. Background waiters that have
 waited through `BACKGROUND_EVERY - 1` (7) foreground turns in a row take the
 next one, so upkeep slows down while a search runs but never stops. Within a
@@ -721,6 +909,11 @@ it hands `signal.buffer` to wraps it with `foregroundSignalFrom`.
   needs no notify protocol and runs under fake timers.
 - **No signal:** with none, or with one that reads zero, nothing awaits anything
   new, and the gate and the slicer behave as they do without one.
+- **On v2:** the runtime creates the signal. Every tool call runs inside
+  `runtime.foreground.run` (`src/host/v2.ts`), and main's fetch gate counts in it
+  too. The worker wraps the buffer it gets in `init`, gives it to its own gate and
+  calls `yieldBackgroundTo` with it, so its cold pass, repair sweep, rollups and
+  range check stand aside while any tool runs. v1 passes no signal.
 
 **Never gate a write another thread serves for the thread that raised the signal**
 (the card runtime's vector writes, any acknowledged request) on the signal or the
