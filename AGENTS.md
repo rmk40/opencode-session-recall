@@ -437,8 +437,12 @@ in-process SDK transport, which cannot leave the thread.
 - **Inline on main:** a SQLite library compiled with `THREADSAFE=0`
   (`sqliteThreadSafety`, read from a throwaway in-memory connection) runs the
   distiller inline, reported as `"inline: sqlite is not thread-safe"`.
-  `V2RuntimeInputs.worker: false` does the same, as `"inline: the worker is turned
-off"`, for tests.
+  `V2RuntimeInputs.worker: false` does the same, for tests, reported as
+  `"inline: the worker is turned off"`. A `storePath` of `:memory:` runs inline
+  as well, reported as
+  `"inline: the store is in memory, which no other thread can open"`: each
+  connection to it opens a private database, so main's reader could never see a
+  worker's.
 
 ### The protocol (`src/worker/protocol.ts`)
 

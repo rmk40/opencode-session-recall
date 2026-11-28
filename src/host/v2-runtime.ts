@@ -109,6 +109,8 @@ const WORKER_EXIT_WAIT_MS = 10_000;
 export const STORE_READY_WAIT_MS = 2_500;
 /** The reason the degraded card tier gives while the worker is starting. */
 export const INDEX_STARTING_REASON = "the index is starting";
+/** Why the distiller of an in-memory store runs on main. */
+export const STORE_IN_MEMORY_REASON = "the store is in memory, which no other thread can open";
 /** The reason the degraded card tier gives while the worker waits for a
  *  store whose write lock another process holds. */
 export const STORE_LOCKED_REASON =
@@ -780,8 +782,14 @@ async function createV2Runtime(
   // see createUnavailableSource.) One exception keeps the card tier when
   // opencode.db is missing or unreadable: an existing store stamped for the
   // same file is opened for cards only, never stamped or distilled into.
+  // An in-memory store is private to the connection that opens it: neither a
+  // worker's store nor main's reader could see the other's, so it runs here.
+  const inMemoryStore = identity.store === ":memory:";
   const threadSafety =
-    identity.store !== null && identity.source !== null && identity.sourceCanonical === true
+    identity.store !== null &&
+    identity.source !== null &&
+    identity.sourceCanonical === true &&
+    !inMemoryStore
       ? await sqliteThreadSafety()
       : undefined;
   if (identity.store !== null && identity.source !== null && identity.sourceCanonical !== true) {
@@ -812,7 +820,8 @@ async function createV2Runtime(
     identity.source !== null &&
     opencodeDb &&
     inputs.worker !== false &&
-    threadSafety !== 0
+    threadSafety !== 0 &&
+    !inMemoryStore
   ) {
     const storePath = identity.store;
     const sourcePath = identity.source;
@@ -956,8 +965,11 @@ async function createV2Runtime(
         // No history, no distilling: the distiller does not start.
         if (opencodeDb) {
           inline = makeInline(opened.store);
-          const reason =
-            threadSafety === 0 ? "sqlite is not thread-safe" : "the worker is turned off";
+          const reason = inMemoryStore
+            ? STORE_IN_MEMORY_REASON
+            : threadSafety === 0
+              ? "sqlite is not thread-safe"
+              : "the worker is turned off";
           distillerMode = () => `inline: ${reason}`;
         }
       } else {

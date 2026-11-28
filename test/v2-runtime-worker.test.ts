@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   INDEX_STARTING_REASON,
+  STORE_IN_MEMORY_REASON,
   v2RuntimeFactory,
   type V2Runtime,
   type V2RuntimeInputs,
@@ -279,6 +280,19 @@ describe("where the distiller runs", () => {
     },
     30_000,
   );
+
+  it("runs it on this thread for an in-memory store, starting no worker", async () => {
+    const harness = workerHarness();
+    const { runtime, logs } = await create({
+      options: { storePath: ":memory:" },
+      worker: { start: harness.start },
+    });
+    expect(harness.sides).toHaveLength(0);
+    expect(writable(runtime.store)).toBe(true);
+    expect(runtime.deps.distiller?.()).toBe(`inline: ${STORE_IN_MEMORY_REASON}`);
+    await waitFor(() => runtime.store?.getCard("ses_a") !== undefined, "the card");
+    expect(logs.filter((line) => /worker generation \d+ failed/.test(line))).toEqual([]);
+  }, 30_000);
 
   it("opens a store without a distiller or a label when opencode.db does not open", async () => {
     const notADb = join(dir, "opencode.db");
