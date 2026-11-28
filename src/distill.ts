@@ -4412,6 +4412,7 @@ export function createDistiller(options: DistillerOptions): Distiller {
             existing.timeUpdated === session.timeUpdated &&
             existing.title === session.title &&
             existing.directory === session.directory &&
+            existing.projectId === session.projectId &&
             (existing.timeArchived ?? null) === (session.timeArchived ?? null) &&
             // A card below the projector generation is rebuilt whatever its
             // tail says; the repair sweep skips sessions being re-distilled.

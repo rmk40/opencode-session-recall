@@ -3007,6 +3007,48 @@ describe("sync-host poll dispatch", () => {
   });
 });
 
+describe("sync-host patchless metadata changes", () => {
+  it("re-reads the metadata for a patchless meta signal, a project change alone included", async () => {
+    const graph: Graph = {
+      sessions: [session("s1", "One", PROJECT_DIR, 1_000)],
+      messagesBySession: {
+        s1: [bundle(userMessage("m1", "s1", 100), [textPart("p1", "s1", "m1", "hello")])],
+      },
+    };
+    const { source } = makeDistillFake(graph);
+    const sync: DistillSync = {
+      checkpoint: async () => null,
+      // The history is unchanged: only the metadata can make a write.
+      compare: async () => "fresh",
+      missing: async () => [],
+      poll: async () => ({ signals: [], commit: () => {}, failures: [] }),
+      pollIntervalMs: 5,
+      reconcileEveryMs: 1e12,
+    };
+    const { db, store } = await freshStore();
+    const distiller = createDistiller({
+      source,
+      store,
+      gate: createFetchGate({ concurrency: 2 }),
+      limits: { ...TEST_LIMITS, coldPass: false },
+      instanceId: "meta-reread",
+      sync,
+      idleDebounceMs: 1,
+      log: () => {},
+    });
+    distiller.start();
+    distiller.onEvent({ type: "turn-ended", sessionID: "s1" });
+    await waitFor(() => store.getCard("s1") !== undefined);
+    expect(store.getCard("s1")?.projectId).toBe("project-main");
+
+    graph.sessions = [{ ...session("s1", "One", PROJECT_DIR, 1_000), projectID: "project-moved" }];
+    distiller.onEvent({ type: "meta", sessionID: "s1" });
+    await waitFor(() => store.getCard("s1")?.projectId === "project-moved");
+    await distiller.stop();
+    db.close();
+  });
+});
+
 describe("sync-host unsettled retries", () => {
   it("stops re-reading an unsettled session on every poll after repeated failures", async () => {
     const graph: Graph = {

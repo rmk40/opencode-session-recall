@@ -466,11 +466,15 @@ No `opencode.db` row, history page, card or row set crosses. The bounds:
 - **Main's event outbox** (`createEventOutbox`) coalesces per session while the
   worker is not running and between flushes. A deletion stays a deletion and drops
   the session's other signals, patches merge field by field (later values win),
-  and a turn end or a patchless metadata change becomes one re-check. At 4,096
-  sessions or 1 MiB a new session evicts the oldest one holding only a re-check or
-  a removal (the poll finds it again). When every entry holds a deletion or a
-  patch, the new signal is dropped and counted (the session scan and the deletion
-  reconcile catch it).
+  patchless metadata changes become one patchless `meta` and turn ends one
+  re-check. At 4,096 sessions or 1 MiB a new session evicts the oldest one holding
+  only a re-check or a removal (the poll finds it again). When every entry holds a
+  deletion or a metadata change, the new signal is dropped and counted (the
+  session scan and the deletion reconcile catch it). A patch that would pass the
+  byte bound, merged or new, becomes a patchless `meta` instead of its text. The
+  distiller answers a patchless `meta` with a re-distill, which reads the
+  session's metadata from `opencode.db` again and writes the card when its title,
+  directory, project or archive state differs.
 - **Event batches:** at most 2 `events` messages wait on their `ack` at once
   (`MAX_UNACKED_BATCHES`). A worker that SQLite holds up reads no message, so
   everything posted meanwhile keeps coalescing in the bounded outbox rather than

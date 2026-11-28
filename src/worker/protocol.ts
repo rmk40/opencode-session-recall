@@ -260,10 +260,15 @@ export function transferableBuffers(rows: readonly VectorRow[]): ArrayBuffer[] {
 type Pending = {
   deleted: boolean;
   removal: boolean;
-  /** A re-distill: a turn ended, or metadata changed without a patch. */
+  /** A re-distill: a turn ended. */
   recheck: boolean;
   /** The metadata patches seen, merged field by field, later values first. */
   patch?: SessionMetaPatch;
+  /** Metadata changed without a patch, or with one that did not fit the byte
+   *  bound: a patchless `meta`, for which the distiller reads the session's
+   *  metadata from `opencode.db` again. It also re-distills the session, so
+   *  it stands for a re-check too. */
+  reread: boolean;
   bytes: number;
 };
 
@@ -278,24 +283,29 @@ function patchBytes(patch: SessionMetaPatch | undefined): number {
 }
 
 /** Whether a session's pending signals hold something only the history
- *  sync's slower scans would find again: a deletion or a metadata patch. */
+ *  sync's slower scans would find again: a deletion or a metadata change. */
 function holdsChange(pending: Pending): boolean {
-  return pending.deleted || pending.patch !== undefined;
+  return pending.deleted || pending.patch !== undefined || pending.reread;
 }
 
 /**
  * Main's outbox of distiller signals, coalesced per session while they wait
  * to be posted. Coalescing loses no deletion, metadata patch or archive
  * change: a deletion is kept as one, patches merge field by field (the later
- * value wins), and the rest becomes one re-check of the session, which the
- * distiller answers by reading `opencode.db` again. A deleted session's other
+ * value wins), metadata changes without a patch become one patchless `meta`,
+ * and turn ends become one re-check of the session; the distiller answers
+ * the last two by reading `opencode.db` again. A deleted session's other
  * signals are dropped with it.
  *
  * At {@link OUTBOX_SESSIONS} sessions or {@link OUTBOX_BYTES} bytes, a new
  * session evicts the oldest session that holds only a re-check or a removal,
  * which the history sync's poll finds again; when every pending session
- * holds a deletion or a patch, the new session's signal is dropped and
- * counted. The sync's session scan and its deletion reconcile then catch it.
+ * holds a deletion or a metadata change, the new session's signal is dropped
+ * and counted. The sync's session scan and its deletion reconcile then catch
+ * it. A patch that would take the outbox past its byte bound, merged or new,
+ * is replaced by a patchless `meta` signal: the distiller then reads the
+ * session's metadata from `opencode.db` again, so the change is kept without
+ * its text.
  */
 export type EventOutbox = {
   add(signal: DistillSignal): void;
@@ -331,14 +341,20 @@ export function createEventOutbox(bounds: { sessions?: number; bytes?: number } 
       const id = signal.sessionID;
       let entry = pending.get(id);
       if (!entry) {
-        const cost = id.length + 32 + (signal.type === "meta" ? patchBytes(signal.patch) : 0);
+        const base = id.length + 32;
+        // Room for the patch too while evicting allows, unless it could never
+        // fit; the session alone must fit, and its patch becomes a re-read
+        // when it does not.
+        const whole = base + (signal.type === "meta" ? patchBytes(signal.patch) : 0);
+        const cost = whole <= maxBytes ? whole : base;
         while (pending.size >= maxSessions || bytes + cost > maxBytes) {
-          if (!evictOne()) {
-            dropped++;
-            return;
-          }
+          if (!evictOne()) break;
         }
-        entry = { deleted: false, removal: false, recheck: false, bytes: id.length + 32 };
+        if (pending.size >= maxSessions || bytes + base > maxBytes) {
+          dropped++;
+          return;
+        }
+        entry = { deleted: false, removal: false, recheck: false, reread: false, bytes: base };
         pending.set(id, entry);
         bytes += entry.bytes;
       }
@@ -350,6 +366,7 @@ export function createEventOutbox(bounds: { sessions?: number; bytes?: number } 
           entry.deleted = true;
           entry.removal = false;
           entry.recheck = false;
+          entry.reread = false;
           entry.patch = undefined;
           return;
         case "removal":
@@ -360,12 +377,20 @@ export function createEventOutbox(bounds: { sessions?: number; bytes?: number } 
           return;
         case "meta": {
           if (!signal.patch) {
-            entry.recheck = true;
+            entry.reread = true;
             return;
           }
           const before = patchBytes(entry.patch);
-          entry.patch = { ...entry.patch, ...signal.patch };
-          const after = patchBytes(entry.patch);
+          const merged = { ...entry.patch, ...signal.patch };
+          const after = patchBytes(merged);
+          if (bytes - before + after > maxBytes) {
+            entry.patch = undefined;
+            entry.reread = true;
+            entry.bytes -= before;
+            bytes -= before;
+            return;
+          }
+          entry.patch = merged;
           entry.bytes += after - before;
           bytes += after - before;
           return;
@@ -380,8 +405,10 @@ export function createEventOutbox(bounds: { sessions?: number; bytes?: number } 
           signals.push({ type: "deleted", sessionID });
         } else {
           if (entry.patch) signals.push({ type: "meta", sessionID, patch: entry.patch });
+          // A patchless meta re-distills the session, as a re-check does.
+          if (entry.reread) signals.push({ type: "meta", sessionID });
           if (entry.removal) signals.push({ type: "removal", sessionID });
-          if (entry.recheck) signals.push({ type: "turn-ended", sessionID });
+          if (entry.recheck && !entry.reread) signals.push({ type: "turn-ended", sessionID });
         }
         if (out.length > 0 && out.length + signals.length > limit) break;
         out.push(...signals);

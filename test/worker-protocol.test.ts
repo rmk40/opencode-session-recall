@@ -124,12 +124,28 @@ describe("the event outbox", () => {
       ]);
     });
 
-    it("turns turn ends and patchless metadata changes into one re-check", () => {
+    it("turns turn ends into one re-check, and patchless metadata changes into one patchless meta that stands for it", () => {
       const outbox = createEventOutbox();
       outbox.add(turnEnded("s1"));
-      outbox.add(meta("s1"));
       outbox.add(turnEnded("s1"));
-      expect(outbox.drain()).toEqual([turnEnded("s1")]);
+      outbox.add(turnEnded("s2"));
+      outbox.add(meta("s2"));
+      outbox.add(meta("s2", { title: "t" }));
+      outbox.add(meta("s2"));
+      outbox.add(turnEnded("s2"));
+      expect(outbox.drain()).toEqual([turnEnded("s1"), meta("s2", { title: "t" }), meta("s2")]);
+    });
+
+    it("drains to signals that, added again, coalesce to the same outbox", () => {
+      const outbox = createEventOutbox();
+      outbox.add(meta("s1", { title: "t" }));
+      outbox.add(meta("s1"));
+      outbox.add(removal("s1"));
+      outbox.add(turnEnded("s2"));
+      outbox.add(deleted("s3"));
+      const drained = outbox.drain();
+      for (const signal of drained) outbox.add(signal);
+      expect(outbox.drain()).toEqual(drained);
     });
 
     it("keeps a removal, draining a session's patch, removal and re-check in that order", () => {
@@ -230,6 +246,37 @@ describe("the event outbox", () => {
       outbox.add(turnEnded("c"));
       expect(outbox.dropped()).toBe(1);
       expect(outbox.drain().map((s) => s.sessionID)).toEqual(["a", "c"]);
+    });
+
+    it("keeps a metadata change whose merged patch passes the byte bound as a patchless meta", () => {
+      const outbox = createEventOutbox({ bytes: 200 });
+      outbox.add(turnEnded("a"));
+      outbox.add(meta("a", { title: "short" }));
+      outbox.add(meta("a", { title: "x".repeat(300) }));
+      // A later patch that fits still goes out, beside the re-read.
+      outbox.add(meta("a", { directory: "/d" }));
+      outbox.add(turnEnded("b"));
+      expect(outbox.dropped()).toBe(0);
+      expect(outbox.drain()).toEqual([meta("a", { directory: "/d" }), meta("a"), turnEnded("b")]);
+    });
+
+    it("keeps a new session's patch larger than the byte bound as a patchless meta", () => {
+      const outbox = createEventOutbox({ bytes: 100 });
+      outbox.add(turnEnded("b"));
+      outbox.add(meta("a", { title: "x".repeat(200) }));
+      expect(outbox.dropped()).toBe(0);
+      expect(outbox.drain()).toEqual([turnEnded("b"), meta("a")]);
+    });
+
+    it("evicts no session that holds a patchless metadata change", () => {
+      // Each entry costs its id's length plus 32 bytes: three fit in 100.
+      const outbox = createEventOutbox({ bytes: 100 });
+      outbox.add(meta("a"));
+      outbox.add(turnEnded("b"));
+      outbox.add(turnEnded("c"));
+      outbox.add(turnEnded("d"));
+      expect(outbox.dropped()).toBe(1);
+      expect(outbox.drain()).toEqual([meta("a"), turnEnded("c"), turnEnded("d")]);
     });
 
     it("frees the bytes of a patch a deletion replaced", () => {
