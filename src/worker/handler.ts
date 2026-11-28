@@ -20,6 +20,8 @@ import {
   PROTOCOL_VERSION,
   STATUS_CHECK_MS,
   STATUS_EVERY_MS,
+  STORE_LOCK_RETRY_FIRST_MS,
+  STORE_LOCK_RETRY_MAX_MS,
   type EventsMessage,
   type InitMessage,
   type StopMessage,
@@ -71,6 +73,10 @@ export type WorkerHandlerOptions = {
    *  transaction. */
   openStoreDb?: (path: string) => Promise<SqliteDb | null>;
   now?: () => number;
+  /** The waits before a store open whose write lock was held runs again
+   *  (default {@link STORE_LOCK_RETRY_FIRST_MS}, doubling up to
+   *  {@link STORE_LOCK_RETRY_MAX_MS}). */
+  lockRetryMs?: { first: number; max: number };
 };
 
 export type WorkerHandler = {
@@ -173,6 +179,14 @@ export function runWorkerHandler(port: WorkerPort, options: WorkerHandlerOptions
   const generation = options.generation;
   const now = options.now ?? Date.now;
   const openStoreDb = options.openStoreDb ?? openSqlite;
+  const lockRetry = options.lockRetryMs ?? {
+    first: STORE_LOCK_RETRY_FIRST_MS,
+    max: STORE_LOCK_RETRY_MAX_MS,
+  };
+  /** The wait before the store's open runs again, which a stop or a halt
+   *  ends at once. */
+  let lockWait: (() => void) | undefined;
+  let lockTimer: ReturnType<typeof setTimeout> | undefined;
 
   let halted = false;
   let stopping = false;
@@ -268,6 +282,9 @@ export function runWorkerHandler(port: WorkerPort, options: WorkerHandlerOptions
   const clearTimers = (): void => {
     if (statusTimer !== undefined) clearInterval(statusTimer);
     statusTimer = undefined;
+    if (lockTimer !== undefined) clearTimeout(lockTimer);
+    lockTimer = undefined;
+    lockWait?.();
   };
 
   const closeAll = (): void => {
@@ -309,13 +326,37 @@ export function runWorkerHandler(port: WorkerPort, options: WorkerHandlerOptions
       fatal("crash", "SQLite could not open the store");
       return;
     }
-    const result = openStore(db, { host: "opencode-v2", source: message.sourcePath });
+    // Closed by a stop or a halt that arrives while the open waits.
+    storeDb = db;
+    let result = openStore(db, { host: "opencode-v2", source: message.sourcePath });
+    // Another connection held the write lock past the open's busy timeout:
+    // no refusal, so the open runs again after a wait that doubles up to a
+    // bound, on this thread, for as long as the lock stays held. Main hears
+    // of each wait and counts none of them as a failure.
+    for (let attempt = 1; !result.ok && result.busy; attempt++) {
+      const retryInMs = Math.min(lockRetry.first * 2 ** (attempt - 1), lockRetry.max);
+      send({
+        type: "waiting",
+        reason: "another process holds the store's write lock",
+        attempt,
+        retryInMs,
+      });
+      await new Promise<void>((resolve) => {
+        lockWait = resolve;
+        lockTimer = setTimeout(resolve, retryInMs);
+        unref(lockTimer);
+      });
+      lockWait = undefined;
+      lockTimer = undefined;
+      if (halted || stopping) return;
+      result = openStore(db, { host: "opencode-v2", source: message.sourcePath });
+    }
     if (!result.ok) {
+      storeDb = null;
       closeQuietly(db);
       send({ type: "store", id: message.id, ok: false, reason: result.reason });
       return;
     }
-    storeDb = db;
     store = instrumentStore(result.store, probe, onCorrupt);
     // SQLite creates the WAL and its index file at a connection's first
     // statement in WAL mode, and openStore switches a new store to WAL as

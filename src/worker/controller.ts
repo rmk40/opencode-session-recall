@@ -69,6 +69,9 @@ export type WorkerControllerOptions = {
   onInline(reason: string, lastHolder: string | undefined): void;
   /** A status message of the current generation arrived. */
   onStatus?(status: WorkerStatus): void;
+  /** The current generation waits for a store whose write lock another
+   *  connection holds (`reason`); it reports its store once it gets it. */
+  onWaiting?(reason: string): void;
   /** The lease row as main's reader sees it, for the watchdog; undefined
    *  while there is no reader. */
   readLease(): LeaseInfo | undefined;
@@ -85,7 +88,9 @@ export type WorkerControllerOptions = {
 
 /** Where the distiller runs, as `coverage.history.distiller` reports it. */
 export type DistillerMode =
-  | { kind: "worker" }
+  /** `detail` says what the worker is doing when it is not simply running,
+   *  such as waiting for the store's write lock. */
+  | { kind: "worker"; detail?: string }
   | { kind: "inline"; reason: string }
   | { kind: "stopped"; reason: string };
 
@@ -300,6 +305,7 @@ export function createWorkerController(options: WorkerControllerOptions): Worker
   async function onStore(gen: Generation, message: Extract<WorkerMessage, { type: "store" }>) {
     if (gen.storeTimer !== undefined) clearTimeout(gen.storeTimer);
     gen.storeTimer = undefined;
+    if (mode.kind === "worker" && gen === current) mode = { kind: "worker" };
     if (!message.ok) {
       stopIndexing(gen, message.reason);
       return;
@@ -352,6 +358,21 @@ export function createWorkerController(options: WorkerControllerOptions): Worker
       case "store":
         void onStore(gen, raw);
         return;
+      case "waiting": {
+        // The worker is alive and keeps trying: its store deadline moves to
+        // past the wait it announced, and the wait is no failure.
+        if (gen.storeTimer === undefined || gen.stopRequested) return;
+        clearTimeout(gen.storeTimer);
+        const wait = Math.max(0, raw.retryInMs) + storeTimeout;
+        gen.storeTimer = setTimeout(
+          () => void fail(gen, `no store result within ${wait} ms of a wait for the store lock`),
+          wait,
+        );
+        unref(gen.storeTimer);
+        if (mode.kind === "worker") mode = { kind: "worker", detail: `waiting (${raw.reason})` };
+        options.onWaiting?.(raw.reason);
+        return;
+      }
       case "status":
         gen.status = raw.status;
         options.onStatus?.(raw.status);

@@ -117,6 +117,8 @@ export function workerHarness(
     openStoreDb?: (path: string) => Promise<SqliteDb | null>;
     /** The handlers' clock (`WorkerHandlerOptions.now`). */
     now?: () => number;
+    /** The handlers' waits for a store lock (`WorkerHandlerOptions.lockRetryMs`). */
+    lockRetryMs?: { first: number; max: number };
   } = {},
 ): WorkerHarness {
   const sides: HandlerSide[] = [];
@@ -178,6 +180,7 @@ export function workerHarness(
     const handler = runWorkerHandler(handlerPort, {
       generation,
       ...(opts.now && { now: opts.now }),
+      ...(opts.lockRetryMs && { lockRetryMs: opts.lockRetryMs }),
       openStoreDb: async (path) => {
         const db = await openBase(path);
         return db ? faultyDb(db, state) : db;

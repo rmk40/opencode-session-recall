@@ -189,6 +189,46 @@ describe("the controller with scripted workers", () => {
       ]);
     });
 
+    it("takes a worker's wait for the store lock as no failure, moving its store deadline past each wait", async () => {
+      const waits: string[] = [];
+      const { controller, scripted, record } = scriptedController({
+        onWaiting: (reason) => waits.push(reason),
+      });
+      await flush();
+      await ready(scripted.worker(1));
+      await advance(9_000);
+      const reason = "another process holds the store's write lock";
+      scripted.worker(1).emit({ type: "waiting", reason, attempt: 1, retryInMs: 30_000 });
+      await flush();
+      expect(controller.mode()).toEqual({ kind: "worker", detail: `waiting (${reason})` });
+      expect(waits).toEqual([reason]);
+      // Past init's 10 s deadline, and still within the wait it announced.
+      await advance(39_000);
+      expect(scripted.worker(1).terminations).toBe(0);
+      expect(failures(record)).toEqual([]);
+
+      const init = scripted.worker(1).last("init");
+      scripted.worker(1).emit({ type: "store", id: init?.id, ok: true });
+      await flush();
+      expect(controller.mode()).toEqual({ kind: "worker" });
+      expect(record.storeOpens).toHaveLength(1);
+      expect(record.stopped).toEqual([]);
+    });
+
+    it("still fails a worker that goes quiet after it announced a wait for the store lock", async () => {
+      const { scripted, record } = scriptedController();
+      await flush();
+      await ready(scripted.worker(1));
+      scripted.worker(1).emit({ type: "waiting", reason: "locked", attempt: 1, retryInMs: 1_000 });
+      await flush();
+      await advance(10_999);
+      expect(failures(record)).toEqual([]);
+      await advance(1);
+      expect(failures(record)).toEqual([
+        "worker generation 1 failed (1 of 3): no store result within 11000 ms of a wait for the store lock",
+      ]);
+    });
+
     it("counts a ready from another build as a failure and sends no init", async () => {
       const { scripted, record } = scriptedController();
       await flush();

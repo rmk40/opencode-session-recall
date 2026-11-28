@@ -250,6 +250,13 @@ function busyCodeOf(error: unknown): string | undefined {
   return undefined;
 }
 
+/** Whether `error`, from either driver or as a {@link SqliteBusyError}, is
+ *  SQLite reporting a lock another connection held (`SQLITE_BUSY` or one of
+ *  its extended codes). */
+export function isBusyError(error: unknown): boolean {
+  return error instanceof SqliteBusyError || busyCodeOf(error) !== undefined;
+}
+
 /** `error` as a {@link SqliteBusyError} when it is a busy error, else as is. */
 function typedBusy(error: unknown): unknown {
   if (error instanceof SqliteBusyError) return error;

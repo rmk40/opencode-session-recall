@@ -1,4 +1,5 @@
 import {
+  isBusyError,
   openSqliteReadOnly,
   SqliteBusyError,
   type ReadOnlyDb,
@@ -630,7 +631,10 @@ type FenceRefusal = Exclude<StoreRefusal, "error">;
 export type OpenStoreResult =
   /** `warning` is set when the store opened but could not be switched to WAL
    *  (a performance setting, not a correctness one); the host may log it. */
-  { ok: true; store: Store; warning?: string } | { ok: false; reason: StoreRefusal };
+  | { ok: true; store: Store; warning?: string }
+  /** `busy` is set on an `error` that was another connection holding the
+   *  write lock past the busy timeout: the same open may succeed later. */
+  | { ok: false; reason: StoreRefusal; busy?: true };
 
 export type Store = {
   /**
@@ -1907,7 +1911,10 @@ export function openStore(
     const store = new SqliteStore(db, now);
     return warning === undefined ? { ok: true, store } : { ok: true, store, warning };
   } catch (error) {
-    return { ok: false, reason: error instanceof StoreRefused ? error.reason : "error" };
+    if (error instanceof StoreRefused) return { ok: false, reason: error.reason };
+    return isBusyError(error)
+      ? { ok: false, reason: "error", busy: true }
+      : { ok: false, reason: "error" };
   }
 }
 

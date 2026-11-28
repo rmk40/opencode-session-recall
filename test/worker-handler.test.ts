@@ -435,6 +435,78 @@ describe("opening the store", () => {
     expect(opener.calls).toEqual([]);
   });
 
+  it("waits for a store whose write lock another connection holds, announcing each wait, and opens it once the lock is free", async () => {
+    let locked = 2;
+    const busy = (): Error =>
+      Object.assign(new Error("database is locked"), { code: "ERR_SQLITE_ERROR", errcode: 5 });
+    const { worker, side } = await startSide(
+      workerHarness({
+        lockRetryMs: { first: 20, max: 30 },
+        openStoreDb: async (path) => {
+          const db = await openSqlite(path);
+          if (!db) return db;
+          return {
+            ...db,
+            tx<T>(fn: () => T): T {
+              if (locked > 0) {
+                locked--;
+                throw busy();
+              }
+              return db.tx(fn);
+            },
+          };
+        },
+      }),
+    );
+    worker.postMessage(initMessage());
+    const store = await nextOf(side, "store");
+    expect(store.ok).toBe(true);
+    expect(
+      sentOf(side, "waiting").map(({ attempt, retryInMs, reason }) => ({
+        attempt,
+        retryInMs,
+        reason,
+      })),
+    ).toEqual([
+      { attempt: 1, retryInMs: 20, reason: "another process holds the store's write lock" },
+      { attempt: 2, retryInMs: 30, reason: "another process holds the store's write lock" },
+    ]);
+    expect(sentOf(side, "fatal")).toEqual([]);
+  });
+
+  it("stops at once while it waits for the store lock, posting stopped and no store result", async () => {
+    const { worker, side } = await startSide(
+      workerHarness({
+        lockRetryMs: { first: 60_000, max: 60_000 },
+        openStoreDb: async (path) => {
+          const db = await openSqlite(path);
+          if (!db) return db;
+          return {
+            ...db,
+            tx<T>(): T {
+              throw Object.assign(new Error("database is locked"), {
+                code: "ERR_SQLITE_ERROR",
+                errcode: 5,
+              });
+            },
+          };
+        },
+      }),
+    );
+    worker.postMessage(initMessage());
+    await nextOf(side, "waiting");
+    worker.postMessage({
+      v: PROTOCOL_VERSION,
+      generation: 1,
+      type: "stop",
+      id: 99,
+      deadline: Date.now() + 2_000,
+    });
+    expect(await nextOf(side, "stopped")).toMatchObject({ id: 99 });
+    await sleep(50);
+    expect(sentOf(side, "store")).toEqual([]);
+  });
+
   it("reports a store connection SQLite cannot open as a fatal crash", async () => {
     const { worker, side } = await startSide(workerHarness({ openStoreDb: async () => null }));
     worker.postMessage(initMessage());

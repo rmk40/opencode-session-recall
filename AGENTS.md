@@ -457,6 +457,7 @@ reason.
 | worker → main | `ready`                            | the worker's `BUILD_ID`, once the module has loaded                                                                                                                                                                         |
 | worker → main | `store`                            | the fence result: `ok` with an optional `warning`, or a refusal reason                                                                                                                                                      |
 | worker → main | `status`                           | `DistillStatus` (lease included), indexing, repair progress, `discoveryTruncated`, the holder id, the worker's history drift and the longest synchronous store call since the last status; on change, at most once a second |
+| worker → main | `waiting`                          | the store's open found its write lock held by another connection past the 5 s busy timeout: the reason, the attempt and the wait before it opens again (1 s, doubling to 30 s)                                              |
 | worker → main | `log`, `fatal`, `reply`, `stopped` | a log line, an unrecoverable error (`store` or `crash`), a request's outcome, the end of a stop                                                                                                                             |
 
 No `opencode.db` row, history page, card or row set crosses. The bounds:
@@ -490,6 +491,16 @@ No `opencode.db` row, history page, card or row set crosses. The bounds:
   thread and `store` within 10 s of `init`. The worker refuses an `init` whose
   `BUILD_ID`, build tag, representation or projector generation differs from its
   own (`fatal`, kind `crash`).
+- **A locked store:** `openStore` reports an `error` that was another
+  connection holding the write lock past its busy timeout with `busy: true`.
+  The worker then opens it again on its own thread, after 1 s and then a wait
+  that doubles up to 30 s, for as long as the lock stays held, posting
+  `waiting` before each wait. Main takes each `waiting` as no failure: it moves
+  the store deadline to the announced wait plus 10 s, reports
+  `coverage.history.distiller` as `"worker: waiting (<reason>)"` and, while it
+  has no reader, the degraded card tier's reason as the store being locked by
+  another process. A stop or a halt ends the wait at once. Fence refusals and a
+  damaged file stay terminal.
 - **The store result:** on `ok` main opens its reader (whose own busy retry
   applies). A reader refusal then is a start failure, logged. Creation waits for
   the result at most 2.5 s (`STORE_READY_WAIT_MS`), and a tool call waits for the

@@ -109,6 +109,10 @@ const WORKER_EXIT_WAIT_MS = 10_000;
 export const STORE_READY_WAIT_MS = 2_500;
 /** The reason the degraded card tier gives while the worker is starting. */
 export const INDEX_STARTING_REASON = "the index is starting";
+/** The reason the degraded card tier gives while the worker waits for a
+ *  store whose write lock another process holds. */
+export const STORE_LOCKED_REASON =
+  "the store is locked by another process, and the index is waiting for it";
 /** How often the runtime compares the history drift with what it last
  *  logged. */
 const DRIFT_LOG_EVERY_MS = 5 * 60_000;
@@ -831,7 +835,8 @@ async function createV2Runtime(
     distillerMode = () => {
       const mode = controller?.mode();
       if (!mode) return undefined;
-      return mode.kind === "worker" ? "worker" : `${mode.kind}: ${mode.reason}`;
+      if (mode.kind === "worker") return mode.detail ? `worker: ${mode.detail}` : "worker";
+      return `${mode.kind}: ${mode.reason}`;
     };
     distillerWarning = () => {
       const mode = controller?.mode();
@@ -916,6 +921,13 @@ async function createV2Runtime(
       onInline: goInline,
       onStatus(status) {
         workerDrift = status.drift;
+      },
+      onWaiting() {
+        // Until the store opens, the degraded tier says why it is waiting.
+        if (reader || disposed || degradedReason === STORE_LOCKED_REASON) return;
+        degradedReason = STORE_LOCKED_REASON;
+        rebuildDeps();
+        revision++;
       },
       readLease: () => reader?.store.leaseStatus(),
       ...(workerInputs.restartDelaysMs && { restartDelaysMs: workerInputs.restartDelaysMs }),

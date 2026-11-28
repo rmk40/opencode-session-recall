@@ -37,6 +37,11 @@ export const MAX_PENDING_REQUESTS = 8;
 export const STATUS_EVERY_MS = 1_000;
 /** How often the worker looks for a status change. */
 export const STATUS_CHECK_MS = 250;
+/** The worker's first wait before it opens a store again whose write lock
+ *  another connection held; each later wait doubles, up to
+ *  {@link STORE_LOCK_RETRY_MAX_MS}. */
+export const STORE_LOCK_RETRY_FIRST_MS = 1_000;
+export const STORE_LOCK_RETRY_MAX_MS = 30_000;
 /** Log lines the worker posts in one second at most; the rest are counted
  *  and reported as dropped with the next line it posts. */
 export const LOG_LINES_PER_SECOND = 200;
@@ -143,6 +148,16 @@ export type StoreMessage = Envelope &
 
 export type StatusMessage = Envelope & { type: "status"; status: WorkerStatus };
 
+/** The store's open found its write lock held by another connection past the
+ *  busy timeout. The worker opens it again after `retryInMs`; this is no
+ *  failure, and the store result follows once an open gets the lock. */
+export type WaitingMessage = Envelope & {
+  type: "waiting";
+  reason: string;
+  attempt: number;
+  retryInMs: number;
+};
+
 export type LogMessage = Envelope & { type: "log"; line: string; dropped?: number };
 
 /** `store`: the store refused or is damaged, which no restart can fix.
@@ -165,13 +180,23 @@ export type WorkerMessage =
   | ReadyMessage
   | StoreMessage
   | StatusMessage
+  | WaitingMessage
   | LogMessage
   | FatalMessage
   | ReplyMessage
   | StoppedMessage;
 
 const MAIN_TYPES = new Set(["init", "events", "vectors", "stop"]);
-const WORKER_TYPES = new Set(["ready", "store", "status", "log", "fatal", "reply", "stopped"]);
+const WORKER_TYPES = new Set([
+  "ready",
+  "store",
+  "status",
+  "waiting",
+  "log",
+  "fatal",
+  "reply",
+  "stopped",
+]);
 
 function enveloped(value: unknown, types: Set<string>): boolean {
   if (typeof value !== "object" || value === null) return false;
