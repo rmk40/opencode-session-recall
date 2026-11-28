@@ -881,51 +881,87 @@ async function createV2Runtime(
         : undefined;
     };
 
+    /** Indexing stops on this thread for `why`: logged, reported as
+     *  `stopped` with the warning, and the cards already stored keep
+     *  serving (the degraded tier's, without a store). */
+    const stopOnMain = (why: string, detail: string): void => {
+      log(
+        `the distiller could not run on the main thread either (${detail}); serving the cards already stored`,
+      );
+      inlineStopped = why;
+      if (!store) {
+        // The degraded tier serves what discovery finds, without saying the
+        // index is starting.
+        startLite(true);
+        installCards(liteSource);
+      }
+    };
+
     /** The distiller moves to this thread over a writable store, once the
      *  last worker's thread has ended. Until it exists, signals wait in
      *  {@link handoff}. */
     const goInline = (reason: string, lastHolder: string | undefined): void => {
       handoff = createEventOutbox();
+      let previousReader: typeof reader = null;
       void (async () => {
-        if (disposed) return;
-        const db = await openSqlite(storePath);
-        if (disposed) {
-          closeQuietly(db);
-          return;
-        }
-        const opened = db ? openStore(db, { host: STORE_HOST, source: sourcePath }) : undefined;
-        if (!db || !opened || !opened.ok) {
-          closeQuietly(db);
-          handoff = undefined;
-          const why = opened && !opened.ok ? opened.reason : "SQLite is unavailable";
-          log(
-            `the distiller could not run on the main thread either (${why}); serving the cards already stored`,
-          );
-          inlineStopped = `the store did not open on the main thread either (${why})`;
-          // The reader's cards keep serving; without one, the degraded tier
-          // serves what discovery finds, no longer as starting.
-          if (!reader) {
-            startLite(true);
-            installCards(liteSource);
+        try {
+          if (disposed) return;
+          const db = await openSqlite(storePath);
+          if (disposed) {
+            closeQuietly(db);
+            return;
           }
-          return;
+          const opened = db ? openStore(db, { host: STORE_HOST, source: sourcePath }) : undefined;
+          if (!db || !opened || !opened.ok) {
+            closeQuietly(db);
+            const why = opened && !opened.ok ? opened.reason : "SQLite is unavailable";
+            stopOnMain(`the store did not open on the main thread either (${why})`, why);
+            return;
+          }
+          if (opened.warning !== undefined) log(opened.warning);
+          writableDb = db;
+          previousReader = reader;
+          reader = null;
+          store = opened.store;
+          installCards(storeCardSource(opened.store, inlineVectorWriter(opened.store)));
+          const next = makeInline(opened.store, lastHolder);
+          inline = next;
+          try {
+            // The lease first: a deletion or a metadata patch is applied only
+            // by the lease holder, and dropped otherwise, as by any distiller
+            // that does not hold it (whose holder's polls and cold pass catch
+            // it). A lease another process holds is no failure: the distiller
+            // retries on its lease loop as every non-holder does. A throw,
+            // such as a write lock held past the busy timeout, is one.
+            if (limits.coldPass) next.start();
+          } catch (error) {
+            void next.stop();
+            const why = errmsg(error);
+            stopOnMain(`the distiller did not start on the main thread (${why})`, why);
+            return;
+          }
+          const queued = [...(controller?.drainEvents() ?? []), ...(handoff?.drain() ?? [])];
+          handoff = undefined;
+          let failed = 0;
+          for (const signal of queued) {
+            try {
+              next.onEvent(signal);
+            } catch (error) {
+              // The distiller runs on: its polls and its deletion reconcile
+              // find what a signal it could not apply carried.
+              if (failed++ === 0)
+                log(`a queued signal failed on the main thread: ${errmsg(error)}`);
+            }
+          }
+          if (failed > 1) log(`${failed} queued signals failed on the main thread`);
+          log(`the distiller runs on the main thread (${reason})`);
+        } catch (error) {
+          const why = errmsg(error);
+          stopOnMain(`the distiller did not start on the main thread (${why})`, why);
+        } finally {
+          handoff = undefined;
+          if (previousReader) closeAfterUsers(previousReader);
         }
-        if (opened.warning !== undefined) log(opened.warning);
-        writableDb = db;
-        const previousReader = reader;
-        reader = null;
-        store = opened.store;
-        installCards(storeCardSource(opened.store, inlineVectorWriter(opened.store)));
-        inline = makeInline(opened.store, lastHolder);
-        // The lease first: a deletion or a metadata patch is applied only by
-        // the lease holder, and dropped otherwise, as by any distiller that
-        // does not hold it (whose holder's polls and cold pass catch it).
-        if (limits.coldPass) inline.start();
-        const queued = [...(controller?.drainEvents() ?? []), ...(handoff?.drain() ?? [])];
-        handoff = undefined;
-        for (const signal of queued) inline.onEvent(signal);
-        log(`the distiller runs on the main thread (${reason})`);
-        if (previousReader) closeAfterUsers(previousReader);
       })();
     };
 

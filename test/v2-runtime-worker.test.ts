@@ -62,6 +62,8 @@ const storeOpens = vi.hoisted(() => ({
   hold: undefined as Promise<void> | undefined,
   entered: false,
   fail: false,
+  /** Wraps the connection an open of `path` returns. */
+  wrap: undefined as ((db: SqliteDb) => SqliteDb) | undefined,
 }));
 
 vi.mock("../src/sqlite.js", async (importOriginal) => {
@@ -75,6 +77,8 @@ vi.mock("../src/sqlite.js", async (importOriginal) => {
         storeOpens.entered = true;
         if (storeOpens.hold) await storeOpens.hold;
         if (storeOpens.fail) return null;
+        const db = await actual.openSqlite(path);
+        return db && storeOpens.wrap ? storeOpens.wrap(db) : db;
       }
       return actual.openSqlite(path);
     },
@@ -106,7 +110,13 @@ const held: SqliteDb[] = [];
 beforeEach(async () => {
   threadSafety.value = "real";
   discovery.hold = undefined;
-  Object.assign(storeOpens, { path: undefined, hold: undefined, entered: false, fail: false });
+  Object.assign(storeOpens, {
+    path: undefined,
+    hold: undefined,
+    entered: false,
+    fail: false,
+    wrap: undefined,
+  });
   dir = realpathSync(mkdtempSync(join(tmpdir(), "recall-v2-worker-")));
   storePath = join(dir, "store.db");
   v2 = await makeV2PartsDb();
@@ -777,6 +787,90 @@ describe("after the worker fails", () => {
     expect(
       out.warnings?.some((w) => w.startsWith(`New sessions are not being indexed: ${reason}.`)),
     ).toBe(true);
+  }, 30_000);
+
+  it("reports indexing stopped when the lease acquire throws on this thread, closing the reader and taking no more signals", async () => {
+    const harness = workerHarness();
+    const recorder = readerStatements();
+    const { runtime, logs } = await create({
+      worker: { start: harness.start, maxFailures: 1 },
+      wrapReader: recorder.wrap,
+    });
+    await waitFor(() => runtime.distiller.status().leaseHeld, "the worker's lease");
+    // The store opens on this thread; its lease write then finds the write
+    // lock taken past the busy timeout.
+    storeOpens.path = storePath;
+    storeOpens.wrap = (db) => ({
+      ...db,
+      run: (sql, params) => {
+        if (sql.includes("json_extract(value,'$.heartbeat') <")) {
+          throw Object.assign(new Error("database is locked"), {
+            code: "ERR_SQLITE_ERROR",
+            errcode: 5,
+          });
+        }
+        return db.run(sql, params);
+      },
+    });
+    const unhandled: unknown[] = [];
+    const onUnhandled = (reason: unknown): void => void unhandled.push(reason);
+    process.on("unhandledRejection", onUnhandled);
+    try {
+      harness.side(1)?.crash();
+      const reason = "the distiller did not start on the main thread (database is locked)";
+      await waitFor(() => runtime.deps.distiller?.() === `stopped: ${reason}`, "the stop");
+      expect(logs).toContain(
+        "the distiller could not run on the main thread either (database is locked); serving the cards already stored",
+      );
+      await waitFor(() => recorder.closes === 1, "the reader's close");
+      // Signals go to the stopped distiller, and no handoff holds them.
+      runtime.onEvent({
+        id: "evt_late",
+        type: "session.deleted",
+        data: { sessionID: "ses_a" },
+      } as never);
+      expect(runtime.store?.getCard("ses_a")).toBeDefined();
+      const out = await recall(runtime, "zephyrine");
+      expect(out.coverage?.history?.distiller).toBe(`stopped: ${reason}`);
+      expect(
+        out.warnings?.some((w) => w.startsWith(`New sessions are not being indexed: ${reason}.`)),
+      ).toBe(true);
+      await sleep(50);
+      expect(unhandled).toEqual([]);
+    } finally {
+      process.off("unhandledRejection", onUnhandled);
+    }
+  }, 30_000);
+
+  it("waits as any non-holder does when another process holds the lease at the move, with no stop", async () => {
+    const harness = workerHarness();
+    const { runtime, logs } = await create({ worker: { start: harness.start, maxFailures: 1 } });
+    await waitFor(() => runtime.distiller.status().leaseHeld, "the worker's lease");
+    // Another process's connection, opened before the opens are held.
+    const other = await openSqlite(storePath);
+    if (!other) throw new Error("no sqlite");
+    held.push(other);
+    let releaseOpen!: () => void;
+    storeOpens.hold = new Promise<void>((resolve) => (releaseOpen = resolve));
+    storeOpens.path = storePath;
+
+    harness.side(1)?.crash();
+    await waitFor(() => storeOpens.entered, "the store's open on this thread");
+    // That process takes the lease while the store opens here.
+    other.run("UPDATE meta SET value=? WHERE key='distill_lease'", [
+      JSON.stringify({
+        holder: "other/process",
+        heartbeat: Date.now(),
+        ttl: 30_000,
+        build: "b",
+        gen: 1,
+      }),
+    ]);
+    releaseOpen();
+    await waitFor(() => writable(runtime.store), "the writable store");
+    expect(runtime.deps.distiller?.()).toBe("inline: the worker exited unexpectedly");
+    expect(runtime.distiller.status().leaseHeld).toBe(false);
+    expect(logs.some((line) => line.includes("did not start on the main thread"))).toBe(false);
   }, 30_000);
 
   it("closes the reader only once the tool calls reading through it have settled", async () => {

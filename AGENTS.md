@@ -559,7 +559,16 @@ No `opencode.db` row, history page, card or row set crosses. The bounds:
   `"inline: <reason>"`. When the store does not open on main either, it reports
   `"stopped: the store did not open on the main thread either (<why>)"`, `recall`
   warns that new sessions are not being indexed, and the reader's cards keep
-  serving (cards-lite without a reader).
+  serving (cards-lite without a reader). A distiller whose start throws there
+  (its lease write finding the write lock held past the busy timeout, say) is
+  stopped and reported as
+  `"stopped: the distiller did not start on the main thread (<why>)"`, and the
+  opened store's cards keep serving. A lease another process holds is no
+  failure: the distiller waits on its lease loop as every non-holder does. A
+  queued signal that throws as it is handed over is logged and skipped, since
+  the polls and the deletion reconcile find what it carried. Whatever happens,
+  the handoff outbox is cleared and the old reader closes once its users have
+  settled.
 - **Store refusals:** a `store` refusal or a `fatal` of kind `store` (a damaged
   file, `isCorruptError`) is never retried and never run inline. Main keeps the
   reader if it had one and otherwise serves cards-lite.
