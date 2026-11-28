@@ -547,7 +547,10 @@ No `opencode.db` row, history page, card or row set crosses. The bounds:
   reader if it had one and otherwise serves cards-lite.
   `coverage.history.distiller` reports `"stopped: <reason>"`, and `recall` warns
   that new sessions are not being indexed and how to fix it.
-- **Dispose:** stop mapping events; flush pending vector writes within the bound
+- **Dispose:** retire the controller (`retire()`: no generation starts from then
+  on, a pending restart is cleared, and the reader refusal a disposed runtime
+  gives a `store` result is no failure); stop mapping events; flush pending vector
+  writes within the bound
   (`flushVectorWrites`), then dispose the card runtime; send `stop` (the worker
   quiesces and stops its distiller, which releases the lease, runs a passive
   checkpoint, closes both connections and posts `stopped`); wait for tool calls,

@@ -1049,6 +1049,8 @@ async function createV2Runtime(
     dispose() {
       if (disposePromise) return disposePromise;
       disposed = true;
+      // No worker generation starts from here on, a pending restart included.
+      controller?.retire();
       if (driftTimer !== undefined) clearInterval(driftTimer);
       mapper.dispose();
       distiller.quiesce();

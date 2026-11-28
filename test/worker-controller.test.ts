@@ -841,6 +841,43 @@ describe("the controller with scripted workers", () => {
       expect(ended.settled).toBe(true);
     });
 
+    it("starts no generation once retired, a pending restart included", async () => {
+      const { controller, scripted, record } = scriptedController();
+      await flush();
+      await run(scripted.worker(1));
+      scripted.worker(1).emit({ type: "fatal", kind: "crash", reason: "crashed" });
+      scripted.worker(1).exit();
+      await flush();
+      controller.retire();
+      await advance(60_000);
+      expect(scripted.workers).toHaveLength(1);
+      expect(failures(record)).toHaveLength(1);
+      expect(record.inline).toEqual([]);
+    });
+
+    it("takes a reader refusal after retire as the stop under way, not a failure", async () => {
+      const { controller, scripted, record } = scriptedController({
+        onStoreOpen: async () => ({ ok: false, reason: "the runtime is disposed" }),
+      });
+      await flush();
+      await ready(scripted.worker(1));
+      controller.retire();
+      scripted.worker(1).emit({ type: "store", id: scripted.worker(1).last("init")?.id, ok: true });
+      await flush();
+      expect(failures(record)).toEqual([]);
+      expect(scripted.worker(1).terminations).toBe(0);
+      // The stop still reaches it, and it ends as asked.
+      const stopped = tracked(controller.stop(1_000));
+      await flush();
+      const stop = scripted.worker(1).last("stop");
+      expect(stop).toBeDefined();
+      scripted.worker(1).emit({ type: "stopped", id: stop?.id });
+      await flush();
+      expect(stopped.value).toBe(true);
+      await advance(60_000);
+      expect(scripted.workers).toHaveLength(1);
+    });
+
     it("ends a worker whose start was pending at the stop, counting no failure, and terminate waits for its exit", async () => {
       const scripted = scriptedWorkers();
       let release!: () => void;

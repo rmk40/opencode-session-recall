@@ -119,6 +119,12 @@ export type WorkerController = {
   /** Take no more signals, and drop the queued ones. */
   quiesce(): void;
   /**
+   * Start no generation from now on and clear a pending restart, for a
+   * runtime going away. The current generation keeps taking vector writes
+   * and a later {@link stop}; a reader refusal from here on is no failure.
+   */
+  retire(): void;
+  /**
    * Stop: no generation starts after this. The running worker is asked to
    * stop its distiller, release its lease and close its connections; resolves
    * true once it reported `stopped`, false at the deadline or when no worker
@@ -356,6 +362,9 @@ export function createWorkerController(options: WorkerControllerOptions): Worker
     }
     if (gen !== current || gen.failed || mode.kind !== "worker") return;
     if (!opened.ok) {
+      // A runtime going away refuses to open its reader: that is the stop
+      // under way, which ends this generation, not a failure of it.
+      if (stopping) return;
       void fail(gen, `main could not open its store reader (${opened.reason})`);
       return;
     }
@@ -551,6 +560,12 @@ export function createWorkerController(options: WorkerControllerOptions): Worker
     quiesce() {
       quiesced = true;
       outbox.drain();
+    },
+    retire() {
+      stopping = true;
+      if (restartTimer !== undefined) clearTimeout(restartTimer);
+      restartTimer = undefined;
+      markSettled();
     },
     stop(deadlineMs) {
       stopPromise ??= (async () => {
