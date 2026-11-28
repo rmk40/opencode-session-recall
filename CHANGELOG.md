@@ -4,7 +4,9 @@ All notable changes to this project are documented here. This project follows
 [Conventional Commits](https://www.conventionalcommits.org/) and
 [Semantic Versioning](https://semver.org/).
 
-## Unreleased
+## 3.1.1
+
+Upgrading needs no migration, since the store stays at schema 5.
 
 On opencode v2, background indexing no longer runs on OpenCode's main thread.
 The indexing pass, every write to the session store and the store's upkeep run
@@ -17,6 +19,10 @@ locked, or restarts after a failure, it says `"worker: waiting (<reason>)"` or
 `"worker: restarting (<reason>)"`. When the store cannot be used, it says
 `"stopped: <reason>"` and searches warn that new sessions are not being
 indexed. opencode v1 is unchanged and reports `"inline"`.
+
+Known issues: a search's own work still runs on the main thread. On a cold or
+busy disk, its full-text scoring can take about 100 to 250 ms in one slice, and
+its first history page reads can wait on the disk.
 
 ## 3.1.0
 
