@@ -981,6 +981,10 @@ async function createV2Runtime(
           } catch (error) {
             void next.stop();
             const why = errmsg(error);
+            // The writable store stays open, and the card runtime keeps
+            // writing its vectors through `inlineVectorWriter`: every process
+            // may persist card vectors whether or not it indexes, and the
+            // store's own checks decide what lands.
             stopOnMain(`the distiller did not start on the main thread (${why})`, why);
             return;
           }
