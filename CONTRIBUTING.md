@@ -25,7 +25,7 @@ The project uses `tsup` for bundling and `tsc` for declaration files. ESM-only (
 npm run typecheck && npm run compile
 ```
 
-Output goes to `dist/`. The plugin's entry point is `src/opencode-session-recall.ts`; the root `server.js` re-exports it for local-directory installs on opencode v2. A second entry, `src/distill-worker.ts`, builds to `dist/distill-worker.js`, the thread the v2 distiller runs in. `npm run test:compiled` runs the checks that start the compiled worker and load the bundled plugin as a host does, from the repository and from an installed tarball, under Node and Bun when it is installed (`test/compiled/*.check.ts`), and `npm run check:pack` checks what `npm pack` would publish; `npm run check` runs both after `compile`.
+Output goes to `dist/`. The plugin's entry point is `src/opencode-session-recall.ts`; the root `server.js` re-exports it for local-directory installs on opencode v2. A second entry, `src/distill-worker.ts`, builds to `dist/distill-worker.js`, the thread the v2 distiller runs in. `npm run test:compiled` runs the checks that start the compiled worker and load the bundled plugin as a host does, from the repository and from an installed tarball, under Node and Bun when it is installed (`test/compiled/*.check.ts`), and `npm run check:pack` checks what `npm pack` would publish; `npm run check` runs both after `compile`. Without `bun` on `PATH` the checks under Bun are skipped, and the output says so. Set `RECALL_REQUIRE_BUN=1` to make them fail instead, as on a machine that must check Bun.
 
 ## Architecture
 

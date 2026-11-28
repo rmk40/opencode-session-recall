@@ -674,8 +674,9 @@ state exists once per thread.
   entry in a child process, the way a host loads it, through the repository's
   `server.js` and from the `npm pack` tarball installed into a scratch project's
   `node_modules` (its dependencies come from npm's cache when it holds them). It
-  runs under Node and, when `bun` is on PATH, under Bun, and logs why it skips
-  Bun otherwise. The child runs `test-dist/bundle-scenario.js`, which drives
+  runs under Node and, when `bun` is on PATH, under Bun. Without `bun` the checks
+  under Bun are skipped with a note the verbose reporter prints, or fail when
+  `RECALL_REQUIRE_BUN=1` is set. The child runs `test-dist/bundle-scenario.js`, which drives
   `setup()` with the fake v2 host over a scratch store and `opencode.db` and
   passes only when `coverage.history.distiller` is `"worker"` and a session was
   distilled into the store. So the production thread starter has to find

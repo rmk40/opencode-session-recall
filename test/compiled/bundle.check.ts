@@ -1,4 +1,13 @@
-import { afterAll, beforeAll, beforeEach, afterEach, describe, expect, it } from "vitest";
+import {
+  afterAll,
+  afterEach,
+  beforeAll,
+  beforeEach,
+  describe,
+  expect,
+  it,
+  type TestContext,
+} from "vitest";
 import { execFile, execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -16,7 +25,9 @@ import { BUNDLE_SCENARIO, REPO_ROOT } from "./worker-runner.js";
 /**
  * The plugin as it ships: the bundled main entry, loaded the way a host
  * loads it, in a process of its own under Node and, where `bun` is on PATH,
- * under Bun. Once from the repository through its `server.js` shim, and once
+ * under Bun: without it the checks under Bun are skipped with a note, or fail
+ * when `RECALL_REQUIRE_BUN=1` is set. Once from the repository through its
+ * `server.js` shim, and once
  * from the tarball `npm pack` makes, installed into a scratch project's
  * `node_modules`. Each run starts the production thread starter, so the
  * bundle must find `distill-worker.js` from whichever chunk it lands in and
@@ -45,11 +56,28 @@ const runtimes: Array<[name: string, program: string | undefined]> = [
   ["Bun", bun],
 ];
 
+/** With `RECALL_REQUIRE_BUN=1` a missing Bun fails the checks under Bun
+ *  instead of skipping them, as a machine that must check Bun wants. */
+const REQUIRE_BUN = process.env.RECALL_REQUIRE_BUN === "1";
+const BUN_MISSING =
+  "bun is not on PATH, so the bundled plugin was not checked under Bun (set RECALL_REQUIRE_BUN=1 to fail instead)";
+
+/** `program`, or for a missing Bun a visible skip (a failure under
+ *  {@link REQUIRE_BUN}). */
+function programOr(program: string | undefined, context: TestContext): string {
+  if (program) return program;
+  if (REQUIRE_BUN) throw new Error("RECALL_REQUIRE_BUN=1 is set, but bun is not on PATH");
+  console.warn(BUN_MISSING);
+  context.skip(BUN_MISSING);
+  throw new Error(BUN_MISSING);
+}
+
 let packed: string;
 let installed: string;
 
 beforeAll(async () => {
-  if (!bun) console.log("bun is not on PATH: the checks under Bun are skipped");
+  if (!bun)
+    console.warn(REQUIRE_BUN ? "bun is not on PATH, and RECALL_REQUIRE_BUN=1 is set" : BUN_MISSING);
   packed = mkdtempSync(join(tmpdir(), "recall-bundle-pack-"));
   const { stdout } = await run(
     "npm",
@@ -141,23 +169,15 @@ async function scenario(program: string, entry: string): Promise<Outcome> {
 }
 
 describe.each(runtimes)("the bundled plugin under %s", (_name, program) => {
-  it.skipIf(!program)(
-    "runs the distiller in a worker thread and distills a session, loaded through the repository's server.js",
-    async () => {
-      const outcome = await scenario(program!, join(REPO_ROOT, "server.js"));
-      expect(outcome).toMatchObject({ distiller: "worker", degraded: false, found: true });
-      expect(outcome.fullCards).toBeGreaterThan(0);
-    },
-    150_000,
-  );
+  it("runs the distiller in a worker thread and distills a session, loaded through the repository's server.js", async (context) => {
+    const outcome = await scenario(programOr(program, context), join(REPO_ROOT, "server.js"));
+    expect(outcome).toMatchObject({ distiller: "worker", degraded: false, found: true });
+    expect(outcome.fullCards).toBeGreaterThan(0);
+  }, 150_000);
 
-  it.skipIf(!program)(
-    "runs the distiller in a worker thread and distills a session, installed from its packed tarball",
-    async () => {
-      const outcome = await scenario(program!, installed);
-      expect(outcome).toMatchObject({ distiller: "worker", degraded: false, found: true });
-      expect(outcome.fullCards).toBeGreaterThan(0);
-    },
-    150_000,
-  );
+  it("runs the distiller in a worker thread and distills a session, installed from its packed tarball", async (context) => {
+    const outcome = await scenario(programOr(program, context), installed);
+    expect(outcome).toMatchObject({ distiller: "worker", degraded: false, found: true });
+    expect(outcome.fullCards).toBeGreaterThan(0);
+  }, 150_000);
 });
