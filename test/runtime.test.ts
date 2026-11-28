@@ -4,6 +4,8 @@ import {
   createIdDedupe,
   DETACH_WAIT_MS,
   differingKeys,
+  noteWorkerExit,
+  pendingWorkerExit,
   resetRuntimeRegistryForTests,
   RETIRE_WAIT_MS,
   type ResolvedIdentity,
@@ -331,6 +333,47 @@ describe("runtime registry, failed creation", () => {
     expect(a.failed()).toBe(true);
     expect(logs).toEqual(["runtime creation failed: no home directory"]);
     await a.detach();
+  });
+});
+
+describe("worker thread exits on a store", () => {
+  const settledOf = (promise: Promise<unknown> | undefined): { settled: boolean } => {
+    const state = { settled: false };
+    void promise?.then(() => (state.settled = true));
+    return state;
+  };
+
+  it("keeps an exit still pending when a later runtime records one that settled at once", async () => {
+    let endA!: () => void;
+    noteWorkerExit("/cache/store.db", new Promise<void>((resolve) => (endA = resolve)));
+    // A runtime that waited on that thread and retired without a thread.
+    noteWorkerExit("/cache/store.db", Promise.resolve());
+    await vi.advanceTimersByTimeAsync(0);
+    const pending = pendingWorkerExit("/cache/store.db");
+    expect(pending).toBeDefined();
+    const state = settledOf(pending);
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(state.settled).toBe(false);
+    endA();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(state.settled).toBe(true);
+    expect(pendingWorkerExit("/cache/store.db")).toBeUndefined();
+  });
+
+  it("settles a store's record only once every exit recorded on it has", async () => {
+    let endA!: () => void;
+    let endB!: () => void;
+    noteWorkerExit("/cache/store.db", new Promise<void>((resolve) => (endA = resolve)));
+    noteWorkerExit("/cache/store.db", new Promise<void>((resolve) => (endB = resolve)));
+    const state = settledOf(pendingWorkerExit("/cache/store.db"));
+    endB();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(state.settled).toBe(false);
+    endA();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(state.settled).toBe(true);
+    // Another store's record is its own.
+    expect(pendingWorkerExit("/cache/other.db")).toBeUndefined();
   });
 });
 

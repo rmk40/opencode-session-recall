@@ -1027,23 +1027,34 @@ describe("dispose", () => {
     expect(afterStopped).toEqual([]);
   }, 30_000);
 
-  it("lets the next runtime on the store start its worker only once the last thread has ended", async () => {
-    // A starter whose threads report their exit only when released.
-    const first = workerHarness();
+  /** A starter over `harness` whose threads report their exit only once
+   *  `release()` is called. */
+  function exitsHeld(harness: WorkerHarness): { start: WorkerStarter; release(): void } {
     const held: Array<() => void> = [];
     let holding = true;
-    const holdExits: WorkerStarter = async (generation) => {
-      const worker = await first.start(generation);
-      return {
-        ...worker,
-        onExit: (listener) =>
-          worker.onExit(() => {
-            if (holding) held.push(listener);
-            else listener();
-          }),
-      };
+    return {
+      start: async (generation) => {
+        const worker = await harness.start(generation);
+        return {
+          ...worker,
+          onExit: (listener) =>
+            worker.onExit(() => {
+              if (holding) held.push(listener);
+              else listener();
+            }),
+        };
+      },
+      release() {
+        holding = false;
+        for (const listener of held.splice(0)) listener();
+      },
     };
-    const { runtime: old } = await create({ worker: { start: holdExits } });
+  }
+
+  it("lets the next runtime on the store start its worker only once the last thread has ended", async () => {
+    const first = workerHarness();
+    const exits = exitsHeld(first);
+    const { runtime: old } = await create({ worker: { start: exits.start } });
     await waitFor(() => old.distiller.status().leaseHeld, "the first worker's lease");
     runtimes.splice(runtimes.indexOf(old), 1);
     const disposing = old.dispose();
@@ -1060,12 +1071,45 @@ describe("dispose", () => {
       "waiting for an earlier worker thread on this store to end before starting one",
     );
 
-    holding = false;
-    for (const listener of held.splice(0)) listener();
+    exits.release();
     await disposing;
     await waitFor(() => second.sides.length === 1, "the second worker");
     await waitFor(() => next.distiller.status().leaseHeld, "the second worker's lease");
     expect(next.deps.distiller?.()).toBe("worker");
+  }, 40_000);
+
+  it("keeps a running thread's record through a reload whose runtime retired before starting a worker", async () => {
+    const first = workerHarness();
+    const exits = exitsHeld(first);
+    const { runtime: a } = await create({ worker: { start: exits.start } });
+    await waitFor(() => a.distiller.status().leaseHeld, "A's lease");
+    runtimes.splice(runtimes.indexOf(a), 1);
+    const disposingA = a.dispose();
+    await waitFor(() => first.side(1)?.ended === true, "the end asked of A's thread");
+
+    // B waits on A's thread, and retires before it starts one.
+    const second = workerHarness();
+    const { runtime: b } = await create({ worker: { start: second.start } });
+    expect(b.deps.distiller?.()).toBe(
+      "worker: waiting (an earlier worker on this store has not ended)",
+    );
+    await dispose(b);
+    expect(second.sides).toHaveLength(0);
+
+    // C still waits, since A's thread has not ended.
+    const third = workerHarness();
+    const { runtime: c } = await create({ worker: { start: third.start } });
+    await sleep(500);
+    expect(third.sides).toHaveLength(0);
+    expect(c.deps.distiller?.()).toBe(
+      "worker: waiting (an earlier worker on this store has not ended)",
+    );
+
+    exits.release();
+    await disposingA;
+    await waitFor(() => third.sides.length === 1, "C's worker");
+    await waitFor(() => c.distiller.status().leaseHeld, "C's lease");
+    expect(second.sides).toHaveLength(0);
   }, 40_000);
 
   it("returns within its bound and closes the reader once a tool call that outlived it settles", async () => {

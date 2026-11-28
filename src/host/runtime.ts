@@ -151,14 +151,21 @@ function workerExits(): Map<string, Promise<void>> {
  * write lock and later commits, and the runtime's own dispose stops waiting
  * for it after a bound: a later runtime on the same store starts its own
  * worker only once this settles ({@link pendingWorkerExit}).
+ *
+ * An exit already recorded for the store is kept: the record settles only
+ * once both have. A runtime that waited on an earlier thread and retired
+ * before starting one of its own records an exit that settles at once,
+ * while the earlier thread may still run.
  */
 export function noteWorkerExit(store: string, exit: Promise<void>): void {
   const exits = workerExits();
-  exits.set(store, exit);
+  const earlier = pendingWorkerExit(store);
+  const recorded = earlier ? Promise.all([earlier, exit]).then(() => undefined) : exit;
+  exits.set(store, recorded);
   const forget = (): void => {
-    if (exits.get(store) === exit) exits.delete(store);
+    if (exits.get(store) === recorded) exits.delete(store);
   };
-  void exit.then(forget, forget);
+  void recorded.then(forget, forget);
 }
 
 /** The exit {@link noteWorkerExit} recorded for `store` that has not settled

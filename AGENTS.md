@@ -590,7 +590,10 @@ No `opencode.db` row, history page, card or row set crosses. The bounds:
   store handle refuses every call from then on.
 - **The next runtime's worker:** dispose also records, per real store path in the
   registry (`noteWorkerExit`, shared across builds), a promise of the last
-  thread's confirmed exit, with no time bound. A later runtime on the same store
+  thread's confirmed exit, with no time bound. A record already there is kept
+  and the two settle together, so a runtime that waited on a thread and retired
+  before starting its own cannot let a third start beside that thread. A later
+  runtime on the same store
   starts its first generation only once that promise settles (`startAfter`),
   reporting `"worker: waiting (an earlier worker on this store has not ended)"`.
   Meanwhile it opens its reader at once when it can and otherwise serves the
