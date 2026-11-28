@@ -8,6 +8,7 @@ import {
   EVENT_BATCH,
   isWorkerMessage,
   MAX_PENDING_REQUESTS,
+  MAX_UNACKED_BATCHES,
   PROTOCOL_VERSION,
   transferableBuffers,
   VECTOR_WRITE_DEADLINE_MS,
@@ -151,6 +152,9 @@ type Generation = {
   markExited: () => void;
   stopped?: () => void;
   status?: WorkerStatus;
+  /** The `events` batches posted to this generation that it has not
+   *  acknowledged yet. */
+  unacked: Set<number>;
 };
 
 function unref(timer: ReturnType<typeof setTimeout> | ReturnType<typeof setInterval>): void {
@@ -176,6 +180,7 @@ export function createWorkerController(options: WorkerControllerOptions): Worker
   let stopping = false;
   let quiesced = false;
   let nextId = 1;
+  let nextBatch = 1;
   let restartTimer: ReturnType<typeof setTimeout> | undefined;
   let watchdog: ReturnType<typeof setInterval> | undefined;
   let flushScheduled = false;
@@ -229,12 +234,23 @@ export function createWorkerController(options: WorkerControllerOptions): Worker
     }, 0);
   }
 
+  /** Post the outbox's signals while fewer than {@link MAX_UNACKED_BATCHES}
+   *  batches wait on their ack. A worker that SQLite holds up reads none, so
+   *  the rest keep coalescing in the bounded outbox meanwhile. */
   function flush(): void {
     const gen = current;
-    if (!gen?.running || gen.failed || gen.stopRequested || outbox.size() === 0) return;
-    const signals = outbox.drain();
-    for (let i = 0; i < signals.length; i += EVENT_BATCH) {
-      send(gen, { type: "events", signals: signals.slice(i, i + EVENT_BATCH) });
+    if (!gen?.running || gen.failed || gen.stopRequested) return;
+    while (gen.unacked.size < MAX_UNACKED_BATCHES && outbox.size() > 0) {
+      const signals = outbox.drain(EVENT_BATCH);
+      const batch = nextBatch++;
+      if (!send(gen, { type: "events", batch, signals })) {
+        // The batch's sessions left the outbox whole in this same turn, so
+        // no newer signal of theirs waits there: adding them back restores
+        // what the outbox held, for the next send or a distiller taking over.
+        for (const signal of signals) outbox.add(signal);
+        return;
+      }
+      gen.unacked.add(batch);
     }
   }
 
@@ -377,6 +393,9 @@ export function createWorkerController(options: WorkerControllerOptions): Worker
         gen.status = raw.status;
         options.onStatus?.(raw.status);
         return;
+      case "ack":
+        if (gen.unacked.delete(raw.batch) && outbox.size() > 0) flush();
+        return;
       case "log":
         if (raw.dropped) log(`worker: ${raw.dropped} log line(s) dropped`);
         log(raw.line);
@@ -416,6 +435,7 @@ export function createWorkerController(options: WorkerControllerOptions): Worker
       failed: false,
       stopRequested: false,
       exited: false,
+      unacked: new Set(),
       exit: new Promise<void>((resolve) => (markExited = resolve)),
       markExited: () => {
         gen.exited = true;

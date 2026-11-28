@@ -405,14 +405,19 @@ export function runWorkerHandler(port: WorkerPort, options: WorkerHandlerOptions
   }
 
   function events(message: EventsMessage): void {
-    if (!distiller || stopping || !Array.isArray(message.signals)) return;
-    for (const signal of message.signals as unknown[]) {
-      if (typeof signal !== "object" || signal === null) continue;
-      const { type, sessionID } = signal as { type?: unknown; sessionID?: unknown };
-      if (typeof sessionID !== "string") continue;
-      if (type === "turn-ended" || type === "removal" || type === "deleted" || type === "meta") {
-        distiller.onEvent(signal as DistillSignal);
+    try {
+      if (!distiller || stopping || !Array.isArray(message.signals)) return;
+      for (const signal of message.signals as unknown[]) {
+        if (typeof signal !== "object" || signal === null) continue;
+        const { type, sessionID } = signal as { type?: unknown; sessionID?: unknown };
+        if (typeof sessionID !== "string") continue;
+        if (type === "turn-ended" || type === "removal" || type === "deleted" || type === "meta") {
+          distiller.onEvent(signal as DistillSignal);
+        }
       }
+    } finally {
+      // Main posts its next batch once this one is acknowledged.
+      if (typeof message.batch === "number") send({ type: "ack", batch: message.batch });
     }
   }
 

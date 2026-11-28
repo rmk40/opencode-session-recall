@@ -22,6 +22,7 @@ const WORKER_TYPES = [
   "store",
   "status",
   "waiting",
+  "ack",
   "log",
   "fatal",
   "reply",
@@ -150,6 +151,33 @@ describe("the event outbox", () => {
       expect(outbox.drain().map((s) => s.sessionID)).toEqual(["s2", "s2", "s1", "s3"]);
       expect(outbox.size()).toBe(0);
       expect(outbox.drain()).toEqual([]);
+    });
+
+    it("drains with a limit only whole sessions that fit, the first one always", () => {
+      const outbox = createEventOutbox();
+      outbox.add(meta("s1", { title: "t" }));
+      outbox.add(removal("s1"));
+      outbox.add(turnEnded("s1"));
+      outbox.add(turnEnded("s2"));
+      outbox.add(meta("s3", { title: "u" }));
+      outbox.add(turnEnded("s3"));
+      expect(outbox.drain(2)).toEqual([meta("s1", { title: "t" }), removal("s1"), turnEnded("s1")]);
+      expect(outbox.drain(2)).toEqual([turnEnded("s2")]);
+      expect(outbox.size()).toBe(1);
+      expect(outbox.drain(2)).toEqual([meta("s3", { title: "u" }), turnEnded("s3")]);
+      expect(outbox.size()).toBe(0);
+    });
+
+    it("frees the bytes of the sessions a limited drain took", () => {
+      // Each re-check costs its id's length plus 32 bytes: three fit in 100.
+      const outbox = createEventOutbox({ bytes: 100 });
+      outbox.add(turnEnded("a"));
+      outbox.add(turnEnded("b"));
+      outbox.add(turnEnded("c"));
+      expect(outbox.drain(1)).toEqual([turnEnded("a")]);
+      outbox.add(turnEnded("d"));
+      expect(outbox.dropped()).toBe(0);
+      expect(outbox.drain().map((s) => s.sessionID)).toEqual(["b", "c", "d"]);
     });
   });
 

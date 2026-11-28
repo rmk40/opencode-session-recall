@@ -845,7 +845,7 @@ describe("vector writes", () => {
 });
 
 describe("events", () => {
-  it("hands each well-formed signal to the distiller and skips the rest", async () => {
+  it("hands each well-formed signal to the distiller, skips the rest and acknowledges each batch", async () => {
     const { worker, side } = await startSide();
     worker.postMessage(initMessage({ limits: { coldPass: true }, idleDebounceMs: 5 }));
     const status = await nextOf(side, "status");
@@ -874,11 +874,11 @@ describe("events", () => {
       time_created: 5_100,
       data: { text: "a question about cranes", time: { created: 5_100 } },
     });
-    const events = (signals: unknown): MainMessage =>
-      ({ v: PROTOCOL_VERSION, generation: 1, type: "events", signals }) as MainMessage;
-    worker.postMessage(events("not a list"));
+    const events = (batch: number, signals: unknown): MainMessage =>
+      ({ v: PROTOCOL_VERSION, generation: 1, type: "events", batch, signals }) as MainMessage;
+    worker.postMessage(events(1, "not a list"));
     worker.postMessage(
-      events([
+      events(2, [
         null,
         7,
         { type: "turn-ended" },
@@ -889,6 +889,8 @@ describe("events", () => {
     );
     await waitFor(() => carded("ses_b"), "the card of ses_b");
     expect(sentOf(side, "fatal")).toEqual([]);
+    // Each batch is acknowledged once it was handled, a malformed one too.
+    expect(sentOf(side, "ack").map((ack) => ack.batch)).toEqual([1, 2]);
   }, 15_000);
 });
 

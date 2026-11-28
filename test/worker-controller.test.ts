@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { BUILD_ID } from "../src/build-id.js";
 import type { CardVectorWriteResult } from "../src/cards.js";
-import { LEASE_TTL_MS, type DistillSignal } from "../src/distill.js";
+import { LEASE_TTL_MS } from "../src/distill.js";
 import { openSqlite } from "../src/sqlite.js";
 import { openStore, VECTORS_REV_KEY, type LeaseInfo } from "../src/store.js";
 import {
@@ -12,7 +12,7 @@ import {
   type WorkerController,
   type WorkerControllerOptions,
 } from "../src/worker/controller.js";
-import type { WorkerStatus } from "../src/worker/protocol.js";
+import type { EventsMessage, WorkerStatus } from "../src/worker/protocol.js";
 import { insertProject, insertSession, makeV2PartsDb, type V2TestDb } from "./v2-db.js";
 import {
   harnessController,
@@ -807,21 +807,82 @@ describe("the controller with scripted workers", () => {
   });
 
   describe("posting signals", () => {
-    it("sends queued signals on the next turn, in messages of at most 256", async () => {
+    const batchesOf = (worker: ScriptedWorker): EventsMessage[] =>
+      worker.received.map((r) => r.message).filter((m): m is EventsMessage => m.type === "events");
+
+    it("sends queued signals on the next turn, in messages of at most 256, at most two waiting on an ack", async () => {
       const { controller, scripted } = scriptedController();
       await flush();
       await run(scripted.worker(1));
       for (let i = 0; i < 600; i++) controller.post({ type: "turn-ended", sessionID: `s${i}` });
       expect(scripted.worker(1).last("events")).toBeUndefined();
       await flush();
-      const batches = scripted
-        .worker(1)
-        .received.filter((r) => r.message.type === "events")
-        .map((r) => (r.message as { signals: DistillSignal[] }).signals);
-      expect(batches.map((b) => b.length)).toEqual([256, 256, 88]);
-      expect(batches.flat().map((s) => s.sessionID)).toEqual(
+      expect(batchesOf(scripted.worker(1)).map((b) => b.signals.length)).toEqual([256, 256]);
+      await advance(60_000);
+      expect(batchesOf(scripted.worker(1))).toHaveLength(2);
+      // The rest wait in the outbox.
+      expect(controller.drainEvents().map((s) => s.sessionID)).toEqual(
+        Array.from({ length: 88 }, (_, i) => `s${512 + i}`),
+      );
+    });
+
+    it("posts the next batch once one is acknowledged, and ignores an ack of no waiting batch", async () => {
+      const { scripted, controller } = scriptedController();
+      await flush();
+      await run(scripted.worker(1));
+      for (let i = 0; i < 600; i++) controller.post({ type: "turn-ended", sessionID: `s${i}` });
+      await flush();
+      const [first, second] = batchesOf(scripted.worker(1));
+      scripted.worker(1).emit({ type: "ack", batch: 999 });
+      expect(batchesOf(scripted.worker(1))).toHaveLength(2);
+      scripted.worker(1).emit({ type: "ack", batch: second?.batch });
+      const batches = batchesOf(scripted.worker(1));
+      expect(batches.map((b) => b.signals.length)).toEqual([256, 256, 88]);
+      expect(new Set(batches.map((b) => b.batch)).size).toBe(3);
+      expect(batches.flatMap((b) => b.signals.map((s) => s.sessionID))).toEqual(
         Array.from({ length: 600 }, (_, i) => `s${i}`),
       );
+      // Both waiting batches are acknowledged and the outbox is empty.
+      scripted.worker(1).emit({ type: "ack", batch: first?.batch });
+      expect(batchesOf(scripted.worker(1))).toHaveLength(3);
+    });
+
+    it("keeps coalescing signals in the outbox while two batches wait on an ack", async () => {
+      const { controller, scripted } = scriptedController();
+      await flush();
+      await run(scripted.worker(1));
+      controller.post({ type: "turn-ended", sessionID: "a" });
+      await flush();
+      controller.post({ type: "turn-ended", sessionID: "b" });
+      await flush();
+      expect(batchesOf(scripted.worker(1))).toHaveLength(2);
+      controller.post({ type: "turn-ended", sessionID: "c" });
+      controller.post({ type: "meta", sessionID: "c", patch: { title: "one" } });
+      controller.post({ type: "turn-ended", sessionID: "c" });
+      controller.post({ type: "meta", sessionID: "c", patch: { title: "two" } });
+      await advance(60_000);
+      expect(batchesOf(scripted.worker(1))).toHaveLength(2);
+      scripted.worker(1).emit({ type: "ack", batch: batchesOf(scripted.worker(1))[0]?.batch });
+      expect(batchesOf(scripted.worker(1))[2]?.signals).toEqual([
+        { type: "meta", sessionID: "c", patch: { title: "two" } },
+        { type: "turn-ended", sessionID: "c" },
+      ]);
+    });
+
+    it("puts a batch whose send failed back in the outbox", async () => {
+      const { controller, scripted, record } = scriptedController();
+      await flush();
+      await run(scripted.worker(1));
+      scripted.worker(1).failPosts(1);
+      controller.post({ type: "deleted", sessionID: "gone" });
+      controller.post({ type: "meta", sessionID: "named", patch: { title: "t" } });
+      await flush();
+      expect(batchesOf(scripted.worker(1))).toEqual([]);
+      expect(record.logs).toContain("worker message failed: the port is closed");
+      expect(controller.drainEvents()).toEqual([
+        { type: "deleted", sessionID: "gone" },
+        { type: "meta", sessionID: "named", patch: { title: "t" } },
+      ]);
     });
 
     it("takes no signal once quiesced, and drops the queued ones", async () => {

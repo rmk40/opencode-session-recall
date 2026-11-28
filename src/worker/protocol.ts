@@ -50,6 +50,9 @@ export const LOG_LINE_CHARS = 2_000;
 
 /** Signals one `events` message carries at most. */
 export const EVENT_BATCH = 256;
+/** `events` messages main lets wait on the worker's `ack` at once; later
+ *  signals keep coalescing in its outbox until one is acknowledged. */
+export const MAX_UNACKED_BATCHES = 2;
 /** Sessions main's event outbox holds at most. */
 export const OUTBOX_SESSIONS = 4_096;
 /** Bytes main's event outbox holds at most (session ids and patch text). */
@@ -103,8 +106,9 @@ export type InitMessage = Envelope & {
   foreground: SharedArrayBuffer;
 };
 
-/** Distiller signals, already coalesced per session ({@link EventOutbox}). */
-export type EventsMessage = Envelope & { type: "events"; signals: DistillSignal[] };
+/** Distiller signals, already coalesced per session ({@link EventOutbox}).
+ *  The worker answers each with an `ack` naming its `batch`. */
+export type EventsMessage = Envelope & { type: "events"; batch: number; signals: DistillSignal[] };
 
 /** One card vector to persist; `embedding` is transferred when it is a whole
  *  buffer of its own. */
@@ -158,6 +162,10 @@ export type WaitingMessage = Envelope & {
   retryInMs: number;
 };
 
+/** The worker handed every signal of `events` message `batch` to its
+ *  distiller. */
+export type AckMessage = Envelope & { type: "ack"; batch: number };
+
 export type LogMessage = Envelope & { type: "log"; line: string; dropped?: number };
 
 /** `store`: the store refused or is damaged, which no restart can fix.
@@ -181,6 +189,7 @@ export type WorkerMessage =
   | StoreMessage
   | StatusMessage
   | WaitingMessage
+  | AckMessage
   | LogMessage
   | FatalMessage
   | ReplyMessage
@@ -192,6 +201,7 @@ const WORKER_TYPES = new Set([
   "store",
   "status",
   "waiting",
+  "ack",
   "log",
   "fatal",
   "reply",
@@ -289,8 +299,10 @@ function holdsChange(pending: Pending): boolean {
  */
 export type EventOutbox = {
   add(signal: DistillSignal): void;
-  /** Every pending signal in the order its session first arrived, emptied. */
-  drain(): DistillSignal[];
+  /** Every pending signal in the order its session first arrived, emptied.
+   *  With `limit`, only the sessions whose signals fit in `limit` together,
+   *  the first one always, which leave the outbox whole. */
+  drain(limit?: number): DistillSignal[];
   size(): number;
   /** Signals dropped at the bound since the outbox was made. */
   dropped(): number;
@@ -360,19 +372,22 @@ export function createEventOutbox(bounds: { sessions?: number; bytes?: number } 
         }
       }
     },
-    drain() {
+    drain(limit = Infinity) {
       const out: DistillSignal[] = [];
       for (const [sessionID, entry] of pending) {
+        const signals: DistillSignal[] = [];
         if (entry.deleted) {
-          out.push({ type: "deleted", sessionID });
-          continue;
+          signals.push({ type: "deleted", sessionID });
+        } else {
+          if (entry.patch) signals.push({ type: "meta", sessionID, patch: entry.patch });
+          if (entry.removal) signals.push({ type: "removal", sessionID });
+          if (entry.recheck) signals.push({ type: "turn-ended", sessionID });
         }
-        if (entry.patch) out.push({ type: "meta", sessionID, patch: entry.patch });
-        if (entry.removal) out.push({ type: "removal", sessionID });
-        if (entry.recheck) out.push({ type: "turn-ended", sessionID });
+        if (out.length > 0 && out.length + signals.length > limit) break;
+        out.push(...signals);
+        pending.delete(sessionID);
+        bytes -= entry.bytes;
       }
-      pending.clear();
-      bytes = 0;
       return out;
     },
     size: () => pending.size,

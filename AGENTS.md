@@ -451,13 +451,14 @@ reason.
 | Direction     | Message                            | Contents                                                                                                                                                                                                                    |
 | ------------- | ---------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | main → worker | `init`                             | store and source paths, holder id, the predecessor's holder id (`takeOver`), limits, sync timings, `BUILD_ID`, the build tag, the representation and projector generations, the foreground signal's buffer                  |
-| main → worker | `events`                           | distiller signals, coalesced per session, up to 256 a message                                                                                                                                                               |
+| main → worker | `events`                           | a batch id and distiller signals, coalesced per session, up to 256 a message                                                                                                                                                |
 | main → worker | `vectors`                          | model, representation and rows, each whole-buffer embedding transferred                                                                                                                                                     |
 | main → worker | `stop`                             | the deadline                                                                                                                                                                                                                |
 | worker → main | `ready`                            | the worker's `BUILD_ID`, once the module has loaded                                                                                                                                                                         |
 | worker → main | `store`                            | the fence result: `ok` with an optional `warning`, or a refusal reason                                                                                                                                                      |
 | worker → main | `status`                           | `DistillStatus` (lease included), indexing, repair progress, `discoveryTruncated`, the holder id, the worker's history drift and the longest synchronous store call since the last status; on change, at most once a second |
 | worker → main | `waiting`                          | the store's open found its write lock held by another connection past the 5 s busy timeout: the reason, the attempt and the wait before it opens again (1 s, doubling to 30 s)                                              |
+| worker → main | `ack`                              | the batch id of an `events` message whose signals the worker handed to its distiller                                                                                                                                        |
 | worker → main | `log`, `fatal`, `reply`, `stopped` | a log line, an unrecoverable error (`store` or `crash`), a request's outcome, the end of a stop                                                                                                                             |
 
 No `opencode.db` row, history page, card or row set crosses. The bounds:
@@ -470,6 +471,11 @@ No `opencode.db` row, history page, card or row set crosses. The bounds:
   a removal (the poll finds it again). When every entry holds a deletion or a
   patch, the new signal is dropped and counted (the session scan and the deletion
   reconcile catch it).
+- **Event batches:** at most 2 `events` messages wait on their `ack` at once
+  (`MAX_UNACKED_BATCHES`). A worker that SQLite holds up reads no message, so
+  everything posted meanwhile keeps coalescing in the bounded outbox rather than
+  queuing on the port. Each batch takes whole sessions out of the outbox, and a
+  batch whose send fails goes back into it.
 - **Vector writes:** at most 8 wait for a reply. A ninth, or any write while no
   generation runs, settles `failed` at once. A write with no reply within 10 s
   settles `failed`. Vector writes are never gated by the foreground signal, and the

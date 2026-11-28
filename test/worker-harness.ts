@@ -379,6 +379,8 @@ export type ScriptedWorker = {
   exit(): void;
   /** How many times main asked the worker to end. */
   readonly terminations: number;
+  /** Make main's next `n` posts to this worker throw, recording none. */
+  failPosts(n: number): void;
   /** The last message main sent of `type`, if any. */
   last<T extends MainMessage["type"]>(type: T): Extract<MainMessage, { type: T }> | undefined;
 };
@@ -406,6 +408,7 @@ export function scriptedWorkers(): {
     const errorListeners: Array<(error: unknown) => void> = [];
     const exitListeners: Array<() => void> = [];
     let terminations = 0;
+    let failingPosts = 0;
     const scripted: ScriptedWorker = {
       generation,
       received: [],
@@ -425,6 +428,9 @@ export function scriptedWorkers(): {
       get terminations() {
         return terminations;
       },
+      failPosts: (n) => {
+        failingPosts = n;
+      },
       last: (type) =>
         [...scripted.received].reverse().find((entry) => entry.message.type === type)
           ?.message as never,
@@ -432,6 +438,10 @@ export function scriptedWorkers(): {
     workers.push(scripted);
     return {
       postMessage: (message, transfer) => {
+        if (failingPosts > 0) {
+          failingPosts--;
+          throw new Error("the port is closed");
+        }
         scripted.received.push({ message, transfer });
       },
       onMessage: (listener) => {
