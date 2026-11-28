@@ -104,8 +104,9 @@ const SHUTDOWN_TIMEOUT_MS = 2_500;
 const WORKER_EXIT_WAIT_MS = 10_000;
 /** How long the runtime's creation waits for the worker's store result. A
  *  runtime created without it serves the degraded card tier, saying the
- *  index is starting, and takes the store's cards once it is open. */
-export const STORE_READY_WAIT_MS = 3_000;
+ *  index is starting, and takes the store's cards once it is open. Shorter
+ *  than a tool call's wait for the runtime (`TOOL_READY_WAIT_MS`). */
+export const STORE_READY_WAIT_MS = 2_500;
 /** The reason the degraded card tier gives while the worker is starting. */
 export const INDEX_STARTING_REASON = "the index is starting";
 /** How often the runtime compares the history drift with what it last

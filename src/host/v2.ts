@@ -59,8 +59,11 @@ import {
  *   yet: enabling one logs a line and changes nothing.
  */
 
-/** How long a tool call waits for a starting runtime. */
-export const TOOL_READY_WAIT_MS = 2_000;
+/** How long a tool call waits for a starting runtime. It is longer than the
+ *  runtime's own wait for the worker's store result (`STORE_READY_WAIT_MS`),
+ *  so a call during a slow start reaches the degraded card tier instead of
+ *  the "still starting" error. */
+export const TOOL_READY_WAIT_MS = 3_000;
 /** Bound on awaiting the host's registrations inside `setup`. */
 const REGISTRATION_WAIT_MS = 2_000;
 /** Parent-lookup cache size (a session's parent never changes). */

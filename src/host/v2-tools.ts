@@ -44,7 +44,7 @@ export function buildToolSet(o: ToolSetInputs): ToolSet {
 }
 
 /** The error a tool reports while the runtime is not ready (tools wait up to
- *  2 s, then answer from the degraded path). */
+ *  `TOOL_READY_WAIT_MS`, then answer from the degraded path). */
 export const STARTING_REASON = "the recall runtime is still starting; try again shortly";
 
 /** The error a tool reports once the runtime's creation has failed (as
